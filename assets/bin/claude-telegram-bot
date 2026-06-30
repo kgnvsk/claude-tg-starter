@@ -4,10 +4,13 @@ set -eu
 export BUN_INSTALL="$HOME/.bun"
 export PATH="$HOME/.local/bin:$BUN_INSTALL/bin:$HOME/bin:/usr/local/bin:/usr/bin:/bin"
 
-# Preflight: пометить онбординг Claude завершённым + доверить рабочие теки, чтобы
-# `claude --channels` запускал Telegram-поллер, а НЕ упирался в интерактивный экран
-# первого старта (выбор темы / "trust this folder?"). `claude auth login` ставит auth,
-# но НЕ эти флаги — без них поллер не стартует и бот молчит (баг свежих деплоев).
+# Preflight: погасить ВСЕ интерактивные промпты первого старта claude, чтобы `claude --channels`
+# поднимал Telegram-поллер, а не блокировался в ожидании ввода. `claude auth login` ставит auth,
+# но НЕ эти флаги; без них свежий бокс упирается в:
+#   1) онбординг (выбор темы «Choose the text style») — hasCompletedOnboarding/theme
+#   2) «trust this folder?» — projects[cwd].hasTrustDialogAccepted
+#   3) upsell-промпты («Try the new fullscreen renderer? 1.Yes/2.Not now», remote control, passes)
+#      — claude капит их показ на 3; ставим *UpsellSeenCount=3 = «уже видел, не показывай».
 # Идемпотентно, self-healing на каждый старт. No-op пока не залогинен (нет ~/.claude.json).
 CJ="$HOME/.claude.json"
 if [ -f "$CJ" ]; then
@@ -23,6 +26,10 @@ if d.get("hasCompletedOnboarding") is not True:
     d["hasCompletedOnboarding"] = True; ch = True
 if not d.get("theme"):
     d["theme"] = "dark"; ch = True
+# upsell-промпты блокируют поллер на свежем боксе; claude капит показ на 3 → ставим 3 ("видел")
+for uk in ("fullscreenUpsellSeenCount", "remoteControlUpsellSeenCount", "passesUpsellSeenCount"):
+    if not isinstance(d.get(uk), int) or d[uk] < 3:
+        d[uk] = 3; ch = True
 proj = d.setdefault("projects", {})
 for k in trust:
     e = proj.setdefault(k, {})
