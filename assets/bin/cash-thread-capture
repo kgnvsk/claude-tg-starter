@@ -1,0 +1,76 @@
+#!/bin/bash
+# UserPromptSubmit hook — captures recent user prompts into wiki/active-thread.md
+# so the NEXT Claude Code session loads cross-session conversation continuity
+# via wiki-hot-inject (SessionStart).
+#
+# Reads stdin JSON from Claude Code: { prompt: "...", session_id: "...", ... }
+# Appends a timestamped turn to active-thread.md, keeps last 12 turns (rolling).
+set -e
+
+THREAD=~/obsidian-vault/wiki/active-thread.md
+MAX_TURNS=30
+
+# Read hook input
+INPUT=$(cat)
+PROMPT=$(echo "$INPUT" | jq -r '.prompt // ""' 2>/dev/null)
+
+# Skip empty prompts
+[ -z "$PROMPT" ] && exit 0
+
+# Skip non-Telegram prompts (CLI typing in terminal directly): heuristic — only
+# capture turns that look like Telegram channel format <channel source=...>
+echo "$PROMPT" | grep -q '<channel source="plugin:telegram' || exit 0
+
+# Extract just the message body (drop the <channel> wrapper for readability)
+BODY=$(echo "$PROMPT" | sed -n 's|.*<channel[^>]*>\(.*\)</channel>.*|\1|p' | head -c 2000)
+[ -z "$BODY" ] && BODY=$(echo "$PROMPT" | head -c 2000)
+
+TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+# Init file if missing
+if [ ! -f "$THREAD" ]; then
+  cat > "$THREAD" <<EOF
+---
+type: meta
+title: "Active Thread"
+description: "Rolling last ${MAX_TURNS} Telegram turns — auto-captured by cash-thread-capture hook for cross-session continuity"
+status: ephemeral
+---
+
+# Active Thread (last ${MAX_TURNS} Telegram turns)
+
+EOF
+fi
+
+# Append new turn
+{
+  echo ""
+  echo "## [$TS] user"
+  echo ""
+  echo "$BODY"
+} >> "$THREAD"
+
+# Trim: keep header (first 9 lines) + last MAX_TURNS turns
+TMP=$(mktemp)
+HEADER_LINES=9
+head -n $HEADER_LINES "$THREAD" > "$TMP"
+
+# Extract turn blocks (each starts with "## [...] user")
+TAIL=$(awk '
+  /^## \[/ { count++ }
+  count > 0 { print }
+' "$THREAD")
+
+# Keep last MAX_TURNS turns
+echo "$TAIL" | awk -v max="$MAX_TURNS" '
+  /^## \[/ { turn_idx++; turns[turn_idx]=NR }
+  { line[NR]=$0 }
+  END {
+    start = (turn_idx > max) ? turns[turn_idx - max + 1] : turns[1]
+    if (!start) start = NR + 1
+    for (i = start; i <= NR; i++) print line[i]
+  }
+' >> "$TMP"
+
+mv "$TMP" "$THREAD"
+exit 0

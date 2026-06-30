@@ -1,0 +1,12 @@
+#!/bin/bash
+set -e
+[ -z "$1" ] && { echo "Usage: html-to-pdf <input.html> [output.pdf]" >&2; exit 1; }
+INPUT_ABS=$(realpath "$1")
+OUTPUT_ABS=$(realpath -m "${2:-${1%.html}.pdf}")
+
+google-chrome --headless=new --no-sandbox --disable-gpu --hide-scrollbars \
+  --print-to-pdf="$OUTPUT_ABS" --print-to-pdf-no-header \
+  --virtual-time-budget=10000 --run-all-compositor-stages-before-draw \
+  "file://$INPUT_ABS" 2>/dev/null
+
+[ -f "$OUTPUT_ABS" ] && echo "$OUTPUT_ABS" || { echo "FAIL" >&2; exit 1; }

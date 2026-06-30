@@ -1,0 +1,181 @@
+#!/bin/bash
+# cash-morning-calendar — fires daily at 07:30 {{TIMEZONE}} (cron).
+#
+# Reads today's calendar via the LOCAL `gcalcli` CLI (cached owner OAuth token),
+# sends a digest to Telegram, and writes T-15min reminder files to
+# ~/.atarax/reminders/ (picked up by ~/bin/cash-reminder-tick every minute).
+#
+# WHY gcalcli and NOT a claude.ai connector: the mcp__claude_ai_Google_Calendar__*
+# connector does NOT load in headless `claude -p` / `--channels` (the available-tools
+# snapshot freezes before remote MCP connects — anthropics/claude-code #36833/#43298).
+# gcalcli authenticates once in the owner's browser, caches a refresh token on the
+# server, and works headless forever. (rewrite: plan v2 D2/D4 — no `claude -p` here.)
+#
+# gcalcli displays events in the server's local TZ (install-core sets it to the
+# owner's {{TIMEZONE}}), so start_date/start_time are already owner-local wall-clock.
+# cal-event-time stays the single source of truth for the reminder epoch — we feed it
+# the local datetime with its DST-aware offset; it is NOT modified by this rewrite.
+set -u
+
+CAL_EMAIL="{{CALENDAR_EMAIL}}"
+OWNER_CHAT="{{OWNER_CHAT_ID}}"
+LOG="$HOME/logs/morning-calendar.log"
+REM_DIR="$HOME/.atarax/reminders"
+TOKEN_FILE="$HOME/.claude/channels/telegram/.env"
+VAULT_LOG="$HOME/obsidian-vault/wiki/log.md"
+GCALCLI="$(command -v gcalcli || echo "$HOME/.local/bin/gcalcli")"
+
+mkdir -p "$HOME/logs" "$REM_DIR"
+
+log() { echo "$(date '+%Y-%m-%d %H:%M:%S %Z') $*" >> "$LOG"; }
+
+log "=== morning-calendar fire ==="
+
+[ -n "$CAL_EMAIL" ] || { log "no CALENDAR_EMAIL configured — exiting"; exit 0; }
+
+token=$(grep -m1 '^TELEGRAM_BOT_TOKEN=' "$TOKEN_FILE" 2>/dev/null | cut -d= -f2-)
+[ -n "$token" ] || { log "no telegram token — exiting"; exit 0; }
+
+api() {  # api <method> <curl-args...>
+  local method="$1"; shift
+  curl -sS -m 15 -X POST "https://api.telegram.org/bot${token}/${method}" "$@"
+}
+
+send_digest() {  # send_digest <markdownv2-text>
+  local escaped
+  escaped=$(printf '%s' "$1" | "$HOME/bin/tg-escape" 2>/dev/null) || escaped="$1"
+  api sendMessage \
+    --data-urlencode "chat_id=${OWNER_CHAT}" \
+    --data-urlencode "parse_mode=MarkdownV2" \
+    --data-urlencode "text=${escaped}" >/dev/null 2>&1
+}
+
+# --- date window: today 00:00 .. tomorrow 00:00 (local TZ from cron env) ---
+START=$(date +%Y-%m-%d)
+END=$(date -d "tomorrow" +%Y-%m-%d)
+
+if [ ! -x "$GCALCLI" ] && ! command -v gcalcli >/dev/null 2>&1; then
+  log "gcalcli not installed"
+  send_digest "не зміг прочитати календар: gcalcli не встановлено на сервері."
+  exit 0
+fi
+
+# --military → 24h times; --details url → adds a url column (Meet/event link when present).
+# Robust across gcalcli versions: we parse by the header row, not fixed positions.
+TSV=$("$GCALCLI" --calendar "$CAL_EMAIL" agenda --tsv --military --details url "$START" "$END" 2>>"$LOG")
+RC=$?
+if [ "$RC" -ne 0 ]; then
+  log "gcalcli failed rc=$RC"
+  send_digest "не зміг прочитати календар зараз (gcalcli помилка). Перевір OAuth: gcalcli list."
+  exit 0
+fi
+
+# Parse TSV into events with a tiny python helper (header-aware). Emits, per timed
+# event, a TSV line: start_date<TAB>start_time<TAB>title<TAB>url
+# TSV is passed via env (GCAL_TSV) so the heredoc owns stdin without a pipe conflict.
+PARSED=$(GCAL_TSV="$TSV" python3 - <<'PY'
+import os, sys
+rows = [l.rstrip("\n") for l in os.environ.get("GCAL_TSV", "").split("\n") if l.strip() != ""]
+if not rows:
+    sys.exit(0)
+# Detect header (gcalcli >=4 prints one); else assume legacy positional order.
+header = rows[0].split("\t")
+LEGACY = ["start_date", "start_time", "end_date", "end_time", "title"]
+if "start_date" in header and "title" in header:
+    cols = header
+    data = rows[1:]
+else:
+    cols = LEGACY
+    data = rows
+idx = {name: i for i, name in enumerate(cols)}
+
+def cell(parts, name):
+    i = idx.get(name, -1)
+    return parts[i] if 0 <= i < len(parts) else ""
+
+for r in data:
+    p = r.split("\t")
+    sd = cell(p, "start_date").strip()
+    st = cell(p, "start_time").strip()
+    title = cell(p, "title").strip()
+    url = cell(p, "url").strip()
+    if not sd or not title:
+        continue
+    # All-day events have empty start_time — keep them in the digest but no reminder.
+    # Join with US (\x1f, non-whitespace) so the bash read loop preserves EMPTY fields
+    # (a whitespace IFS like TAB collapses runs, losing the empty start_time column).
+    print("\x1f".join([sd, st, title, url]))
+PY
+)
+
+if [ -z "$PARSED" ]; then
+  send_digest "Доброго ранку, бро. Сьогодні в календарі пусто. 🔆"
+  log "no events today; digest sent"
+  exit 0
+fi
+
+# --- build digest + reminder files ---
+DIGEST="Доброго ранку, бро. Сьогодні в календарі:"$'\n\n'
+N_EVENTS=0
+N_REM=0
+
+while IFS=$'\x1f' read -r sd st title url; do
+  [ -n "$title" ] || continue
+  N_EVENTS=$((N_EVENTS + 1))
+  if [ -z "$st" ]; then
+    # all-day event: list it, no time, no reminder
+    DIGEST+="• *(увесь день)* — ${title}"$'\n'
+    continue
+  fi
+
+  # local DST-aware offset for this date+time, then let cal-event-time resolve it.
+  off=$(date -d "${sd} ${st}" +%z 2>/dev/null)
+  iso="${sd}T${st}:00${off}"
+  eval "$("$HOME/bin/cal-event-time" "$iso" 2>/dev/null | sed 's/^/CET_/')" 2>/dev/null || true
+  show="${CET_LISBON:-$st}"
+
+  if [ -n "$url" ]; then
+    DIGEST+="• *${show}* — ${title}. [Meet](${url})"$'\n'
+  else
+    DIGEST+="• *${show}* — ${title}"$'\n'
+  fi
+
+  # reminder file (skip if already past)
+  if [ -n "${CET_REMINDER_EPOCH:-}" ] && [ "${CET_PAST:-yes}" = "no" ]; then
+    slug=$(printf '%s' "$title" | tr -cs 'A-Za-z0-9' '-' | cut -c1-15 | sed 's/-$//')
+    [ -n "$slug" ] || slug="event"
+    rfile="$REM_DIR/${CET_REMINDER_EPOCH}-${slug}.rem"
+    if [ -n "$url" ]; then
+      rbody="бро, через 15 хв: ${title} о ${show} Лісабон"$'\n'"Meet: ${url}"
+    else
+      rbody="бро, через 15 хв: ${title} о ${show} Лісабон"
+    fi
+    {
+      echo "EPOCH=${CET_REMINDER_EPOCH}"
+      echo "CHAT=${OWNER_CHAT}"
+      echo "PARSE=text"
+      echo
+      echo "$rbody"
+    } > "$rfile"
+    N_REM=$((N_REM + 1))
+  fi
+  # clear per-iteration cal-event-time vars so a parse failure can't leak forward
+  unset CET_LISBON CET_KYIV CET_REMINDER_EPOCH CET_REMINDER_LISBON CET_PAST
+done <<< "$PARSED"
+
+DIGEST+=$'\n'"За 15 хв до кожного нагадаю."
+send_digest "$DIGEST"
+log "events=${N_EVENTS} reminders=${N_REM}; digest sent"
+
+# --- log to vault ---
+if [ -f "$VAULT_LOG" ]; then
+  {
+    echo "## [$(date '+%Y-%m-%d %H:%M %Z')] cron | Morning calendar digest"
+    echo "- Events today: ${N_EVENTS}"
+    echo "- Reminders scheduled: ${N_REM}"
+    echo
+  } >> "$VAULT_LOG" 2>/dev/null || true
+fi
+
+log "=== morning-calendar done ==="
+exit 0

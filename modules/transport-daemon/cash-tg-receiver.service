@@ -1,0 +1,19 @@
+[Unit]
+Description=Telegram receiver daemon — owns getUpdates, decouples receive from the claude session
+Documentation=https://github.com/kgnvsk/cash-deploy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Token comes from the same secret file install-core writes (chmod 600). Reads
+# TELEGRAM_BOT_TOKEN from it; the daemon needs nothing else.
+EnvironmentFile=%h/.claude/channels/telegram/.env
+ExecStart=%h/.bun/bin/bun %h/.claude/channels/telegram/tg-receiver-daemon.ts
+# OpenClaw-style supervision: OS babysits a tiny, simple process.
+Restart=always
+RestartSec=3
+SuccessExitStatus=0 143
+
+[Install]
+WantedBy=default.target

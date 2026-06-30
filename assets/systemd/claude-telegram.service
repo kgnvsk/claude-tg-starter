@@ -1,0 +1,33 @@
+[Unit]
+Description=Claude Code Telegram Bot (24/7 personal assistant)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=claude
+Group=claude
+WorkingDirectory=/home/claude
+Environment=HOME=/home/claude
+Environment=USER=claude
+Environment=TERM=xterm-256color
+Environment=BUN_INSTALL=/home/claude/.bun
+Environment=PATH=/home/claude/.local/bin:/home/claude/.bun/bin:/home/claude/bin:/usr/local/bin:/usr/bin:/bin
+
+# screen -Dm: detach+stay foreground, -S name
+ExecStart=/usr/bin/screen -L -Logfile /home/claude/logs/claude-screen.log -Dm -S claude-bot /home/claude/bin/claude-telegram-bot
+ExecStop=/usr/bin/screen -S claude-bot -X quit
+
+StandardInput=null
+StandardOutput=journal
+StandardError=journal
+
+Restart=always
+RestartSec=10
+StartLimitInterval=120
+StartLimitBurst=5
+LimitNOFILE=65536
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

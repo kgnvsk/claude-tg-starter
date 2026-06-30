@@ -1,0 +1,18 @@
+#!/bin/bash
+# Download a YouTube video. Handles the 2026 bot-check + n-challenge:
+#   - cookies from ~/.config/yt/youtube-cookies.txt (владелец кладёт свои)
+#   - deno JS runtime (~/.deno/bin) so yt-dlp-ejs can solve the n-challenge
+# Default: <=720p mp4 (keeps size sane). Output to /tmp/yt-<id>.mp4, prints path.
+# Usage: yt-dl <url> [max_height]   e.g. yt-dl https://youtu.be/ID 1080
+set -e
+URL="$1"; MAXH="${2:-720}"
+[ -z "$URL" ] && { echo "usage: yt-dl <url> [max_height]" >&2; exit 1; }
+export PATH="$HOME/.deno/bin:$PATH"
+COOKIES="$HOME/.config/yt/youtube-cookies.txt"
+ID=$(yt-dlp --no-update --cookies "$COOKIES" --print "%(id)s" --skip-download "$URL" 2>/dev/null | tail -1)
+[ -z "$ID" ] && { echo "could not resolve video id (cookies stale? video private?)" >&2; exit 2; }
+OUT="/tmp/yt-${ID}.mp4"
+yt-dlp --no-update --cookies "$COOKIES" \
+  -f "bestvideo[height<=${MAXH}][ext=mp4]+bestaudio[ext=m4a]/best[height<=${MAXH}][ext=mp4]/best[ext=mp4]/best" \
+  --merge-output-format mp4 -o "/tmp/yt-${ID}.%(ext)s" "$URL" >&2
+echo "$OUT"

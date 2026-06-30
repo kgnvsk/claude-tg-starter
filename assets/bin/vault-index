@@ -1,0 +1,60 @@
+#!/usr/bin/env python3
+"""SessionStart hook — inject a compact auto-built MAP of the vault so the agent
+consults it BEFORE grepping/reading (lightweight local pre-search). Rebuilt each
+session start; free; no API. Fails silent (exit 0, no output) on any error."""
+import os, re, json, glob, sys
+
+def build():
+    VAULT = os.path.expanduser("~/obsidian-vault")
+    SKIP = ("/report/", "/_attachments/", "/_templates/", "/.git/", "/node_modules/")
+    ORDER = ["wiki", "research", "creatives", "niches", "products", "packages", "raw_creatives"]
+    allmd = [p for p in glob.glob(f"{VAULT}/**/*.md", recursive=True) if not any(s in p for s in SKIP)]
+    if not allmd:
+        return None
+
+    def topic(path):
+        title = os.path.splitext(os.path.basename(path))[0]
+        desc = ""
+        lines = open(path, encoding="utf-8", errors="replace").read().splitlines()
+        in_fm = False
+        for i, ln in enumerate(lines):
+            s = ln.strip()
+            if i == 0 and s == "---":
+                in_fm = True; continue
+            if in_fm:
+                if s == "---": in_fm = False
+                elif s.lower().startswith("description:"): desc = s.split(":", 1)[1].strip().strip('"')
+                continue
+            if s.startswith("# ") and not title.startswith("#"): title = s[2:].strip()
+            elif s and not s.startswith("#") and not desc: desc = s
+            if desc: break
+        return title, desc[:90]
+
+    notes, inbound = {}, {}
+    linkre = re.compile(r"\[\[([^\]|#]+)")
+    for p in allmd:
+        rel = os.path.relpath(p, VAULT)
+        folder = rel.split(os.sep)[0] if os.sep in rel else "."
+        notes.setdefault(folder, []).append((rel,) + topic(p))
+        for m in linkre.findall(open(p, encoding="utf-8", errors="replace").read()):
+            inbound[m.strip()] = inbound.get(m.strip(), 0) + 1
+
+    out = ["КАРТА ТВОЕГО VAULT (авто). Сверяйся с ней ПЕРЕД grep/Read — найдёшь нужный файл сразу, без слепого поиска.", ""]
+    for folder in ORDER + [f for f in notes if f not in ORDER]:
+        if folder not in notes: continue
+        out.append(f"## {folder}/")
+        for rel, title, desc in sorted(notes[folder]):
+            out.append(f"- `{rel}` — {title}" + (f": {desc}" if desc else ""))
+        out.append("")
+    hubs = sorted(inbound.items(), key=lambda x: -x[1])[:6]
+    if hubs:
+        out.append("Узлы (куда больше всего ссылок): " + ", ".join(f"{h}({n})" for h, n in hubs))
+    return "<vault-map source='auto-index'>\n" + "\n".join(out).rstrip() + "\n</vault-map>"
+
+try:
+    ctx = build()
+    if ctx:
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": ctx}}, ensure_ascii=False))
+except Exception:
+    pass
+sys.exit(0)

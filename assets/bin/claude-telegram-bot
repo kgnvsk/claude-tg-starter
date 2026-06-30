@@ -1,0 +1,7 @@
+#!/bin/bash
+set -eu
+[ -f ~/.claude/channels/telegram/.env ] && export $(grep -v "^#" ~/.claude/channels/telegram/.env | xargs)
+export BUN_INSTALL="$HOME/.bun"
+export PATH="$HOME/.local/bin:$BUN_INSTALL/bin:$HOME/bin:/usr/local/bin:/usr/bin:/bin"
+cd ~/obsidian-vault
+exec $HOME/.local/bin/claude --channels plugin:telegram@claude-plugins-official

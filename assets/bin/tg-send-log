@@ -1,0 +1,10 @@
+#!/bin/bash
+# Who sent to Telegram (NEW connection = sendMessage/sendPhoto, not getUpdates long-poll).
+# Maps UID -> name. Usage: tg-send-log [since]   e.g. tg-send-log "1 hour ago"
+declare -A U=([0]=root [1000]=claude [1001]=paperclip)
+journalctl -k --since "${1:-1 hour ago}" --no-pager 2>/dev/null | grep -E "TGSEND6? " | while read -r line; do
+  ts=$(echo "$line" | grep -oE "^[A-Za-z]+ +[0-9]+ [0-9:]+")
+  uid=$(echo "$line" | grep -oE "UID=[0-9]+" | cut -d= -f2)
+  dst=$(echo "$line" | grep -oE "DST=[0-9a-f.:]+" | cut -d= -f2)
+  echo "$ts  uid=$uid (${U[$uid]:-?})  dst=$dst"
+done | tail -40

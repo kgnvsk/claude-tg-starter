@@ -1,0 +1,33 @@
+#!/bin/bash
+# cash-fix — on-demand heal ("doctor --fix"): re-patch the plugin from the golden (in
+# case the marketplace sync reverted it), clear any failed state, restart the service,
+# then report via cash-doctor. The AUTO-FIXABLE subset only — codex login and low disk
+# need the owner (cash-doctor flags them). Most failures self-heal via healthcheck (cron);
+# this is the on-demand "force heal".
+set -u
+H=/home/claude
+echo "🔧 {{AGENT_NAME}} fix"
+echo
+
+# 1. golden-restore — re-apply the patched plugin if it drifted (upstream sync revert)
+if [ -f "$H/telegram-server-fixed.ts" ]; then
+  n=0
+  for SRV in "$H"/.claude/plugins/cache/claude-plugins-official/telegram/*/server.ts \
+             "$H"/.claude/plugins/marketplaces/claude-plugins-official/external_plugins/telegram/server.ts; do
+    if [ -f "$SRV" ] && ! cmp -s "$H/telegram-server-fixed.ts" "$SRV"; then cp "$H/telegram-server-fixed.ts" "$SRV"; n=$((n+1)); fi
+  done
+  [ "$n" -gt 0 ] && echo "  ✅ golden восстановлен (${n} шт. дрейфнули)" || echo "  ✅ golden уже на месте"
+fi
+
+# 2. clear failed state + restart — re-reads creds, respawns poller, clears crash-loop stop
+sudo systemctl reset-failed claude-telegram.service 2>/dev/null
+if sudo systemctl restart claude-telegram.service 2>/dev/null; then
+  echo "  ✅ сервис перезапущен"
+else
+  echo "  ❌ рестарт не удался — нужен ты (ssh)"
+fi
+
+sleep 5
+echo
+echo "── состояние после фикса ──"
+"$H/bin/cash-doctor"

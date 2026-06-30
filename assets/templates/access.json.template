@@ -1,0 +1,9 @@
+{
+  "dmPolicy": "allowlist",
+  "allowFrom": ["{{OWNER_CHAT_ID}}"],
+  "groups": {},
+  "ackReaction": "👀",
+  "replyToMode": "first",
+  "textChunkLimit": 4096,
+  "chunkMode": "newline"
+}

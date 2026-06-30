@@ -1,0 +1,37 @@
+#!/bin/bash
+# Deterministic event-time helper for cash-morning-calendar.
+#
+# WHY: Google Calendar events from external organizers can carry a `dateTime`
+# with one UTC offset (e.g. ...T15:00:00+01:00) but a `timeZone` field naming a
+# DIFFERENT city (e.g. Europe/Kiev). An LLM that "helpfully" reconverts using the
+# timeZone field double-shifts the time → reminders fire hours early.
+# (Real incident 2026-06-03: 15:00 Lisbon meeting reminded at 12:45.)
+#
+# This util takes ONLY the raw dateTime string. The offset embedded in that
+# string is the single source of truth; the timeZone field is never consulted.
+# `date` resolves the absolute instant from the offset, then we render it in
+# Lisbon and Kyiv and compute the T-15min reminder epoch. No arithmetic by the
+# model — it just calls this and copies the output.
+#
+# Usage:  cal-event-time "2026-06-03T15:00:00+01:00"
+# Output (KEY=VALUE lines):
+#   LISBON=15:00
+#   KYIV=17:00
+#   REMINDER_EPOCH=1780494300      # event - 15min, in seconds
+#   REMINDER_LISBON=14:45
+#   PAST=no                        # yes if reminder time already passed
+set -e
+
+DT="$1"
+[ -z "$DT" ] && { echo "usage: cal-event-time <ISO_dateTime_with_offset>" >&2; exit 1; }
+
+# Absolute instant from the offset inside the string (timeZone field ignored by design).
+EPOCH=$(date -d "$DT" +%s 2>/dev/null) || { echo "bad datetime: $DT" >&2; exit 2; }
+REM_EPOCH=$((EPOCH - 900))
+NOW=$(date +%s)
+
+echo "LISBON=$(TZ=Europe/Lisbon date -d "@$EPOCH" +%H:%M)"
+echo "KYIV=$(TZ=Europe/Kyiv date -d "@$EPOCH" +%H:%M)"
+echo "REMINDER_EPOCH=$REM_EPOCH"
+echo "REMINDER_LISBON=$(TZ=Europe/Lisbon date -d "@$REM_EPOCH" +%H:%M)"
+echo "PAST=$([ "$REM_EPOCH" -le "$NOW" ] && echo yes || echo no)"

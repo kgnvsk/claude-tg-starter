@@ -1,0 +1,35 @@
+#!/bin/bash
+# cash-update — обновить ЭТОГО агента из репозитория кита (github.com/kgnvsk/cash-deploy).
+# Запускай прямо в сессии агента (или из шелла): подтянет свежий кит, покажет
+# git diff --stat (что меняется), и накатит update.sh (через sudo — на это есть право).
+#
+# Требует: кит развёрнут как git-КЛОН в /opt/cash-deploy, владелец claude, и
+# sudoers-правило на update.sh (см. DEPLOY.md «Самообновление»).
+set -u
+KIT=/opt/cash-deploy
+
+if [ ! -d "$KIT/.git" ]; then
+  echo "✗ Кит в $KIT — не git-клон, сам обновиться не могу."
+  echo "  Владельцу (root) разово:"
+  echo "    rm -rf $KIT && git clone https://github.com/kgnvsk/cash-deploy $KIT && chown -R claude:claude $KIT"
+  exit 1
+fi
+
+OLD=$(git -C "$KIT" rev-parse --short HEAD 2>/dev/null || echo '?')
+echo "==> git pull (сейчас: $OLD)"
+if ! git -C "$KIT" pull --ff-only; then
+  echo "✗ git pull не прошёл (конфликт локальных правок или нет сети). Не трогаю ничего."
+  exit 1
+fi
+NEW=$(git -C "$KIT" rev-parse --short HEAD)
+if [ "$OLD" = "$NEW" ]; then
+  echo "✅ Уже последняя версия ($NEW) — обновлять нечего."
+  exit 0
+fi
+
+echo "==> Что меняется ($OLD → $NEW):"
+git -C "$KIT" diff --stat "$OLD..$NEW" | tail -40
+
+echo "==> Применяю update.sh (sudo) — re-render + golden-патч + рестарт…"
+sudo "$KIT/update.sh"
+echo "✅ Обновление накатано: $OLD → $NEW"

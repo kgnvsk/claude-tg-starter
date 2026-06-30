@@ -1,0 +1,133 @@
+#!/usr/bin/env python3
+"""tg-escape - экранирует текст для Telegram MarkdownV2.
+
+Решает корневую проблему: ручное экранирование MarkdownV2 хрупкое — пропуск
+одного reserved-символа (. - ( ) ! + = | { } # > ~) роняет ВСЁ сообщение с
+"can't parse entities", после чего ассистент скатывается в plain text.
+
+Этот скрипт делает экранирование детерминированным: сохраняет намеренное
+форматирование (*bold*, _italic_, `code`, ```pre```, [text](url)) и
+экранирует все reserved-символы в обычном тексте.
+
+Usage:
+    echo "текст с *жирным* и точкой." | tg-escape
+    tg-escape <<'EOF'
+    *Заголовок*
+    • пункт (с скобками) и дефисом - вот так.
+    EOF
+
+Правила MarkdownV2 (Telegram Bot API):
+- bold: *text*  italic: _text_  underline: __text__  strike: ~text~
+- spoiler: ||text||  code: `text`  pre: ```text```  link: [text](url)
+- Reserved вне сущностей: _ * [ ] ( ) ~ ` > # + - = | { } . !
+- Внутри code/pre экранируются только ` и \
+- Внутри (url) части ссылки экранируются только ) и \
+"""
+import sys
+import re
+
+# Все reserved-символы для обычного текста.
+RESERVED = r'_*[]()~`>#+-=|{}.!'
+
+# Маркеры форматирования, которые НЕ экранируем (это намеренная разметка).
+# Порядок важен: длинные/жадные конструкции раньше коротких.
+# Группы:
+#   ``` ... ```      pre-block
+#   ` ... `          inline code
+#   [ ... ]( ... )   link
+#   * ... *          bold
+#   ___ нет; __ ... __ underline; _ ... _ italic
+#   ~ ... ~          strike
+#   || ... ||        spoiler
+TOKEN_RE = re.compile(
+    r'(?P<pre>```.*?```)'
+    r'|(?P<code>`[^`\n]*?`)'
+    r'|(?P<link>\[[^\]\n]*?\]\([^)\n]*?\))'
+    r'|(?P<bold>\*[^*\n]+?\*)'
+    r'|(?P<underline>__[^_\n]+?__)'
+    r'|(?P<italic>_[^_\n]+?_)'
+    r'|(?P<spoiler>\|\|[^|\n]+?\|\|)'
+    r'|(?P<strike>~[^~\n]+?~)',
+    re.DOTALL,
+)
+
+
+def escape_plain(text: str) -> str:
+    """Экранировать каждый reserved-символ в обычном тексте."""
+    out = []
+    for ch in text:
+        if ch in RESERVED:
+            out.append('\\' + ch)
+        else:
+            out.append(ch)
+    return ''.join(out)
+
+
+def escape_code_inner(text: str) -> str:
+    """Внутри code/pre экранируются только ` и \\."""
+    return text.replace('\\', '\\\\').replace('`', '\\`')
+
+
+def escape_link_url(url: str) -> str:
+    """Внутри url-части ссылки экранируются только ) и \\."""
+    return url.replace('\\', '\\\\').replace(')', '\\)')
+
+
+def process(text: str) -> str:
+    result = []
+    pos = 0
+    for m in TOKEN_RE.finditer(text):
+        # обычный текст до токена → полное экранирование
+        if m.start() > pos:
+            result.append(escape_plain(text[pos:m.start()]))
+
+        kind = m.lastgroup
+        raw = m.group()
+
+        if kind == 'pre':
+            inner = raw[3:-3]
+            result.append('```' + escape_code_inner(inner) + '```')
+        elif kind == 'code':
+            inner = raw[1:-1]
+            result.append('`' + escape_code_inner(inner) + '`')
+        elif kind == 'link':
+            lm = re.match(r'\[([^\]]*)\]\(([^)]*)\)', raw)
+            label, url = lm.group(1), lm.group(2)
+            result.append('[' + escape_plain(label) + '](' + escape_link_url(url) + ')')
+        elif kind == 'bold':
+            inner = raw[1:-1]
+            result.append('*' + escape_plain(inner) + '*')
+        elif kind == 'underline':
+            inner = raw[2:-2]
+            result.append('__' + escape_plain(inner) + '__')
+        elif kind == 'italic':
+            inner = raw[1:-1]
+            result.append('_' + escape_plain(inner) + '_')
+        elif kind == 'spoiler':
+            inner = raw[2:-2]
+            result.append('||' + escape_plain(inner) + '||')
+        elif kind == 'strike':
+            inner = raw[1:-1]
+            result.append('~' + escape_plain(inner) + '~')
+        else:
+            result.append(escape_plain(raw))
+
+        pos = m.end()
+
+    # хвост
+    if pos < len(text):
+        result.append(escape_plain(text[pos:]))
+
+    return ''.join(result)
+
+
+def main():
+    text = sys.stdin.read()
+    # убрать единственный завершающий перевод строки от heredoc
+    if text.endswith('\n'):
+        text = text[:-1]
+    sys.stdout.write(process(text))
+
+
+if __name__ == '__main__':
+    main()

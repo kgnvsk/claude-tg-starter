@@ -1,0 +1,29 @@
+#!/bin/bash
+# Auto-commit+push vault changes. Idempotent, silent on no-change.
+set -e
+
+VAULT=~/obsidian-vault
+[ -d "$VAULT/.git" ] || exit 0
+
+cd "$VAULT"
+
+# Skip if nothing changed
+if git diff --quiet && git diff --staged --quiet && [ -z "$(git status --porcelain)" ]; then
+  exit 0
+fi
+
+# Load token
+[ -f ~/.claude/channels/telegram/.env ] && export $(grep -v '^#' ~/.claude/channels/telegram/.env | xargs)
+
+# Get summary of what changed (first file name)
+CHANGED=$(git status --porcelain | head -3 | awk '{print $2}' | xargs basename -a 2>/dev/null | paste -sd ", ")
+[ -z "$CHANGED" ] && CHANGED="vault update"
+
+# Commit + push (async, won't block Claude)
+{
+  git add -A
+  git commit -m "auto: $CHANGED" --quiet
+  git push --quiet 2>&1 | head -3 > /tmp/vault-sync.log
+} >> ~/logs/vault-sync.log 2>&1
+
+exit 0

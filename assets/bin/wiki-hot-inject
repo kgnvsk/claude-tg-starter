@@ -1,0 +1,46 @@
+#!/bin/bash
+# SessionStart hook — injects wiki/hot.md (curated) and wiki/active-thread.md
+# (auto-captured Telegram turns) into session context.
+# Strips YAML frontmatter from both so they read cleanly.
+set -e
+
+HOT=~/obsidian-vault/wiki/hot.md
+THREAD=~/obsidian-vault/wiki/active-thread.md
+
+strip_frontmatter() {
+  awk '
+    BEGIN{in_fm=0; done_fm=0}
+    /^---$/ {
+      if (!done_fm) {
+        if (!in_fm) { in_fm=1; next }
+        else { in_fm=0; done_fm=1; next }
+      }
+    }
+    !in_fm && done_fm { print }
+    !in_fm && !done_fm && NR==1 { print; done_fm=1 }
+  ' "$1"
+}
+
+HOT_BODY=""
+THREAD_BODY=""
+[ -f "$HOT" ] && HOT_BODY=$(strip_frontmatter "$HOT")
+[ -f "$THREAD" ] && THREAD_BODY=$(strip_frontmatter "$THREAD")
+
+[ -z "$HOT_BODY" ] && [ -z "$THREAD_BODY" ] && exit 0
+
+CTX=""
+if [ -n "$HOT_BODY" ]; then
+  CTX="<wiki-hot-cache source='wiki/hot.md'>
+$HOT_BODY
+</wiki-hot-cache>"
+fi
+if [ -n "$THREAD_BODY" ]; then
+  [ -n "$CTX" ] && CTX="$CTX
+
+"
+  CTX="$CTX<wiki-active-thread source='wiki/active-thread.md'>
+$THREAD_BODY
+</wiki-active-thread>"
+fi
+
+jq -n --arg ctx "$CTX" '{hookSpecificOutput:{hookEventName:"SessionStart",additionalContext:$ctx}}'

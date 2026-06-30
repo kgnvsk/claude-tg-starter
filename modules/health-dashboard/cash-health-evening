@@ -1,0 +1,89 @@
+#!/bin/bash
+# Fires daily at 22:00 Europe/Lisbon.
+#   1. Rebuild dashboard data.json from raw HAE payloads (deterministic)
+#   2. Deploy dashboard to Vercel (deterministic)
+#   3. Spawn one-shot Claude session to read the data and send an evening
+#      health summary + recommendations to Telegram.
+#
+# Deploy is kept OUT of the Claude session so it never depends on the model
+# remembering to do it. The model only does the soft part: reading the numbers
+# and writing human recommendations.
+set -e
+
+LOG=~/logs/health-evening.log
+mkdir -p ~/logs
+echo "=== $(date '+%Y-%m-%d %H:%M:%S %Z') health-evening fire ===" >> "$LOG"
+
+# --- 1. rebuild data.json ---
+python3 ~/health/bin/build_dashboard.py >> "$LOG" 2>&1 || echo "build failed" >> "$LOG"
+
+# --- 2. deploy to Vercel ---
+cd ~/health/dashboard
+~/bin/vc deploy --prod --yes --scope {{VERCEL_SCOPE}} >> "$LOG" 2>&1 \
+  || echo "deploy failed (continuing to summary anyway)" >> "$LOG"
+
+# --- 3. spawn Claude for the evening summary ---
+DASH_URL="{{DASH_URL}}"
+PROMPT='<<cash-health-evening>>
+
+Ти робиш вечірнє зведення здоровʼя для {{OWNER_NAME}} (chat_id {{OWNER_CHAT_ID}}) о 22:00.
+
+ФАЗА 1 — ПРОЧИТАТИ ДАНІ:
+Read файл /home/claude/health/dashboard/data.json.
+Це агреговані дані Apple Health по днях + baselines (середні по всій історії).
+Структура: days[YYYY-MM-DD] з метриками; кожна {value, units} або вкладена (heart_rate: {avg,min,max}, sleep: {total,rem,deep,core,awake,start,end}).
+Baselines: hrv, resting_hr, sleep, steps, resp_rate, spo2.
+
+Бери ОСТАННІЙ день у days (найбільша дата) як "сьогодні". Якщо сьогоднішній день майже порожній (мало даних) — візьми останній повний.
+
+ФАЗА 2 — ПОРАХУВАТИ ІНСАЙТИ (думай, не вигадуй; тільки те що є в даних):
+- Відновлення: HRV vs baseline (вище = краще), пульс спокою vs baseline (нижче = краще), дихання.
+- Сон: скільки спав (total), фази, чи добрав до 7-8 год. Якщо сну немає в останньому дні — скажи що ще не синхронізувалось, не вигадуй.
+- Активність: кроки vs baseline, активна енергія.
+- Аномалії: різкі відхилення (>15-20%) від baseline в будь-який бік.
+- Звʼязки: напр. мало спав → пульс спокою вгору → бережи себе.
+
+ФАЗА 3 — РЕКОМЕНДАЦІЇ:
+- Коли лягати спати сьогодні (з огляду на те як спав і пульс спокою). Конкретний час.
+- Як провести завтра: якщо відновлення низьке — легкий день; якщо добре — можна навантаження.
+- 1-2 практичні поради максимум. Без води, без "проконсультуйтесь з лікарем".
+
+ФАЗА 4 — ВІДПРАВИТИ В TELEGRAM:
+Формат markdownv2. НЕ екрануй руками — склади текст з *bold* і • буллетами і прожени:
+  printf "%s" "$TEXT" | ~/bin/tg-escape
+Потім reply через mcp__plugin_telegram_telegram__reply, chat_id="{{OWNER_CHAT_ID}}", format="markdownv2".
+
+Структура повідомлення (КОРОТКО, не полотно):
+  *🌙 Зведення дня* (дата)
+
+  *Відновлення:* одне речення з головним (recovery добре/норм/низьке + чому)
+  • HRV X мс (стрілка vs baseline)
+  • пульс спокою X (стрілка)
+  • сон X год
+
+  *Активність:* кроки X, енергія X ккал
+
+  *Рекомендації:*
+  • коли лягати: конкретний час
+  • завтра: легкий/звичайний/можна навантаження
+
+  Деталі й графіки: '"$DASH_URL"'
+
+Стиль: бро-тон, коротко, без заїкань "конечно". Якщо даних мало — чесно скажи що baseline ще набирається, не вигадуй цифри яких немає.
+
+ФАЗА 5 — ЛОГ:
+Додай у /home/claude/obsidian-vault/wiki/log.md рядок:
+  ## [YYYY-MM-DD HH:MM Lisbon] cron | Health evening summary
+  - recovery: <твоя оцінка>
+  - TG msg_id: <id>
+'
+
+cd /home/claude
+echo "$PROMPT" | ATARAX_SUPPRESS_TELEGRAM=1 /home/claude/.local/bin/claude -p \
+  --dangerously-skip-permissions \
+  --add-dir /home/claude/health \
+  --add-dir /home/claude/obsidian-vault \
+  --output-format text \
+  >> "$LOG" 2>&1
+
+echo "=== $(date '+%Y-%m-%d %H:%M:%S %Z') health-evening done ===" >> "$LOG"

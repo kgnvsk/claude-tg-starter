@@ -1,0 +1,181 @@
+#!/bin/bash
+# Cash healthcheck — runs every 2 min via cron
+# Checks 7 signals + can auto-recover + alerts via Bot API bypass
+set -u
+
+LOG=/home/claude/logs/healthcheck.log
+STATE=/home/claude/logs/health-state.json
+ALERT_COOLDOWN=600  # 10 min between repeat alerts
+mkdir -p /home/claude/logs
+
+# Load bot credentials for alerts
+BOT_TOKEN=$(grep "^TELEGRAM_BOT_TOKEN=" /home/claude/.claude/channels/telegram/.env 2>/dev/null | cut -d= -f2)
+USER_ID={{OWNER_CHAT_ID}}  # owner chat id (rendered by install-core)
+
+# Alert function (with cooldown per alert-key)
+alert() {
+    local key="$1"
+    local msg="$2"
+    local cooldown="${3:-$ALERT_COOLDOWN}"
+    # Silent by default (2026-06-28): the bot self-heals (restart / golden-restore /
+    # token-reread), so routine alerts (token dying/expired, service restarted, bun
+    # respawned, codex) are pure noise to the owner. Ping ONLY for states it genuinely
+    # can't auto-fix — crash-loop (auto-recovery gave up) and low disk.
+    case "$key" in crash-loop|low-disk) ;; *) return 0 ;; esac
+    local last_file="/tmp/cash-alert-${key}.ts"
+    local now=$(date +%s)
+    local last=$(cat "$last_file" 2>/dev/null || echo 0)
+    local delta=$((now - last))
+    if [ "$delta" -lt "$cooldown" ]; then
+        return 0
+    fi
+    echo "$now" > "$last_file"
+    curl -sS --max-time 10 -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+        --data-urlencode "chat_id=${USER_ID}" \
+        --data-urlencode "text=🚨 {{AGENT_NAME}} healthcheck: ${msg}" \
+        --data-urlencode "parse_mode=HTML" >/dev/null 2>&1
+    echo "[$(date -u +%FT%TZ)] ALERT [${key}]: ${msg}" >> "$LOG"
+}
+
+# 0. Pin patched telegram plugin. claude 2.1.156 loads the plugin from the GitHub-synced
+#    marketplace dir, and that sync periodically reverts server.ts to upstream — which
+#    reintroduces the orphan-watchdog self-kill (process.ppid !== bootPpid) that killed the
+#    bun MCP every few min. Restore from the golden copy on drift. No restart here: the
+#    running process keeps its good in-memory code; this just guarantees the NEXT launch
+#    uses the patched file. (added 2026-05-29)
+GOLDEN=/home/claude/telegram-server-fixed.ts
+for SRV in \
+    /home/claude/.claude/plugins/cache/claude-plugins-official/telegram/0.0.6/server.ts \
+    /home/claude/.claude/plugins/marketplaces/claude-plugins-official/external_plugins/telegram/server.ts; do
+    if [ -f "$GOLDEN" ] && [ -f "$SRV" ] && ! cmp -s "$GOLDEN" "$SRV"; then
+        cp "$GOLDEN" "$SRV"
+        echo "[$(date -u +%FT%TZ)] restored patched telegram server.ts (sync had reverted ${SRV})" >> "$LOG"
+    fi
+done
+
+# 1. Service active?
+if ! sudo systemctl is-active claude-telegram.service >/dev/null 2>&1; then
+    alert "service-down" "claude-telegram.service is NOT active. Auto-recovering..."
+    sudo systemctl reset-failed claude-telegram.service 2>/dev/null
+    sudo systemctl start claude-telegram.service 2>/dev/null
+    echo "[$(date -u +%FT%TZ)] service was down, tried restart" >> "$LOG"
+fi
+
+# 2. Claude process alive?
+if ! pgrep -f "^claude $" >/dev/null 2>&1 && ! pgrep -af "/usr/bin/claude " | grep -v grep >/dev/null 2>&1; then
+    # Fallback: check by screen session existence
+    if ! screen -S claude-bot -ls 2>/dev/null | grep -q claude-bot; then
+        alert "no-claude-process" "No claude process found. Service says active but no process."
+    fi
+fi
+
+# 3. Bun telegram MCP alive? Grace-period 4 min before restart — restarting claude-telegram
+# kills any active TG session in progress, so we wait to see if claude respawns bun on its own.
+# Most bun MCP deaths self-heal within 1-2 min. (added 2026-06-17 after restart-mid-task issue)
+BUN_DEAD_TS=/home/claude/logs/bun-mcp-dead-since.ts
+if ! pgrep -f "bun.*plugins-official.*telegram" >/dev/null 2>&1; then
+    if sudo systemctl is-active claude-telegram.service >/dev/null 2>&1; then
+        NOW=$(date +%s)
+        DEAD_SINCE=$(cat "$BUN_DEAD_TS" 2>/dev/null || echo "$NOW")
+        # First detection: record timestamp, do nothing
+        [ ! -f "$BUN_DEAD_TS" ] && echo "$NOW" > "$BUN_DEAD_TS"
+        DEAD_FOR=$((NOW - DEAD_SINCE))
+        if [ "$DEAD_FOR" -ge 240 ]; then
+            echo "[$(date -u +%FT%TZ)] bun MCP dead ${DEAD_FOR}s, restarting claude-telegram" >> "$LOG"
+            sudo systemctl restart claude-telegram.service 2>/dev/null
+            rm -f "$BUN_DEAD_TS"
+        else
+            echo "[$(date -u +%FT%TZ)] bun MCP dead ${DEAD_FOR}s, within grace period (240s)" >> "$LOG"
+        fi
+    fi
+else
+    rm -f "$BUN_DEAD_TS"
+fi
+
+# 4. Crash loop?
+RESTARTS=$(journalctl -u claude-telegram --since "10 min ago" --no-pager 2>/dev/null | grep -c "Started Claude Code")
+if [ "$RESTARTS" -gt 4 ]; then
+    alert "crash-loop" "Crash loop: ${RESTARTS} restarts in 10 min. Stopping auto-restart — investigate manually."
+    sudo systemctl stop claude-telegram.service 2>/dev/null
+    echo "[$(date -u +%FT%TZ)] CRASH LOOP — stopped service (${RESTARTS} restarts)" >> "$LOG"
+fi
+
+# 5. MCP connectivity — DO NOT use "claude mcp list" (spawns new Claude instance
+# which re-spawns all MCP servers, causing primary bun to receive SIGTERM via 
+# plugin"s stale-PID replace logic). Rely on process checks in steps 2-3 instead.
+
+# 6. Claude Max proxy (:3456) — ONLY if that optional module is installed (skip on base install).
+if systemctl list-unit-files claude-max-proxy.service --no-legend 2>/dev/null | grep -q claude-max-proxy; then
+    if ! curl -sS --max-time 5 http://localhost:3456/health | grep -q "\"status\":\"ok\""; then
+        alert "proxy-down" "Claude Max proxy (:3456) not responding. Auto-publisher LLM calls will fail."
+        sudo systemctl restart claude-max-proxy 2>/dev/null
+    fi
+fi
+
+# 7. Auto-publisher — ONLY if that optional module is installed (skip on base install).
+if systemctl list-unit-files auto-publisher.service --no-legend 2>/dev/null | grep -q auto-publisher; then
+    if ! pgrep -f "auto_publisher.py" >/dev/null 2>&1; then
+        alert "auto-publisher-down" "Auto-publisher is not running. TG channel not being fed."
+        sudo systemctl start auto-publisher.service 2>/dev/null
+    fi
+fi
+
+# 8. Disk space (< 5% free = critical)
+DISK_PCT=$(df /home | awk 'NR==2 {gsub("%",""); print 100-$5}')
+if [ "$DISK_PCT" -lt 10 ]; then
+    alert "low-disk" "Low disk space: ${DISK_PCT}% free on /home. Check /home/claude/auto-publisher/data/tg_media/"
+fi
+
+# 9. Write state (for diagnostics)
+cat > "$STATE" <<STATE_EOF
+{
+  "timestamp": "$(date -u +%FT%TZ)",
+  "service_active": $(sudo systemctl is-active claude-telegram.service >/dev/null 2>&1 && echo true || echo false),
+  "restarts_10min": ${RESTARTS},
+  "disk_free_pct": ${DISK_PCT},
+  "auto_publisher_alive": $(pgrep -f auto_publisher.py >/dev/null 2>&1 && echo true || echo false),
+  "proxy_alive": $(curl -sS --max-time 3 http://localhost:3456/health 2>/dev/null | grep -q ok && echo true || echo false)
+}
+STATE_EOF
+
+# Log heartbeat (only on anomaly — to avoid log spam)
+if [ "$RESTARTS" -gt 1 ] || [ "$DISK_PCT" -lt 20 ]; then
+    echo "[$(date -u +%FT%TZ)] HB restarts=${RESTARTS} disk=${DISK_PCT}%" >> "$LOG"
+fi
+
+# 10. Claude OAuth token freshness + auto-recovery (added 2026-06-09; restart-on-expiry 2026-06-12).
+# Несколько процессов (бот, max-proxy, claude -p краны) делят один .credentials.json, а рефреш
+# РОТИРУЕТ refresh-токен — у долгоживущего бота in-memory токен протухает, хотя в ФАЙЛЕ уже лежит
+# свежий (его записал тот, кто рефрешнул последним). Рестарт заставляет бота перечитать файл и
+# взять валидный токен. Кулдаун 15м, чтобы не словить crash-loop guard (#4).
+EXP=$(jq -r ".claudeAiOauth.expiresAt // 0" /home/claude/.claude/.credentials.json 2>/dev/null)
+NOW_MS=$(( $(date +%s) * 1000 ))
+if [ "${EXP:-0}" -gt 0 ]; then
+    LEFT_MIN=$(( (EXP - NOW_MS) / 60000 ))
+    if [ "$LEFT_MIN" -le 0 ]; then
+        RESTART_TS=/tmp/cash-token-restart.ts
+        NOW_S2=$(date +%s); LAST_R=$(cat "$RESTART_TS" 2>/dev/null || echo 0)
+        if [ $(( NOW_S2 - LAST_R )) -ge 900 ]; then
+            echo "$NOW_S2" > "$RESTART_TS"
+            echo "[$(date -u +%FT%TZ)] token expired — restarting claude-telegram to re-read refreshed creds" >> "$LOG"
+            sudo systemctl restart claude-telegram.service 2>/dev/null
+            alert "claude-token-expired" "Claude OAuth токен протух — авто-рестарт бота (подхватит свежий токен из файла). Если через 5 мин молчит — нужен /login." 3600
+        fi
+    elif [ "$LEFT_MIN" -le 30 ]; then
+        alert "claude-token-dying" "Claude OAuth токен умирает через ${LEFT_MIN} мин. При протухании healthcheck сам рестартнёт бота; если не поможет — /login." 7200
+    fi
+fi
+
+# 11. Codex auth (картинки gpt-image-2) — проверка раз в 30 мин, лёгкая.
+CODEX_STAMP=/tmp/cash-codex-check.ts
+NOW_S=$(date +%s)
+LAST_CODEX=$(cat "$CODEX_STAMP" 2>/dev/null || echo 0)
+# Only if the images option is installed (codex present) — else base installs false-alert.
+if [ -x /home/claude/.npm-global/bin/codex ] && [ $(( NOW_S - LAST_CODEX )) -ge 1800 ]; then
+    echo "$NOW_S" > "$CODEX_STAMP"
+    if ! timeout 20 /home/claude/.npm-global/bin/codex login status 2>&1 | grep -q "Logged in"; then
+        alert "codex-auth-dead" "Codex auth отвалился — gpt-image-2 не работает. Нужен: codex login --device-auth (или скажи десктопному Клоду)." 7200
+    fi
+fi
+
+exit 0

@@ -1,0 +1,49 @@
+#!/bin/bash
+# cash-research-deep "<тема>" [chat_id]
+# Запускает ДЕТАЧНУТЫЙ фоновый deep-research воркер. claude -p сейчас работает В РАМКАХ
+# ПОДПИСКИ (headless usage пока не метерится — июньская смена биллинга на паузе, см.
+# support.claude.com «Use the Claude Agent SDK with your Claude plan»). Воркер НЕ блокирует
+# вызвавшую сессию: петля сабагентов → синтез → публикация на Vercel → пинг владельцу.
+# Печатает job-id. Прогресс: ~/research-jobs/<id>/status.json
+set -u
+TOPIC="${1:?usage: cash-research-deep \"<тема>\" [chat_id]}"
+CHATID="${2:-{{OWNER_CHAT_ID}}}"
+ENVFILE="$HOME/.claude/channels/telegram/.env"
+TOKEN_FILE="$HOME/.config/vercel-token"
+ID="r$(date +%s)"
+JOB="$HOME/research-jobs/$ID"
+mkdir -p "$JOB/site"
+printf '{"state":"queued","topic":%s,"round":0,"sources":0,"note":"запуск"}\n' \
+  "$(printf '%s' "$TOPIC" | python3 -c 'import json,sys;print(json.dumps(sys.stdin.read().strip()))')" > "$JOB/status.json"
+
+cat > "$JOB/prompt.txt" <<PROMPT
+Ты — фоновый deep-research воркер (headless). Работай ПОЛНОСТЬЮ автономно, ничего не спрашивай.
+
+ТЕМА: «$TOPIC»
+Рабочая папка: $JOB
+Статус-файл: $JOB/status.json — ПЕРЕЗАПИСЫВАЙ его после КАЖДОГО круга строкой вида:
+  {"state":"running","round":N,"sources":<кол-во реально открытых URL за всё время>,"note":"<что делаю сейчас>"}
+Язык отчёта = язык темы/владельца (тема украинская → украинский, английская → английский, и т.д.).
+
+ПЛАН:
+1) Разбей тему на 4-6 независимых под-вопросов (суть / как работает / цифры и данные / альтернативы / риски-критика / свежее).
+2) ПЕТЛЯ (2-4 круга, до насыщения):
+   - В каждом круге запусти ПАРАЛЛЕЛЬНО (несколько Task-вызовов в ОДНОМ сообщении) суб-агентов — по одному на непокрытый угол. Каждому: «Глубоко рой ТОЛЬКО этот угол: <под-вопрос>. WebSearch (несколько разных запросов, не один) + WebFetch первоисточников. Сверяй ≥2 независимых источника, помечай где расходятся. Верни: выводы буллетами + конкретные цифры/даты + список реально открытых URL.»
+   - После круга — сам себе критик: чего не хватает / что не сверено / где голословные цифры? Есть дыры и кругов <4 — ещё круг точечно по дырам. Насыщено — стоп.
+   - После КАЖДОГО круга перезапиши $JOB/status.json.
+3) Синтез: ОДИН глубокий структурированный отчёт. Сам разреши противоречия; где не сошлось — честно «спорно». Никаких выдуманных URL/цифр.
+4) ПУБЛИКАЦИЯ: напиши самодостаточный $JOB/site/index.html — дизайн как vault-web: Google Fonts CDN (Unbounded заголовки + Onest текст, subset нужного языка), акцент янтарь #b45309, основа #f3f0e9, чернила #2a2620, колонка ≤72ch, читабельно с телефона. Полный отчёт БЕЗ обрезаний + inline-SVG инфографика ТОЛЬКО где есть данные (stat-карточки / горизонтальные бары / линия / donut / таймлайн) + источники со ссылками. Затем из $JOB/site выполни:
+   vercel deploy --prod --yes --token "\$(cat $TOKEN_FILE)"
+   и возьми из вывода URL вида https://...vercel.app
+5) Запиши $JOB/status.json: {"state":"done","url":"<URL>","round":N,"sources":<N>}
+6) ПИНГ владельцу: TOK=\$(grep '^TELEGRAM_BOT_TOKEN=' $ENVFILE | cut -d= -f2); выполни:
+   curl -s "https://api.telegram.org/bot\${TOK}/sendMessage" --data-urlencode "chat_id=$CHATID" --data-urlencode "text=✅ Deep research готов: «$TOPIC»
+<URL>"
+При ЛЮБОЙ ошибке: запиши status.json {"state":"error","note":"<причина>"} и тем же curl пингни владельца текстом ошибки.
+PROMPT
+
+# Детач: отдельный процесс (не блокирует родителя), на подписке.
+# --strict-mcp-config: не грузить лишние MCP-серверы (ресёрчу нужны только встроенные Web/Task/Bash/Write) — легче и быстрее.
+# --max-budget-usd: предохранитель от рана (один глубокий проход ~ $5-10 API-эквивалента).
+setsid bash -c "cd '$JOB' && cat '$JOB/prompt.txt' | claude -p --dangerously-skip-permissions --strict-mcp-config --max-budget-usd 12 > '$JOB/worker.log' 2>&1; echo \"EXIT:\$?\" >> '$JOB/worker.log'" < /dev/null > /dev/null 2>&1 &
+echo "$ID"

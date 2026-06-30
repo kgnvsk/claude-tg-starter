@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# threads-dl <threads_post_url> [output.mp4]
+# Downloads the video from a public Threads post by bypassing the consent wall
+# with a Googlebot user-agent, then extracting the CDN mp4 from the embedded JSON.
+set -euo pipefail
+
+URL="${1:-}"
+OUT="${2:-}"
+if [[ -z "$URL" ]]; then
+  echo "usage: threads-dl <threads_post_url> [output.mp4]" >&2
+  exit 1
+fi
+
+UA='Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)'
+TMP="$(mktemp /tmp/threads-dl.XXXXXX.html)"
+trap 'rm -f "$TMP"' EXIT
+
+curl -sL -A "$UA" -H 'Accept-Language: en-US,en;q=0.9' "$URL" -o "$TMP"
+
+# Extract the best (highest-bitrate) mp4 URL from embedded JSON.
+MP4="$(python3 - "$TMP" <<'PY'
+import sys, re, json
+html = open(sys.argv[1], encoding='utf-8', errors='ignore').read()
+d = html.replace('\\u0026', '&').replace('\\/', '/')
+
+cands = []
+# 1) video_versions JSON blocks (carry width/type for quality ranking)
+for m in re.finditer(r'"video_versions":\s*(\[.*?\])', html):
+    try:
+        arr = json.loads(m.group(1).replace('\\/', '/').replace('\\u0026', '&'))
+        for v in arr:
+            u = v.get('url')
+            if u:
+                cands.append((int(v.get('width', 0) or 0), u))
+    except Exception:
+        pass
+# 2) fallback: any raw .mp4 on the IG/FB CDN
+if not cands:
+    for u in re.findall(r'https[^"\\<> ]*\.mp4[^"\\<> ]*', d):
+        if 'cdninstagram' in u or 'fbcdn' in u:
+            cands.append((0, u))
+
+if not cands:
+    sys.exit(3)
+cands.sort(key=lambda x: x[0], reverse=True)
+print(cands[0][1])
+PY
+)" || { echo "no video found (post may have no video, be private, or token expired)" >&2; exit 3; }
+
+if [[ -z "$OUT" ]]; then
+  ID="$(echo "$URL" | grep -oE 'post/[A-Za-z0-9_-]+' | head -1 | cut -d/ -f2)"
+  OUT="/tmp/threads-${ID:-video}.mp4"
+fi
+
+# Download the media with a browser UA + referer (CDN checks these).
+curl -sL \
+  -A 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36' \
+  -H 'Referer: https://www.threads.com/' \
+  "$MP4" -o "$OUT"
+
+# Sanity check it's a real video file.
+if [[ ! -s "$OUT" ]] || ! file "$OUT" | grep -qiE 'mp4|ISO Media|MPEG'; then
+  echo "download failed or not a video: $OUT" >&2
+  exit 4
+fi
+
+echo "$OUT"
