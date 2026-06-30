@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# claude-login — подписочный (Max) OAuth-логин Claude Code для ТЕКУЩЕГО юзера, headless-friendly.
+#
+# Использует `claude auth login --claudeai` (полный scope подписки, вкл. user:mcp_servers —
+# в отличие от урезанного `setup-token`). Гонит его в detached screen с редиректом вывода,
+# поэтому URL ловится чисто (интерактивный промпт не рендерится в сырой SSH-канал → SSH виснет).
+#
+# Два шага, чтобы владелец сделал минимум — открыл один URL и вставил один код:
+#   claude-login          → стартует логин, печатает OAuth-URL (отдать владельцу)
+#   claude-login <код>    → скармливает вставленный владельцем код, завершает + верифицирует
+#
+# Запускать ОТ ИМЕНИ юзера бота:  runuser -l claude -c 'claude-login'
+set -uo pipefail
+SES="clogin-$(id -u)"
+LOG="/tmp/claude-login.$(id -u).log"
+
+authed() { claude auth status 2>/dev/null | grep -q '"loggedIn": *true'; }
+
+if authed; then
+  echo "✅ Уже залогинен:"; claude auth status 2>/dev/null | grep -E '"(email|subscriptionType|authMethod)"'
+  exit 0
+fi
+
+if [ $# -eq 0 ]; then
+  # ШАГ 1 — старт логина, поймать URL
+  screen -S "$SES" -X quit 2>/dev/null || true
+  : > "$LOG"
+  screen -dmS "$SES" bash -c "claude auth login --claudeai > '$LOG' 2>&1"
+  URL=""
+  for _ in $(seq 1 40); do
+    URL=$(grep -oE 'https://[^[:space:]]+' "$LOG" | head -1)
+    [ -n "$URL" ] && break
+    sleep 1
+  done
+  if [ -z "$URL" ]; then
+    echo "⚠ OAuth-URL не появился за 40с. Полный лог логина:"; cat "$LOG"
+    screen -S "$SES" -X quit 2>/dev/null || true
+    exit 1
+  fi
+  echo "1) Отдай владельцу этот URL — пусть откроет в браузере и войдёт СВОЕЙ Max-подпиской:"
+  echo
+  echo "   $URL"
+  echo
+  echo "2) Владелец копирует код со страницы → выполни:  claude-login <код>"
+  exit 0
+fi
+
+# ШАГ 2 — скормить вставленный код
+if ! screen -S "$SES" -X stuff "$1"$'\n' 2>/dev/null; then
+  echo "⚠ Сессия логина не найдена — запусти сначала: claude-login"; exit 1
+fi
+for _ in $(seq 1 20); do authed && break; sleep 1; done
+if authed; then
+  echo "✅ Залогинено по подписке:"; claude auth status 2>/dev/null | grep -E '"(email|subscriptionType|authMethod)"'
+  screen -S "$SES" -X quit 2>/dev/null || true
+else
+  echo "⚠ Пока не подтверждено. Хвост лога:"; tail -10 "$LOG"
+  echo "Проверь код или запусти claude-login заново."; exit 1
+fi

@@ -63,16 +63,15 @@ mkdir -p /home/claude/{logs,bin,obsidian-vault} && chown -R claude:claude /home/
 ```bash
 runuser -l claude -c 'curl -fsSL https://claude.ai/install.sh | bash'   # ставит ~/.local/bin/claude
 ```
-Логин по подписке (ИНТЕРАКТИВНЫЙ — через владельца):
-1. Запусти под `claude` в screen: `screen -dmS clogin -L -Logfile /home/claude/clogin.log claude`
-2. Пошли в сессию `/login`, выбери пункт 1 (Claude account with subscription).
-3. Достань из лога ПОЛНУЮ oauth-ссылку (`sed -n '/oauth/,/Paste code/p'` склей переносы; проверь что `state=` не обрезан!).
-4. Отдай ссылку владельцу → он логинится → присылает код → вставь код в сессию (`screen -X stuff`, код БЕЗ хвостового `\r`, потом отдельный Enter через 2 сек).
-5. Убей screen clogin, затри лог.
+Логин по подписке (через владельца) — хелпером `claude-login` (идёт с китом в `assets/bin/`; гонит `claude auth login --claudeai` — это ЛИНЕЙНЫЙ промпт, не полный TUI, поэтому ловится чисто и SSH не виснет). Запускать ОТ ИМЕНИ `claude`; до install-core — из клона `<kit>/assets/bin/claude-login`, после — `~/bin/claude-login`.
 
-⚠️ **НЕ используй `claude setup-token`** — его токен имеет scope только `user:inference` и ЛОМАЕТ claude.ai-коннекторы (Gmail/Calendar/Drive). Только полный `/login`.
+1. **Старт + URL:** `runuser -l claude -c '~/bin/claude-login'` → напечатает OAuth-URL.
+2. Отдай URL владельцу → он открывает в браузере, входит СВОЕЙ Max-подпиской, копирует код со страницы.
+3. **Финиш:** `runuser -l claude -c '~/bin/claude-login <код>'` → залогинит и проверит сам.
 
-**Verify:** `runuser -l claude -c 'claude -p "reply only: OK"'` → `OK`; `jq -r '.claudeAiOauth.scopes[]' ~claude/.claude/.credentials.json` содержит `user:mcp_servers`.
+⚠️ Метод — `--claudeai` (подписка, ПОЛНЫЙ scope, вкл. `user:mcp_servers`). НЕ `--console` (это API-биллинг) и НЕ `claude setup-token` (у него scope только `user:inference` → нет `user:mcp_servers`, ломает MCP/коннекторы).
+
+**Verify:** `runuser -l claude -c 'claude auth status'` → `"loggedIn": true`, `"subscriptionType": "max"`, `"authMethod": "claude.ai"` (это `claude-login` делает сам в конце).
 
 ## Фаза 3 — раскладка кита
 
