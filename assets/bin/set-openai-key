@@ -1,0 +1,27 @@
+#!/usr/bin/env python3
+"""set-openai-key <sk-...> — safely set OPENAI_API_KEY in the bot's .env (for gpt-4o-transcribe).
+
+Self-service voice setup: the bot runs this ONLY on the owner's command (persona-gated).
+Keeps the strict KEY=value format the launcher expects; chmod 600.
+"""
+import sys, os
+
+ENV = os.path.expanduser("~/.claude/channels/telegram/.env")
+
+if len(sys.argv) < 2 or not sys.argv[1].startswith("sk-"):
+    print("usage: set-openai-key sk-...")
+    sys.exit(1)
+
+key = sys.argv[1].strip()
+lines = open(ENV).read().splitlines() if os.path.exists(ENV) else []
+out, found = [], False
+for ln in lines:
+    if ln.startswith("OPENAI_API_KEY="):
+        out.append("OPENAI_API_KEY=" + key); found = True
+    else:
+        out.append(ln)
+if not found:
+    out.append("OPENAI_API_KEY=" + key)
+open(ENV, "w").write("\n".join(out) + "\n")
+os.chmod(ENV, 0o600)
+print("OPENAI_API_KEY set in .env — restart the service to apply (systemctl restart claude-telegram)")

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Transcribe audio via OpenAI gpt-4o-mini-transcribe
+# Transcribe audio via OpenAI gpt-4o-transcribe
 # Handles: .ogg .oga .opus .mp3 .m4a .wav .webm
 # Auto-fallback to OPENAI_API_KEY_FALLBACK if primary returns quota/billing/auth error
 # Usage: transcribe <audio_file>
@@ -26,7 +26,7 @@ try_key() {
   curl -sS -X POST "https://api.openai.com/v1/audio/transcriptions" \
     -H "Authorization: Bearer $1" \
     -F "file=@$SRC" \
-    -F "model=gpt-4o-mini-transcribe" \
+    -F "model=gpt-4o-transcribe" \
     -F "response_format=json"
 }
 
