@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""set-openai-key <sk-...> — safely set OPENAI_API_KEY in the bot's .env (for gpt-4o-transcribe).
+"""set-openai-key <sk-...> — safely set OPENAI_API_KEY in the bot's .env (for gpt-4o-mini-transcribe).
 
 Self-service voice setup: the bot runs this ONLY on the owner's command (persona-gated).
 Keeps the strict KEY=value format the launcher expects; chmod 600.

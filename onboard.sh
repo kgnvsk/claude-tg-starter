@@ -52,7 +52,7 @@ echo "── Окружение ──"
 ask_req TIMEZONE "Таймзона (IANA)" "напр. Europe/Lisbon — для кронов"
 echo
 echo "── Опционально (Enter чтобы пропустить) ──"
-ask_opt OPENAI_API_KEY "OpenAI API key" "распознавание голосовых через gpt-4o-transcribe. Пусто → бот сам попросит ключ, когда придёт первое голосовое."
+ask_opt OPENAI_API_KEY "OpenAI API key" "распознавание голосовых через gpt-4o-mini-transcribe. Пусто → бот сам попросит ключ, когда придёт первое голосовое."
 read -rp "Хочешь, чтобы бот слал утренний дайджест дня в 07:30 (события календаря)? [y/N]: " __cal
 case "${__cal:-}" in
   y|Y|yes|да|Да) ask_req CALENDAR_EMAIL "  Email Google-календаря для дайджеста" ;;
