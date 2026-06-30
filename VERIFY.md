@@ -3,7 +3,8 @@
 ## Установка (детерминизм)
 - [ ] `install-core.sh` напечатал `✅ install-core OK ... gate passed` (без FATAL)
 - [ ] `grep -rE '\{\{[A-Z_]+\}\}' /home/claude/bin /home/claude/CLAUDE.md /home/claude/.claude` → ПУСТО (ни одного плейсхолдера в боевых файлах)
-- [ ] `claude -p "reply only: OK"` под юзером claude → `OK`; в creds scope содержит `user:mcp_servers`
+- [ ] Логин по подписке: `runuser -l claude -c 'claude auth status'` → `"loggedIn": true` + `"subscriptionType": "max"`; scope в `~/.claude/.credentials.json` содержит `user:mcp_servers`
+- [ ] claude.ai-коннекторы в ЖИВОЙ сессии бота (если настроены в аккаунте): после первого диалога `grep -l mcp__claude_ai_ /home/claude/.claude/projects/*/*.jsonl` находит (Gmail/Calendar/Drive/ClickUp/Notion). НЕ проверять через `claude -p` — там коннекторы не грузятся
 
 ## Ядро
 - [ ] `systemctl is-active claude-telegram` → active; `systemctl is-enabled` → enabled
@@ -39,4 +40,4 @@
 - [ ] `ls -la ~claude/.claude/channels/telegram/.env` → права 600
 - [ ] В `/home/claude/CLAUDE.md` нет `{{` (все плейсхолдеры заполнены)
 - [ ] `logrotate -d /etc/logrotate.d/cash-claude` без ошибок
-- [ ] Временные логи логинов (clogin.log и т.п.) затёрты
+- [ ] Временные логи логина (`/tmp/claude-login.*.log`) затёрты
