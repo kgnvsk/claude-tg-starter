@@ -73,6 +73,8 @@ runuser -l claude -c 'curl -fsSL https://claude.ai/install.sh | bash'   # ста
 
 **Verify:** `runuser -l claude -c 'claude auth status'` → `"loggedIn": true`, `"subscriptionType": "max"`, `"authMethod": "claude.ai"` (это `claude-login` делает сам в конце).
 
+**Онбординг — авто (важно для свежих боксов):** wrapper `claude-telegram-bot` перед запуском `claude` сам проставляет в `~/.claude.json` `hasCompletedOnboarding: true` + `theme` + trust рабочих тек (`/home/claude`, `~/obsidian-vault`) — идемпотентный preflight, self-healing на каждый старт. Зачем: `claude auth login` ставит auth, но НЕ эти флаги; без них `claude --channels` на первом старте упирается в интерактивный экран (выбор темы / «trust this folder?»), поллер не стартует и бот молчит. Если в `~/logs/claude-screen.log` видишь `Welcome to Claude Code … Choose the text style` — значит поллер заблокирован онбордингом: проверь, что на боксе есть `python3` (им preflight мёржит флаги в `~/.claude.json`).
+
 ## Фаза 3 — раскладка кита
 
 **3a. Доставь кит на сервер — приватным git-КЛОНОМ** (репо приватное; ты ставишь лично → авторизуешь `gh` своим GitHub, и бокс сможет тянуть кит сам):

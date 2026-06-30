@@ -3,5 +3,37 @@ set -eu
 [ -f ~/.claude/channels/telegram/.env ] && export $(grep -v "^#" ~/.claude/channels/telegram/.env | xargs)
 export BUN_INSTALL="$HOME/.bun"
 export PATH="$HOME/.local/bin:$BUN_INSTALL/bin:$HOME/bin:/usr/local/bin:/usr/bin:/bin"
+
+# Preflight: пометить онбординг Claude завершённым + доверить рабочие теки, чтобы
+# `claude --channels` запускал Telegram-поллер, а НЕ упирался в интерактивный экран
+# первого старта (выбор темы / "trust this folder?"). `claude auth login` ставит auth,
+# но НЕ эти флаги — без них поллер не стартует и бот молчит (баг свежих деплоев).
+# Идемпотентно, self-healing на каждый старт. No-op пока не залогинен (нет ~/.claude.json).
+CJ="$HOME/.claude.json"
+if [ -f "$CJ" ]; then
+  python3 - "$CJ" "$HOME" "$HOME/obsidian-vault" <<'PY' 2>/dev/null || true
+import json, sys
+p = sys.argv[1]; trust = sys.argv[2:]
+try:
+    d = json.load(open(p))
+except Exception:
+    sys.exit(0)
+ch = False
+if d.get("hasCompletedOnboarding") is not True:
+    d["hasCompletedOnboarding"] = True; ch = True
+if not d.get("theme"):
+    d["theme"] = "dark"; ch = True
+proj = d.setdefault("projects", {})
+for k in trust:
+    e = proj.setdefault(k, {})
+    if e.get("hasTrustDialogAccepted") is not True:
+        e["hasTrustDialogAccepted"] = True; ch = True
+    if e.get("hasCompletedProjectOnboarding") is not True:
+        e["hasCompletedProjectOnboarding"] = True; ch = True
+if ch:
+    json.dump(d, open(p, "w"), indent=2)
+PY
+fi
+
 cd ~/obsidian-vault
 exec $HOME/.local/bin/claude --channels plugin:telegram@claude-plugins-official
