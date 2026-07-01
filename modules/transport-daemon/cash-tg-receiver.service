@@ -1,6 +1,6 @@
 [Unit]
 Description=Telegram receiver daemon — owns getUpdates, decouples receive from the claude session
-Documentation=https://github.com/kgnvsk/cash-deploy
+Documentation=https://github.com/kgnvsk/claude-tg-starter
 After=network-online.target
 Wants=network-online.target
 

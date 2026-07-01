@@ -1,17 +1,17 @@
 #!/bin/bash
-# cash-update — обновить ЭТОГО агента из репозитория кита (github.com/kgnvsk/cash-deploy).
+# cash-update — обновить ЭТОГО агента из репозитория кита (github.com/kgnvsk/claude-tg-starter).
 # Запускай прямо в сессии агента (или из шелла): подтянет свежий кит, покажет
 # git diff --stat (что меняется), и накатит update.sh (через sudo — на это есть право).
 #
-# Требует: кит развёрнут как git-КЛОН в /opt/cash-deploy, владелец claude, и
+# Требует: кит развёрнут как git-КЛОН в /opt/claude-tg-starter, владелец claude, и
 # sudoers-правило на update.sh (см. DEPLOY.md «Самообновление»).
 set -u
-KIT=/opt/cash-deploy
+KIT=/opt/claude-tg-starter
 
 if [ ! -d "$KIT/.git" ]; then
   echo "✗ Кит в $KIT — не git-клон, сам обновиться не могу."
   echo "  Владельцу (root) разово:"
-  echo "    rm -rf $KIT && git clone https://github.com/kgnvsk/cash-deploy $KIT && chown -R claude:claude $KIT"
+  echo "    rm -rf $KIT && git clone https://github.com/kgnvsk/claude-tg-starter $KIT && chown -R claude:claude $KIT"
   exit 1
 fi
 

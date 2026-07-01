@@ -35,4 +35,4 @@ cd /opt/claude-tg-starter && bash onboard.sh
 - `assets/` — bin, skills (наши), agents, systemd, templates, vault-skeleton
 - `modules/` — опц. аддоны (transport-daemon для макс. устойчивости, vault-web, и др.)
 
-Построен на архитектуре cash-deploy. Сторонние скиллы (superpowers, frontend-design) ставятся из их публичных маркетплейсов, а не бандлятся в код.
+Построен на той же проверенной архитектуре, что и боевые ассистенты. Сторонние скиллы (superpowers, frontend-design) ставятся из их публичных маркетплейсов, а не бандлятся в код.
