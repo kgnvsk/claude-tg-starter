@@ -85,15 +85,12 @@ install -m600 -o claude -g claude /dev/null "$H"/.cash-agent.env
   done; } > "$H"/.cash-agent.env
 chmod 600 "$H"/.cash-agent.env
 
-echo "[5/6] crontab (feature-flagged: calendar only if CALENDAR_EMAIL set)"
+echo "[5/6] crontab (утренний дайджест китом НЕ ставится — агент поставит крон по просьбе владельца)"
 {
   echo "CRON_TZ=$TIMEZONE"; echo "TZ=$TIMEZONE"; echo
   echo "* * * * * /usr/bin/timeout 55 $H/bin/cash-reminder-tick"
   echo "*/2 * * * * /usr/bin/timeout 110 $H/bin/cash-healthcheck"
   echo "17 4 * * * find $H/.claude/channels/telegram/inbox/ -type f -mtime +2 -delete"
-  if [ -n "$CALENDAR_EMAIL" ]; then
-    echo "30 7 * * * /usr/bin/timeout 900 $H/bin/cash-morning-calendar"
-  fi
 } | crontab -u claude -
 
 echo "[6/6] GATE: no leftover {{PLACEHOLDER}} in deployed files"
