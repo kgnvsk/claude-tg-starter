@@ -1,6 +1,11 @@
 {
   "dmPolicy": "allowlist",
-  "allowFrom": ["{{OWNER_CHAT_ID}}"],
+  "allowFrom": [
+    "{{OWNER_CHAT_ID}}"
+  ],
+  "admins": [
+    "{{OWNER_CHAT_ID}}"
+  ],
   "groups": {},
   "ackReaction": "👀",
   "replyToMode": "first",
