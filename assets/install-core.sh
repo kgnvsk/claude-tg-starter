@@ -57,9 +57,23 @@ while IFS= read -r f; do
 done < <(printf '%s\n' "$H"/bin/*; find "$H"/.claude/skills -name 'SKILL.md')
 chmod +x "$H"/bin/*
 
+echo "[3b/6] gog CLI (Google: calendar/meet/gmail/docs/sheets — used by google-workspace skill)"
+if [ ! -x /usr/local/bin/gog ]; then
+  GOG_URL=$(curl -s https://api.github.com/repos/openclaw/gogcli/releases/latest \
+    | grep -oE '"browser_download_url": *"[^"]*linux_amd64\.tar\.gz"' | grep -oE 'https[^"]+' | head -1)
+  if [ -n "$GOG_URL" ] && curl -fsSL "$GOG_URL" | tar -xz -C /tmp gog 2>/dev/null; then
+    install -m755 /tmp/gog /usr/local/bin/gog && rm -f /tmp/gog
+    echo "  gog: $(/usr/local/bin/gog --version 2>/dev/null | head -1)"
+  else
+    echo "  WARN: gog не скачался — Google-скилл заработает после ручной установки gog"
+  fi
+fi
+
 echo "[4/6] secrets (.env, strict KEY=value, mode 600)"
 { printf 'TELEGRAM_BOT_TOKEN=%s\n' "$TELEGRAM_BOT_TOKEN"
-  printf 'OPENAI_API_KEY=%s\n' "$OPENAI_API_KEY"; } > "$H"/.claude/channels/telegram/.env
+  printf 'OPENAI_API_KEY=%s\n' "$OPENAI_API_KEY"
+  printf 'GOG_KEYRING_BACKEND=file\n'
+  printf 'GOG_KEYRING_PASSWORD=%s\n' "$(openssl rand -hex 16 2>/dev/null || head -c16 /dev/urandom | od -An -tx1 | tr -d ' \n')"; } > "$H"/.claude/channels/telegram/.env
 chmod 600 "$H"/.claude/channels/telegram/.env
 
 # Persist the owner inputs so update.sh can re-render placeholders on later kit pulls

@@ -1,0 +1,46 @@
+#!/bin/bash
+# Voice reply: OpenAI TTS (gpt-4o-mini-tts) → Telegram voice message (ogg/opus).
+# Same OPENAI_API_KEY as transcribe — no extra service needed.
+# Usage: speak <chat_id> "text"   [env: OPENAI_TTS_VOICE=onyx]
+set -e
+
+CHAT_ID="$1"
+TEXT="$2"
+[ -z "$CHAT_ID" ] || [ -z "$TEXT" ] && { echo "Usage: speak <chat_id> \"text\"" >&2; exit 1; }
+
+# Load env (same source as transcribe)
+[ -f ~/.claude/channels/telegram/.env ] && export $(grep -v '^#' ~/.claude/channels/telegram/.env | xargs)
+[ -z "$OPENAI_API_KEY" ] && { echo "No OPENAI_API_KEY" >&2; exit 1; }
+[ -z "$TELEGRAM_BOT_TOKEN" ] && { echo "No TELEGRAM_BOT_TOKEN" >&2; exit 1; }
+
+# OpenAI TTS caps input at 4096 chars — refuse louder texts so the caller
+# shortens instead of sending a voice that cuts off mid-sentence.
+if [ ${#TEXT} -gt 4096 ]; then
+  echo "Text too long for TTS (${#TEXT} > 4096 chars) — shorten it" >&2
+  exit 1
+fi
+
+VOICE="${OPENAI_TTS_VOICE:-onyx}"
+OGG="/tmp/speak-$$.ogg"
+trap 'rm -f "$OGG"' EXIT
+
+# 1. TTS → ogg/opus (Telegram's native voice format)
+HTTP=$(curl -sS -o "$OGG" -w "%{http_code}" -X POST "https://api.openai.com/v1/audio/speech" \
+  -H "Authorization: Bearer $OPENAI_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d "$(jq -n --arg t "$TEXT" --arg v "$VOICE" '{model:"gpt-4o-mini-tts", input:$t, voice:$v, response_format:"opus"}')")
+if [ "$HTTP" != "200" ]; then
+  echo "TTS failed (HTTP $HTTP): $(head -c 300 "$OGG")" >&2
+  exit 1
+fi
+
+# 2. Send as Telegram voice message
+RESP=$(curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendVoice" \
+  -F "chat_id=${CHAT_ID}" \
+  -F "voice=@${OGG}")
+if echo "$RESP" | jq -e '.ok' >/dev/null 2>&1; then
+  echo "voice sent (message_id: $(echo "$RESP" | jq -r '.result.message_id'))"
+else
+  echo "sendVoice failed: $(echo "$RESP" | head -c 300)" >&2
+  exit 1
+fi

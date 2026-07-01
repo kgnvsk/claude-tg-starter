@@ -99,6 +99,15 @@
             "timeout": 5
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/claude/bin/tg-context-inject",
+            "timeout": 5
+          }
+        ]
       }
     ]
   },

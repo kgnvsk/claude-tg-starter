@@ -36,3 +36,13 @@ cd /opt/claude-tg-starter && bash onboard.sh
 - `modules/` — опц. аддоны (transport-daemon для макс. устойчивости, vault-web, и др.)
 
 Построен на той же проверенной архитектуре, что и боевые ассистенты. Сторонние скиллы (superpowers, frontend-design) ставятся из их публичных маркетплейсов, а не бандлятся в код.
+
+## Windows (WSL2) — beta
+
+Кит рассчитан на Linux VPS, но запускается и локально на Windows через WSL2:
+
+1. PowerShell от администратора: `wsl --install -d Ubuntu` → перезагрузка → при первом запуске Ubuntu задай имя пользователя и пароль.
+2. Включи systemd внутри Ubuntu: `printf '[boot]\nsystemd=true\n' | sudo tee /etc/wsl.conf`, затем в PowerShell `wsl --shutdown` и открой Ubuntu заново.
+3. Дальше — обычный путь VPS: `sudo -i`, клонируй кит и запускай `bash onboard.sh`.
+
+Ограничение: бот работает, пока WSL запущен (ноутбук включён). Статус: beta — основной проверенный путь остаётся Linux VPS.

@@ -22,6 +22,7 @@ import { randomBytes } from 'crypto'
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync } from 'fs'
 import { homedir } from 'os'
 import { join, extname, sep } from 'path'
+import { Database } from 'bun:sqlite'
 
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
@@ -75,6 +76,26 @@ if (!SUPPRESS) {
     }
   } catch {}
   writeFileSync(PID_FILE, String(process.pid))
+}
+
+// ── message log (added 2026-07-01) ───────────────────────────────────────────
+// Every inbound (pre-gate, incl. non-allowlisted senders) and outbound reply
+// lands in messages.db. The context hook reads the last N rows per chat to
+// re-ground the model after compaction/restart; digest crons can mine it too.
+const MSG_DB = new Database(join(STATE_DIR, 'messages.db'))
+MSG_DB.run(`PRAGMA journal_mode=WAL`)
+MSG_DB.run(`CREATE TABLE IF NOT EXISTS messages (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  chat_id TEXT NOT NULL, user_id TEXT, username TEXT,
+  direction TEXT DEFAULT 'in', text TEXT, ts INTEGER NOT NULL, message_id INTEGER
+)`)
+MSG_DB.run(`CREATE INDEX IF NOT EXISTS idx_msg_chat_ts ON messages(chat_id, ts DESC)`)
+const msgInsert = MSG_DB.prepare(
+  `INSERT INTO messages (chat_id,user_id,username,direction,text,ts,message_id) VALUES (?,?,?,?,?,?,?)`,
+)
+function logMsg(r: { chat_id: string; user_id: string; username: string; direction: 'in' | 'out'; text: string; ts: number; message_id?: number }): void {
+  try { msgInsert.run(r.chat_id, r.user_id, r.username, r.direction, r.text, r.ts, r.message_id ?? null) }
+  catch (e) { process.stderr.write(`telegram channel: msg-log: ${e}\n`) }
 }
 
 // Last-resort safety net — without these the process dies silently on any
@@ -650,6 +671,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           }
         }
 
+        // Log outbound once per reply (full text) — history/context.
+        logMsg({ chat_id, user_id: '', username: botUsername || 'bot', direction: 'out', text, ts: Date.now(), message_id: sentIds[0] })
+
         // Files go as separate messages (Telegram doesn't mix text+file in one
         // sendMessage call). Thread under reply_to if present.
         for (const f of files) {
@@ -1012,6 +1036,19 @@ async function handleInbound(
   downloadImage: (() => Promise<string | undefined>) | undefined,
   attachment?: AttachmentMeta,
 ): Promise<void> {
+  // Log every inbound pre-gate (incl. non-allowlisted senders) — history/context.
+  if (ctx.chat && ctx.from) {
+    logMsg({
+      chat_id: String(ctx.chat.id),
+      user_id: String(ctx.from.id),
+      username: ctx.from.username ?? ctx.from.first_name ?? String(ctx.from.id),
+      direction: 'in',
+      text,
+      ts: Date.now(),
+      message_id: ctx.message?.message_id,
+    })
+  }
+
   const result = gate(ctx)
 
   if (result.action === 'drop') return
@@ -1084,6 +1121,22 @@ async function handleInbound(
           user: from.username ?? String(from.id),
           user_id: String(from.id),
           ts: new Date((ctx.message?.date ?? 0) * 1000).toISOString(),
+          // reply-to meta (added 2026-07-01): shows when the inbound quotes an
+          // earlier message — who and what was quoted. Sanitized like attachment
+          // names: quoted text is sender-controlled and must not break the tag.
+          ...(ctx.message?.reply_to_message ? (() => {
+            const r = ctx.message!.reply_to_message!
+            const rf = r.from
+            const rt = safeName((((r as { text?: string; caption?: string }).text ?? (r as { text?: string; caption?: string }).caption ?? '')).slice(0, 200))
+            return {
+              reply_to_message_id: String(r.message_id),
+              ...(rf ? {
+                reply_to_user: safeName(rf.username ?? rf.first_name ?? String(rf.id)) ?? '',
+                reply_to_is_bot: String(rf.is_bot === true),
+              } : {}),
+              ...(rt ? { reply_to_text: rt } : {}),
+            }
+          })() : {}),
           ...(imagePath ? { image_path: imagePath } : {}),
           ...(attachment ? {
             attachment_kind: attachment.kind,

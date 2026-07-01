@@ -1,0 +1,5 @@
+#!/bin/bash
+# gog wrapper — loads keyring env (GOG_KEYRING_*) then execs the real binary.
+# Headless boxes have no OS keyring; gog needs the encrypted-file backend + password.
+[ -f ~/.claude/channels/telegram/.env ] && export $(grep -v '^#' ~/.claude/channels/telegram/.env | xargs)
+exec /usr/local/bin/gog "$@"
