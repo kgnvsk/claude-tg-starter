@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# install-plugins — детерминированно ставит маркетплейс-плагины (superpowers, frontend-design,
+# impeccable, document/example-skills, lazyweb). settings.json их ОБЪЯВЛЯЕТ (enabledPlugins +
+# extraKnownMarketplaces), но claude не всегда сам РЕГИСТРИРУЕТ маркетплейс и ставит плагин
+# (особенно git-url источники) → поэтому ставим явно: marketplace add <repo> + plugin install <name>.
+#
+# Запускать ОТ юзера claude ПОСЛЕ claude-login (нужна авторизация + сеть), до старта сервиса
+# (или перезапусти сервис после). Идемпотентно — повторный запуск безопасен.
+#   runuser -l claude -c '~/bin/install-plugins'
+#
+# telegram СЮДА НЕ входит — он ставится отдельно с golden-патчем (DEPLOY Фаза 3c).
+set -uo pipefail
+C="$HOME/.local/bin/claude"; command -v "$C" >/dev/null 2>&1 || C="claude"
+add(){ echo "  + marketplace $1"; ATARAX_SUPPRESS_TELEGRAM=1 "$C" plugin marketplace add "$1" 2>&1 | tail -1 || true; }
+ins(){ echo "  + plugin      $1"; ATARAX_SUPPRESS_TELEGRAM=1 "$C" plugin install "$1"          2>&1 | tail -1 || true; }
+
+echo "→ регистрирую маркетплейсы…"
+add anthropics/claude-plugins-official    # frontend-design (telegram — отдельно, с golden-патчем)
+add anthropics/skills                     # document-skills, example-skills
+add obra/superpowers-marketplace          # superpowers
+add pbakaus/impeccable                    # impeccable — дизайн-скилл (1 skill + 23 команды /impeccable)
+add aboul3ata/lazyweb-skill               # lazyweb
+
+echo "→ ставлю плагины…"
+for p in frontend-design document-skills example-skills superpowers impeccable lazyweb; do ins "$p"; done
+
+echo "✓ готово. Проверь: $C plugin list"

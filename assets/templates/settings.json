@@ -108,7 +108,8 @@
     "example-skills@anthropic-agent-skills": true,
     "lazyweb@lazyweb": true,
     "superpowers@superpowers-marketplace": true,
-    "frontend-design@claude-plugins-official": true
+    "frontend-design@claude-plugins-official": true,
+    "impeccable@impeccable": true
   },
   "extraKnownMarketplaces": {
     "anthropic-agent-skills": {
@@ -127,6 +128,12 @@
       "source": {
         "source": "github",
         "repo": "obra/superpowers-marketplace"
+      }
+    },
+    "impeccable": {
+      "source": {
+        "source": "github",
+        "repo": "pbakaus/impeccable"
       }
     }
   },

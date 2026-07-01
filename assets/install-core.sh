@@ -35,7 +35,7 @@ install -m755 -o claude -g claude "$KIT"/assets/bin/* "$H"/bin/
 install -m644 -o claude -g claude "$KIT"/assets/telegram-server-fixed.ts "$H"/telegram-server-fixed.ts
 install -m644 "$KIT"/assets/systemd/claude-telegram.service /etc/systemd/system/claude-telegram.service
 install -m644 "$KIT"/assets/systemd/logrotate-cash /etc/logrotate.d/cash-claude
-cp -a "$KIT"/assets/skills/. "$H"/.claude/skills/   # codex-imagegen, vercel-deploy, impeccable, …
+cp -a "$KIT"/assets/skills/. "$H"/.claude/skills/   # codex-imagegen, vercel-deploy, research, analyze-video (impeccable/superpowers/frontend-design — из маркетплейсов: install-plugins)
 cp -a "$KIT"/assets/agents/. "$H"/.claude/agents/   # native subagents (researcher example + README)
 install -m644 -o claude -g claude "$KIT"/assets/templates/settings.json "$H"/.claude/settings.json
 cp -a "$KIT"/assets/vault-skeleton/. "$H"/obsidian-vault/

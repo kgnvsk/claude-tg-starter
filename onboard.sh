@@ -126,9 +126,11 @@ echo
 set -a; . "$ENV_OUT"; set +a
 if bash "$KIT/assets/install-core.sh"; then
   echo
-  echo "✅ Core готов. Дальше — Telegram-плагин + golden-патч (Фаза 3c в DEPLOY.md):"
-  echo "   нужен живой claude из Фазы 2, install-core этого не делает."
-  echo "   Доп-модули (дизайн/канал/браузер) — опционально, см. agent.env.example + DEPLOY.md."
+  echo "✅ Core готов. Дальше (нужен живой claude из Фазы 2, install-core этого не делает):"
+  echo "   • Фаза 3c — Telegram-плагин + golden-патч (DEPLOY.md)"
+  echo "   • Фаза 3d — маркетплейс-скиллы:  runuser -l claude -c '~/bin/install-plugins'"
+  echo "     (superpowers, frontend-design, impeccable, document/example-skills)"
+  echo "   Доп-модули (канал/браузер) — опционально, см. agent.env.example + DEPLOY.md."
 else
   echo
   echo "✗ install-core упал — см. ошибку выше. Поправь ввод и запусти снова (идемпотентно)."
