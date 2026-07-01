@@ -92,4 +92,12 @@ if grep -rlE '\{\{[A-Z_]+\}\}' \
   echo "FATAL: leftover placeholder in file(s) above (check your agent.env inputs). Aborting."; exit 1
 fi
 chown -R claude:claude "$H"
+
+# git init вольта — vault-sync коммитит историю памяти на каждый Write/Edit; без .git хук
+# молча выходит ([ -d .git ] || exit 0) → история версий НЕ ведётся. Ставим репо + git identity.
+if [ ! -d "$H"/obsidian-vault/.git ]; then
+  runuser -l claude -c "cd ~/obsidian-vault && git init -q && git config user.email '${OWNER_EMAIL:-claude@localhost}' && git config user.name '${AGENT_NAME:-Claude Agent}' && git add -A && git commit -q -m 'init: vault skeleton'" \
+    && echo "  vault: git initialized (история памяти включена)" \
+    || echo "  ! vault git init не удался — вручную: cd ~/obsidian-vault && git init && git add -A && git commit -m init"
+fi
 echo "✅ install-core OK: user+dirs+assets+render+secrets+crontab done, gate passed."
