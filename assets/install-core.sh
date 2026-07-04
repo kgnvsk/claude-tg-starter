@@ -78,6 +78,11 @@ if [ ! -x /usr/local/bin/gog ]; then
   fi
 fi
 
+echo "[3c/6] HyperFrames — генерація відео з HTML (motion-graphics / explainer / promo → MP4)"
+runuser -l claude -c 'command -v npx >/dev/null 2>&1 && npx --yes skills add heygen-com/hyperframes -y -g -s "*" -a "*" </dev/null >/dev/null 2>&1' \
+  && echo "  hyperframes skills OK (рендер потребує node 22+ / ffmpeg / chrome — Фаза 1)" \
+  || echo "  WARN: hyperframes skills не встали — потім: runuser -l claude -c 'npx skills add heygen-com/hyperframes'"
+
 echo "[4/6] secrets (.env, strict KEY=value, mode 600)"
 { printf 'TELEGRAM_BOT_TOKEN=%s\n' "$TELEGRAM_BOT_TOKEN"
   printf 'OPENAI_API_KEY=%s\n' "$OPENAI_API_KEY"

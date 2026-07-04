@@ -53,7 +53,9 @@ echo 'claude ALL=(ALL) NOPASSWD: /usr/bin/systemctl' > /etc/sudoers.d/claude-sys
 chmod 440 /etc/sudoers.d/claude-systemctl
 # bun (нужен telegram-плагину):
 runuser -l claude -c 'curl -fsSL https://bun.sh/install | bash'
-# node 22+ если нет (для vercel/npm-утилит): установи через apt/nvm по ситуации
+# node 22+ (vercel/npm + ОБОВ'ЯЗКОВО для HyperFrames-рендеру відео). Ставимо явно з nodesource:
+node -e 'process.exit(+process.versions.node.split(".")[0]>=22?0:1)' 2>/dev/null || \
+  { curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && apt-get install -y nodejs; }
 mkdir -p /home/claude/{logs,bin,obsidian-vault} && chown -R claude:claude /home/claude
 ```
 **Verify:** `runuser -l claude -c 'bun --version'` отвечает; `id claude` существует.
