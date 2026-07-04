@@ -1,0 +1,16 @@
+[Unit]
+Description=StreamPost — Telegram channel auto-publisher
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/streampost
+ExecStart=/usr/bin/python3 /opt/streampost/core/engine.py
+Restart=always
+RestartSec=10
+User=root
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

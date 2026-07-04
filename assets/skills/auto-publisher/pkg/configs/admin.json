@@ -1,0 +1,8 @@
+{
+  "admin_user_ids": [],
+  "target_channel_id": null,
+  "target_channel_name": "",
+  "safe_mode": true,
+  "require_confirm": ["pause", "test_post", "remove_source"],
+  "rate_limit_per_min": 10
+}
