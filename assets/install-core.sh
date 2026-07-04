@@ -35,6 +35,15 @@ install -m755 -o claude -g claude "$KIT"/assets/bin/* "$H"/bin/
 install -m644 -o claude -g claude "$KIT"/assets/telegram-server-fixed.ts "$H"/telegram-server-fixed.ts
 install -m644 "$KIT"/assets/systemd/claude-telegram.service /etc/systemd/system/claude-telegram.service
 install -m644 "$KIT"/assets/systemd/logrotate-cash /etc/logrotate.d/cash-claude
+
+# self-heal sudo: cash-healthcheck restarts the bot via `sudo systemctl` on MCP death.
+# Without this the healthcheck can DETECT a dead bot but can't recover it — the bot hangs
+# dead for hours (Yasha was silent 25h). Scoped to just its own service, no broad sudo.
+cat > /etc/sudoers.d/claude-telegram-heal <<'SUDOERS'
+claude ALL=(root) NOPASSWD: /usr/bin/systemctl is-active claude-telegram.service, /usr/bin/systemctl start claude-telegram.service, /usr/bin/systemctl restart claude-telegram.service, /usr/bin/systemctl stop claude-telegram.service, /usr/bin/systemctl reset-failed claude-telegram.service
+SUDOERS
+chmod 440 /etc/sudoers.d/claude-telegram-heal
+visudo -cf /etc/sudoers.d/claude-telegram-heal >/dev/null 2>&1 || { echo "  WARN: self-heal sudoers invalid — removed"; rm -f /etc/sudoers.d/claude-telegram-heal; }
 cp -a "$KIT"/assets/skills/. "$H"/.claude/skills/   # codex-imagegen, vercel-deploy, research, analyze-video (impeccable/superpowers/frontend-design — из маркетплейсов: install-plugins)
 cp -a "$KIT"/assets/agents/. "$H"/.claude/agents/   # native subagents (researcher example + README)
 install -m644 -o claude -g claude "$KIT"/assets/templates/settings.json "$H"/.claude/settings.json
