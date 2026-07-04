@@ -127,11 +127,19 @@ echo
 set -a; . "$ENV_OUT"; set +a
 if bash "$KIT/assets/install-core.sh"; then
   echo
-  echo "✅ Core готов. Дальше (нужен живой claude из Фазы 2, install-core этого не делает):"
-  echo "   • Фаза 3c — Telegram-плагин + golden-патч (DEPLOY.md)"
-  echo "   • Фаза 3d — маркетплейс-скиллы:  runuser -l claude -c '~/bin/install-plugins'"
-  echo "     (superpowers, frontend-design, impeccable, document/example-skills)"
-  echo "   Доп-модули (канал/браузер) — опционально, см. agent.env.example + DEPLOY.md."
+  echo "✅ Ядро готово (файлы, персона, секреты, крон). НО бот ещё НЕ запущен —"
+  echo "   install-core НЕ ставит Claude, НЕ логинит подписку, НЕ ставит плагин/скиллы."
+  echo "   Осталось (полностью — в DEPLOY.md; здесь короткая шпаргалка):"
+  echo
+  echo "   1) МОЗГ — вход в Claude (если ещё не залогинен, Фаза 2):"
+  echo "        runuser -l claude -c '~/bin/claude-login'            # напечатает URL"
+  echo "        → отдай URL владельцу; он войдёт Max-подпиской и пришлёт код →"
+  echo "        runuser -l claude -c '~/bin/claude-login <код>'      # проверит сам"
+  echo "   2) Telegram-плагин + golden-патч            (Фаза 3c — см. DEPLOY.md, нужен живой claude)"
+  echo "   3) Скиллы:  runuser -l claude -c '~/bin/install-plugins' (Фаза 3d)"
+  echo "   4) Запуск:  systemctl daemon-reload && systemctl enable --now claude-telegram   (Фаза 4)"
+  echo
+  echo "   Затем смоук-тест по VERIFY.md. Опции (голос/картинки/календарь/Vercel/канал) — DEPLOY.md Фаза 6."
 else
   echo
   echo "✗ install-core упал — см. ошибку выше. Поправь ввод и запусти снова (идемпотентно)."
