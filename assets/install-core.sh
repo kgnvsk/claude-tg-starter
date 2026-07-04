@@ -78,6 +78,10 @@ if [ ! -x /usr/local/bin/gog ]; then
   fi
 fi
 
+# node 22+ ОБОВ'ЯЗКОВИЙ для HyperFrames-рендеру + npx skills add — гарантуємо ТУТ (Фазу 1 могли пропустити):
+node -e 'process.exit(+process.versions.node.split(".")[0]>=22?0:1)' 2>/dev/null || \
+  { echo "  node<22 або відсутній → ставлю 22.x з nodesource"; curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && apt-get install -y nodejs; } || \
+  echo "  WARN: node 22 не встановився (мережа?) — HyperFrames-рендер не працюватиме, постав вручну"
 echo "[3c/6] HyperFrames — генерація відео з HTML (motion-graphics / explainer / promo → MP4)"
 runuser -l claude -c 'command -v npx >/dev/null 2>&1 && npx --yes skills add heygen-com/hyperframes -y -g -s "*" -a "*" </dev/null >/dev/null 2>&1' \
   && echo "  hyperframes skills OK (рендер потребує node 22+ / ffmpeg / chrome — Фаза 1)" \
