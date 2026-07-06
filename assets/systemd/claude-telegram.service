@@ -16,7 +16,7 @@ Environment=PATH=/home/claude/.local/bin:/home/claude/.bun/bin:/home/claude/bin:
 
 # screen -Dm: detach+stay foreground, -S name
 ExecStart=/usr/bin/screen -L -Logfile /home/claude/logs/claude-screen.log -Dm -S claude-bot /home/claude/bin/claude-telegram-bot
-ExecStop=/usr/bin/screen -S claude-bot -X quit
+ExecStop=-/usr/bin/screen -S claude-bot -X quit
 
 StandardInput=null
 StandardOutput=journal

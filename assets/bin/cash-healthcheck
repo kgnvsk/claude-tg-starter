@@ -194,6 +194,7 @@ if [ -f "$DB" ]; then
             echo "$NOW_S3" > "$STUCK_TS"
             AGE_MIN=$(( (NOW_MS3 - LAST_IN) / 60000 ))
             echo "[$(date -u +%FT%TZ)] stuck-turn: unanswered incoming ${AGE_MIN}m, sessions idle — restarting" >> "$LOG"
+            XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user restart cash-tg-receiver 2>/dev/null
             sudo systemctl restart claude-telegram.service 2>/dev/null
         fi
     fi
