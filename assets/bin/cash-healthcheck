@@ -183,8 +183,8 @@ fi
 # >=6 min AND no session jsonl activity >=3 min (claude idle, not a long legit task) -> restart.
 DB=/home/claude/.claude/channels/telegram/messages.db
 if [ -f "$DB" ]; then
-    LAST_IN=$(sqlite3 "$DB" "SELECT COALESCE(MAX(ts),0) FROM messages WHERE direction='in'" 2>/dev/null || echo 0)
-    LAST_OUT=$(sqlite3 "$DB" "SELECT COALESCE(MAX(ts),0) FROM messages WHERE direction='out'" 2>/dev/null || echo 0)
+    LAST_IN=$(sqlite3 "$DB" "SELECT COALESCE(MAX(ts),0) FROM messages WHERE direction='in' AND chat_id='${USER_ID}'" 2>/dev/null || echo 0)
+    LAST_OUT=$(sqlite3 "$DB" "SELECT COALESCE(MAX(ts),0) FROM messages WHERE direction='out' AND chat_id='${USER_ID}'" 2>/dev/null || echo 0)
     NOW_MS3=$(( $(date +%s) * 1000 ))
     if [ "$LAST_IN" -gt "$LAST_OUT" ] && [ $(( NOW_MS3 - LAST_IN )) -ge 360000 ]; then
         RECENT_JSONL=$(find /home/claude/.claude/projects -name "*.jsonl" -newermt "-180 seconds" 2>/dev/null | head -1)
