@@ -178,4 +178,25 @@ if [ -x /home/claude/.npm-global/bin/codex ] && [ $(( NOW_S - LAST_CODEX )) -ge 
     fi
 fi
 
+# 12. Stuck-turn watchdog (added 2026-07-06 after 23:38->00:13 hang: poller alive, turn hung,
+# voices sat unanswered 35 min; none of checks 1-11 fire in this mode). Unanswered incoming
+# >=6 min AND no session jsonl activity >=3 min (claude idle, not a long legit task) -> restart.
+DB=/home/claude/.claude/channels/telegram/messages.db
+if [ -f "$DB" ]; then
+    LAST_IN=$(sqlite3 "$DB" "SELECT COALESCE(MAX(ts),0) FROM messages WHERE direction='in'" 2>/dev/null || echo 0)
+    LAST_OUT=$(sqlite3 "$DB" "SELECT COALESCE(MAX(ts),0) FROM messages WHERE direction='out'" 2>/dev/null || echo 0)
+    NOW_MS3=$(( $(date +%s) * 1000 ))
+    if [ "$LAST_IN" -gt "$LAST_OUT" ] && [ $(( NOW_MS3 - LAST_IN )) -ge 360000 ]; then
+        RECENT_JSONL=$(find /home/claude/.claude/projects -name "*.jsonl" -newermt "-180 seconds" 2>/dev/null | head -1)
+        STUCK_TS=/tmp/cash-stuck-restart.ts
+        NOW_S3=$(date +%s); LAST_SR=$(cat "$STUCK_TS" 2>/dev/null || echo 0)
+        if [ -z "$RECENT_JSONL" ] && [ $(( NOW_S3 - LAST_SR )) -ge 900 ]; then
+            echo "$NOW_S3" > "$STUCK_TS"
+            AGE_MIN=$(( (NOW_MS3 - LAST_IN) / 60000 ))
+            echo "[$(date -u +%FT%TZ)] stuck-turn: unanswered incoming ${AGE_MIN}m, sessions idle — restarting" >> "$LOG"
+            sudo systemctl restart claude-telegram.service 2>/dev/null
+        fi
+    fi
+fi
+
 exit 0
