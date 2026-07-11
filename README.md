@@ -1,80 +1,82 @@
+**English** · [Українська](README.uk.md)
+
 # claude-tg-starter
 
-Turn-key старт для **своего личного Claude-Code Telegram-агента** — self-hosted, на твоей подписке Claude. Развернул один раз, дальше **настраиваешь всё через самого бота** — без инженера.
+Turn-key start for **your own personal Claude Code Telegram agent** — self-hosted, on your Claude subscription. Deploy it once, then **configure everything through the bot itself** — no engineer required.
 
-## Что внутри коробки
-- Claude-Code агент в Telegram (голос, файлы, картинки, PDF)
-- Генерация изображений (`gpt-image-2` через Codex) с правильными правилами типографики
-- Деплой на Vercel (веб-страницы/отчёты)
-- Память Obsidian-vault + pre-search индекс (агент знает, что у него в памяти)
-- Устойчивость: self-kill guard, healthcheck, format-enforcer, мгновенный ack — бот не падает и не немеет
-- **Self-service:** владелец настраивает бота прямо из чата — добавляет людей (pairing), меняет настройки, allow-list, пишет файлы. Безопасно (только владелец)
-- Полезные скиллы из публичных маркетплейсов: `superpowers` (process-скиллы), `frontend-design`, + наши (codex-imagegen, vercel-deploy, research, analyze-video)
+## What's in the box
+- Claude Code agent in Telegram (voice, files, images, PDF)
+- Image generation (`gpt-image-2` via Codex) with proper typography rules
+- Deploy to Vercel (web pages / reports)
+- Obsidian-vault memory + pre-search index (the agent knows what's in its memory)
+- Resilience: self-kill guard, healthcheck, format-enforcer, instant ack — the bot doesn't crash or go silent
+- **Self-service:** the owner configures the bot straight from chat — adds people (pairing), changes settings, allow-list, writes files. Safe (owner only)
+- Useful skills from public marketplaces: `superpowers` (process skills), `frontend-design`, + ours (codex-imagegen, vercel-deploy, research, analyze-video)
 
-## Развернуть
+## Deploy
 
-**Проще всего — руками агента:** открой Claude Code в этой папке и напиши «установи мне ассистента» (см. [QUICKSTART.md](QUICKSTART.md)). Агент сам пройдёт установку по ранбуку и проведёт тебя по шагам.
+**Easiest — hand it to your agent:** open Claude Code in this folder and say "install the assistant for me" (see [QUICKSTART.md](QUICKSTART.md)). The agent runs the install by the runbook and walks you through each step.
 
-**Ставишь сам (или ты — агент-установщик): твой ранбук — [DEPLOY.md](DEPLOY.md).** Это полная последовательность (~7 фаз, по порядку, после каждой — verify):
+**Doing it yourself (or you *are* the installer agent): your runbook is [DEPLOY.md](DEPLOY.md).** It's the full sequence (~7 phases, in order, a verify gate after each):
 ```
-Фаза 1  база системы (пакеты, bun, node)
-Фаза 2  Claude CLI + ВХОД по подписке владельца   ← «мозг» бота, без него не работает
-Фаза 3  раскладка кита (onboard.sh / install-core) + Telegram-плагин (3c) + скиллы (3d)
-Фаза 4  запуск (systemd)
-Фаза 5-7 устойчивость · опции (голос/картинки/календарь/Vercel) · смоук-тест (VERIFY.md)
+Phase 1   system base (packages, bun, node)
+Phase 2   Claude CLI + owner's subscription LOGIN   ← the bot's "brain"; nothing works without it
+Phase 3   kit layout (onboard.sh / install-core) + Telegram plugin (3c) + skills (3d)
+Phase 4   launch (systemd)
+Phase 5-7 resilience · options (voice/images/calendar/Vercel) · smoke test (VERIFY.md)
 ```
 
-> ⚠️ **Мозг бота = подписка Claude владельца.** Вход делает хелпер `claude-login`: он печатает URL, владелец открывает его в браузере, входит своей Claude Max-подпиской и присылает код (пароль НЕ вводится). Это Фаза 2 — самый важный шаг, и он **отдельный** от `onboard.sh`.
+> ⚠️ **The bot's brain = the owner's Claude subscription.** Login is done by the `claude-login` helper: it prints a URL, the owner opens it in a browser, signs in with their Claude Max subscription and sends back a code (no password is ever typed). This is Phase 2 — the most important step, and it is **separate** from `onboard.sh`.
 
-**Что делает `onboard.sh` (и чего НЕ делает):** это интерактивный помощник для ОДНОЙ фазы (конфиг ядра, Фаза 3b) — спрашивает имя/владельца/токен бота/TZ, пишет `agent.env` (chmod 600) и запускает `install-core` (юзер, папки, рендер персоны, секреты, крон). Идемпотентно. Он **НЕ** ставит сам Claude, **НЕ** логинит подписку, **НЕ** ставит плагин/скиллы и **НЕ** поднимает бота — это соседние фазы из DEPLOY.md. После него бот ещё не отвечает.
+**What `onboard.sh` does (and doesn't):** it's an interactive helper for ONE phase (core config, Phase 3b) — asks for the agent name / owner / bot token / TZ, writes `agent.env` (chmod 600) and runs `install-core` (user, dirs, persona render, secrets, cron). Idempotent, with input validation and hidden secret entry. It does **NOT** install Claude itself, does **NOT** log in the subscription, does **NOT** install the plugin/skills and does **NOT** bring the bot up — those are neighboring phases in DEPLOY.md. After it, the bot isn't answering yet.
 
 ```
 ssh root@<SERVER>
 git clone https://github.com/kgnvsk/claude-tg-starter /opt/claude-tg-starter
-cd /opt/claude-tg-starter && bash onboard.sh   # Фаза 3b; дальше — по DEPLOY.md
+cd /opt/claude-tg-starter && bash onboard.sh   # Phase 3b; then follow DEPLOY.md
 ```
 
-## Self-service — главная фишка
-После деплоя владелец рулит из Telegram-чата:
-- «добавь @user в доступ» → бот добавит (pairing, только по команде владельца)
-- «поменяй настройку X» → бот правит свой settings
-- «запомни правило Y» → бот дописывает свою персону
+## Self-service — the main feature
+After deploy the owner runs everything from the Telegram chat:
+- "add @user to access" → the bot adds them (pairing, owner command only)
+- "change setting X" → the bot edits its own settings
+- "remember rule Y" → the bot appends to its persona
 
-Без второго инструмента, без инженера.
+No second tool, no engineer.
 
-## Безопасность
-Изменения allow-list / настроек / pairing — ТОЛЬКО по команде из чата владельца (его chat_id). Любой другой, написавший боту, никогда не добавляется автоматически. Секреты живут в `agent.env` (он в `.gitignore`) — в репозиторий не попадают.
+## Security
+Changes to the allow-list / settings / pairing happen ONLY on a command from the owner's chat (their chat_id). Anyone else who writes to the bot is never added automatically. Secrets live in `agent.env` (which is in `.gitignore`) — they never reach the repository.
 
-## Состав
-- `onboard.sh` · `assets/install-core.sh` — онбординг/установка
-- `assets/` — bin, skills (наши), agents, systemd, templates, vault-skeleton
-- `modules/` — опц. аддоны (transport-daemon для макс. устойчивости, vault-web, и др.)
+## Layout
+- `onboard.sh` · `assets/install-core.sh` — onboarding / installation
+- `assets/` — bin, skills (ours), agents, systemd, templates, vault-skeleton
+- `modules/` — optional add-ons (transport-daemon for max resilience, vault-web, etc.)
 
-Построен на той же проверенной архитектуре, что и боевые ассистенты. Сторонние скиллы (superpowers, frontend-design) ставятся из их публичных маркетплейсов, а не бандлятся в код.
+Built on the same battle-tested architecture as production assistants. Third-party skills (superpowers, frontend-design) are installed from their public marketplaces, not vendored into the code.
 
-## Хочешь больше? → `claude-premium` 🔒
+## Want more? → `claude-premium` 🔒
 
-Бесплатный `claude-tg-starter` — это полноценный личный ассистент. **Premium** (приватный, платный тир) надстраивается поверх — для тех, кому ассистент нужен как рабочий инструмент:
+The free `claude-tg-starter` is a full personal assistant. **Premium** (private, paid tier) builds on top — for those who want the assistant as a working tool:
 
-- 🧠 **Умный поиск памяти** (SQLite FTS5) — бот находит по всей истории заметок и переписки, а не только по последним сообщениям
-- 🎯 **Durable-цели + переносимый бэкап** агента (переезд на новый сервер за минуту)
-- 🛡️ **Изолированный браузер-сервис** + серверный хардненинг (UFW / fail2ban / SSH-lockdown / audit / rollback)
-- 🔑 **Самовосстановление логина через Telegram** — протух Claude-логин? бот сам пришлёт ссылку для входа, восстановишь с телефона, без SSH
-- 🎬 **Генерация видео** (HTML → MP4: промо, explainer, motion-графика)
-- 📢 **Авто-паблишер** в Telegram-канал (рерайт источников → публикация)
-- 🕸️ **Граф знаний** по заметкам
-- 📸 **Instagram Direct** — читать И отвечать в директе (Meta API): даёшь свой токен из Meta Developers, модуль сам поднимает вебхук + тоннель, дальше бот ведёт переписку
-- 💬 **YouTube** — парсинг неотвеченных комментариев канала (ничего не пропустишь)
-- 🧪 Полная тестовая обвязка + CI
+- 🧠 **Smart memory search** (SQLite FTS5) — the bot finds across the whole history of notes and chats, not just the last few messages
+- 🎯 **Durable goals + portable backup** of the agent (move to a new server in a minute)
+- 🛡️ **Isolated browser service** + server hardening (UFW / fail2ban / SSH lockdown / audit / rollback)
+- 🔑 **Self-service re-login via Telegram** — Claude login expired? the bot sends you a login link, you recover from your phone, no SSH
+- 🎬 **Video generation** (HTML → MP4: promo, explainer, motion graphics)
+- 📢 **Auto-publisher** to a Telegram channel (rewrite sources → publish)
+- 🕸️ **Knowledge graph** over your notes
+- 📸 **Instagram Direct** — read AND reply to DMs (Meta API): give your token from Meta Developers, the module brings up the webhook + tunnel itself, then the bot handles the conversation
+- 💬 **YouTube** — parse unanswered channel comments (never miss one)
+- 🧪 Full test suite + CI
 
-Доступ к `claude-premium` — по запросу: [напиши в Telegram @kgnvsk](https://t.me/kgnvsk).
+Access to `claude-premium` — on request: [message @kgnvsk on Telegram](https://t.me/kgnvsk).
 
 ## Windows (WSL2) — beta
 
-Кит рассчитан на Linux VPS, но запускается и локально на Windows через WSL2:
+The kit targets a Linux VPS, but it also runs locally on Windows via WSL2:
 
-1. PowerShell от администратора: `wsl --install -d Ubuntu` → перезагрузка → при первом запуске Ubuntu задай имя пользователя и пароль.
-2. Включи systemd внутри Ubuntu: `printf '[boot]\nsystemd=true\n' | sudo tee /etc/wsl.conf`, затем в PowerShell `wsl --shutdown` и открой Ubuntu заново.
-3. Дальше — обычный путь VPS: `sudo -i`, клонируй кит и запускай `bash onboard.sh`.
+1. PowerShell as Administrator: `wsl --install -d Ubuntu` → reboot → on first Ubuntu launch set a username and password.
+2. Enable systemd inside Ubuntu: `printf '[boot]\nsystemd=true\n' | sudo tee /etc/wsl.conf`, then in PowerShell `wsl --shutdown` and reopen Ubuntu.
+3. From there — the usual VPS path: `sudo -i`, clone the kit and run `bash onboard.sh`.
 
-Ограничение: бот работает, пока WSL запущен (ноутбук включён). Статус: beta — основной проверенный путь остаётся Linux VPS.
+Limitation: the bot runs only while WSL is running (laptop on). Status: beta — the primary, proven path remains a Linux VPS.
