@@ -1,0 +1,54 @@
+#!/bin/bash
+# Transcribe audio via OpenAI gpt-4o-mini-transcribe
+# Handles: .ogg .oga .opus .mp3 .m4a .wav .webm
+# Auto-fallback to OPENAI_API_KEY_FALLBACK if primary returns quota/billing/auth error
+# Usage: transcribe <audio_file>
+set -e
+
+[ -z "$1" ] && { echo "Usage: transcribe <audio>" >&2; exit 1; }
+[ ! -f "$1" ] && { echo "Not found: $1" >&2; exit 1; }
+
+# Load env
+[ -f ~/.claude/channels/telegram/.env ] && export $(grep -v '^#' ~/.claude/channels/telegram/.env | xargs)
+[ -z "$OPENAI_API_KEY" ] && { echo "No OPENAI_API_KEY" >&2; exit 1; }
+
+SRC="$1"
+EXT="${SRC##*.}"
+# OpenAI doesn't accept .oga — rename (it's valid ogg container)
+if [ "$EXT" = "oga" ]; then
+  TMP="/tmp/transcribe-$$.ogg"
+  cp "$SRC" "$TMP"
+  SRC="$TMP"
+  trap 'rm -f "$TMP"' EXIT
+fi
+
+try_key() {
+  curl -sS -X POST "https://api.openai.com/v1/audio/transcriptions" \
+    -H "Authorization: Bearer $1" \
+    -F "file=@$SRC" \
+    -F "model=gpt-4o-mini-transcribe" \
+    -F "response_format=json"
+}
+
+RESP=$(try_key "$OPENAI_API_KEY")
+
+# Detect quota/billing/auth errors → retry with fallback
+if echo "$RESP" | jq -e '.error' >/dev/null 2>&1; then
+  ERR_MSG=$(echo "$RESP" | jq -r '.error.message')
+  ERR_CODE=$(echo "$RESP" | jq -r '.error.code // .error.type // ""')
+  case "$ERR_MSG $ERR_CODE" in
+    *quota*|*billing*|*insufficient*|*invalid_api_key*|*account_deactivated*)
+      if [ -n "$OPENAI_API_KEY_FALLBACK" ]; then
+        echo "Primary key failed ($ERR_CODE), trying fallback..." >&2
+        RESP=$(try_key "$OPENAI_API_KEY_FALLBACK")
+      fi
+      ;;
+  esac
+fi
+
+if echo "$RESP" | jq -e '.error' >/dev/null 2>&1; then
+  echo "OpenAI: $(echo "$RESP" | jq -r '.error.message')" >&2
+  exit 1
+fi
+
+echo "$RESP" | jq -r '.text'

@@ -1,0 +1,8 @@
+CRON_TZ={{TIMEZONE}}
+TZ={{TIMEZONE}}
+
+30 7 * * * /usr/bin/timeout 900 /home/claude/bin/cash-morning-calendar
+* * * * * /usr/bin/timeout 55 /home/claude/bin/cash-reminder-tick
+*/2 * * * * /usr/bin/timeout 110 /home/claude/bin/cash-healthcheck
+17 4 * * * find /home/claude/.claude/channels/telegram/inbox/ -type f -mtime +2 -delete  # inbox-clean
+0 22 * * * /usr/bin/timeout 1800 /home/claude/bin/cash-health-evening

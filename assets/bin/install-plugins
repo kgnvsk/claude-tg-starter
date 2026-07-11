@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# install-plugins — регистрирует marketplace'ы + ставит плагины, ОБЪЯВЛЕННЫЕ в ~/.claude/settings.json.
+# Причина: enabledPlugins в settings.json сам по себе НЕ регистрирует маркетплейсы надёжно
+# (особенно git-url) → делаем marketplace add + plugin install через CLI здесь.
+# Data-driven: читает settings.json, поэтому корректен для любого кита без правок.
+# Идемпотентно. Запускать ПОСЛЕ входа в Claude (Фаза 2), от пользователя claude.
+set -uo pipefail
+
+CLAUDE="$HOME/.local/bin/claude"; command -v "$CLAUDE" >/dev/null 2>&1 || CLAUDE=claude
+command -v "$CLAUDE" >/dev/null 2>&1 || { echo "✗ claude CLI не найден — сначала Фаза 2 (вход в Claude)"; exit 1; }
+S="$HOME/.claude/settings.json"
+[ -f "$S" ] || { echo "✗ нет $S"; exit 1; }
+
+echo "==> marketplace add (из extraKnownMarketplaces)"
+python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));[print(v.get("repo") or v.get("url")) for v in d.get("extraKnownMarketplaces",{}).values() if isinstance(v,dict) and (v.get("repo") or v.get("url"))]' "$S" | while read -r m; do
+  [ -n "$m" ] || continue
+  "$CLAUDE" plugin marketplace add "$m" </dev/null >/dev/null 2>&1 && echo "  + $m" || echo "  = $m (уже есть / или ошибка сети)"
+done
+
+echo "==> plugin install (из enabledPlugins; telegram пропускаем — он в Фазе 3c)"
+python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));[print(k) for k,en in d.get("enabledPlugins",{}).items() if en and not str(k).startswith("telegram@")]' "$S" | while read -r p; do
+  [ -n "$p" ] || continue
+  "$CLAUDE" plugin install "$p" </dev/null >/dev/null 2>&1 && echo "  + $p" || echo "  = $p (уже стоит / или ошибка)"
+done
+
+echo "✅ install-plugins done. Проверка: $CLAUDE plugin list"

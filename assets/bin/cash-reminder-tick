@@ -1,0 +1,63 @@
+#!/bin/bash
+# Fires every minute. Scans ~/.atarax/reminders/ for due reminder files,
+# sends them via Telegram Bot API, and removes.
+#
+# Reminder file format: plain text
+#   Line 1: EPOCH=<unix_timestamp_when_to_fire>
+#   Line 2: CHAT=<chat_id>
+#   Line 3: PARSE=<markdown|markdownv2|html|text>  (optional, default: text)
+#   Line 4 onwards: message body (raw)
+#
+# File name convention: <epoch>-<slug>.rem  (slug is just for human browsing)
+
+set -u
+
+REM_DIR="$HOME/.atarax/reminders"
+LOG="$HOME/logs/reminder-tick.log"
+TOKEN_FILE="$HOME/.claude/channels/telegram/.env"
+
+mkdir -p "$REM_DIR" "$(dirname "$LOG")"
+
+[ -d "$REM_DIR" ] || exit 0
+[ -f "$TOKEN_FILE" ] || { echo "$(date '+%F %T') no token file" >> "$LOG"; exit 0; }
+
+token=$(grep '^TELEGRAM_BOT_TOKEN=' "$TOKEN_FILE" | cut -d= -f2-)
+[ -n "$token" ] || { echo "$(date '+%F %T') empty token" >> "$LOG"; exit 0; }
+
+now=$(date +%s)
+
+shopt -s nullglob
+for f in "$REM_DIR"/*.rem; do
+  epoch=$(grep -m1 '^EPOCH=' "$f" | cut -d= -f2-)
+  chat=$(grep -m1 '^CHAT=' "$f" | cut -d= -f2-)
+  parse=$(grep -m1 '^PARSE=' "$f" | cut -d= -f2-)
+  [ -z "$epoch" ] || [ -z "$chat" ] && { echo "$(date '+%F %T') skip $f: missing header" >> "$LOG"; continue; }
+
+  # Fire if due or overdue (but not more than 10 min late — stale)
+  if [ "$now" -ge "$epoch" ] && [ $((now - epoch)) -lt 600 ]; then
+    # Extract body (everything after first blank-line-looking separator: skip lines matching ^(EPOCH|CHAT|PARSE)=)
+    body=$(sed '/^\(EPOCH\|CHAT\|PARSE\)=/d' "$f")
+
+    args=(-s -m 10 -X POST "https://api.telegram.org/bot${token}/sendMessage"
+          --data-urlencode "chat_id=${chat}"
+          --data-urlencode "text=${body}")
+    if [ -n "${parse:-}" ] && [ "$parse" != "text" ]; then
+      args+=(--data-urlencode "parse_mode=${parse}")
+    fi
+
+    resp=$(curl "${args[@]}" 2>&1)
+    if echo "$resp" | grep -q '"ok":true'; then
+      echo "$(date '+%F %T') fired $(basename "$f") → chat=$chat" >> "$LOG"
+      rm -f "$f"
+    else
+      echo "$(date '+%F %T') FAILED $(basename "$f"): $resp" >> "$LOG"
+      # Still remove so we don't spam on parse errors
+      rm -f "$f"
+    fi
+  elif [ $((now - epoch)) -ge 600 ]; then
+    echo "$(date '+%F %T') stale $(basename "$f") (>10min late), removing" >> "$LOG"
+    rm -f "$f"
+  fi
+done
+
+exit 0

@@ -1,0 +1,23 @@
+#!/bin/bash
+# vc — thin wrapper around the Vercel CLI for headless deploys.
+# Loads the owner's Vercel token from ~/.config/vercel-token (set up once in
+# Phase 6) and exec's `vercel` with it, so deploys work without an interactive
+# `vercel login`. All args pass straight through.
+#
+#   vc deploy --prod        # deploy current dir to production
+#   vc ls                   # list deployments
+#   vc --help               # vercel help
+#
+# Token file is chmod 600 and never echoed. If it is missing, vercel will fall
+# back to whatever auth it already has (or prompt) — but on a headless server
+# you want the token, so set it up per DEPLOY.md Phase 6.
+set -euo pipefail
+
+TOKEN_FILE="$HOME/.config/vercel-token"
+export PATH="$HOME/.npm-global/bin:$PATH"
+
+if [ -r "$TOKEN_FILE" ]; then
+  export VERCEL_TOKEN="$(cat "$TOKEN_FILE")"
+fi
+
+exec vercel "$@"

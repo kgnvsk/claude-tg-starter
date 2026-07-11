@@ -1,0 +1,173 @@
+#!/usr/bin/env bash
+# onboard.sh — interactive "asks everything" setup for a FRESH agent deploy.
+# Run as ROOT on the TARGET server, from the kit dir. Replaces hand-editing
+# agent.env: asks every input, writes agent.env (chmod 600), runs install-core.
+# OpenClaw-style onboarding — nothing is hardcoded, the agent's name is asked.
+#
+# ПРИНЦИП ТОНА: объясняй каждый шаг ПРОСТЫМ языком — человек может быть НЕ-технарём
+# (бухгалтер, гуманитарий). Он должен понимать ЧТО происходит, ЧТО от него хотят и
+# МЕЖДУ ЧЕМ выбирает. Никакого жаргона без перевода (бэкап/Git/токен/деплой/vault).
+#
+# Usage:
+#   ssh root@<SERVER>
+#   cd /opt/claude-tg-starter && bash onboard.sh
+set -uo pipefail
+
+KIT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENV_OUT="$KIT/agent.env"
+
+echo "=================================================="
+echo "  Онбординг агента — ответь на вопросы."
+echo "  Ничего не пишется на диск до подтверждения в конце."
+echo "=================================================="
+echo
+
+# ── валидаторы (ловят опечатки ДО записи) ──
+v_chat_id()  { [[ "$1" =~ ^[0-9]{4,20}$ ]]; }
+v_username() { local u="${1#@}"; [[ "$u" =~ ^[A-Za-z0-9_]{5,32}$ ]]; }
+v_botname()  { local u="${1#@}"; [[ "$u" =~ ^[A-Za-z0-9_]{1,27}_bot$ ]]; }
+v_token()    { [[ "$1" =~ ^[0-9]{6,12}:[A-Za-z0-9_-]{30,}$ ]]; }
+v_tz()       { [ -f "/usr/share/zoneinfo/$1" ] && [[ "$1" != *..* ]]; }
+v_email()    { [[ -z "$1" || "$1" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]]; }
+
+ask_req() {  # ask_req VAR "prompt" "hint" [validator]
+  local var="$1" prompt="$2" hint="${3:-}" vfn="${4:-}" val
+  [ -n "$hint" ] && echo "  ↳ $hint"
+  while :; do
+    read -rp "$prompt: " val
+    if [ -z "$val" ]; then echo "  ! обязательное поле"
+    elif [ -n "$vfn" ] && ! "$vfn" "$val"; then echo "  ! формат не похож на ожидаемый — проверь и введи снова"
+    else break; fi
+  done
+  printf -v "$var" '%s' "$val"
+}
+ask_opt() {  # ask_opt VAR "prompt" "hint" [validator]
+  local var="$1" prompt="$2" hint="${3:-}" vfn="${4:-}" val
+  [ -n "$hint" ] && echo "  ↳ $hint"
+  while :; do
+    read -rp "$prompt (Enter — пропустить): " val
+    if [ -n "$vfn" ] && ! "$vfn" "$val"; then echo "  ! формат не похож на ожидаемый — исправь или Enter, чтобы пропустить"
+    else break; fi
+  done
+  printf -v "$var" '%s' "$val"
+}
+ask_secret() {  # ask_secret VAR "prompt" "hint" [validator] — ввод СКРЫТ (не эхо на экран)
+  local var="$1" prompt="$2" hint="${3:-}" vfn="${4:-}" val
+  [ -n "$hint" ] && echo "  ↳ $hint"
+  while :; do
+    read -rsp "$prompt (ввод скрыт): " val; echo
+    if [ -z "$val" ]; then echo "  ! обязательное поле"
+    elif [ -n "$vfn" ] && ! "$vfn" "$val"; then echo "  ! формат не похож на ожидаемый — введи снова"
+    else break; fi
+  done
+  printf -v "$var" '%s' "$val"
+}
+
+echo "── Агент ──"
+ask_req AGENT_NAME "Как назвать агента (имя бота для себя)" "напр. BroAgent. НЕ «Cash» — это чужой агент."
+echo
+echo "── Владелец ──"
+ask_req OWNER_NAME "Имя владельца (для персоны)" "напр. Alex"
+ask_req OWNER_TG_USERNAME "Telegram @username владельца (БЕЗ @)" "" v_username
+OWNER_TG_USERNAME="${OWNER_TG_USERNAME#@}"
+ask_req OWNER_CHAT_ID "Telegram user_id владельца" "узнать: напиши @userinfobot в Telegram" v_chat_id
+ask_opt OWNER_EMAIL "Email владельца" "нужен для веб-vault (Vercel требует, чтобы автор коммита совпадал с email аккаунта). Тот же email — для GitHub ниже." v_email
+echo
+echo "── Бот ──"
+ask_req BOT_USERNAME "Username бота (БЕЗ @, оканчивается на _bot)" "от @BotFather" v_botname
+BOT_USERNAME="${BOT_USERNAME#@}"
+ask_secret TELEGRAM_BOT_TOKEN "Токен бота" "от @BotFather, вида 1234567890:AA… — ввод скрыт для безопасности" v_token
+echo
+echo "── Окружение ──"
+ask_req TIMEZONE "Таймзона (IANA)" "напр. Europe/Lisbon — для кронов" v_tz
+echo
+echo "── Опционально (Enter чтобы пропустить) ──"
+ask_opt OPENAI_API_KEY "OpenAI API key" "распознавание голосовых через gpt-4o-mini-transcribe. Пусто → бот сам попросит ключ, когда придёт первое голосовое."
+# Утренний дайджест китом не ставится — владелец попросит бота, тот сам добавит крон
+# (bin cash-morning-calendar остаётся в ~/bin).
+CALENDAR_EMAIL=""
+echo
+
+echo "── Копия памяти в интернете + сайт-визитка (по желанию) ──"
+echo "  Что это: GitHub — бесплатное облако для кода. Сюда уезжает ПРИВАТНАЯ копия"
+echo "  памяти ассистента (его vault — всё, что он про тебя знает) и исходник сайта-vault."
+echo "  Зачем: чтобы память не потерялась, если с сервером что-то случится, и чтобы"
+echo "  Vercel мог собрать из неё веб-страницу (граф + заметки за паролем). Репозиторий"
+echo "  ПРИВАТНЫЙ — видишь только ты."
+read -rp "Настроить GitHub сейчас? (нужен для веб-vault) [y/N]: " __gh
+case "${__gh:-}" in
+  y|Y|yes|да|Да)
+    echo "  1) Аккаунт: если его нет — заведи на https://github.com/signup (1 минута, бесплатно)."
+    echo "     Совет: используй тот же email, что выше ($([ -n "${OWNER_EMAIL:-}" ] && echo "$OWNER_EMAIL" || echo "OWNER_EMAIL")) —"
+    echo "     иначе сайт-визитку из заметок потом может не получиться собрать."
+    if command -v gh >/dev/null 2>&1; then
+      echo "  2) Вход в GitHub: программа покажет короткий код — открой указанную"
+      echo "     страницу в браузере, впиши код и подтверди. Пароль здесь не вводится."
+      read -rp "     Запустить 'gh auth login' сейчас? [y/N]: " __ghlogin
+      case "${__ghlogin:-}" in
+        y|Y|yes|да|Да) gh auth login || echo "  ! gh auth login не завершён — можно повторить позже: gh auth login" ;;
+        *) echo "  ↳ ок, позже сам: gh auth login" ;;
+      esac
+    else
+      echo "  2) gh (GitHub CLI) не установлен. Поставь и залогинься позже:"
+      echo "       apt-get install -y gh   # или см. https://github.com/cli/cli#installation"
+      echo "       gh auth login           # device flow: код вставляешь в браузере"
+    fi
+    echo "  3) Дальше веб-vault (модуль vault-web) сам закоммитит память и подскажет шаги Vercel."
+    ;;
+  *) echo "  ↳ пропущено. Без этого запасная копия памяти в интернете и сайт-визитка не заработают — настроишь позже." ;;
+esac
+echo
+
+echo "=================================================="
+echo "  Проверь:"
+echo "    Агент:     $AGENT_NAME"
+echo "    Владелец:  $OWNER_NAME (@$OWNER_TG_USERNAME, id $OWNER_CHAT_ID)"
+echo "    Email:     ${OWNER_EMAIL:-—(веб-vault деплой будет недоступен)}"
+echo "    Бот:       @$BOT_USERNAME"
+echo "    Токен:     …${TELEGRAM_BOT_TOKEN: -6}"
+echo "    TZ:        $TIMEZONE"
+echo "    Голос:     $([ -n "$OPENAI_API_KEY" ] && echo вкл || echo выкл)"
+echo "=================================================="
+read -rp "Всё верно? Записать agent.env и установить? [y/N]: " ok
+case "${ok:-}" in y|Y|yes|да|Да) ;; *) echo "Отменено. Ничего не записано."; exit 0 ;; esac
+
+umask 077
+cat > "$ENV_OUT" <<EOF
+AGENT_NAME=$AGENT_NAME
+OWNER_NAME=$OWNER_NAME
+OWNER_TG_USERNAME=$OWNER_TG_USERNAME
+OWNER_CHAT_ID=$OWNER_CHAT_ID
+OWNER_EMAIL=${OWNER_EMAIL:-}
+BOT_USERNAME=$BOT_USERNAME
+TIMEZONE=$TIMEZONE
+TELEGRAM_BOT_TOKEN=$TELEGRAM_BOT_TOKEN
+OPENAI_API_KEY=$OPENAI_API_KEY
+CALENDAR_EMAIL=$CALENDAR_EMAIL
+EOF
+chmod 600 "$ENV_OUT"
+echo "✅ agent.env записан (chmod 600)."
+echo "==> Запускаю install-core…"
+echo
+
+set -a; . "$ENV_OUT"; set +a
+if bash "$KIT/assets/install-core.sh"; then
+  echo
+  echo "✅ Ядро готово (файлы, персона, секреты, крон). НО бот ещё НЕ запущен —"
+  echo "   install-core НЕ ставит Claude, НЕ логинит подписку, НЕ ставит плагин/скиллы."
+  echo "   Осталось (полностью — в DEPLOY.md; здесь короткая шпаргалка):"
+  echo
+  echo "   1) МОЗГ — вход в Claude (если ещё не залогинен, Фаза 2):"
+  echo "        runuser -l claude -c '~/bin/claude-login'            # напечатает URL"
+  echo "        → отдай URL владельцу; он войдёт Max-подпиской и пришлёт код →"
+  echo "        runuser -l claude -c '~/bin/claude-login <код>'      # проверит сам"
+  echo "   2) Telegram-плагин + golden-патч            (Фаза 3c — см. DEPLOY.md, нужен живой claude)"
+  echo "   3) Скиллы:  runuser -l claude -c '~/bin/install-plugins' (Фаза 3d)"
+  echo "   4) Запуск:  systemctl daemon-reload && systemctl enable --now claude-telegram   (Фаза 4)"
+  echo
+  echo "   Затем смоук-тест по VERIFY.md. Опции (голос/картинки/календарь/Vercel/канал) — DEPLOY.md Фаза 6."
+else
+  echo
+  echo "✗ install-core упал — см. ошибку выше. Поправь ввод и запусти снова (идемпотентно)."
+  exit 1
+fi

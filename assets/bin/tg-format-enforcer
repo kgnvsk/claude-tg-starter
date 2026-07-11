@@ -1,0 +1,202 @@
+#!/usr/bin/env python3
+"""tg-format-enforcer — PreToolUse hook на mcp__plugin_telegram_telegram__reply.
+
+Две проверки (обе → block если триггер):
+
+A) DOUBLE-ESCAPE GUARD (added 2026-06-23 после повторных проёбов):
+   Reply-tool с 2026-06-23 САМ всегда прогоняет text через ~/bin/tg-escape.
+   Если модель отдала уже заэкранированный text (`\\.`, `\\-`, `\\(`, `\\+` ...),
+   tool сделает escape ВТОРОЙ раз → парсер падает → улетает plain с литеральными *.
+   Блокируем, если видим backslash перед reserved-символом в `text`.
+
+B) LIST-LIKE WITHOUT MARKDOWNV2:
+   Если text выглядит list-like, но format=text (plain) — блокируем.
+   Пользователь видит plain-полотно вместо структуры.
+
+Триггеры list-like:
+- ≥4 буллетов ИЛИ
+- ≥3 нумерованных ИЛИ
+- ≥2 *bold* секций ИЛИ
+- (≥3 ссылки И ≥5 строк) ИЛИ
+- text > 400 символов И есть хотя бы 2 признака структуры
+
+Короткие реплики ("ок", "погнали", статусы "🔄 ...") НЕ триггерят.
+
+Bypass: touch ~/.claude/state/tg-format-enforcer.bypass
+"""
+import json
+import os
+import re
+import sys
+import time
+
+LOG_FILE = os.path.expanduser("~/.claude/state/tg-format-enforcer.log")
+BYPASS_FILE = os.path.expanduser("~/.claude/state/tg-format-enforcer.bypass")
+
+
+def log(msg: str) -> None:
+    try:
+        os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+        with open(LOG_FILE, "a") as f:
+            f.write(f"{int(time.time())} {msg}\n")
+    except Exception:
+        pass
+
+
+def is_bypassed() -> bool:
+    """Тумблер для выключения hook вручную: touch ~/.claude/state/tg-format-enforcer.bypass"""
+    return os.path.exists(BYPASS_FILE)
+
+
+def count_bullets(text: str) -> int:
+    return len(re.findall(r"(?m)^\s*[•\-\*]\s+\S", text))
+
+
+def count_numbered(text: str) -> int:
+    return len(re.findall(r"(?m)^\s*\d+[\.\)]\s+\S", text))
+
+
+def count_bold_sections(text: str) -> int:
+    # *bold* или **bold** (минимум 3 символа внутри)
+    single = len(re.findall(r"(?<!\*)\*[^\s*][^*\n]{2,}[^\s*]\*(?!\*)", text))
+    double = len(re.findall(r"\*\*[^\s*][^*\n]{2,}[^\s*]\*\*", text))
+    return single + double
+
+
+def count_links(text: str) -> int:
+    return len(re.findall(r"\[[^\]]+\]\([^\)]+\)", text))
+
+
+def count_lines(text: str) -> int:
+    return len([l for l in text.split("\n") if l.strip()])
+
+
+def has_double_escape(text: str) -> tuple[bool, str]:
+    """Детектит backslash-эскейпы, которые модель НЕ должна была ставить.
+    Reply-tool сам прогонит через tg-escape — мой `\\.` станет `\\\\.` и парсер падает.
+    Считаем escape-последовательности перед MarkdownV2 reserved chars."""
+    # Считаем \X где X — reserved char для MarkdownV2 (исключая bold/italic/code маркеры
+    # потому что \* и \_ могут быть осознанным escape литеральной звёздочки).
+    pattern = r"\\[\-\.\(\)\+\=\!\|\{\}\#\>\~]"
+    hits = re.findall(pattern, text)
+    if len(hits) >= 3:
+        return True, f"{len(hits)} ручных escape-последовательностей (\\. \\- \\( ...)"
+    return False, ""
+
+
+def is_list_like(text: str) -> tuple[bool, str]:
+    """Возвращает (block?, reason)."""
+    if not text:
+        return False, "empty"
+
+    b = count_bullets(text)
+    n = count_numbered(text)
+    bold = count_bold_sections(text)
+    links = count_links(text)
+    lines = count_lines(text)
+
+    # Чек 1: явный список буллетами
+    if b >= 4:
+        return True, f"{b} буллетов — list-like"
+
+    # Чек 2: нумерация
+    if n >= 3:
+        return True, f"{n} нумерованных пунктов"
+
+    # Чек 3: множественные bold-заголовки = структурное сообщение
+    if bold >= 2:
+        return True, f"{bold} bold-секций — структурное сообщение"
+
+    # Чек 4: много ссылок + много строк = отчёт/research
+    if links >= 3 and lines >= 5:
+        return True, f"{links} ссылок + {lines} строк — отчёт"
+
+    # Чек 5: длинное сообщение со структурой
+    if len(text) > 400 and (b + n + bold) >= 2:
+        return True, f"{len(text)} символов + {b+n+bold} признаков структуры"
+
+    return False, "ok"
+
+
+def main() -> None:
+    try:
+        data = json.load(sys.stdin)
+    except Exception:
+        sys.exit(0)
+
+    if is_bypassed():
+        log("bypassed via state file")
+        sys.exit(0)
+
+    tool_name = data.get("tool_name") or ""
+    if tool_name != "mcp__plugin_telegram_telegram__reply":
+        sys.exit(0)
+
+    tool_input = data.get("tool_input") or {}
+    text = tool_input.get("text") or ""
+    fmt = tool_input.get("format") or "markdownv2"  # tool default since 2026-06-23
+
+    # ПРОВЕРКА A: двойной escape (модель сама заэкранировала, tool сделает второй раз).
+    de_block, de_reason = has_double_escape(text)
+    if de_block:
+        log(f"BLOCK double-escape: {de_reason} len={len(text)} fmt={fmt}")
+        msg = (
+            f"❌ FORMAT ENFORCER (double-escape guard): reply заблокирован.\n"
+            f"\n"
+            f"Найдено: {de_reason}.\n"
+            f"\n"
+            f"С 2026-06-23 reply-tool САМ всегда прогоняет text через "
+            f"~/bin/tg-escape. Если ты ручно заэкранировал `.`, `-`, `(`, `+` "
+            f"и т.п. — tool сделает escape ВТОРОЙ раз, парсер MarkdownV2 "
+            f"упадёт, и сообщение улетит plain-текстом с литеральными `*`.\n"
+            f"\n"
+            f"ЧТО ДЕЛАТЬ:\n"
+            f"1. Убери ВСЕ обратные слэши перед `.`, `-`, `(`, `)`, `+`, `=`, "
+            f"`!`, `|`, `{{`, `}}`, `#`, `>`, `~` в твоём text.\n"
+            f"2. Оставь только *bold*, _italic_, `code`, [label](url) — "
+            f"остальное голым текстом.\n"
+            f"3. Передай в reply с format='markdownv2' (или без format — "
+            f"это дефолт). Tool сам всё корректно заэкранирует ОДИН раз.\n"
+            f"\n"
+            f"Правило в ~/CLAUDE.md секция 'КОРНЕВОЕ РЕШЕНИЕ' (updated 2026-06-23).\n"
+            f"Bypass: touch ~/.claude/state/tg-format-enforcer.bypass"
+        )
+        print(json.dumps({"decision": "block", "reason": msg}))
+        sys.exit(0)
+
+    # ПРОВЕРКА B: markdownv2/markdown — структурное форматирование заявлено, пропускаем.
+    if fmt in ("markdownv2", "markdown"):
+        log(f"pass: format={fmt} len={len(text)}")
+        sys.exit(0)
+
+    block, reason = is_list_like(text)
+    if not block:
+        log(f"pass: {reason} len={len(text)}")
+        sys.exit(0)
+
+    # Блокируем — list-like без markdownv2.
+    log(f"BLOCK list-like: {reason} len={len(text)} fmt={fmt}")
+
+    msg = (
+        f"❌ FORMAT ENFORCER: reply заблокирован — {reason}, но format='{fmt}'.\n"
+        f"\n"
+        f"Это list-like сообщение, оно ОБЯЗАНО идти как markdownv2 "
+        f"с жирными заголовками и буллетами. Plain-полотно запрещено "
+        f"(правило CLAUDE.md + обсуждение 2026-06-23).\n"
+        f"\n"
+        f"ЧТО ДЕЛАТЬ:\n"
+        f"1. Перепиши текст с *bold* заголовками и буллетами `-` или `•`.\n"
+        f"2. БЕЗ ручного экранирования (никаких \\. \\- \\( и т.п.).\n"
+        f"3. Передай в reply с format='markdownv2'. Tool сам всё заэкранирует.\n"
+        f"\n"
+        f"Если хук ошибся (это реально не list-like) — touch "
+        f"~/.claude/state/tg-format-enforcer.bypass и повтори, потом убери "
+        f"bypass-файл."
+    )
+
+    print(json.dumps({"decision": "block", "reason": msg}))
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,115 @@
+#!/usr/bin/env python3
+"""no-nested-claude-guard — PreToolUse hook on Bash.
+
+Hard DENY for any Bash command that would spawn a SECOND Claude Code instance
+on this box. A nested `claude` re-spawns all MCP servers, and the telegram
+plugin's stale-PID replace logic then SIGTERMs the live bun poller → the bot
+goes mute until healthcheck revives it (1-2 min). This already killed Cash on
+2026-06-25 (ran `claude mcp list` on a "add blender mcp" task and self-killed).
+
+It inspects the FIRST executable of each pipeline/sequence segment (skipping
+leading `VAR=val` and `env` prefixes), so it catches path-qualified forms like
+`~/.local/bin/claude mcp …` and `/home/claude/.local/bin/claude -p`, but does
+NOT false-positive on `claude` appearing as an argument (`pgrep -af claude`,
+`grep claude`, `which claude`).
+
+Denies when that executable's basename is `claude` and either:
+  • the next token is `mcp`  (the classic self-kill), or
+  • it is a nested session (`claude` / `claude -p …`) WITHOUT
+    ATARAX_SUPPRESS_TELEGRAM=1 in the command (the suppress env makes the plugin
+    inert, so the morning/evening crons that call
+    `ATARAX_SUPPRESS_TELEGRAM=1 claude -p …` are allowed).
+`claude plugin …` is allowed (it manages plugins, doesn't start a poller).
+
+The matching CLAUDE.md rule ("НИКОГДА не запускай claude mcp …") is the soft
+guard; this hook is the hard backstop the model can't talk itself past.
+
+Bypass (rarely needed): touch ~/.claude/state/no-nested-claude-guard.bypass
+"""
+import json
+import os
+import re
+import shlex
+import sys
+
+BYPASS_FILE = os.path.expanduser("~/.claude/state/no-nested-claude-guard.bypass")
+
+
+def segments(cmd: str):
+    """Split a command line into pipeline/sequence segments on ; | & (incl && ||)."""
+    return re.split(r"&&|\|\||[;|&]", cmd)
+
+
+def first_executable(seg: str):
+    """Return (exe_basename, rest_tokens) for a segment, skipping VAR=val / env prefixes.
+    Returns (None, []) if the segment has no command token."""
+    try:
+        toks = shlex.split(seg)
+    except ValueError:
+        toks = seg.split()
+    i = 0
+    while i < len(toks):
+        t = toks[i]
+        if t == "env":          # `env claude …`
+            i += 1
+            continue
+        if re.match(r"^\w+=", t):  # `VAR=val claude …`
+            i += 1
+            continue
+        break
+    if i >= len(toks):
+        return None, []
+    exe = os.path.basename(toks[i])
+    return exe, toks[i + 1:]
+
+
+def main() -> None:
+    try:
+        data = json.load(sys.stdin)
+    except Exception:
+        sys.exit(0)
+
+    if os.path.exists(BYPASS_FILE):
+        sys.exit(0)
+
+    if (data.get("tool_name") or "") != "Bash":
+        sys.exit(0)
+
+    cmd = (data.get("tool_input") or {}).get("command") or ""
+    suppressed = "ATARAX_SUPPRESS_TELEGRAM=1" in cmd
+
+    for seg in segments(cmd):
+        exe, rest = first_executable(seg)
+        if exe != "claude":
+            continue
+        nxt = rest[0] if rest else ""
+        if nxt == "plugin":
+            continue  # plugin management — safe
+        if nxt == "mcp":
+            deny(
+                "🚫 SELF-KILL GUARD: `claude mcp …` запрещён на живом боте.\n\n"
+                "Он спавнит ВТОРОЙ инстанс Claude Code, который через stale-PID "
+                "replace в telegram-плагине SIGTERM-ит твой bun-поллер — бот немеет.\n\n"
+                "Проверить MCP/поллер → `pgrep -af \"bun.*telegram\"`.\n"
+                "Поставить/настроить MCP → правь .mcp.json / settings файлом + рестарт "
+                "сервиса, НЕ `claude mcp add` вживую."
+            )
+        # bare `claude` or `claude -p …` (nested session) without the suppress env
+        if not suppressed:
+            deny(
+                "🚫 SELF-KILL GUARD: вложенный `claude` без ATARAX_SUPPRESS_TELEGRAM=1.\n\n"
+                "Любой вложенный `claude`/`claude -p` поднимает второй инстанс и убивает "
+                "твой живой поллер. Если реально нужен headless-вызов — префикс "
+                "`ATARAX_SUPPRESS_TELEGRAM=1 claude -p …` (делает плагин инертным)."
+            )
+
+    sys.exit(0)
+
+
+def deny(reason: str) -> None:
+    print(json.dumps({"decision": "block", "reason": reason}))
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,71 @@
+#!/bin/bash
+# cash-doctor — owner-facing health report. READ-ONLY: checks, prints, never restarts
+# (that's healthcheck's job). Run anytime to see if the agent is OK:
+#   ssh root@server 'sudo -u claude /home/claude/bin/cash-doctor'
+# The bot can also run it via Bash to self-check when the owner asks "ты в порядке?".
+set -u
+H=/home/claude
+ok()   { printf '  ✅ %s\n' "$1"; }
+warn() { printf '  ⚠️  %s\n' "$1"; }
+bad()  { printf '  ❌ %s\n' "$1"; }
+
+echo "🩺 {{AGENT_NAME}} doctor — $(date '+%F %T %Z')"
+echo
+
+# 1. systemd service
+if systemctl is-active claude-telegram.service >/dev/null 2>&1; then
+  ok "сервис claude-telegram активен"
+else
+  bad "сервис claude-telegram НЕ активен → sudo systemctl start claude-telegram"
+fi
+
+# 2. telegram poller (bun MCP)
+if pgrep -f "bun.*plugins-official.*telegram" >/dev/null 2>&1; then
+  ok "telegram-поллер (bun) жив"
+else
+  warn "telegram-поллер не найден — если только что был рестарт, подожди 1-2 мин"
+fi
+
+# 3. Claude OAuth token freshness
+EXP=$(jq -r '.claudeAiOauth.expiresAt // 0' "$H/.claude/.credentials.json" 2>/dev/null)
+NOW_MS=$(( $(date +%s) * 1000 ))
+if [ "${EXP:-0}" -gt 0 ]; then
+  LEFT=$(( (EXP - NOW_MS) / 60000 ))
+  if   [ "$LEFT" -le 0 ];  then bad  "Claude OAuth токен протух → нужен /login (healthcheck тоже попробует рестарт)"
+  elif [ "$LEFT" -le 30 ]; then warn "Claude OAuth токен умирает через ${LEFT} мин"
+  else ok "Claude OAuth токен свеж (${LEFT} мин в запасе)"; fi
+else
+  warn "не прочитал срок OAuth токена (.credentials.json)"
+fi
+
+# 4. telegram bot token configured
+if grep -q '^TELEGRAM_BOT_TOKEN=.' "$H/.claude/channels/telegram/.env" 2>/dev/null; then
+  ok "токен бота настроен"
+else
+  bad "токен бота пуст в telegram/.env"
+fi
+
+# 5. codex (картинки) — только если модуль установлен
+if [ -x "$H/.npm-global/bin/codex" ]; then
+  if timeout 20 "$H/.npm-global/bin/codex" login status 2>&1 | grep -q "Logged in"; then
+    ok "codex авторизован (картинки работают)"
+  else
+    warn "codex не авторизован → gpt-image-2 не работает (codex login --device-auth)"
+  fi
+fi
+
+# 6. субагенты + скиллы
+AG=$(find "$H/.claude/agents" -maxdepth 1 -name '*.md' ! -name 'README.md' 2>/dev/null | wc -l | tr -d ' ')
+ok "субагентов установлено: $AG  (добавить: положи .md в ~/.claude/agents/ + рестарт)"
+SK=$(find "$H/.claude/skills" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')
+ok "скиллов установлено: $SK"
+
+# 7. диск
+DF=$(df /home | awk 'NR==2 {gsub("%",""); print 100-$5}')
+if   [ "$DF" -lt 10 ]; then bad  "мало места на /home: ${DF}% свободно"
+elif [ "$DF" -lt 20 ]; then warn "место на /home: ${DF}% свободно"
+else ok "место на /home: ${DF}% свободно"; fi
+
+echo
+echo "Готово. ⚠️/❌ — подсказка по фиксу рядом. Полные логи: $H/logs/healthcheck.log"
+exit 0

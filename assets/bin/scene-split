@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# scene-split — detect scene cuts in a video, dump keyframe PNGs + scenes.md (timecodes).
+# Local fallback for video breakdown (no Gemini): Claude reads the frames + transcript.
+#
+# Usage: scene-split <video> <outdir> [threshold 0..1, default 0.3]
+set -euo pipefail
+VIDEO="${1:?usage: scene-split <video> <outdir> [threshold]}"
+OUT="${2:?usage: scene-split <video> <outdir> [threshold]}"
+THRESH="${3:-0.3}"
+mkdir -p "$OUT/scenes"
+LOG="$OUT/scenes/_showinfo.log"
+
+# 1) keyframes at scene changes
+ffmpeg -hide_banner -loglevel error -i "$VIDEO" \
+  -vf "select='gt(scene,${THRESH})',showinfo" -vsync vfr \
+  "$OUT/scenes/scene_%03d.png" 2> "$LOG" || true
+
+# 2) fallback: 1 frame / 2s if scene detection found too few cuts
+n=$(find "$OUT/scenes" -name 'scene_*.png' | wc -l | tr -d ' ')
+if [ "$n" -lt 2 ]; then
+  ffmpeg -hide_banner -loglevel error -i "$VIDEO" -vf "fps=1/2" "$OUT/scenes/frame_%03d.png" || true
+fi
+
+# 3) scenes.md with timecodes parsed from showinfo
+{
+  echo "# Scenes — $(basename "$VIDEO")"
+  echo
+  echo "Keyframes in scenes/ . Timecodes of detected cuts:"
+  echo
+  grep -o 'pts_time:[0-9.]*' "$LOG" 2>/dev/null | sed 's/pts_time:/t=/' | nl -ba || true
+} > "$OUT/scenes.md"
+
+echo "scene-split: $(find "$OUT/scenes" -name '*.png' | wc -l | tr -d ' ') frames → $OUT/scenes/"

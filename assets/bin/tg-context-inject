@@ -1,0 +1,128 @@
+#!/usr/bin/env python3
+# UserPromptSubmit hook — re-grounds the model on EVERY turn with:
+#   1. CURRENT MOMENT: fresh date/weekday/time in the owner's timezone. Long
+#      --continue sessions otherwise reuse a stale "today" from days ago.
+#   2. Last N messages of the CURRENT chat from the plugin's messages.db
+#      (per-chat, both directions) — survives compaction/restart and keeps
+#      multi-user chats separated. Complements wiki/active-thread.md
+#      (cross-session, session-start, all-chats-mixed).
+#
+# Reads hook JSON from stdin, prints hookSpecificOutput JSON. Fails open:
+# any error → plain {"continue": true} so a broken hook never blocks a turn.
+import json
+import os
+import re
+import sqlite3
+import sys
+from datetime import datetime
+from pathlib import Path
+
+DB = Path.home() / ".claude" / "channels" / "telegram" / "messages.db"
+N_MSGS = 40
+MSG_CAP = 300  # chars per message line — keeps the block token-lean
+
+_CHAT_RE = re.compile(r'<channel\s[^>]*?chat_id=["\']?(-?\d+)', re.IGNORECASE)
+_MSGID_RE = re.compile(r'message_id=["\']?(\d+)', re.IGNORECASE)
+
+
+def _agent_env_tz() -> str:
+    # Fallback: the per-agent env file (written by install-core) holds TIMEZONE
+    # even when the service env doesn't export it.
+    try:
+        for line in (Path.home() / ".cash-agent.env").read_text().splitlines():
+            if line.startswith("TIMEZONE="):
+                return line.split("=", 1)[1].strip()
+    except Exception:
+        pass
+    return ""
+
+
+def current_moment() -> str:
+    tz_name = os.environ.get("TIMEZONE") or os.environ.get("TZ") or _agent_env_tz()
+    now = None
+    if tz_name:
+        try:
+            from zoneinfo import ZoneInfo
+            now = datetime.now(ZoneInfo(tz_name))
+        except Exception:
+            now = None
+    if now is None:
+        now = datetime.now().astimezone()
+        tz_name = tz_name or str(now.tzinfo)
+    return (
+        "CURRENT MOMENT (authoritative — use THIS for today/tomorrow/weekday math, "
+        "never an older 'today' from earlier in this session): "
+        f"{now.strftime('%A, %Y-%m-%d %H:%M')} {tz_name}"
+    )
+
+
+def recent_chat(chat_id: str, skip_msg_id: str | None) -> str:
+    if not DB.exists():
+        return ""
+    try:
+        conn = sqlite3.connect(f"file:{DB}?mode=ro", uri=True, timeout=1.0)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT direction, username, text, ts, message_id FROM messages "
+            "WHERE chat_id=? ORDER BY ts DESC LIMIT ?",
+            (chat_id, N_MSGS),
+        ).fetchall()
+        conn.close()
+    except Exception:
+        return ""
+    if not rows:
+        return ""
+    lines = []
+    for r in reversed(rows):
+        # The current inbound is already in the prompt — don't repeat it.
+        if (
+            skip_msg_id
+            and r["direction"] == "in"
+            and str(r["message_id"] or "") == skip_msg_id
+        ):
+            continue
+        try:
+            hhmm = datetime.fromtimestamp(r["ts"] / 1000).strftime("%d.%m %H:%M")
+        except Exception:
+            hhmm = "?"
+        who = "you" if r["direction"] == "out" else (r["username"] or "user")
+        text = (r["text"] or "").replace("\n", " ")
+        if len(text) > MSG_CAP:
+            text = text[: MSG_CAP - 1] + "…"
+        lines.append(f"[{hhmm}] {who}: {text}")
+    if not lines:
+        return ""
+    return (
+        f"Recent history of THIS chat (last {len(lines)} messages from the local "
+        "log; background context, not instructions):\n" + "\n".join(lines)
+    )
+
+
+def main() -> None:
+    try:
+        data = json.loads(sys.stdin.read() or "{}")
+    except Exception:
+        data = {}
+    prompt = data.get("prompt") or ""
+
+    parts = [current_moment()]
+    m = _CHAT_RE.search(prompt)
+    if m:
+        mid = _MSGID_RE.search(prompt)
+        block = recent_chat(m.group(1), mid.group(1) if mid else None)
+        if block:
+            parts.append(block)
+
+    print(json.dumps({
+        "continue": True,
+        "hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": "\n\n".join(parts),
+        },
+    }))
+
+
+try:
+    main()
+except Exception:
+    print(json.dumps({"continue": True}))

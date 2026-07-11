@@ -1,0 +1,63 @@
+#!/bin/bash
+# PostToolUse hook — appends Cash's OWN replies to wiki/active-thread.md so the
+# next session sees BOTH sides of the conversation. Pairs with cash-thread-capture
+# (which captures the user's turns). Uses the SAME format + SAME trim as that hook
+# (## [TS] role  +  keep last MAX_TURNS "## [" blocks) so the two never corrupt
+# each other's rotation.
+set -e
+
+THREAD=~/obsidian-vault/wiki/active-thread.md
+MAX_TURNS=30
+MAX_TEXT_LEN=800
+HEADER_LINES=9
+
+INPUT=$(cat)
+TOOL_NAME=$(jq -r '.tool_name // ""' <<<"$INPUT")
+case "$TOOL_NAME" in
+  mcp__plugin_telegram_telegram__reply|mcp__plugin_telegram_telegram__edit_message) ;;
+  *) exit 0 ;;
+esac
+
+TEXT=$(jq -r '.tool_input.text // ""' <<<"$INPUT")
+[ -z "$TEXT" ] && exit 0
+[ ${#TEXT} -gt $MAX_TEXT_LEN ] && TEXT="${TEXT:0:$MAX_TEXT_LEN}…[truncated]"
+
+TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+# Init file (same header as cash-thread-capture so head -9 trim matches for both).
+if [ ! -f "$THREAD" ]; then
+  cat > "$THREAD" <<EOF
+---
+type: meta
+title: "Active Thread"
+description: "Rolling last ${MAX_TURNS} Telegram turns — auto-captured for cross-session continuity"
+status: ephemeral
+---
+
+# Active Thread (last ${MAX_TURNS} Telegram turns)
+
+EOF
+fi
+
+# Append Cash's reply as a turn.
+{
+  echo ""
+  echo "## [$TS] cash"
+  echo ""
+  echo "$TEXT"
+} >> "$THREAD"
+
+# Trim: keep header + last MAX_TURNS turns (## [ blocks). Identical logic to cash-thread-capture.
+TMP=$(mktemp)
+head -n "$HEADER_LINES" "$THREAD" > "$TMP"
+awk '/^## \[/ { c++ } c>0 { print }' "$THREAD" | awk -v max="$MAX_TURNS" '
+  /^## \[/ { ti++; turns[ti]=NR }
+  { line[NR]=$0 }
+  END {
+    start = (ti > max) ? turns[ti-max+1] : turns[1]
+    if (!start) start = NR+1
+    for (i=start;i<=NR;i++) print line[i]
+  }
+' >> "$TMP"
+mv "$TMP" "$THREAD"
+exit 0

@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# media-dl <url> [max_height] — мгновенно скачать видео почти с любого сайта
+# (Instagram, TikTok, YouTube, X/Twitter, Facebook, Reddit, …) через yt-dlp.
+# Быстро, бесплатно, локально. Печатает путь к готовому .mp4 в stdout (логи — в stderr).
+# ≤720p по умолчанию, чтобы файл влезал в лимит Telegram (50MB у reply).
+# Приватный/login-only контент: владелец кладёт куки в ~/.config/yt/<площадка>-cookies.txt
+set -euo pipefail
+URL="${1:?usage: media-dl <url> [max_height]}"
+MAXH="${2:-720}"
+export PATH="$HOME/.deno/bin:$PATH"   # deno нужен yt-dlp для YouTube n-challenge; остальным не мешает
+
+# Куки по площадке, если владелец их положил (для публичного — не нужны).
+# Проверяем несколько типичных путей — берём первый существующий.
+case "$URL" in
+  *instagram.com*) CANDS=("$HOME/.config/instagram/cookies.txt" "$HOME/.config/yt/instagram-cookies.txt") ;;
+  *tiktok.com*)    CANDS=("$HOME/.config/tiktok/cookies.txt" "$HOME/.config/yt/tiktok-cookies.txt") ;;
+  *youtu*)         CANDS=("$HOME/.config/yt/youtube-cookies.txt") ;;
+  *)               CANDS=() ;;
+esac
+CK=()
+for f in "${CANDS[@]}"; do [ -f "$f" ] && { CK=(--cookies "$f"); break; }; done
+
+ID=$(yt-dlp --no-update "${CK[@]}" --print "%(id)s" --skip-download "$URL" 2>/dev/null | tail -1)
+[ -z "$ID" ] && { echo "media-dl: не удалось достать (приватное / нужны куки / нет видео): $URL" >&2; exit 2; }
+
+yt-dlp --no-update "${CK[@]}" \
+  -f "bestvideo[height<=${MAXH}][ext=mp4]+bestaudio[ext=m4a]/best[height<=${MAXH}][ext=mp4]/best[ext=mp4]/best" \
+  --merge-output-format mp4 -o "/tmp/dl-${ID}.%(ext)s" "$URL" >&2
+
+OUT="/tmp/dl-${ID}.mp4"
+[ -s "$OUT" ] || OUT="$(ls -t /tmp/dl-${ID}.* 2>/dev/null | head -1)"
+{ [ -n "$OUT" ] && [ -s "$OUT" ]; } || { echo "media-dl: yt-dlp не создал файл" >&2; exit 3; }
+echo "$OUT"

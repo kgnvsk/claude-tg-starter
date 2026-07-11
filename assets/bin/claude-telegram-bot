@@ -1,0 +1,59 @@
+#!/bin/bash
+set -eu
+if [ -f "$HOME/.claude/channels/telegram/.env" ]; then set -a; . "$HOME/.claude/channels/telegram/.env"; set +a; fi
+export BUN_INSTALL="$HOME/.bun"
+export PATH="$HOME/.local/bin:$BUN_INSTALL/bin:$HOME/bin:/usr/local/bin:/usr/bin:/bin"
+
+# Preflight: погасить ВСЕ интерактивные промпты первого старта claude, чтобы `claude --channels`
+# поднимал Telegram-поллер, а не блокировался в ожидании ввода. `claude auth login` ставит auth,
+# но НЕ эти флаги; без них свежий бокс упирается в:
+#   1) онбординг (выбор темы «Choose the text style») — hasCompletedOnboarding/theme
+#   2) «trust this folder?» — projects[cwd].hasTrustDialogAccepted
+#   3) upsell-промпты («Try the new fullscreen renderer? 1.Yes/2.Not now», remote control, passes)
+#      — claude капит их показ на 3; ставим *UpsellSeenCount=3 = «уже видел, не показывай».
+# Идемпотентно, self-healing на каждый старт. No-op пока не залогинен (нет ~/.claude.json).
+CJ="${CLAUDE_CONFIG_DIR:-$HOME}/.claude.json"  # уважаем per-bot CLAUDE_CONFIG_DIR
+if [ -f "$CJ" ]; then
+  python3 - "$CJ" "$HOME" "$HOME/obsidian-vault" <<'PY' 2>/dev/null || true
+import json, sys
+p = sys.argv[1]; trust = sys.argv[2:]
+try:
+    d = json.load(open(p))
+except Exception:
+    sys.exit(0)
+ch = False
+if d.get("hasCompletedOnboarding") is not True:
+    d["hasCompletedOnboarding"] = True; ch = True
+if not d.get("theme"):
+    d["theme"] = "dark"; ch = True
+# upsell-промпты блокируют поллер на свежем боксе; claude капит показ на 3 → ставим 3 ("видел")
+for uk in ("fullscreenUpsellSeenCount", "remoteControlUpsellSeenCount", "passesUpsellSeenCount"):
+    if not isinstance(d.get(uk), int) or d[uk] < 3:
+        d[uk] = 3; ch = True
+proj = d.setdefault("projects", {})
+for k in trust:
+    e = proj.setdefault(k, {})
+    if e.get("hasTrustDialogAccepted") is not True:
+        e["hasTrustDialogAccepted"] = True; ch = True
+    if e.get("hasCompletedProjectOnboarding") is not True:
+        e["hasCompletedProjectOnboarding"] = True; ch = True
+# playwright-MCP: гарантируем наличие + ПИН версии (дрейф @latest ломал браузер —
+# новые версии требуют собственный chrome-for-testing). Нет → добавляем пиненый;
+# @latest → заменяем на пин; ручной другой пин уважаем.
+mcp = d.setdefault("mcpServers", {})
+pw = mcp.get("playwright")
+if not isinstance(pw, dict):
+    mcp["playwright"] = {"type": "stdio", "command": "npx",
+        "args": ["-y", "@playwright/mcp@0.0.78", "--headless", "--isolated"]}; ch = True
+else:
+    args = pw.get("args") or []
+    na = [a.replace("@playwright/mcp@latest", "@playwright/mcp@0.0.78") for a in args]
+    if na != args:
+        pw["args"] = na; ch = True
+if ch:
+    json.dump(d, open(p, "w"), indent=2)
+PY
+fi
+
+cd ~/obsidian-vault
+exec $HOME/.local/bin/claude --channels plugin:telegram@claude-plugins-official

@@ -1,0 +1,24 @@
+#!/usr/bin/env python3
+"""allow-chat <chat_id> [name] — add a Telegram chat to the bot's DM allowlist (access.json).
+
+OWNER-GATED by the persona: the bot runs this ONLY when the command came from the
+owner's chat. Anyone else asking for access is never auto-added.
+"""
+import json, sys
+
+P = "/home/claude/.claude/channels/telegram/access.json"
+
+if len(sys.argv) < 2 or not sys.argv[1].lstrip("-").isdigit():
+    print("usage: allow-chat <chat_id> [name]")
+    sys.exit(1)
+
+cid = str(sys.argv[1]).strip()
+d = json.load(open(P))
+af = d.setdefault("allowFrom", [])
+if cid in [str(x) for x in af]:
+    print(f"{cid} already in allowlist ({len(af)} total)")
+    sys.exit(0)
+af.append(cid)
+json.dump(d, open(P, "w"), ensure_ascii=False, indent=2)
+who = (" " + " ".join(sys.argv[2:])) if len(sys.argv) > 2 else ""
+print(f"added {cid}{who} to allowlist ({len(af)} total)")

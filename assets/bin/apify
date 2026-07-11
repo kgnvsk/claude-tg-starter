@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+# Apify API wrapper
+# Usage:
+#   apify me                          — current user info
+#   apify actors                      — list my actors
+#   apify store [query]               — search Apify Store (public actors)
+#   apify runs [limit]                — list my last actor runs (default 10)
+#   apify run-get <runId>             — get run by id
+#   apify run-log <runId>             — tail run log
+#   apify run-items <runId> [limit]   — dataset items of a run (default 100)
+#   apify start <actorId> [inputFile] — start an actor; inputFile is path to JSON
+#   apify ds <datasetId> [limit]      — fetch dataset items (default 100)
+#   apify kv <storeId> <key>          — fetch key-value-store record
+#   apify raw <METHOD> <path> [body]  — raw request, e.g. apify raw GET /v2/acts
+
+set -euo pipefail
+
+BASE="${APIFY_BASE_URL:-https://api.apify.com/v2}"
+TOKEN_FILE="$HOME/.config/apify-token"
+
+if [[ ! -f "$TOKEN_FILE" ]]; then
+  echo "error: token file not found at $TOKEN_FILE" >&2
+  exit 1
+fi
+TOKEN="$(cat "$TOKEN_FILE")"
+
+req() {
+  local method="$1" path="$2" body="${3:-}"
+  if [[ -n "$body" ]]; then
+    curl -sS -X "$method" \
+      -H "Authorization: Bearer $TOKEN" \
+      -H "Content-Type: application/json" \
+      -d "$body" \
+      "${BASE}${path}"
+  else
+    curl -sS -X "$method" \
+      -H "Authorization: Bearer $TOKEN" \
+      "${BASE}${path}"
+  fi
+}
+
+cmd="${1:-me}"
+case "$cmd" in
+  me)
+    req GET "/users/me" | jq .
+    ;;
+  actors)
+    req GET "/acts?limit=100&desc=true" | jq '.data.items[] | {id, name, username, stats: .stats}'
+    ;;
+  store)
+    q="${2:-}"
+    if [[ -n "$q" ]]; then
+      req GET "/store?search=$(printf '%s' "$q" | jq -sRr @uri)&limit=20" | jq '.data.items[] | {name, username, title, stats: .stats}'
+    else
+      req GET "/store?limit=20" | jq '.data.items[] | {name, username, title}'
+    fi
+    ;;
+  runs)
+    limit="${2:-10}"
+    req GET "/actor-runs?limit=${limit}&desc=true" | jq '.data.items'
+    ;;
+  run-get)
+    runId="${2:?runId required}"
+    req GET "/actor-runs/${runId}" | jq .
+    ;;
+  run-log)
+    runId="${2:?runId required}"
+    curl -sS -H "Authorization: Bearer $TOKEN" "${BASE}/actor-runs/${runId}/log"
+    ;;
+  run-items)
+    runId="${2:?runId required}"
+    limit="${3:-100}"
+    dsid=$(req GET "/actor-runs/${runId}" | jq -r '.data.defaultDatasetId')
+    req GET "/datasets/${dsid}/items?limit=${limit}&clean=true" | jq .
+    ;;
+  start)
+    actorId="${2:?actorId required (e.g. apify/web-scraper or actorId)}"
+    actorId="$(printf '%s' "$actorId" | tr '/' '~')"
+    inputFile="${3:-}"
+    if [[ -n "$inputFile" ]]; then
+      curl -sS -X POST \
+        -H "Authorization: Bearer $TOKEN" \
+        -H "Content-Type: application/json" \
+        --data-binary "@${inputFile}" \
+        "${BASE}/acts/${actorId}/runs" | jq .
+    else
+      curl -sS -X POST \
+        -H "Authorization: Bearer $TOKEN" \
+        -H "Content-Type: application/json" \
+        -d '{}' \
+        "${BASE}/acts/${actorId}/runs" | jq .
+    fi
+    ;;
+  ds)
+    dsid="${2:?datasetId required}"
+    limit="${3:-100}"
+    req GET "/datasets/${dsid}/items?limit=${limit}&clean=true" | jq .
+    ;;
+  kv)
+    storeId="${2:?storeId required}"
+    key="${3:?key required}"
+    curl -sS -H "Authorization: Bearer $TOKEN" "${BASE}/key-value-stores/${storeId}/records/${key}"
+    ;;
+  raw)
+    method="${2:?METHOD required}"
+    path="${3:?path required}"
+    body="${4:-}"
+    req "$method" "$path" "$body" | jq .
+    ;;
+  *)
+    echo "usage: apify [me|actors|store [q]|runs [limit]|run-get <id>|run-log <id>|run-items <id> [limit]|start <actorId> [inputFile]|ds <id> [limit]|kv <storeId> <key>|raw <METHOD> <path> [body]]" >&2
+    exit 2
+    ;;
+esac
