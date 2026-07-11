@@ -13,16 +13,32 @@ description: Deploy a static site or web app to Vercel from the server via the `
 
 ## Базовый поток (статический сайт / лендинг)
 
-1. `Write` файлы сайта в папку, напр. `/tmp/site/index.html` (+ css/js/assets рядом). Можно использовать скилл `frontend-design` / `apple-bento-grid` для вёрстки, `codex-imagegen` для картинок.
+1. `Write` файлы сайта в папку с **говорящим слагом** — имя папки станет именем проекта и субдоменом: `/tmp/marina-fedorenko/` → проект `marina-fedorenko` → `https://marina-fedorenko.vercel.app`. Можно использовать скилл `frontend-design` / `apple-bento-grid` для вёрстки, `codex-imagegen` для картинок.
 2. Деплой в прод одной командой из папки проекта:
 
 ```bash
-cd /tmp/site && vc deploy --prod --yes
+cd /tmp/marina-fedorenko && vc deploy --prod --yes
 ```
 
-`vc` сам подставит `VERCEL_TOKEN`. CLI напечатает публичный `https://...vercel.app` URL — это и есть результат.
+3. Отдай владельцу **чистый прод-домен** и проверь его перед отправкой (см. железное правило ниже).
 
-3. Отправь URL владельцу через `reply`.
+## ЖЕЛЕЗНО: деливерабл = чистый прод-домен, НЕ вывод CLI
+
+CLI после деплоя печатает **технический URL деплоймента** (`имя-xxxx-scope.vercel.app`) — он длинный и **закрыт Vercel-логином по умолчанию** (Standard Protection гейтит deployment-URL'ы даже в проде): человек снаружи увидит стену входа. Публичная ссылка — **прод-домен проекта** `https://<проект>.vercel.app`, он открыт сразу.
+
+Перед отправкой владельцу — проверь ровно ту ссылку, которую отдаёшь:
+
+```bash
+curl -sI https://<проект>.vercel.app | head -1   # ожидаем HTTP/2 200
+```
+
+- `200` → отдавай.
+- `404` → слаг `.vercel.app` глобально занят чужим проектом — повесь свой алиас и проверь его:
+  ```bash
+  vc alias set <технический-url-деплоймента> <другой-слаг>.vercel.app
+  curl -sI https://<другой-слаг>.vercel.app | head -1
+  ```
+- `401`/редирект на vercel.com — ты отдаёшь технический URL вместо прод-домена; возьми прод-домен.
 
 ## Команды
 
@@ -46,14 +62,18 @@ cd /tmp/site && vc deploy --prod --yes
 - Деплой — всегда через `~/bin/vc`, не через голый `vercel` (иначе нет токена).
 - Всегда `--yes` в headless.
 - Большой HTML/JSON — сначала `Write` в файл, потом `cd … && vc deploy`. Никогда инлайном.
-- Прод-деплой (`--prod`) — только когда владелец явно просит «в прод» / «обнови сайт»; иначе preview.
+- Страница, которую увидит человек (лендинг, отчёт, сайт клиенту), = `--prod` по умолчанию. Preview-деплой — для внутренних черновиков себе: его URL закрыт Vercel-логином, наружу такой не отдавай.
+- Отдаёшь ссылку → сначала `curl -sI` на неё = 200 (правило выше).
 - Никаких секретов в репозиторий проекта (`.env` не коммить в папку сайта).
 
 ## Пример (лендинг в прод)
 
 ```bash
-# шаг 1: Write /tmp/lp/index.html (+ /tmp/lp/style.css) — вёрстка
+# шаг 1: Write /tmp/dr-ivanov/index.html (+ style.css) — вёрстка
 # шаг 2:
-cd /tmp/lp && vc deploy --prod --yes
-# → https://lp-xxxx.vercel.app  — отдать владельцу через reply
+cd /tmp/dr-ivanov && vc deploy --prod --yes
+# CLI напечатает технический url — им НЕ делимся
+# шаг 3:
+curl -sI https://dr-ivanov.vercel.app | head -1   # HTTP/2 200
+# → владельцу через reply уходит: https://dr-ivanov.vercel.app
 ```
