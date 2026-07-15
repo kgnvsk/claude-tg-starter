@@ -102,8 +102,10 @@ receiver daemon -- durable update --> queue/database
 - Allows different conversations to run concurrently.
 - Preserves message order within a conversation.
 - May coalesce a short burst of consecutive messages from the same conversation.
-- Applies server safety controls based on CPU, memory, queue depth, and process health;
-  it does not impose an artificial subscription quota.
+- Enforces a configured fixed `maxWorkers` ceiling. An optional admission guard may
+  pause new leases using machine-health or queue policy, while systemd resource limits
+  provide process-level containment. Dynamic CPU or memory autoscaling is not required,
+  and the scheduler does not impose an artificial subscription quota.
 
 ### 4.4 Claude worker manager
 
@@ -260,12 +262,18 @@ command remains ordinary text and cannot mutate control-plane state.
 
 ## 11. Failure handling
 
+Accepted requests are durable once recorded as updates/jobs, and final success or error
+replies are durable through the outbound outbox. Interim queued, typing, and timeout
+status indicators are deliberately best-effort: they may be omitted or repeated across
+failures and restarts. The design does not add a second durable message lifecycle for
+interim status, keeping status delivery YAGNI and terminal reply recovery authoritative.
+
 - **Daemon restart:** resumes from the persisted Telegram offset and deduplicates already
   stored updates.
 - **Worker crash:** job lease expires; retryable work returns to the queue with bounded
   attempts and backoff.
-- **Worker timeout:** process tree is terminated, failure is recorded, and the user gets
-  a concise status message.
+- **Worker timeout:** process tree is terminated and joined before retry or slot release,
+  failure is recorded, and the user may receive a concise best-effort timeout status.
 - **Server reboot:** systemd restores the receiver and dispatcher; queued jobs remain.
 - **Duplicate Telegram delivery:** unique `update_id` prevents duplicate execution and
   duplicate reply intents. The outbound acknowledgement gap below can still cause a
@@ -273,7 +281,7 @@ command remains ordinary text and cannot mutate control-plane state.
 - **Poison job:** after bounded retries it enters a failed state and no longer blocks the
   conversation; admin diagnostics retain the error.
 - **Overload:** receiver continues persisting updates while the scheduler delays new
-  workers; users receive a queued status rather than silent loss.
+  workers; users may receive a best-effort queued status rather than silent loss.
 - **Reply failure:** terminal transport replies are recorded in a durable outbox and
   delivered with at-least-once semantics. Explicit `sendMessage` failures retry with
   bounded attempts and backoff, using fenced leases so only one receiver owns an attempt.

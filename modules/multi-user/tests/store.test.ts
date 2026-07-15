@@ -819,6 +819,197 @@ describe("Store outbound replies", () => {
 });
 
 describe("Store leases", () => {
+  test("atomically completes a job with session state and a durable reply", () => {
+    const store = createStore();
+    store.acceptUpdate(update(1, 22, 22), identity(22, 22), 1_000);
+    const job = store.leaseNextJob("dispatcher", 1_100, 1_000)!;
+
+    expect(store.completeJobWithReply(
+      job.id,
+      "dispatcher",
+      job.leaseToken!,
+      "final answer",
+      "session-one",
+      "guest",
+      "final answer",
+      1_200,
+    )).toBe(true);
+    expect(store.getJob(job.id)).toMatchObject({
+      status: "completed",
+      result: "final answer",
+      error: null,
+    });
+    expect(store.getConversation("dm:22")).toMatchObject({
+      sessionId: "session-one",
+      sessionRole: "guest",
+      leaseOwner: null,
+    });
+    expect(store.listOutboundReplies()).toEqual([
+      expect.objectContaining({
+        updateId: 1,
+        chatId: 22,
+        text: "final answer",
+        status: "pending",
+      }),
+    ]);
+  });
+
+  test("rolls back completion and session state when final reply persistence fails", () => {
+    const store = createStore();
+    store.acceptUpdate(update(1, 22, 22), identity(22, 22), 1_000);
+    const job = store.leaseNextJob("dispatcher", 1_100, 1_000)!;
+    store.db.run(`
+      CREATE TRIGGER reject_final_outbox BEFORE INSERT ON outbound_replies
+      BEGIN
+        SELECT RAISE(ABORT, 'final outbox failed');
+      END
+    `);
+
+    expect(() => store.completeJobWithReply(
+      job.id,
+      "dispatcher",
+      job.leaseToken!,
+      "final answer",
+      "session-one",
+      "guest",
+      "final answer",
+      1_200,
+    )).toThrow("final outbox failed");
+    expect(store.getJob(job.id)).toMatchObject({
+      status: "running",
+      result: null,
+      leaseToken: job.leaseToken,
+    });
+    expect(store.getConversation("dm:22")).toMatchObject({
+      sessionId: null,
+      sessionRole: null,
+      leaseOwner: "dispatcher",
+    });
+    expect(store.listOutboundReplies()).toHaveLength(0);
+  });
+
+  test("schedules retries and releases shutdown attempts without breaking turn order", () => {
+    const store = createStore();
+    store.acceptUpdate(update(1, 22, 22), identity(22, 22), 1_000);
+    store.acceptUpdate(update(2, 22, 22), identity(22, 22), 1_001);
+    const first = store.leaseNextJob("dispatcher", 1_100, 1_000)!;
+
+    expect(store.retryJob(
+      first.id,
+      "dispatcher",
+      first.leaseToken!,
+      "temporary",
+      2_000,
+      1_200,
+    )).toBe(true);
+    expect(store.leaseNextJob("dispatcher", 1_999, 1_000)).toBeNull();
+    const retry = store.leaseNextJob("dispatcher", 2_000, 1_000)!;
+    expect(retry).toMatchObject({ updateId: 1, attempts: 2 });
+
+    expect(store.releaseJob(
+      retry.id,
+      "dispatcher",
+      retry.leaseToken!,
+      "shutdown",
+      2_100,
+    )).toBe(true);
+    expect(store.getJob(retry.id)).toMatchObject({
+      status: "queued",
+      attempts: 1,
+      error: "shutdown",
+    });
+    expect(store.leaseNextJob("next-dispatcher", 2_100, 1_000)).toMatchObject({
+      updateId: 1,
+      attempts: 2,
+    });
+  });
+
+  test("fenced unstarted release restores the acquisition attempt and conversation lease", () => {
+    const store = createStore();
+    store.acceptUpdate(update(1, 22, 22), identity(22, 22), 1_000);
+    const job = store.leaseNextJob("dispatcher", 1_100, 1_000)!;
+
+    expect(store.releaseUnstartedJob(
+      job.id,
+      "dispatcher",
+      job.leaseToken!,
+      "preflight unavailable",
+      1_101,
+    )).toBe(true);
+    expect(store.getJob(job.id)).toMatchObject({
+      status: "queued",
+      attempts: 0,
+      error: "preflight unavailable",
+      leaseOwner: null,
+    });
+    expect(store.getConversation("dm:22")).toMatchObject({
+      leaseOwner: null,
+      leaseUntil: null,
+    });
+    expect(store.leaseNextJob("dispatcher", 1_101, 1_000)).toMatchObject({
+      id: job.id,
+      attempts: 1,
+    });
+  });
+
+  test("atomically fails poison jobs with an error reply and unblocks the next turn", () => {
+    const store = createStore();
+    store.acceptUpdate(update(1, 22, 22), identity(22, 22), 1_000);
+    store.acceptUpdate(update(2, 22, 22), identity(22, 22), 1_001);
+    const poison = store.leaseNextJob("dispatcher", 1_100, 1_000)!;
+
+    expect(store.failJobWithReply(
+      poison.id,
+      "dispatcher",
+      poison.leaseToken!,
+      "invalid worker input",
+      "Sorry, I could not process that message.",
+      1_200,
+    )).toBe(true);
+    expect(store.getJob(poison.id)).toMatchObject({
+      status: "failed",
+      error: "invalid worker input",
+    });
+    expect(store.listOutboundReplies()[0]).toMatchObject({
+      updateId: 1,
+      chatId: 22,
+      text: "Sorry, I could not process that message.",
+    });
+    expect(store.leaseNextJob("dispatcher", 1_200, 1_000)).toMatchObject({
+      updateId: 2,
+    });
+  });
+
+  test("preserves the prior diagnostic when an expired final attempt is exhausted", () => {
+    const store = createStore();
+    store.acceptUpdate(update(1, 22, 22), identity(22, 22), 1_000);
+    const first = store.leaseNextJob("dispatcher", 1_100, 100)!;
+    expect(store.retryJob(
+      first.id,
+      "dispatcher",
+      first.leaseToken!,
+      "network unavailable",
+      1_200,
+      1_150,
+    )).toBe(true);
+    store.leaseNextJob("dispatcher", 1_200, 100);
+    expect(store.recoverExpiredLeases(1_301)).toBe(1);
+
+    expect(store.failExhaustedJobs(
+      2,
+      "Sorry, I could not process that message.",
+      1_301,
+    )).toBe(1);
+    expect(store.getJob(first.id)).toMatchObject({
+      status: "failed",
+      error: "network unavailable; attempts_exhausted",
+    });
+    expect(store.listOutboundReplies()[0]).toMatchObject({
+      updateId: 1,
+      chatId: 22,
+    });
+  });
+
   test("rejects invalid timestamps without mutating leased state", () => {
     const store = createStore();
     store.acceptUpdate(update(1, 22, 22), identity(22, 22), 1_000);
@@ -994,6 +1185,42 @@ describe("Store leases", () => {
       attempts: 2,
       leaseOwner: "worker-b",
     });
+  });
+
+  test("transactionally excludes active jobs and conversations from recovery and leasing", () => {
+    const store = createStore();
+    store.acceptUpdate(update(1, 22, 22), identity(22, 22), 1_000);
+    const first = store.leaseNextJob("worker-a", 2_000, 100)!;
+    const exclusions = [{
+      jobId: first.id,
+      conversationKey: first.conversationKey,
+    }];
+
+    expect(store.recoverExpiredLeases(2_101, exclusions)).toBe(0);
+    expect(store.leaseNextJob("worker-b", 2_101, 100, exclusions)).toBeNull();
+    expect(store.getJob(first.id)).toMatchObject({
+      status: "running",
+      attempts: 1,
+      leaseOwner: "worker-a",
+    });
+
+    expect(store.recoverExpiredLeases(2_101)).toBe(1);
+    expect(store.leaseNextJob("worker-b", 2_101, 100)).toMatchObject({
+      id: first.id,
+      attempts: 2,
+      leaseOwner: "worker-b",
+    });
+  });
+
+  test("rejects active lease exclusions that omit either side of the lease pair", () => {
+    const store = createStore();
+
+    expect(() => store.recoverExpiredLeases(2_000, [
+      { jobId: 1 } as never,
+    ])).toThrow("active lease conversation key is invalid");
+    expect(() => store.leaseNextJob("worker-a", 2_000, 100, [
+      { conversationKey: "dm:22" } as never,
+    ])).toThrow("active lease job ID must be a positive safe integer");
   });
 
   test("rejects completion and failure from workers whose leases expired", () => {

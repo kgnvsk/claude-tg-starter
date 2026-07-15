@@ -117,6 +117,16 @@ export interface StoreOptions {
   adminChatIds?: ReadonlySet<number>;
 }
 
+export interface ActiveLeaseDescriptor {
+  jobId: number;
+  conversationKey: string;
+}
+
+interface NormalizedLeaseExclusions {
+  jobIds: number[];
+  conversationKeys: string[];
+}
+
 interface ConversationRow {
   conversation_key: string;
   telegram_chat_id: number;
@@ -144,6 +154,7 @@ interface JobRow {
   lease_token: string | null;
   lease_until: number | null;
   error: string | null;
+  result: string | null;
   created_at: number;
   updated_at: number;
 }
@@ -631,20 +642,30 @@ export class Store {
     leaseOwner: string,
     now = Date.now(),
     leaseMs = 60_000,
+    activeLeases: readonly ActiveLeaseDescriptor[] = [],
   ): StoredJob | null {
     if (!leaseOwner) throw new Error("lease owner is required");
     const leaseUntil = calculateLeaseUntil(now, leaseMs);
+    const excluded = normalizeActiveLeases(activeLeases);
 
     const lease = this.db.transaction(() => {
-      this.recoverExpiredLeasesWithinTransaction(now);
+      this.recoverExpiredLeasesWithinTransaction(now, excluded);
+      const excludedJobs = sqlNotIn("j.id", excluded.jobIds.length);
+      const excludedConversations = sqlNotIn(
+        "j.conversation_key",
+        excluded.conversationKeys.length,
+      );
       const candidate = this.db
-        .query<{ id: number; conversation_key: string }, [number]>(`
+        .query<{ id: number; conversation_key: string }, unknown[]>(`
           SELECT j.id, j.conversation_key
           FROM jobs AS j
           JOIN conversations AS c ON c.conversation_key = j.conversation_key
           WHERE j.status = 'queued'
+            AND j.updated_at <= ?
             AND j.generation = c.generation
             AND (c.lease_until IS NULL OR c.lease_until <= ?)
+            ${excludedJobs}
+            ${excludedConversations}
             AND NOT EXISTS (
               SELECT 1 FROM jobs AS earlier
               WHERE earlier.conversation_key = j.conversation_key
@@ -654,7 +675,7 @@ export class Store {
           ORDER BY j.created_at, j.id
           LIMIT 1
         `)
-        .get(now);
+        .get(now, now, ...excluded.jobIds, ...excluded.conversationKeys);
       if (!candidate) return null;
 
       const leaseToken = crypto.randomUUID();
@@ -740,6 +761,31 @@ export class Store {
       result,
       sessionId,
       sessionRole,
+      null,
+      now,
+    );
+  }
+
+  completeJobWithReply(
+    jobId: number,
+    leaseOwner: string,
+    leaseToken: string,
+    result: string,
+    sessionId: string,
+    sessionRole: Role,
+    replyText: string,
+    now = Date.now(),
+  ): boolean {
+    if (!replyText) throw new Error("final reply text is required");
+    return this.finishJob(
+      jobId,
+      leaseOwner,
+      leaseToken,
+      "completed",
+      result,
+      sessionId,
+      sessionRole,
+      replyText,
       now,
     );
   }
@@ -760,16 +806,165 @@ export class Store {
       error,
       null,
       null,
+      null,
       now,
     );
   }
 
-  recoverExpiredLeases(now = Date.now()): number {
+  failJobWithReply(
+    jobId: number,
+    leaseOwner: string,
+    leaseToken: string,
+    error: string,
+    replyText: string,
+    now = Date.now(),
+  ): boolean {
+    if (!replyText) throw new Error("error reply text is required");
+    return this.finishJob(
+      jobId,
+      leaseOwner,
+      leaseToken,
+      "failed",
+      error,
+      null,
+      null,
+      replyText,
+      now,
+    );
+  }
+
+  retryJob(
+    jobId: number,
+    leaseOwner: string,
+    leaseToken: string,
+    error: string,
+    nextAttemptAt: number,
+    now = Date.now(),
+  ): boolean {
     validateTimestamp(now);
+    validateTimestamp(nextAttemptAt);
+    if (nextAttemptAt < now) throw new Error("job retry time may not be in the past");
+    return this.rescheduleJob(
+      jobId,
+      leaseOwner,
+      leaseToken,
+      error,
+      nextAttemptAt,
+      false,
+      now,
+    );
+  }
+
+  releaseJob(
+    jobId: number,
+    leaseOwner: string,
+    leaseToken: string,
+    error: string,
+    now = Date.now(),
+  ): boolean {
+    validateTimestamp(now);
+    return this.rescheduleJob(
+      jobId,
+      leaseOwner,
+      leaseToken,
+      error,
+      now,
+      true,
+      now,
+    );
+  }
+
+  releaseUnstartedJob(
+    jobId: number,
+    leaseOwner: string,
+    leaseToken: string,
+    error: string,
+    now = Date.now(),
+  ): boolean {
+    validateTimestamp(now);
+    return this.rescheduleJob(
+      jobId,
+      leaseOwner,
+      leaseToken,
+      error,
+      now,
+      true,
+      now,
+    );
+  }
+
+  recoverExpiredLeases(
+    now = Date.now(),
+    activeLeases: readonly ActiveLeaseDescriptor[] = [],
+  ): number {
+    validateTimestamp(now);
+    const excluded = normalizeActiveLeases(activeLeases);
     const recover = this.db.transaction(() =>
-      this.recoverExpiredLeasesWithinTransaction(now),
+      this.recoverExpiredLeasesWithinTransaction(now, excluded),
     );
     return recover.immediate();
+  }
+
+  failExhaustedJobs(
+    maxAttempts: number,
+    replyText: string,
+    now = Date.now(),
+  ): number {
+    validateAttemptLimit(maxAttempts);
+    validateTimestamp(now);
+    if (!replyText) throw new Error("error reply text is required");
+    const fail = this.db.transaction(() => {
+      const exhausted = this.db
+        .query<
+          { id: number; update_id: number; telegram_chat_id: number },
+          [number]
+        >(`
+          SELECT j.id, j.update_id, c.telegram_chat_id
+          FROM jobs AS j
+          JOIN conversations AS c ON c.conversation_key = j.conversation_key
+          WHERE j.status = 'queued' AND j.attempts >= ?
+            AND j.generation = c.generation
+            AND NOT EXISTS (
+              SELECT 1 FROM jobs AS earlier
+              WHERE earlier.conversation_key = j.conversation_key
+                AND earlier.sequence < j.sequence
+                AND earlier.status IN ('queued', 'running')
+            )
+          ORDER BY j.id
+        `)
+        .all(maxAttempts);
+      for (const job of exhausted) {
+        this.db
+          .query(`
+            UPDATE jobs
+            SET status = 'failed',
+                error = CASE
+                  WHEN error IS NULL OR error = '' THEN 'attempts_exhausted'
+                  ELSE error || '; attempts_exhausted'
+                END,
+                updated_at = ?
+            WHERE id = ? AND status = 'queued'
+          `)
+          .run(now, job.id);
+        this.db
+          .query(`
+            INSERT INTO outbound_replies (
+              update_id, chat_id, text, status, attempts, next_chunk_index,
+              next_attempt_at, created_at, updated_at
+            ) VALUES (?, ?, ?, 'pending', 0, 0, ?, ?, ?)
+          `)
+          .run(
+            job.update_id,
+            job.telegram_chat_id,
+            replyText,
+            now,
+            now,
+            now,
+          );
+      }
+      return exhausted.length;
+    });
+    return fail.immediate();
   }
 
   getConversation(conversationKey: string): StoredConversation | null {
@@ -882,22 +1077,32 @@ export class Store {
       .run(key, value, now);
   }
 
-  private recoverExpiredLeasesWithinTransaction(now: number): number {
+  private recoverExpiredLeasesWithinTransaction(
+    now: number,
+    exclusions: NormalizedLeaseExclusions = { jobIds: [], conversationKeys: [] },
+  ): number {
+    const excludedJobs = sqlNotIn("id", exclusions.jobIds.length);
     const recovered = this.db
       .query(`
         UPDATE jobs
         SET status = 'queued', lease_owner = NULL, lease_token = NULL,
             lease_until = NULL, updated_at = ?
         WHERE status = 'running' AND lease_until <= ?
+          ${excludedJobs}
       `)
-      .run(now, now).changes;
+      .run(now, now, ...exclusions.jobIds).changes;
+    const excludedConversations = sqlNotIn(
+      "conversation_key",
+      exclusions.conversationKeys.length,
+    );
     this.db
       .query(`
         UPDATE conversations
         SET lease_owner = NULL, lease_until = NULL, updated_at = ?
         WHERE lease_until <= ?
+          ${excludedConversations}
       `)
-      .run(now, now);
+      .run(now, now, ...exclusions.conversationKeys);
     return recovered;
   }
 
@@ -939,16 +1144,17 @@ export class Store {
     detail: string | null,
     sessionId: string | null,
     sessionRole: Role | null,
+    replyText: string | null,
     now: number,
   ): boolean {
     validateTimestamp(now);
     const finish = this.db.transaction(() => {
       const job = this.db
         .query<
-          { conversation_key: string },
+          { conversation_key: string; update_id: number; telegram_chat_id: number },
           [number, string, string, number, string, number]
         >(`
-          SELECT j.conversation_key
+          SELECT j.conversation_key, j.update_id, c.telegram_chat_id
           FROM jobs AS j
           JOIN conversations AS c ON c.conversation_key = j.conversation_key
           WHERE j.id = ? AND j.status = 'running'
@@ -982,9 +1188,75 @@ export class Store {
           WHERE conversation_key = ? AND lease_owner = ?
         `)
         .run(sessionId, sessionRole, now, now, job.conversation_key, leaseOwner);
+      if (replyText !== null) {
+        this.db
+          .query(`
+            INSERT INTO outbound_replies (
+              update_id, chat_id, text, status, attempts, next_chunk_index,
+              next_attempt_at, created_at, updated_at
+            ) VALUES (?, ?, ?, 'pending', 0, 0, ?, ?, ?)
+          `)
+          .run(
+            job.update_id,
+            job.telegram_chat_id,
+            replyText,
+            now,
+            now,
+            now,
+          );
+      }
       return true;
     });
     return finish.immediate();
+  }
+
+  private rescheduleJob(
+    jobId: number,
+    leaseOwner: string,
+    leaseToken: string,
+    error: string,
+    nextAttemptAt: number,
+    restoreAttempt: boolean,
+    now: number,
+  ): boolean {
+    const reschedule = this.db.transaction(() => {
+      const job = this.db
+        .query<
+          { conversation_key: string },
+          [number, string, string, number, string, number]
+        >(`
+          SELECT j.conversation_key
+          FROM jobs AS j
+          JOIN conversations AS c ON c.conversation_key = j.conversation_key
+          WHERE j.id = ? AND j.status = 'running'
+            AND j.lease_owner = ? AND j.lease_token = ? AND j.lease_until > ?
+            AND j.generation = c.generation
+            AND c.lease_owner = ? AND c.lease_until > ?
+        `)
+        .get(jobId, leaseOwner, leaseToken, now, leaseOwner, now);
+      if (!job) return false;
+
+      this.db
+        .query(`
+          UPDATE jobs
+          SET status = 'queued',
+              attempts = CASE WHEN ? THEN MAX(attempts - 1, 0) ELSE attempts END,
+              lease_owner = NULL, lease_token = NULL, lease_until = NULL,
+              error = ?, result = NULL, updated_at = ?
+          WHERE id = ?
+        `)
+        .run(restoreAttempt ? 1 : 0, error, nextAttemptAt, jobId);
+      this.db
+        .query(`
+          UPDATE conversations
+          SET lease_owner = NULL, lease_until = NULL,
+              last_activity_at = ?, updated_at = ?
+          WHERE conversation_key = ? AND lease_owner = ?
+        `)
+        .run(now, now, job.conversation_key, leaseOwner);
+      return true;
+    });
+    return reschedule.immediate();
   }
 
   private createSchema(db: Database = this.db): void {
@@ -1263,6 +1535,38 @@ function mapOutboundReply(row: OutboundReplyRow): StoredOutboundReply {
   };
 }
 
+function normalizeActiveLeases(
+  activeLeases: readonly ActiveLeaseDescriptor[],
+): NormalizedLeaseExclusions {
+  if (!Array.isArray(activeLeases)) {
+    throw new Error("active leases must be paired descriptors");
+  }
+  const jobIds = new Set<number>();
+  const conversationKeys = new Set<string>();
+  for (const activeLease of activeLeases) {
+    const jobId = activeLease?.jobId;
+    const conversationKey = activeLease?.conversationKey;
+    if (!Number.isSafeInteger(jobId) || jobId <= 0) {
+      throw new Error("active lease job ID must be a positive safe integer");
+    }
+    if (
+      typeof conversationKey !== "string"
+      || !/^(?:dm|group):-?\d+$/.test(conversationKey)
+    ) {
+      throw new Error("active lease conversation key is invalid");
+    }
+    jobIds.add(jobId);
+    conversationKeys.add(conversationKey);
+  }
+  return { jobIds: [...jobIds], conversationKeys: [...conversationKeys] };
+}
+
+function sqlNotIn(column: string, count: number): string {
+  return count === 0
+    ? ""
+    : `AND ${column} NOT IN (${Array.from({ length: count }, () => "?").join(", ")})`;
+}
+
 function calculateLeaseUntil(now: number, leaseMs: number): number {
   if (!Number.isSafeInteger(leaseMs) || leaseMs <= 0) {
     throw new Error("lease duration must be a positive safe integer");
@@ -1529,6 +1833,7 @@ function mapJob(row: JobRow): StoredJob {
     leaseToken: row.lease_token,
     leaseUntil: row.lease_until,
     error: row.error,
+    result: row.result,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };

@@ -112,6 +112,7 @@ export interface StoredJob {
   leaseToken: string | null;
   leaseUntil: number | null;
   error: string | null;
+  result?: string | null;
   createdAt: number;
   updatedAt: number;
 }
