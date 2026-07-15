@@ -7,6 +7,26 @@ LOG=/home/claude/logs/healthcheck.log
 STATE=/home/claude/logs/health-state.json
 ALERT_COOLDOWN=600  # 10 min between repeat alerts
 mkdir -p /home/claude/logs
+LIFECYCLE_LOCK=/home/claude/logs/transport-lifecycle.lock
+touch "$LIFECYCLE_LOCK" 2>/dev/null || exit 0
+chmod 0600 "$LIFECYCLE_LOCK" 2>/dev/null || exit 0
+command -v flock >/dev/null 2>&1 || exit 0
+exec 9>"$LIFECYCLE_LOCK"
+flock -n -x 9 || exit 0
+
+TRANSITION_FILE=/home/claude/multi-user/state/transitioning
+if [ -f "$TRANSITION_FILE" ]; then
+    DIRECTION=$(sed -n 's/^direction=//p' "$TRANSITION_FILE" 2>/dev/null)
+    STARTED_AT=$(sed -n 's/^started_at=//p' "$TRANSITION_FILE" 2>/dev/null)
+    NOW=$(date +%s)
+    if [[ "$DIRECTION" =~ ^(enabling|disabling)$ && "$STARTED_AT" =~ ^[0-9]+$ ]] \
+       && [ $((NOW - STARTED_AT)) -ge 300 ]; then
+        flock -u 9
+        sudo /usr/local/sbin/claude-multi-user-reconcile reconcile >/dev/null 2>&1 || true
+    fi
+    echo "[$(date -u +%FT%TZ)] transport transition pending: ${DIRECTION:-invalid}" >> "$LOG"
+    exit 0
+fi
 
 # Load bot credentials for alerts
 BOT_TOKEN=$(grep "^TELEGRAM_BOT_TOKEN=" /home/claude/.claude/channels/telegram/.env 2>/dev/null | cut -d= -f2)
@@ -36,6 +56,68 @@ alert() {
         --data-urlencode "parse_mode=HTML" >/dev/null 2>&1
     echo "[$(date -u +%FT%TZ)] ALERT [${key}]: ${msg}" >> "$LOG"
 }
+
+MULTI_USER_ENABLED=0
+[ -f /home/claude/multi-user/state/enabled ] && MULTI_USER_ENABLED=1
+if [ "$MULTI_USER_ENABLED" -eq 1 ]; then
+    userctl() { XDG_RUNTIME_DIR="/run/user/$(id -u)" systemctl --user "$@"; }
+
+    # Enforce sole poller after package updates, reboots, or manual service starts.
+    sudo systemctl stop claude-telegram.service 2>/dev/null || true
+    userctl stop cash-tg-receiver.service 2>/dev/null || true
+
+    for unit in claude-multi-user-receiver.service claude-multi-user-dispatcher.service; do
+        if ! userctl is-active "$unit" >/dev/null 2>&1; then
+            userctl reset-failed "$unit" 2>/dev/null || true
+            userctl start "$unit" 2>/dev/null || true
+            echo "[$(date -u +%FT%TZ)] $unit was down, tried restart" >> "$LOG"
+        fi
+    done
+
+    ROUTER_DB=/home/claude/multi-user/state/router.sqlite
+    DB_OK=null
+    if command -v sqlite3 >/dev/null 2>&1 && [ -f "$ROUTER_DB" ] \
+       && [ "$(sqlite3 "$ROUTER_DB" 'PRAGMA quick_check;' 2>/dev/null)" = ok ]; then
+        DB_OK=true
+    elif command -v sqlite3 >/dev/null 2>&1; then
+        DB_OK=false
+    fi
+    RECEIVER_ACTIVE=$(userctl is-active claude-multi-user-receiver.service >/dev/null 2>&1 && echo true || echo false)
+    DISPATCHER_ACTIVE=$(userctl is-active claude-multi-user-dispatcher.service >/dev/null 2>&1 && echo true || echo false)
+    SOLE_POLLER=$(
+      [ "$RECEIVER_ACTIVE" = true ] \
+        && ! sudo systemctl is-active claude-telegram.service >/dev/null 2>&1 \
+        && ! userctl is-active cash-tg-receiver.service >/dev/null 2>&1 \
+        && echo true || echo false
+    )
+
+    EXP=$(jq -r '.claudeAiOauth.expiresAt // 0' /home/claude/.claude/.credentials.json 2>/dev/null)
+    NOW_MS=$(( $(date +%s) * 1000 ))
+    if [ "${EXP:-0}" -gt 0 ] && [ $(( (EXP - NOW_MS) / 60000 )) -le 0 ]; then
+        RESTART_TS=/tmp/cash-token-restart.ts
+        NOW_S2=$(date +%s); LAST_R=$(cat "$RESTART_TS" 2>/dev/null || echo 0)
+        if [ $(( NOW_S2 - LAST_R )) -ge 900 ]; then
+            echo "$NOW_S2" > "$RESTART_TS"
+            userctl restart claude-multi-user-dispatcher.service 2>/dev/null || true
+        fi
+    fi
+
+    DISK_PCT=$(df /home | awk 'NR==2 {gsub("%",""); print 100-$5}')
+    if [ "$DISK_PCT" -lt 10 ]; then
+        alert "low-disk" "Low disk space: ${DISK_PCT}% free on /home."
+    fi
+    cat > "$STATE" <<STATE_EOF
+{
+  "timestamp": "$(date -u +%FT%TZ)",
+  "mode": "multi-user",
+  "receiver_active": ${RECEIVER_ACTIVE},
+  "dispatcher_active": ${DISPATCHER_ACTIVE},
+  "router_db_ok": ${DB_OK},
+  "sole_poller": ${SOLE_POLLER},
+  "disk_free_pct": ${DISK_PCT}
+}
+STATE_EOF
+else
 
 # 0. Pin patched telegram plugin. claude 2.1.156 loads the plugin from the GitHub-synced
 #    marketplace dir, and that sync periodically reverts server.ts to upstream — which
@@ -198,6 +280,8 @@ if [ -f "$DB" ]; then
             sudo systemctl restart claude-telegram.service 2>/dev/null
         fi
     fi
+fi
+
 fi
 
 exit 0

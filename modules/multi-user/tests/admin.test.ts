@@ -258,6 +258,22 @@ describe("AdminController", () => {
     expect(store.leaseNextJob("worker-b", 1_951, 1_000)?.updateId).toBe(51);
   });
 
+  test("reset reports busy without invalidating maintenance fences", async () => {
+    for (const state of ["cleanup_pending:token", "attachment_ingress:token"]) {
+      const store = createStore();
+      store.acceptUpdate(update(50, "queued", 44), identity(44, 44, "guest"), 900);
+      store.db.query("UPDATE conversations SET state = ? WHERE conversation_key = 'dm:44'")
+        .run(state);
+      const admin = new AdminController({ store, adminIds: new Set([11, 12]), clock: () => 1_000 });
+
+      await admin.handle(update(1, "/reset 44"), identity());
+      await admin.handle(update(2, `/confirm ${actionToken(store)}`), identity());
+
+      expect(store.getConversation("dm:44")).toMatchObject({ state, generation: 1 });
+      expect(store.listOutboundReplies().at(-1)?.text).toContain("busy");
+    }
+  });
+
   test("rolls back immediate unblock and its update when the durable reply cannot persist", async () => {
     const store = createStore();
     store.blockUser(44, 11, "blocked", 900);

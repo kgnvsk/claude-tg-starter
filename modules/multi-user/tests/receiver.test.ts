@@ -231,6 +231,111 @@ describe("Receiver", () => {
     });
   });
 
+  test("does not download when guest cleanup owns the conversation", async () => {
+    const directory = temporaryDirectory();
+    const store = new Store(join(directory, "state.sqlite"), { adminChatIds: config.adminChatIds });
+    stores.push(store);
+    store.acceptUpdate(normalizeTelegramUpdate(rawMessage(1, 22, 22))!, {
+      accepted: true,
+      role: "guest",
+      userId: 22,
+      chatId: 22,
+      chatType: "private",
+      conversationKey: "dm:22",
+    }, 1_000);
+    const job = store.leaseNextJob("worker", 1_010, 100)!;
+    store.completeJob(job.id, "worker", job.leaseToken!, "done", "session", "guest", 1_020);
+    store.claimInactiveGuestSession(1_500, 2_000, 500);
+    const telegram = fakeTelegram();
+    const receiver = new Receiver({
+      telegram,
+      store,
+      config,
+      baseDirectory: directory,
+      clock: () => 2_100,
+    });
+
+    await expect(receiver.processUpdate(rawMessage(2, 22, 22, "private", {
+      text: undefined,
+      document: { file_id: "doc", file_name: "report.txt" },
+    }))).rejects.toThrow("conversation is unavailable for attachment ingress");
+    expect(telegram.downloads).toHaveLength(0);
+  });
+
+  test("releases attachment ingress when download fails", async () => {
+    const directory = temporaryDirectory();
+    const store = new Store(join(directory, "state.sqlite"), { adminChatIds: config.adminChatIds });
+    stores.push(store);
+    const telegram = {
+      ...fakeTelegram(),
+      downloadAttachment: async () => { throw new Error("download failed"); },
+    };
+    const receiver = new Receiver({
+      telegram,
+      store,
+      config,
+      baseDirectory: directory,
+      clock: () => 2_000,
+    });
+    await receiver.processUpdate(rawMessage(1, 22, 22));
+
+    await expect(receiver.processUpdate(rawMessage(2, 22, 22, "private", {
+      text: undefined,
+      document: { file_id: "doc", file_name: "report.txt" },
+    }))).rejects.toThrow("download failed");
+    expect(store.getConversation("dm:22")).toMatchObject({
+      state: "active",
+    });
+  });
+
+  test("accepts attachment ingress while preserving an active worker lease", async () => {
+    const directory = temporaryDirectory();
+    const store = new Store(join(directory, "state.sqlite"), { adminChatIds: config.adminChatIds });
+    stores.push(store);
+    const telegram = fakeTelegram();
+    const receiver = new Receiver({
+      telegram,
+      store,
+      config,
+      baseDirectory: directory,
+      clock: () => 2_000,
+    });
+    await receiver.processUpdate(rawMessage(1, 22, 22));
+    const worker = store.leaseNextJob("worker", 2_000, 10_000)!;
+
+    expect(await receiver.processUpdate(rawMessage(2, 22, 22, "private", {
+      text: undefined,
+      document: { file_id: "doc", file_name: "report.txt" },
+    }))).toBe("accepted");
+    expect(store.listJobs("dm:22")).toHaveLength(2);
+    expect(store.getConversation("dm:22")).toMatchObject({
+      state: "active",
+      leaseOwner: "worker",
+      leaseUntil: 12_000,
+    });
+    expect(store.renewLease(worker.id, "worker", worker.leaseToken!, 2_100, 10_000)).toBe(true);
+  });
+
+  test("recovers stale attachment ingress before a later text-only update", async () => {
+    const directory = temporaryDirectory();
+    const store = new Store(join(directory, "state.sqlite"), { adminChatIds: config.adminChatIds });
+    stores.push(store);
+    let now = 1_000;
+    const receiver = new Receiver({
+      telegram: fakeTelegram(),
+      store,
+      config,
+      baseDirectory: directory,
+      clock: () => now,
+    });
+    await receiver.processUpdate(rawMessage(1, 22, 22));
+    store.claimAttachmentIngress("dm:22", now, 120_000);
+    now = 121_001;
+
+    expect(await receiver.processUpdate(rawMessage(2, 22, 22))).toBe("accepted");
+    expect(store.getConversation("dm:22")?.state).toBe("active");
+  });
+
   test("answers blocked and invite-only users without creating jobs", async () => {
     const directory = temporaryDirectory();
     const store = new Store(join(directory, "state.sqlite"), { adminChatIds: config.adminChatIds });
@@ -776,6 +881,8 @@ describe("Receiver", () => {
       lookupIdentity: () => null,
       hasUpdate: () => false,
       acceptUpdate: () => true,
+      claimAttachmentIngress: () => null,
+      releaseAttachmentIngress: () => true,
       recordTerminalUpdate: () => true,
       claimOutboundReply: () => null,
       markOutboundReplyDelivered: () => true,

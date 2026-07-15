@@ -7,6 +7,7 @@ import {
 
 import type {
   AcceptedIdentity,
+  AttachmentIngressContext,
   AdminMutationAction,
   IdentityLookup,
   JobStatus,
@@ -126,6 +127,15 @@ export interface StoreOptions {
 export interface ActiveLeaseDescriptor {
   jobId: number;
   conversationKey: string;
+}
+
+export interface ExpiredGuestSession {
+  conversationKey: string;
+  sessionId: string;
+}
+
+export interface GuestCleanupClaim extends ExpiredGuestSession {
+  token: string;
 }
 
 interface NormalizedLeaseExclusions {
@@ -660,11 +670,23 @@ export class Store {
     update: NormalizedUpdate,
     identity: AcceptedIdentity,
     now = Date.now(),
+    ingress?: AttachmentIngressContext,
   ): boolean {
     validateTimestamp(now);
     this.validateAcceptedIdentity(update, identity);
+    if (ingress && ingress.conversationKey !== identity.conversationKey) {
+      throw new Error("attachment ingress conversation does not match the update");
+    }
 
     const enqueue = this.db.transaction(() => {
+      const ingressState = ingress ? `attachment_ingress:${ingress.token}` : null;
+      if (ingressState) {
+        const activeIngress = this.db.query<{ present: number }, [string, string]>(`
+          SELECT 1 AS present FROM conversations
+          WHERE conversation_key = ? AND state = ?
+        `).get(identity.conversationKey, ingressState);
+        if (!activeIngress) throw new Error("attachment ingress fence is stale");
+      }
       const inserted = this.db
         .query<{ update_id: number }, [number, string, string, number]>(`
           INSERT INTO updates (update_id, conversation_key, processing_state, payload_json, created_at)
@@ -678,7 +700,15 @@ export class Store {
           JSON.stringify(update),
           now,
         );
-      if (!inserted) return false;
+      if (!inserted) {
+        if (ingressState) {
+          this.db.query(`
+            UPDATE conversations SET state = 'active', updated_at = ?
+            WHERE conversation_key = ? AND state = ?
+          `).run(now, identity.conversationKey, ingressState);
+        }
+        return false;
+      }
 
       const { chat, sender } = update.message;
       this.db
@@ -747,13 +777,13 @@ export class Store {
         .run(identity.conversationKey, chat.id, now, now, now);
 
       const allocation = this.db
-        .query<{ sequence: number; generation: number }, [number, string]>(`
+        .query<{ sequence: number; generation: number }, [number, string, string]>(`
           UPDATE conversations
           SET next_sequence = next_sequence + 1, updated_at = ?
-          WHERE conversation_key = ?
+          WHERE conversation_key = ? AND state = ?
           RETURNING next_sequence - 1 AS sequence, generation
         `)
-        .get(now, identity.conversationKey);
+        .get(now, identity.conversationKey, ingressState ?? "active");
       if (!allocation) throw new Error("conversation sequence allocation failed");
 
       this.db
@@ -773,6 +803,13 @@ export class Store {
           now,
           now,
         );
+      if (ingressState) {
+        const released = this.db.query(`
+          UPDATE conversations SET state = 'active', updated_at = ?
+          WHERE conversation_key = ? AND state = ?
+        `).run(now, identity.conversationKey, ingressState).changes;
+        if (released === 0) throw new Error("attachment ingress fence is stale");
+      }
       return true;
     });
 
@@ -841,10 +878,10 @@ export class Store {
       this.db
         .query(`
           UPDATE conversations
-          SET lease_owner = ?, lease_until = ?, updated_at = ?
+          SET lease_owner = ?, lease_until = ?
           WHERE conversation_key = ?
         `)
-        .run(leaseOwner, leaseUntil, now, candidate.conversation_key);
+        .run(leaseOwner, leaseUntil, candidate.conversation_key);
       const row = this.db
         .query<JobRow, [string, string, number, number, number]>(`
           UPDATE jobs
@@ -891,10 +928,10 @@ export class Store {
         .run(leaseUntil, now, jobId);
       this.db
         .query(`
-          UPDATE conversations SET lease_until = ?, updated_at = ?
+          UPDATE conversations SET lease_until = ?
           WHERE conversation_key = ? AND lease_owner = ?
         `)
-        .run(leaseUntil, now, job.conversation_key, leaseOwner);
+        .run(leaseUntil, job.conversation_key, leaseOwner);
       return true;
     });
     return renew.immediate();
@@ -1135,11 +1172,200 @@ export class Store {
     return row ? mapConversation(row) : null;
   }
 
+  claimAttachmentIngress(
+    conversationKey: string,
+    now = Date.now(),
+    claimTimeoutMs = 120_000,
+  ): string | null {
+    validateTimestamp(now);
+    if (!Number.isSafeInteger(claimTimeoutMs) || claimTimeoutMs <= 0) {
+      throw new Error("attachment ingress timeout must be a positive safe integer");
+    }
+    const staleBefore = Math.max(0, now - claimTimeoutMs);
+    const claim = this.db.transaction(() => {
+      const existing = this.db.query<{ present: number }, [string]>(`
+        SELECT 1 AS present FROM conversations WHERE conversation_key = ?
+      `).get(conversationKey);
+      if (!existing) return null;
+
+      const token = crypto.randomUUID();
+      const changed = this.db.query(`
+        UPDATE conversations
+        SET state = ?, updated_at = ?
+        WHERE conversation_key = ?
+          AND (
+            state = 'active'
+            OR (state LIKE 'attachment_ingress:%' AND updated_at < ?)
+          )
+      `).run(
+        `attachment_ingress:${token}`,
+        now,
+        conversationKey,
+        staleBefore,
+      ).changes;
+      if (changed === 0) {
+        throw new Error("conversation is unavailable for attachment ingress");
+      }
+      return token;
+    });
+    return claim.immediate();
+  }
+
+  recoverStaleAttachmentIngress(
+    conversationKey: string,
+    now = Date.now(),
+    claimTimeoutMs = 120_000,
+  ): boolean {
+    validateTimestamp(now);
+    if (!Number.isSafeInteger(claimTimeoutMs) || claimTimeoutMs <= 0) {
+      throw new Error("attachment ingress timeout must be a positive safe integer");
+    }
+    const staleBefore = Math.max(0, now - claimTimeoutMs);
+    return this.db.query(`
+      UPDATE conversations SET state = 'active', updated_at = ?
+      WHERE conversation_key = ? AND state LIKE 'attachment_ingress:%'
+        AND updated_at < ?
+    `).run(now, conversationKey, staleBefore).changes > 0;
+  }
+
+  releaseAttachmentIngress(
+    conversationKey: string,
+    token: string,
+    now = Date.now(),
+  ): boolean {
+    validateTimestamp(now);
+    if (!token) throw new Error("attachment ingress token is required");
+    return this.db.query(`
+      UPDATE conversations SET state = 'active', updated_at = ?
+      WHERE conversation_key = ? AND state = ?
+    `).run(now, conversationKey, `attachment_ingress:${token}`).changes > 0;
+  }
+
+  claimInactiveGuestSession(
+    cutoff: number,
+    now = Date.now(),
+    claimTimeoutMs = 30 * 60 * 1_000,
+  ): GuestCleanupClaim | null {
+    validateTimestamp(cutoff);
+    validateTimestamp(now);
+    if (cutoff > now) throw new Error("guest session cutoff may not be in the future");
+    if (!Number.isSafeInteger(claimTimeoutMs) || claimTimeoutMs <= 0) {
+      throw new Error("guest cleanup claim timeout must be a positive safe integer");
+    }
+    const staleBefore = Math.max(0, now - claimTimeoutMs);
+
+    const claim = this.db.transaction(() => {
+      const candidate = this.db.query<
+        { conversation_key: string; session_id: string; state: string },
+        [number, number, number]
+      >(`
+        SELECT conversation_key, session_id, state
+        FROM conversations AS c
+        WHERE c.session_id IS NOT NULL
+          AND c.session_role = 'guest'
+          AND c.last_activity_at < ?
+          AND (c.lease_until IS NULL OR c.lease_until <= ?)
+          AND (
+            c.state = 'active'
+            OR (c.state LIKE 'cleanup_pending:%' AND c.updated_at <= ?)
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM jobs AS j
+            WHERE j.conversation_key = c.conversation_key
+              AND j.status IN ('queued', 'running')
+          )
+        ORDER BY c.conversation_key
+        LIMIT 1
+      `).get(cutoff, now, staleBefore);
+      if (!candidate) return null;
+
+      const token = crypto.randomUUID();
+      const state = `cleanup_pending:${token}`;
+      const changed = this.db.query(`
+        UPDATE conversations
+        SET state = ?, updated_at = ?
+        WHERE conversation_key = ? AND session_id = ? AND state = ?
+      `).run(
+        state,
+        now,
+        candidate.conversation_key,
+        candidate.session_id,
+        candidate.state,
+      ).changes;
+      if (changed === 0) throw new Error("guest cleanup claim acquisition failed");
+      return {
+        conversationKey: candidate.conversation_key,
+        sessionId: candidate.session_id,
+        token,
+      };
+    });
+    return claim.immediate();
+  }
+
+  listPendingGuestSessionCleanups(limit = 100): GuestCleanupClaim[] {
+    if (!Number.isSafeInteger(limit) || limit <= 0 || limit > 1_000) {
+      throw new Error("guest cleanup limit must be between 1 and 1000");
+    }
+    return this.db.query<
+      { conversation_key: string; session_id: string; state: string },
+      [number]
+    >(`
+      SELECT conversation_key, session_id, state
+      FROM conversations
+      WHERE session_id IS NOT NULL AND session_role = 'guest'
+        AND state LIKE 'cleanup_pending:%'
+      ORDER BY updated_at, conversation_key
+      LIMIT ?
+    `).all(limit).map((row) => ({
+      conversationKey: row.conversation_key,
+      sessionId: row.session_id,
+      token: row.state.slice("cleanup_pending:".length),
+    }));
+  }
+
+  isGuestSessionCleanupPending(token: string): boolean {
+    if (!token) throw new Error("guest cleanup token is required");
+    return this.db.query<{ present: number }, [string]>(`
+      SELECT 1 AS present FROM conversations WHERE state = ? LIMIT 1
+    `).get(`cleanup_pending:${token}`) !== null;
+  }
+
+  completeGuestSessionCleanup(
+    conversationKey: string,
+    token: string,
+    now = Date.now(),
+  ): boolean {
+    validateTimestamp(now);
+    if (!token) throw new Error("guest cleanup token is required");
+    return this.db.query(`
+      UPDATE conversations
+      SET session_id = NULL, session_role = NULL,
+          generation = generation + 1, state = 'active',
+          lease_owner = NULL, lease_until = NULL, updated_at = ?
+      WHERE conversation_key = ? AND state = ?
+    `).run(now, conversationKey, `cleanup_pending:${token}`).changes > 0;
+  }
+
+  releaseGuestSessionCleanup(
+    conversationKey: string,
+    token: string,
+    now = Date.now(),
+  ): boolean {
+    validateTimestamp(now);
+    if (!token) throw new Error("guest cleanup token is required");
+    return this.db.query(`
+      UPDATE conversations SET state = 'active', updated_at = ?
+      WHERE conversation_key = ? AND state = ?
+    `).run(now, conversationKey, `cleanup_pending:${token}`).changes > 0;
+  }
+
   resetConversation(conversationKey: string, now = Date.now()): number {
     validateTimestamp(now);
     const reset = this.db.transaction(() =>
       this.resetConversationWithinTransaction(conversationKey, now));
-    return reset.immediate();
+    const generation = reset.immediate();
+    if (generation === null) throw new Error("conversation is busy");
+    return generation;
   }
 
   lookupIdentity: IdentityLookup = (userId) => {
@@ -1315,6 +1541,9 @@ export class Store {
           return `Conversation ${action.conversationKey} was not found.`;
         }
         const generation = this.resetConversationWithinTransaction(action.conversationKey, now);
+        if (generation === null) {
+          return `Conversation ${action.conversationKey} is busy; retry reset after maintenance.`;
+        }
         return `Conversation ${action.conversationKey} reset to generation ${generation}.`;
       }
       case "restart":
@@ -1322,7 +1551,7 @@ export class Store {
     }
   }
 
-  private resetConversationWithinTransaction(conversationKey: string, now: number): number {
+  private resetConversationWithinTransaction(conversationKey: string, now: number): number | null {
     const row = this.db
       .query<{ generation: number }, [number, number, number, number, string]>(`
         UPDATE conversations
@@ -1331,11 +1560,11 @@ export class Store {
             lease_owner = CASE WHEN lease_until > ? THEN lease_owner ELSE NULL END,
             lease_until = CASE WHEN lease_until > ? THEN lease_until ELSE NULL END,
             last_activity_at = ?, updated_at = ?
-        WHERE conversation_key = ?
+        WHERE conversation_key = ? AND state = 'active'
         RETURNING generation
       `)
       .get(now, now, now, now, conversationKey);
-    if (!row) throw new Error("conversation not found");
+    if (!row) return null;
     this.db
       .query(`
         UPDATE jobs
@@ -1379,11 +1608,11 @@ export class Store {
     this.db
       .query(`
         UPDATE conversations
-        SET lease_owner = NULL, lease_until = NULL, updated_at = ?
+        SET lease_owner = NULL, lease_until = NULL
         WHERE lease_until <= ?
           ${excludedConversations}
       `)
-      .run(now, now, ...exclusions.conversationKeys);
+      .run(now, ...exclusions.conversationKeys);
     return recovered;
   }
 
@@ -1465,7 +1694,10 @@ export class Store {
           UPDATE conversations
           SET session_id = COALESCE(?, session_id),
               session_role = COALESCE(?, session_role), lease_owner = NULL,
-              lease_until = NULL, last_activity_at = ?, updated_at = ?
+              lease_until = NULL, last_activity_at = ?,
+              updated_at = CASE
+                WHEN state LIKE 'attachment_ingress:%' THEN updated_at ELSE ?
+              END
           WHERE conversation_key = ? AND lease_owner = ?
         `)
         .run(sessionId, sessionRole, now, now, job.conversation_key, leaseOwner);
@@ -1531,7 +1763,10 @@ export class Store {
         .query(`
           UPDATE conversations
           SET lease_owner = NULL, lease_until = NULL,
-              last_activity_at = ?, updated_at = ?
+              last_activity_at = ?,
+              updated_at = CASE
+                WHEN state LIKE 'attachment_ingress:%' THEN updated_at ELSE ?
+              END
           WHERE conversation_key = ? AND lease_owner = ?
         `)
         .run(now, now, job.conversation_key, leaseOwner);

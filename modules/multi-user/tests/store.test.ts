@@ -1342,6 +1342,169 @@ describe("Store leases", () => {
 });
 
 describe("Store conversations and controls", () => {
+  test("claims only inactive guest sessions without runnable work or a live lease", () => {
+    const store = createStore();
+    for (const chatId of [22, 23, 24, 25, 26]) {
+      store.acceptUpdate(update(chatId, chatId, chatId), identity(chatId, chatId), 1_000);
+      const job = store.leaseNextJob(`worker-${chatId}`, 1_010, 10_000)!;
+      expect(store.completeJob(
+        job.id,
+        `worker-${chatId}`,
+        job.leaseToken!,
+        "done",
+        `session-${chatId}`,
+        "guest",
+        chatId === 23 ? 9_500 : 1_100,
+      )).toBe(true);
+    }
+    store.db.query("UPDATE conversations SET session_role = 'admin' WHERE conversation_key = ?")
+      .run("dm:24");
+    store.acceptUpdate(update(100, 25, 25), identity(25, 25), 1_200);
+    store.db.query(`
+      UPDATE conversations SET lease_owner = 'live', lease_until = 12_000
+      WHERE conversation_key = 'dm:26'
+    `).run();
+
+    const claim = store.claimInactiveGuestSession(9_000, 10_000, 1_000);
+    expect(claim).toMatchObject({ conversationKey: "dm:22", sessionId: "session-22" });
+    expect(store.getConversation("dm:22")).toMatchObject({
+      sessionId: "session-22",
+      sessionRole: "guest",
+      generation: 1,
+      state: `cleanup_pending:${claim!.token}`,
+    });
+    expect(store.getConversation("dm:23")?.sessionId).toBe("session-23");
+    expect(store.getConversation("dm:24")?.sessionId).toBe("session-24");
+    expect(store.getConversation("dm:25")?.sessionId).toBe("session-25");
+    expect(store.getConversation("dm:26")?.sessionId).toBe("session-26");
+  });
+
+  test("fences stale cleanup claims and permits updates only after release or completion", () => {
+    const store = createStore();
+    for (const chatId of [22]) {
+      store.acceptUpdate(update(chatId, chatId, chatId), identity(chatId, chatId), 1_000);
+      const job = store.leaseNextJob(`worker-${chatId}`, 1_010, 1_000)!;
+      store.completeJob(
+        job.id,
+        `worker-${chatId}`,
+        job.leaseToken!,
+        "done",
+        `session-${chatId}`,
+        "guest",
+        1_100,
+      );
+    }
+
+    const first = store.claimInactiveGuestSession(2_000, 3_000, 500)!;
+    expect(() => store.acceptUpdate(update(100, 22, 22), identity(22, 22), 3_100))
+      .toThrow("conversation sequence allocation failed");
+    expect(store.hasUpdate(100)).toBe(false);
+    expect(store.claimInactiveGuestSession(2_000, 3_499, 500)).toBeNull();
+    const reclaimed = store.claimInactiveGuestSession(2_000, 3_500, 500)!;
+    expect(reclaimed.conversationKey).toBe("dm:22");
+    expect(reclaimed.token).not.toBe(first.token);
+    expect(store.completeGuestSessionCleanup("dm:22", first.token, 3_600)).toBe(false);
+    expect(store.releaseGuestSessionCleanup("dm:22", first.token, 3_600)).toBe(false);
+    expect(store.releaseGuestSessionCleanup("dm:22", reclaimed.token, 3_600)).toBe(true);
+    expect(store.acceptUpdate(update(100, 22, 22), identity(22, 22), 3_700)).toBe(true);
+
+    store.acceptUpdate(update(23, 23, 23), identity(23, 23), 1_000);
+    const job = store.leaseNextJob("worker-23", 1_010, 1_000)!;
+    store.completeJob(
+      job.id,
+      "worker-23",
+      job.leaseToken!,
+      "done",
+      "session-23",
+      "guest",
+      1_100,
+    );
+    const second = store.claimInactiveGuestSession(2_000, 3_800, 500)!;
+    expect(second.conversationKey).toBe("dm:23");
+    expect(store.completeGuestSessionCleanup("dm:23", second.token, 3_900)).toBe(true);
+    expect(store.getConversation("dm:23")).toMatchObject({
+      sessionId: null,
+      sessionRole: null,
+      generation: 2,
+      state: "active",
+    });
+    expect(store.acceptUpdate(update(101, 23, 23), identity(23, 23), 4_000)).toBe(true);
+  });
+
+  test("attachment ingress coexists with and preserves an active worker lease", () => {
+    const store = createStore();
+    store.acceptUpdate(update(1, 22, 22), identity(22, 22), 1_000);
+    const ingress = store.claimAttachmentIngress("dm:22", 1_050, 500)!;
+    const worker = store.leaseNextJob("worker", 1_100, 1_000)!;
+    expect(store.getConversation("dm:22")).toMatchObject({
+      state: `attachment_ingress:${ingress}`,
+      leaseOwner: "worker",
+      leaseUntil: 2_100,
+    });
+    expect(store.db.query<{ updated_at: number }, [string]>(
+      "SELECT updated_at FROM conversations WHERE conversation_key = ?",
+    ).get("dm:22")?.updated_at).toBe(1_050);
+    expect(store.renewLease(worker.id, "worker", worker.leaseToken!, 1_200, 1_000)).toBe(true);
+    expect(store.db.query<{ updated_at: number }, [string]>(
+      "SELECT updated_at FROM conversations WHERE conversation_key = ?",
+    ).get("dm:22")?.updated_at).toBe(1_050);
+    expect(store.acceptUpdate(
+      update(2, 22, 22),
+      identity(22, 22),
+      1_300,
+      { conversationKey: "dm:22", token: ingress },
+    )).toBe(true);
+    expect(store.getConversation("dm:22")).toMatchObject({
+      state: "active",
+      leaseOwner: "worker",
+      leaseUntil: 2_200,
+      lastActivityAt: 1_300,
+    });
+  });
+
+  test("attachment ingress blocks cleanup without blocking unrelated conversations", () => {
+    const store = createStore();
+    store.acceptUpdate(update(1, 22, 22), identity(22, 22), 1_000);
+    const job = store.leaseNextJob("worker", 1_010, 100)!;
+    store.completeJob(
+      job.id,
+      "worker",
+      job.leaseToken!,
+      "done",
+      "guest-session",
+      "guest",
+      1_020,
+    );
+
+    const ingress = store.claimAttachmentIngress("dm:22", 2_000, 500)!;
+    expect(store.claimInactiveGuestSession(1_500, 2_100, 500)).toBeNull();
+    expect(store.acceptUpdate(update(3, 33, 33), identity(33, 33), 2_100)).toBe(true);
+    expect(store.releaseAttachmentIngress("dm:22", ingress, 2_101)).toBe(true);
+  });
+
+  test("stale attachment ingress is recoverable and old tokens remain fenced", () => {
+    const store = createStore();
+    store.acceptUpdate(update(1, 22, 22), identity(22, 22), 1_000);
+    const stale = store.claimAttachmentIngress("dm:22", 2_000, 100)!;
+    expect(store.recoverStaleAttachmentIngress("dm:22", 2_100, 100)).toBe(false);
+    expect(store.recoverStaleAttachmentIngress("dm:22", 2_101, 100)).toBe(true);
+    expect(store.releaseAttachmentIngress("dm:22", stale, 2_101)).toBe(false);
+    expect(() => store.acceptUpdate(
+      update(2, 22, 22),
+      identity(22, 22),
+      2_102,
+      { conversationKey: "dm:22", token: stale },
+    )).toThrow("attachment ingress fence is stale");
+    expect(store.hasUpdate(2)).toBe(false);
+    expect(store.acceptUpdate(update(2, 22, 22), identity(22, 22), 2_103)).toBe(true);
+
+    const first = store.claimAttachmentIngress("dm:22", 3_000, 100)!;
+    const reclaimed = store.claimAttachmentIngress("dm:22", 3_101, 100)!;
+    expect(reclaimed).not.toBe(first);
+    expect(store.releaseAttachmentIngress("dm:22", first, 3_102)).toBe(false);
+    expect(store.releaseAttachmentIngress("dm:22", reclaimed, 3_102)).toBe(true);
+  });
+
   test("persists a session only through fenced completion before reset", () => {
     const store = createStore();
     store.acceptUpdate(update(1, 22, 22), identity(22, 22), 1_000);

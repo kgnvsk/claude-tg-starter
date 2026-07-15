@@ -3,6 +3,7 @@ import { resolveIdentity } from "./policy";
 import { TelegramApiError, splitTelegramMessage } from "./telegram";
 import type {
   AcceptedIdentity,
+  AttachmentIngressContext,
   IdentityLookup,
   MultiUserConfig,
   NormalizedAttachment,
@@ -12,6 +13,8 @@ import type {
 } from "./types";
 
 const OFFSET_SETTING = "telegram_offset";
+const ATTACHMENT_INGRESS_STALE_MS = 120_000;
+const ATTACHMENT_DOWNLOAD_TIMEOUT_MS = 90_000;
 
 interface TelegramIngress {
   getUpdates(
@@ -99,7 +102,23 @@ interface ReceiverStore extends AdminStore {
     maxAttempts: number,
     now: number,
   ): boolean;
-  acceptUpdate(update: NormalizedUpdate, identity: AcceptedIdentity): boolean;
+  claimAttachmentIngress(
+    conversationKey: string,
+    now: number,
+    claimTimeoutMs: number,
+  ): string | null;
+  recoverStaleAttachmentIngress?(
+    conversationKey: string,
+    now: number,
+    claimTimeoutMs: number,
+  ): boolean;
+  releaseAttachmentIngress(conversationKey: string, token: string, now: number): boolean;
+  acceptUpdate(
+    update: NormalizedUpdate,
+    identity: AcceptedIdentity,
+    now?: number,
+    ingress?: AttachmentIngressContext,
+  ): boolean;
   getSetting(key: string): string | null;
   setSetting(key: string, value: string): void;
 }
@@ -234,23 +253,52 @@ export class Receiver {
       return "rejected";
     }
 
+    this.store.recoverStaleAttachmentIngress?.(
+      identity.conversationKey,
+      this.clock(),
+      ATTACHMENT_INGRESS_STALE_MS,
+    );
+
     const adminResult = await this.admin.handle(update, identity);
     if (adminResult !== "not_handled") {
       return adminResult === "duplicate" ? "duplicate" : "accepted";
     }
 
     const attachments = update.message.attachments;
-    const durableUpdate: NormalizedUpdate = attachments?.length
-      ? {
-          ...update,
-          message: {
-            ...update.message,
-            attachments: await this.downloadAttachments(update, identity, signal),
-          },
-        }
-      : update;
-
-    return this.store.acceptUpdate(durableUpdate, identity) ? "accepted" : "duplicate";
+    let ingressToken: string | null = null;
+    if (attachments?.length) {
+      ingressToken = this.store.claimAttachmentIngress(
+        identity.conversationKey,
+        this.clock(),
+        ATTACHMENT_INGRESS_STALE_MS,
+      );
+    }
+    try {
+      const durableUpdate: NormalizedUpdate = attachments?.length
+        ? {
+            ...update,
+            message: {
+              ...update.message,
+              attachments: await withOperationDeadline(
+                ATTACHMENT_DOWNLOAD_TIMEOUT_MS,
+                signal,
+                (downloadSignal) => this.downloadAttachments(update, identity, downloadSignal),
+              ),
+            },
+          }
+        : update;
+      const ingress = ingressToken
+        ? { conversationKey: identity.conversationKey, token: ingressToken }
+        : undefined;
+      return this.store.acceptUpdate(durableUpdate, identity, this.clock(), ingress)
+        ? "accepted"
+        : "duplicate";
+    } catch (error) {
+      if (ingressToken) {
+        this.store.releaseAttachmentIngress(identity.conversationKey, ingressToken, this.clock());
+      }
+      throw error;
+    }
   }
 
   async pollOnce(signal?: AbortSignal): Promise<number> {
@@ -585,7 +633,7 @@ async function withOperationDeadline<T>(
   if (shutdownSignal?.aborted) abortFromShutdown();
   else shutdownSignal?.addEventListener("abort", abortFromShutdown, { once: true });
   const timeout = setTimeout(
-    () => controller.abort(new DOMException("outbox send deadline exceeded", "TimeoutError")),
+    () => controller.abort(new DOMException("receiver operation deadline exceeded", "TimeoutError")),
     milliseconds,
   );
   try {

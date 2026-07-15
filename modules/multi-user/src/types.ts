@@ -73,6 +73,11 @@ export interface AcceptedIdentity {
   conversationKey: string;
 }
 
+export interface AttachmentIngressContext {
+  conversationKey: string;
+  token: string;
+}
+
 export interface RejectedIdentity {
   accepted: false;
   reason: "blocked" | "invite_required";
