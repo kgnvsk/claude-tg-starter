@@ -56,7 +56,7 @@ expect(resolveIdentity(cfg, groupUpdate(-100, 22))).toMatchObject({
 
 - [ ] **Step 2: Run the policy tests and confirm missing-module failure**
 
-Run: `bun test modules/multi-user/tests/policy.test.ts`  
+Run: `bun test modules/multi-user/tests/policy.test.ts`
 Expected: FAIL because `src/policy.ts` does not exist.
 
 - [ ] **Step 3: Implement typed identity policy**
@@ -85,7 +85,7 @@ increasing per-conversation job sequence, transactional enqueue, and lease times
 
 - [ ] **Step 6: Run foundation tests**
 
-Run: `bun test modules/multi-user/tests/store.test.ts modules/multi-user/tests/policy.test.ts`  
+Run: `bun test modules/multi-user/tests/store.test.ts modules/multi-user/tests/policy.test.ts`
 Expected: PASS.
 
 - [ ] **Step 7: Commit foundation**
@@ -129,7 +129,7 @@ commits. Keep this process as the only Bot API poller.
 
 - [ ] **Step 5: Run ingress tests and commit**
 
-Run: `bun test modules/multi-user/tests/telegram.test.ts modules/multi-user/tests/receiver.test.ts`  
+Run: `bun test modules/multi-user/tests/telegram.test.ts modules/multi-user/tests/receiver.test.ts`
 Expected: PASS.
 
 ```bash
@@ -171,7 +171,7 @@ parsing. Return structured `WorkerResult`; never send Telegram messages from the
 
 - [ ] **Step 5: Run worker tests and commit**
 
-Run: `bun test modules/multi-user/tests/worker.test.ts`  
+Run: `bun test modules/multi-user/tests/worker.test.ts`
 Expected: PASS with the Claude executable replaced by a fixture script.
 
 ```bash
@@ -204,7 +204,7 @@ job and continue the conversation queue.
 
 - [ ] **Step 4: Run dispatcher tests and commit**
 
-Run: `bun test modules/multi-user/tests/dispatcher.test.ts`  
+Run: `bun test modules/multi-user/tests/dispatcher.test.ts`
 Expected: PASS.
 
 ```bash
@@ -239,7 +239,7 @@ but never reaches mutation code.
 
 - [ ] **Step 4: Run admin tests and commit**
 
-Run: `bun test modules/multi-user/tests/admin.test.ts`  
+Run: `bun test modules/multi-user/tests/admin.test.ts`
 Expected: PASS.
 
 ```bash
@@ -287,7 +287,7 @@ saved flag is enabled.
 
 - [ ] **Step 5: Run installer tests and commit**
 
-Run: `bun test modules/multi-user/tests && bash -n modules/multi-user/install.sh assets/install-core.sh update.sh`  
+Run: `bun test modules/multi-user/tests && bash -n modules/multi-user/install.sh assets/install-core.sh update.sh`
 Expected: all tests PASS and shell syntax checks exit 0.
 
 ```bash
@@ -364,4 +364,3 @@ gh pr create --base main --head feat/multi-user-routing --title "feat: parallel 
 
 Use a normal merge through GitHub, then verify `origin/main` contains the merge commit. Do not force
 push the rewritten main history.
-

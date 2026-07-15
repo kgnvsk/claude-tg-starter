@@ -1,7 +1,7 @@
 # Multi-user Telegram routing: admin and guest
 
-**Status:** approved design  
-**Date:** 2026-07-15  
+**Status:** approved design
+**Date:** 2026-07-15
 **Repository:** `kgnvsk/claude-tg-starter`
 
 ## 1. Goal
