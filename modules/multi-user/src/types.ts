@@ -1,0 +1,103 @@
+export type Role = "admin" | "guest";
+export type AccessMode = "public" | "invite";
+export type ChatType = "private" | "group" | "supergroup";
+export type UserStatus = "active" | "inactive";
+
+export interface MultiUserConfig {
+  adminChatIds: ReadonlySet<number>;
+  guestAccessMode: AccessMode;
+}
+
+export interface NormalizedUser {
+  id: number;
+  username?: string;
+  firstName?: string;
+  lastName?: string;
+}
+
+export interface NormalizedChat {
+  id: number;
+  type: ChatType;
+  title?: string;
+  username?: string;
+}
+
+export interface NormalizedAttachment {
+  kind: "document" | "photo" | "audio" | "video" | "voice";
+  fileId: string;
+  fileName?: string;
+  mimeType?: string;
+  fileSize?: number;
+}
+
+export interface NormalizedMessage {
+  messageId: number;
+  date: number;
+  text: string;
+  sender: NormalizedUser;
+  chat: NormalizedChat;
+  attachments?: readonly NormalizedAttachment[];
+}
+
+export interface NormalizedUpdate {
+  updateId: number;
+  message: NormalizedMessage;
+}
+
+export interface StoredIdentity {
+  role: Role;
+  status: UserStatus;
+  blocked?: boolean;
+}
+
+export type IdentityLookup = (userId: number) => StoredIdentity | null;
+
+export interface AcceptedIdentity {
+  accepted: true;
+  role: Role;
+  userId: number;
+  chatId: number;
+  chatType: ChatType;
+  conversationKey: string;
+}
+
+export interface RejectedIdentity {
+  accepted: false;
+  reason: "blocked" | "invite_required";
+  userId: number;
+  chatId: number;
+}
+
+export type ResolvedIdentity = AcceptedIdentity | RejectedIdentity;
+
+export type JobStatus = "queued" | "running" | "completed" | "failed";
+
+export interface StoredConversation {
+  key: string;
+  chatId: number;
+  sessionId: string | null;
+  generation: number;
+  state: string;
+  nextSequence: number;
+  leaseOwner: string | null;
+  leaseUntil: number | null;
+  lastActivityAt: number;
+}
+
+export interface StoredJob {
+  id: number;
+  updateId: number;
+  conversationKey: string;
+  generation: number;
+  sequence: number;
+  status: JobStatus;
+  role: Role;
+  payload: NormalizedUpdate;
+  attempts: number;
+  leaseOwner: string | null;
+  leaseToken: string | null;
+  leaseUntil: number | null;
+  error: string | null;
+  createdAt: number;
+  updatedAt: number;
+}
