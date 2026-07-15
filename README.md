@@ -10,6 +10,7 @@ Turn-key start for **your own personal Claude Code Telegram agent** — self-hos
 - Deploy to Vercel (web pages / reports)
 - Obsidian-vault memory + pre-search index (the agent knows what's in its memory)
 - Resilience: self-kill guard, healthcheck, format-enforcer, instant ack — the bot doesn't crash or go silent
+- Optional multi-user mode: unrelated Telegram chats run concurrently; every private guest and every group gets an isolated resumable session
 - **Self-service:** the owner configures the bot straight from chat — adds people (pairing), changes settings, allow-list, writes files. Safe (owner only)
 - Useful skills from public marketplaces: `superpowers` (process skills), `frontend-design`, + ours (codex-imagegen, vercel-deploy, research, analyze-video)
 
@@ -43,6 +44,12 @@ After deploy the owner runs everything from the Telegram chat:
 - "remember rule Y" → the bot appends to its persona
 
 No second tool, no engineer.
+
+## Optional multi-user mode
+
+Set `MODULE_MULTI_USER=1` when the bot must accept messages from many people. One durable receiver records Telegram updates, then a bounded dispatcher runs unrelated chats in parallel. Private chats have independent sessions; all members of one group share that group's session. Dormant sessions are SQLite records, not background processes.
+
+Admins are matched only by numeric `ADMIN_CHAT_IDS` and keep the owner's normal agent capabilities in private chat. Guests cannot read the owner vault, change the agent/server, or use private MCP tools. Public access is the default; invitation-only mode and one-command rollback are documented in [the module guide](modules/multi-user/README.md). The module is off by default and cannot run together with `MODULE_TRANSPORT_DAEMON=1`.
 
 ## Security
 Changes to the allow-list / settings / pairing happen ONLY on a command from the owner's chat (their chat_id). Anyone else who writes to the bot is never added automatically. Secrets live in `agent.env` (which is in `.gitignore`) — they never reach the repository.

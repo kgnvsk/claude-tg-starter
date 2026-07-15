@@ -12,6 +12,7 @@
 |---|---|---|---|
 | `MODULE_DESIGN_PACK=1`    | Дизайн-скиллы (`impeccable`, `frontend-design`, `apple-bento`) + деплой на Vercel (`vercel-deploy` + `~/bin/vc`) | `assets/skills/impeccable`, `assets/skills/vercel-deploy`, `assets/bin/vc` | node (Фаза 1), токен Vercel (Фаза 6) |
 | `MODULE_TRANSPORT_DAEMON=1` | (v3, эксперимент) приём Telegram → lingered systemd-user демон — бот не глохнет при смерти claude-процесса; offset на диске, нет 409 | `modules/transport-daemon/` | bun, systemd-user + linger; ставится `modules/transport-daemon/install.sh` (откат: `… install.sh disable`) |
+| `MODULE_MULTI_USER=1` | Durable multi-user Telegram routing: один receiver и bounded Claude dispatcher | `modules/multi-user/` | bun, SQLite, systemd-user + linger; несовместим с `MODULE_TRANSPORT_DAEMON=1` |
 | `MODULE_VAULT_WEB=1` | Веб-вью Obsidian-vault на Vercel (Quartz: граф + заметки + бэклинки + поиск), за паролем (free middleware-auth). Read-only. | `modules/vault-web/` | Vercel-аккаунт (подключить репо vault + env `SITE_PASSWORD`); ставится `modules/vault-web/setup.sh <домен>` |
 
 Дополнительно (ставится по `modules/`, не флагом ядра):

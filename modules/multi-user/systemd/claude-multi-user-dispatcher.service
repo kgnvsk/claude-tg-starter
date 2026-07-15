@@ -1,0 +1,25 @@
+[Unit]
+Description=Cash multi-user Claude dispatcher
+Documentation=https://github.com/kgnvsk/claude-tg-starter
+Wants=network-online.target claude-multi-user-receiver.service
+After=network-online.target claude-multi-user-receiver.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h
+EnvironmentFile=%h/multi-user/multi-user.env
+Environment=PATH=%h/.local/bin:%h/.bun/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/.bun/bin/bun %h/multi-user/src/dispatcher-main.ts
+Restart=always
+RestartSec=3
+UMask=0077
+PrivateTmp=true
+ProtectHome=false
+MemoryMax=4G
+TasksMax=512
+LimitNOFILE=8192
+TimeoutStopSec=30
+SuccessExitStatus=0 143
+
+[Install]
+WantedBy=default.target
