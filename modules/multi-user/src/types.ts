@@ -85,6 +85,18 @@ export type ResolvedIdentity = AcceptedIdentity | RejectedIdentity;
 export type JobStatus = "queued" | "running" | "completed" | "failed";
 export type OutboundReplyStatus = "pending" | "leased" | "delivered" | "failed";
 
+export type AdminMutationAction =
+  | { type: "access"; mode: AccessMode }
+  | { type: "block"; userId: number; reason: string | null }
+  | { type: "cancel"; jobId: number }
+  | { type: "reset"; conversationKey: string }
+  | { type: "restart" };
+
+export interface EmergencyResult {
+  ok: boolean;
+  message: string;
+}
+
 export interface StoredConversation {
   key: string;
   chatId: number;

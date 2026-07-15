@@ -1,3 +1,4 @@
+import { AdminController, type AdminStore, type EmergencyControls } from "./admin";
 import { resolveIdentity } from "./policy";
 import { TelegramApiError, splitTelegramMessage } from "./telegram";
 import type {
@@ -35,7 +36,7 @@ interface TelegramIngress {
   ): Promise<void>;
 }
 
-interface ReceiverStore {
+interface ReceiverStore extends AdminStore {
   lookupIdentity: IdentityLookup;
   hasUpdate(updateId: number): boolean;
   recordTerminalUpdate(
@@ -121,6 +122,7 @@ interface ReceiverOptions {
     initialBackoffMs: number;
     maxBackoffMs: number;
   };
+  emergency?: EmergencyControls;
 }
 
 interface RawFile {
@@ -147,6 +149,7 @@ export class Receiver {
   private readonly outboundMaxAttempts: number;
   private readonly outboundInitialBackoffMs: number;
   private readonly outboundMaxBackoffMs: number;
+  private readonly admin: AdminController;
 
   constructor(options: ReceiverOptions) {
     this.telegram = options.telegram;
@@ -167,6 +170,12 @@ export class Receiver {
     this.outboundMaxAttempts = options.outbound?.maxAttempts ?? 5;
     this.outboundInitialBackoffMs = options.outbound?.initialBackoffMs ?? 1_000;
     this.outboundMaxBackoffMs = options.outbound?.maxBackoffMs ?? 60_000;
+    this.admin = new AdminController({
+      store: this.store,
+      adminIds: this.config.adminChatIds,
+      emergency: options.emergency,
+      clock: this.clock,
+    });
     if (this.initialBackoffMs <= 0 || this.maxBackoffMs < this.initialBackoffMs) {
       throw new Error("receiver backoff must be positive and bounded");
     }
@@ -202,7 +211,15 @@ export class Receiver {
         : "duplicate";
     }
 
-    const identity = resolveIdentity(this.config, update, this.store.lookupIdentity);
+    const storedAccessMode = this.store.getSetting("guest_access_mode");
+    const guestAccessMode = storedAccessMode === "public" || storedAccessMode === "invite"
+      ? storedAccessMode
+      : this.config.guestAccessMode;
+    const identity = resolveIdentity(
+      { ...this.config, guestAccessMode },
+      update,
+      this.store.lookupIdentity,
+    );
     if (!identity.accepted) {
       const replyText = identity.reason === "blocked"
         ? "Access to this bot is blocked."
@@ -215,6 +232,11 @@ export class Receiver {
       );
       if (!inserted) return "duplicate";
       return "rejected";
+    }
+
+    const adminResult = await this.admin.handle(update, identity);
+    if (adminResult !== "not_handled") {
+      return adminResult === "duplicate" ? "duplicate" : "accepted";
     }
 
     const attachments = update.message.attachments;

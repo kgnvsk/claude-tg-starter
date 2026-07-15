@@ -1440,12 +1440,13 @@ describe("Store conversations and controls", () => {
     expect(store.getConversation("dm:22")).toMatchObject({
       generation: 2,
       sessionId: null,
-      leaseOwner: null,
-      leaseUntil: null,
+      leaseOwner: "worker-a",
+      leaseUntil: 3_000,
     });
 
     store.acceptUpdate(update(3, 22, 22), identity(22, 22), 2_300);
-    expect(store.leaseNextJob("worker-b", 2_400, 1_000)).toMatchObject({
+    expect(store.leaseNextJob("worker-b", 2_400, 1_000)).toBeNull();
+    expect(store.leaseNextJob("worker-b", 3_001, 1_000)).toMatchObject({
       updateId: 3,
       generation: 2,
     });

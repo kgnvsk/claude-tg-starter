@@ -1,7 +1,13 @@
 import { Database } from "bun:sqlite";
 
+import {
+  parseAdminActionJson,
+  type AdminConfirmResult,
+} from "./admin";
+
 import type {
   AcceptedIdentity,
+  AdminMutationAction,
   IdentityLookup,
   JobStatus,
   NormalizedUpdate,
@@ -289,6 +295,159 @@ export class Store {
       return true;
     });
     return record.immediate();
+  }
+
+  recordAdminReply(
+    update: NormalizedUpdate,
+    identity: AcceptedIdentity,
+    text: string,
+    now = Date.now(),
+  ): boolean {
+    validateTimestamp(now);
+    this.validateAdminIdentity(update, identity);
+    if (!text) throw new Error("admin reply text is required");
+    const record = this.db.transaction(() => {
+      if (!this.insertAdminUpdate(update, identity, now)) return false;
+      this.insertOutboundReply(update.updateId, identity.chatId, text, now);
+      return true;
+    });
+    return record.immediate();
+  }
+
+  recordAdminActionRequest(
+    update: NormalizedUpdate,
+    identity: AcceptedIdentity,
+    action: AdminMutationAction,
+    token: string,
+    expiresAt: number,
+    text: string,
+    now = Date.now(),
+  ): boolean {
+    validateTimestamp(now);
+    validateTimestamp(expiresAt);
+    this.validateAdminIdentity(update, identity);
+    if (expiresAt <= now) throw new Error("admin action expiry must be in the future");
+    if (!/^[A-Za-z0-9_-]{16,128}$/.test(token)) throw new Error("admin action token is invalid");
+    if (!text) throw new Error("admin confirmation reply is required");
+    if (action.type === "block" && this.adminChatIds.has(action.userId)) {
+      throw new Error("configured administrators cannot be blocked");
+    }
+    const payloadJson = JSON.stringify(action);
+    parseAdminActionJson(action.type, payloadJson);
+
+    const record = this.db.transaction(() => {
+      if (!this.insertAdminUpdate(update, identity, now)) return false;
+      this.db
+        .query(`
+          INSERT INTO pending_admin_actions (
+            token, action_type, payload_json, requested_by, expires_at, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?)
+        `)
+        .run(token, action.type, payloadJson, identity.userId, expiresAt, now);
+      this.insertOutboundReply(update.updateId, identity.chatId, text, now);
+      return true;
+    });
+    return record.immediate();
+  }
+
+  recordAdminUnblock(
+    update: NormalizedUpdate,
+    identity: AcceptedIdentity,
+    userId: number,
+    now = Date.now(),
+  ): boolean {
+    validateTimestamp(now);
+    this.validateAdminIdentity(update, identity);
+    if (!Number.isSafeInteger(userId) || userId === 0) {
+      throw new Error("Telegram user ID must be a non-zero safe integer");
+    }
+    const record = this.db.transaction(() => {
+      if (!this.insertAdminUpdate(update, identity, now)) return false;
+      const changed = this.db
+        .query("DELETE FROM blocks WHERE telegram_user_id = ?")
+        .run(userId).changes > 0;
+      this.insertOutboundReply(
+        update.updateId,
+        identity.chatId,
+        changed
+          ? `Telegram user ${userId} is unblocked.`
+          : `Telegram user ${userId} was not blocked.`,
+        now,
+      );
+      return true;
+    });
+    return record.immediate();
+  }
+
+  confirmAdminAction(
+    update: NormalizedUpdate,
+    identity: AcceptedIdentity,
+    token: string,
+    now = Date.now(),
+  ): AdminConfirmResult {
+    validateTimestamp(now);
+    this.validateAdminIdentity(update, identity);
+    if (!/^[A-Za-z0-9_-]{16,128}$/.test(token)) throw new Error("admin action token is invalid");
+
+    const confirm = this.db.transaction(() => {
+      if (!this.insertAdminUpdate(update, identity, now)) {
+        return { recorded: false, postCommitEffect: null } satisfies AdminConfirmResult;
+      }
+      const row = this.db
+        .query<{
+          action_type: string;
+          payload_json: string;
+          requested_by: number;
+          expires_at: number;
+          consumed_at: number | null;
+        }, [string]>(`
+          SELECT action_type, payload_json, requested_by, expires_at, consumed_at
+          FROM pending_admin_actions WHERE token = ?
+        `)
+        .get(token);
+
+      let reply: string;
+      let postCommitEffect: AdminConfirmResult["postCommitEffect"] = null;
+      if (!row) {
+        reply = "Confirmation token was not found.";
+      } else if (row.requested_by !== identity.userId) {
+        reply = "This confirmation belongs to another administrator.";
+      } else if (row.consumed_at !== null) {
+        reply = "This confirmation was already used.";
+      } else if (row.expires_at <= now) {
+        reply = "This confirmation has expired.";
+        this.db
+          .query(`
+            UPDATE pending_admin_actions SET consumed_at = ?
+            WHERE token = ? AND consumed_at IS NULL
+          `)
+          .run(now, token);
+      } else {
+        let action: AdminMutationAction | null = null;
+        try {
+          action = parseAdminActionJson(row.action_type, row.payload_json);
+        } catch (error) {
+          reply = `Stored admin action is invalid: ${errorMessage(error)}`;
+        }
+        if (action?.type === "block" && this.adminChatIds.has(action.userId)) {
+          action = null;
+          reply = "Stored admin action is invalid: configured administrators cannot be blocked";
+        }
+        if (action !== null) {
+          reply = this.executeAdminAction(action, identity.userId, now);
+          if (action.type === "restart") postCommitEffect = { type: "restart" };
+        }
+        this.db
+          .query(`
+            UPDATE pending_admin_actions SET consumed_at = ?
+            WHERE token = ? AND consumed_at IS NULL
+          `)
+          .run(now, token);
+      }
+      this.insertOutboundReply(update.updateId, identity.chatId, reply, now);
+      return { recorded: true, postCommitEffect } satisfies AdminConfirmResult;
+    });
+    return confirm.immediate();
   }
 
   listOutboundReplies(): StoredOutboundReply[] {
@@ -978,32 +1137,8 @@ export class Store {
 
   resetConversation(conversationKey: string, now = Date.now()): number {
     validateTimestamp(now);
-    const reset = this.db.transaction(() => {
-      const row = this.db
-        .query<{ generation: number }, [number, number, string]>(`
-          UPDATE conversations
-          SET session_id = NULL, session_role = NULL,
-              generation = generation + 1, state = 'active',
-              lease_owner = NULL, lease_until = NULL,
-              last_activity_at = ?, updated_at = ?
-          WHERE conversation_key = ?
-          RETURNING generation
-        `)
-        .get(now, now, conversationKey);
-      if (!row) throw new Error("conversation not found");
-
-      this.db
-        .query(`
-          UPDATE jobs
-          SET status = 'failed', lease_owner = NULL, lease_token = NULL,
-              lease_until = NULL,
-              error = 'conversation_reset', updated_at = ?
-          WHERE conversation_key = ? AND generation < ?
-            AND status IN ('queued', 'running')
-        `)
-        .run(now, conversationKey, row.generation);
-      return row.generation;
-    });
+    const reset = this.db.transaction(() =>
+      this.resetConversationWithinTransaction(conversationKey, now));
     return reset.immediate();
   }
 
@@ -1075,6 +1210,152 @@ export class Store {
         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
       `)
       .run(key, value, now);
+  }
+
+  private insertAdminUpdate(
+    update: NormalizedUpdate,
+    identity: AcceptedIdentity,
+    now: number,
+  ): boolean {
+    const payloadJson = JSON.stringify(update);
+    if (payloadJson === undefined) throw new Error("admin update payload is not serializable");
+    return Boolean(
+      this.db
+        .query<{ update_id: number }, [number, string, string, number]>(`
+          INSERT INTO updates (
+            update_id, conversation_key, processing_state, payload_json, created_at
+          ) VALUES (?, ?, 'accepted', ?, ?)
+          ON CONFLICT(update_id) DO NOTHING
+          RETURNING update_id
+        `)
+        .get(update.updateId, identity.conversationKey, payloadJson, now),
+    );
+  }
+
+  private insertOutboundReply(
+    updateId: number,
+    chatId: number,
+    text: string,
+    now: number,
+  ): void {
+    this.db
+      .query(`
+        INSERT INTO outbound_replies (
+          update_id, chat_id, text, status, attempts, next_chunk_index,
+          next_attempt_at, created_at, updated_at
+        ) VALUES (?, ?, ?, 'pending', 0, 0, ?, ?, ?)
+      `)
+      .run(updateId, chatId, text, now, now, now);
+  }
+
+  private executeAdminAction(
+    action: AdminMutationAction,
+    requestedBy: number,
+    now: number,
+  ): string {
+    switch (action.type) {
+      case "access":
+        this.db
+          .query(`
+            INSERT INTO settings (key, value, updated_at) VALUES ('guest_access_mode', ?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+          `)
+          .run(action.mode, now);
+        return `Guest access mode is now ${action.mode}.`;
+      case "block":
+        if (this.adminChatIds.has(action.userId)) {
+          throw new Error("configured administrators cannot be blocked");
+        }
+        this.db
+          .query(`
+            INSERT INTO blocks (telegram_user_id, reason, blocked_by, created_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(telegram_user_id) DO UPDATE SET
+              reason = excluded.reason,
+              blocked_by = excluded.blocked_by,
+              created_at = excluded.created_at
+          `)
+          .run(action.userId, action.reason, requestedBy, now);
+        return `Telegram user ${action.userId} is blocked.`;
+      case "cancel": {
+        const job = this.db
+          .query<{
+            status: JobStatus;
+            conversation_key: string;
+          }, [number]>(`
+            SELECT status, conversation_key FROM jobs WHERE id = ?
+          `)
+          .get(action.jobId);
+        if (!job) return `Job ${action.jobId} was not found.`;
+        if (job.status !== "queued" && job.status !== "running") {
+          return `Job ${action.jobId} is already ${job.status}.`;
+        }
+        this.db
+          .query(`
+            UPDATE jobs
+            SET status = 'failed', lease_owner = NULL, lease_token = NULL,
+                lease_until = NULL, error = 'admin_cancelled', updated_at = ?
+            WHERE id = ? AND status IN ('queued', 'running')
+          `)
+          .run(now, action.jobId);
+        // A running worker is fenced immediately, but its conversation lease is
+        // retained until expiry so the next turn cannot overlap its shutdown.
+        return `Job ${action.jobId} was cancelled.`;
+      }
+      case "reset": {
+        const conversation = this.db
+          .query<{ telegram_chat_id: number }, [string]>(`
+            SELECT telegram_chat_id FROM conversations WHERE conversation_key = ?
+          `)
+          .get(action.conversationKey);
+        if (
+          !conversation ||
+          !conversationKeyMatchesChat(action.conversationKey, conversation.telegram_chat_id)
+        ) {
+          return `Conversation ${action.conversationKey} was not found.`;
+        }
+        const generation = this.resetConversationWithinTransaction(action.conversationKey, now);
+        return `Conversation ${action.conversationKey} reset to generation ${generation}.`;
+      }
+      case "restart":
+        return "Restart requested.";
+    }
+  }
+
+  private resetConversationWithinTransaction(conversationKey: string, now: number): number {
+    const row = this.db
+      .query<{ generation: number }, [number, number, number, number, string]>(`
+        UPDATE conversations
+        SET session_id = NULL, session_role = NULL,
+            generation = generation + 1, state = 'active',
+            lease_owner = CASE WHEN lease_until > ? THEN lease_owner ELSE NULL END,
+            lease_until = CASE WHEN lease_until > ? THEN lease_until ELSE NULL END,
+            last_activity_at = ?, updated_at = ?
+        WHERE conversation_key = ?
+        RETURNING generation
+      `)
+      .get(now, now, now, now, conversationKey);
+    if (!row) throw new Error("conversation not found");
+    this.db
+      .query(`
+        UPDATE jobs
+        SET status = 'failed', lease_owner = NULL, lease_token = NULL,
+            lease_until = NULL, error = 'conversation_reset', updated_at = ?
+        WHERE conversation_key = ? AND generation < ?
+          AND status IN ('queued', 'running')
+      `)
+      .run(now, conversationKey, row.generation);
+    return row.generation;
+  }
+
+  private validateAdminIdentity(
+    update: NormalizedUpdate,
+    identity: AcceptedIdentity,
+  ): void {
+    this.validateAcceptedIdentity(update, identity);
+    if (identity.role !== "admin" || !this.adminChatIds.has(identity.userId)) {
+      throw new Error("admin command requires a configured numeric administrator");
+    }
   }
 
   private recoverExpiredLeasesWithinTransaction(
@@ -1816,6 +2097,14 @@ function validateTimestamp(now: number): void {
   if (!Number.isSafeInteger(now) || now < 0) {
     throw new Error("timestamp must be a non-negative safe integer");
   }
+}
+
+function conversationKeyMatchesChat(conversationKey: string, chatId: number): boolean {
+  return conversationKey === (chatId < 0 ? `group:${chatId}` : `dm:${chatId}`);
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function mapJob(row: JobRow): StoredJob {
