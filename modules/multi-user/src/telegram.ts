@@ -7,6 +7,8 @@ import { createHash } from "node:crypto";
 import { open, rename, rm } from "node:fs/promises";
 import { basename, dirname, extname, join, relative, resolve, sep } from "node:path";
 
+import { encodeConversationKey } from "./types";
+
 const TELEGRAM_MESSAGE_LIMIT = 4096;
 
 export type FetchLike = (
@@ -320,13 +322,7 @@ export function splitTelegramMessage(text: string): string[] {
 }
 
 function prepareUploadRoot(baseDirectory: string, conversationKey: string): string {
-  if (!/^(?:dm|group):-?\d+$/.test(conversationKey)) {
-    throw new Error("conversation key is invalid");
-  }
-  const encodedConversation = encodeURIComponent(conversationKey);
-  if (encodedConversation.includes("/") || encodedConversation.includes("\\")) {
-    throw new Error("encoded conversation key is not a safe path component");
-  }
+  const encodedConversation = encodeConversationKey(conversationKey);
 
   const requestedBase = resolve(baseDirectory);
   mkdirSync(requestedBase, { recursive: true, mode: 0o700 });

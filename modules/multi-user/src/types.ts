@@ -3,6 +3,17 @@ export type AccessMode = "public" | "invite";
 export type ChatType = "private" | "group" | "supergroup";
 export type UserStatus = "active" | "inactive";
 
+export function encodeConversationKey(conversationKey: string): string {
+  if (!/^(?:dm|group):-?\d+$/.test(conversationKey)) {
+    throw new Error("conversation key is invalid");
+  }
+  const encoded = encodeURIComponent(conversationKey);
+  if (encoded.includes("/") || encoded.includes("\\")) {
+    throw new Error("encoded conversation key is not a safe path component");
+  }
+  return encoded;
+}
+
 export interface MultiUserConfig {
   adminChatIds: ReadonlySet<number>;
   guestAccessMode: AccessMode;
@@ -78,6 +89,7 @@ export interface StoredConversation {
   key: string;
   chatId: number;
   sessionId: string | null;
+  sessionRole: Role | null;
   generation: number;
   state: string;
   nextSequence: number;

@@ -114,7 +114,7 @@ describe("Store schema", () => {
       journal_mode: "wal",
     });
     expect(store.db.query("PRAGMA user_version").get()).toEqual({
-      user_version: 3,
+      user_version: 4,
     });
     expect(tables).toEqual(
       expect.arrayContaining([
@@ -177,10 +177,10 @@ describe("Store schema", () => {
 
   test("rejects schema versions newer than supported", () => {
     const path = createDatabasePath();
-    withDatabase(path, (db) => db.exec("PRAGMA user_version = 4"));
+    withDatabase(path, (db) => db.exec("PRAGMA user_version = 5"));
 
     expect(() => trackStore(new Store(path))).toThrow(
-      "database schema version 4 is newer than supported version 3",
+      "database schema version 5 is newer than supported version 4",
     );
   });
 
@@ -194,7 +194,7 @@ describe("Store schema", () => {
 
     const store = trackStore(new Store(path));
 
-    expect(store.db.query("PRAGMA user_version").get()).toEqual({ user_version: 3 });
+    expect(store.db.query("PRAGMA user_version").get()).toEqual({ user_version: 4 });
     expect(
       store.db
         .query<{ name: string }, []>(`
@@ -215,13 +215,41 @@ describe("Store schema", () => {
 
     const store = trackStore(new Store(path));
 
-    expect(store.db.query("PRAGMA user_version").get()).toEqual({ user_version: 3 });
+    expect(store.db.query("PRAGMA user_version").get()).toEqual({ user_version: 4 });
     expect(
       store.db
         .query<{ name: string }, []>("PRAGMA table_info(outbound_replies)")
         .all()
         .map(({ name }) => name),
     ).toContain("next_chunk_index");
+  });
+
+  test("migrates version three conversations with unknown session policy", () => {
+    const path = createDatabasePath();
+    const legacy = trackStore(new Store(path));
+    legacy.acceptUpdate(update(1, 22, 22), identity(22, 22), 1_000);
+    legacy.db
+      .query("UPDATE conversations SET session_id = ? WHERE conversation_key = ?")
+      .run("legacy-session", "dm:22");
+    closeTrackedStore(legacy);
+    withDatabase(path, (db) => {
+      db.exec("ALTER TABLE conversations DROP COLUMN session_role");
+      db.exec("PRAGMA user_version = 3");
+    });
+
+    const store = trackStore(new Store(path));
+
+    expect(store.db.query("PRAGMA user_version").get()).toEqual({ user_version: 4 });
+    expect(
+      store.db
+        .query<{ name: string }, []>("PRAGMA table_info(conversations)")
+        .all()
+        .map(({ name }) => name),
+    ).toContain("session_role");
+    expect(store.getConversation("dm:22")).toMatchObject({
+      sessionId: "legacy-session",
+      sessionRole: null,
+    });
   });
 
   test("rejects a version-one table with matching columns but missing primary key", () => {
@@ -356,6 +384,7 @@ describe("Store schema", () => {
           last_activity_at INTEGER NOT NULL,
           created_at INTEGER NOT NULL,
           updated_at INTEGER NOT NULL,
+          session_role TEXT CHECK (session_role IN ('admin', 'guest')),
           CHECK ((lease_owner IS NULL) = (lease_until IS NULL))
         )
       `);
@@ -817,6 +846,7 @@ describe("Store leases", () => {
         job.leaseToken!,
         "result",
         "bad-session",
+        "guest",
         Number.POSITIVE_INFINITY,
       ),
     ).toThrow("timestamp must be a non-negative safe integer");
@@ -980,6 +1010,7 @@ describe("Store leases", () => {
         completion.leaseToken!,
         "stale result",
         "stale-session",
+        "guest",
         2_101,
       ),
     ).toBe(false);
@@ -1061,6 +1092,7 @@ describe("Store leases", () => {
         first.leaseToken!,
         "stale result",
         "stale-session",
+        "guest",
         2_200,
       ),
     ).toBe(false);
@@ -1072,6 +1104,7 @@ describe("Store leases", () => {
         second.leaseToken!,
         "current result",
         "current-session",
+        "guest",
         2_200,
       ),
     ).toBe(true);
@@ -1094,6 +1127,7 @@ describe("Store conversations and controls", () => {
         job.leaseToken!,
         "result",
         "session-one",
+        "guest",
         1_100,
       ),
     ).toBe(true);
@@ -1101,14 +1135,45 @@ describe("Store conversations and controls", () => {
       key: "dm:22",
       chatId: 22,
       sessionId: "session-one",
+      sessionRole: "guest",
       generation: 1,
     });
     expect("setConversationSession" in store).toBe(false);
     expect(store.resetConversation("dm:22", 1_200)).toBe(2);
     expect(store.getConversation("dm:22")).toMatchObject({
       sessionId: null,
+      sessionRole: null,
       generation: 2,
       state: "active",
+    });
+  });
+
+  test("persists session role across restart and clears it with reset", () => {
+    const path = createDatabasePath();
+    let store = trackStore(new Store(path));
+    store.acceptUpdate(update(1, 22, 22), identity(22, 22), 1_000);
+    const job = store.leaseNextJob("worker-a", 1_050, 1_000)!;
+
+    expect(store.completeJob(
+      job.id,
+      "worker-a",
+      job.leaseToken!,
+      "result",
+      "durable-session",
+      "guest",
+      1_100,
+    )).toBe(true);
+    closeTrackedStore(store);
+
+    store = trackStore(new Store(path));
+    expect(store.getConversation("dm:22")).toMatchObject({
+      sessionId: "durable-session",
+      sessionRole: "guest",
+    });
+    expect(store.resetConversation("dm:22", 1_200)).toBe(2);
+    expect(store.getConversation("dm:22")).toMatchObject({
+      sessionId: null,
+      sessionRole: null,
     });
   });
 
@@ -1141,6 +1206,7 @@ describe("Store conversations and controls", () => {
         inFlight.leaseToken!,
         "stale result",
         "old-session",
+        "guest",
         2_200,
       ),
     ).toBe(false);

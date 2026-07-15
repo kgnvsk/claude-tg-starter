@@ -110,6 +110,21 @@ describe("resolveIdentity", () => {
       conversationKey: "group:-200",
     });
   });
+
+  test("preserves admin identity in groups for transport-level controls", () => {
+    expect(resolveIdentity(publicConfig, update(-100, 11, "group"))).toMatchObject({
+      accepted: true,
+      role: "admin",
+      userId: 11,
+      conversationKey: "group:-100",
+    });
+    expect(resolveIdentity(publicConfig, update(-100, 22, "supergroup"))).toMatchObject({
+      accepted: true,
+      role: "guest",
+      userId: 22,
+      conversationKey: "group:-100",
+    });
+  });
 });
 
 describe("loadConfig", () => {

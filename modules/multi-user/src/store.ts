@@ -13,7 +13,7 @@ import type {
   StoredOutboundReply,
 } from "./types";
 
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 4;
 
 export type UpdateState = "accepted" | "ignored" | "rejected";
 
@@ -56,6 +56,7 @@ const REQUIRED_SCHEMA = {
     "last_activity_at",
     "created_at",
     "updated_at",
+    "session_role",
   ],
   updates: [
     "update_id",
@@ -120,6 +121,7 @@ interface ConversationRow {
   conversation_key: string;
   telegram_chat_id: number;
   session_id: string | null;
+  session_role: Role | null;
   generation: number;
   state: string;
   next_sequence: number;
@@ -724,8 +726,12 @@ export class Store {
     leaseToken: string,
     result: string | null = null,
     sessionId: string | null = null,
+    sessionRole: Role | null = null,
     now = Date.now(),
   ): boolean {
+    if ((sessionId === null) !== (sessionRole === null)) {
+      throw new Error("session ID and session role must be stored together");
+    }
     return this.finishJob(
       jobId,
       leaseOwner,
@@ -733,6 +739,7 @@ export class Store {
       "completed",
       result,
       sessionId,
+      sessionRole,
       now,
     );
   }
@@ -751,6 +758,7 @@ export class Store {
       leaseToken,
       retry ? "queued" : "failed",
       error,
+      null,
       null,
       now,
     );
@@ -779,7 +787,8 @@ export class Store {
       const row = this.db
         .query<{ generation: number }, [number, number, string]>(`
           UPDATE conversations
-          SET session_id = NULL, generation = generation + 1, state = 'active',
+          SET session_id = NULL, session_role = NULL,
+              generation = generation + 1, state = 'active',
               lease_owner = NULL, lease_until = NULL,
               last_activity_at = ?, updated_at = ?
           WHERE conversation_key = ?
@@ -929,6 +938,7 @@ export class Store {
     status: "queued" | "completed" | "failed",
     detail: string | null,
     sessionId: string | null,
+    sessionRole: Role | null,
     now: number,
   ): boolean {
     validateTimestamp(now);
@@ -966,11 +976,12 @@ export class Store {
       this.db
         .query(`
           UPDATE conversations
-          SET session_id = COALESCE(?, session_id), lease_owner = NULL,
+          SET session_id = COALESCE(?, session_id),
+              session_role = COALESCE(?, session_role), lease_owner = NULL,
               lease_until = NULL, last_activity_at = ?, updated_at = ?
           WHERE conversation_key = ? AND lease_owner = ?
         `)
-        .run(sessionId, now, now, job.conversation_key, leaseOwner);
+        .run(sessionId, sessionRole, now, now, job.conversation_key, leaseOwner);
       return true;
     });
     return finish.immediate();
@@ -1020,6 +1031,7 @@ export class Store {
         last_activity_at INTEGER NOT NULL,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL,
+        session_role TEXT CHECK (session_role IN ('admin', 'guest')),
         CHECK ((lease_owner IS NULL) = (lease_until IS NULL))
       );
 
@@ -1110,6 +1122,7 @@ export class Store {
         this.db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
       } else if (version === 1) {
         this.createOutboundRepliesSchema();
+        this.addSessionRoleColumn();
         this.db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
       } else if (version === 2) {
         this.db.exec(`
@@ -1117,12 +1130,27 @@ export class Store {
           ADD COLUMN next_chunk_index INTEGER NOT NULL DEFAULT 0
             CHECK (next_chunk_index >= 0)
         `);
+        this.addSessionRoleColumn();
+        this.db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+      } else if (version === 3) {
+        this.addSessionRoleColumn();
         this.db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
       }
 
       this.validateSchema();
     });
     migrate.immediate();
+  }
+
+  private addSessionRoleColumn(db: Database = this.db): void {
+    const columns = readColumns(db, "conversations");
+    if (columns.length === 0 || columns.some(({ name }) => name === "session_role")) {
+      return;
+    }
+    db.exec(`
+      ALTER TABLE conversations
+      ADD COLUMN session_role TEXT CHECK (session_role IN ('admin', 'guest'))
+    `);
   }
 
   private createOutboundRepliesSchema(db: Database = this.db): void {
@@ -1205,6 +1233,7 @@ function mapConversation(row: ConversationRow): StoredConversation {
     key: row.conversation_key,
     chatId: row.telegram_chat_id,
     sessionId: row.session_id,
+    sessionRole: row.session_role,
     generation: row.generation,
     state: row.state,
     nextSequence: row.next_sequence,

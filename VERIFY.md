@@ -13,6 +13,11 @@
 - [ ] md5: golden == cache/server.ts == marketplaces/server.ts
 - [ ] поведенческий тест персоны: бот применяет правило, которое есть ТОЛЬКО в CLAUDE.md (напр. пинг «🔄 Взяв») — значит persona реально загрузилась
 
+## Multi-user isolation (live gate)
+- [ ] `runuser -l claude -c 'claude --help'` показывает `--allowedTools`, `--safe-mode`, `--strict-mcp-config` и `--permission-mode`
+- [ ] В argv гостевого worker разрешение Read имеет абсолютную форму `Read(//<absolute-workspaces-base>/<encoded-conversation-key>/**)`
+- [ ] Создай один canary-файл внутри workspace тестового гостя и второй рядом, вне этого workspace. В живом авторизованном guest turn чтение внутреннего файла проходит, а чтение внешнего отклоняется без prompt/расширения permissions. До прохождения этого gate multi-user dispatcher не включать
+
 ## Поведение (владелец, в Telegram)
 - [ ] Текст «привет» → ответ ≤30 сек, на языке владельца
 - [ ] Многошаговая задача → СНАЧАЛА пинг «🔄 Взяв: …», потом результат
