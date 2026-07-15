@@ -339,8 +339,8 @@ export class Store {
     if (expiresAt <= now) throw new Error("admin action expiry must be in the future");
     if (!/^[A-Za-z0-9_-]{16,128}$/.test(token)) throw new Error("admin action token is invalid");
     if (!text) throw new Error("admin confirmation reply is required");
-    if (action.type === "block" && this.adminChatIds.has(action.userId)) {
-      throw new Error("configured administrators cannot be blocked");
+    if ((action.type === "block" || action.type === "allow") && this.adminChatIds.has(action.userId)) {
+      throw new Error("configured administrators cannot be changed as guests");
     }
     const payloadJson = JSON.stringify(action);
     parseAdminActionJson(action.type, payloadJson);
@@ -439,9 +439,12 @@ export class Store {
         } catch (error) {
           reply = `Stored admin action is invalid: ${errorMessage(error)}`;
         }
-        if (action?.type === "block" && this.adminChatIds.has(action.userId)) {
+        if (
+          (action?.type === "block" || action?.type === "allow")
+          && this.adminChatIds.has(action.userId)
+        ) {
           action = null;
-          reply = "Stored admin action is invalid: configured administrators cannot be blocked";
+          reply = "Stored admin action is invalid: configured administrators cannot be changed as guests";
         }
         if (action !== null) {
           reply = this.executeAdminAction(action, identity.userId, now);
@@ -1488,6 +1491,22 @@ export class Store {
           `)
           .run(action.mode, now);
         return `Guest access mode is now ${action.mode}.`;
+      case "allow":
+        if (this.adminChatIds.has(action.userId)) {
+          throw new Error("configured administrators cannot be changed as guests");
+        }
+        this.db
+          .query(`
+            INSERT INTO users (
+              telegram_user_id, role, status, username, first_name, last_name,
+              created_at, updated_at
+            ) VALUES (?, 'guest', 'active', NULL, NULL, NULL, ?, ?)
+            ON CONFLICT(telegram_user_id) DO UPDATE SET
+              role = 'guest', status = 'active', updated_at = excluded.updated_at
+          `)
+          .run(action.userId, now, now);
+        this.db.query("DELETE FROM blocks WHERE telegram_user_id = ?").run(action.userId);
+        return `Telegram user ${action.userId} is allowed as a guest.`;
       case "block":
         if (this.adminChatIds.has(action.userId)) {
           throw new Error("configured administrators cannot be blocked");

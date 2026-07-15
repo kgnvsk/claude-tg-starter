@@ -21,9 +21,9 @@ MODULE_MULTI_USER=1 OWNER_CHAT_ID=123456 TELEGRAM_BOT_TOKEN=... \
 bash modules/multi-user/install.sh status
 ```
 
-Use comma-separated numeric IDs for more than one admin: `ADMIN_CHAT_IDS="123456,987654"`. Usernames are never authorization keys. `GUEST_ACCESS_MODE=public` accepts anyone; `invite` accepts only known/unblocked identities. Change mode from the admin's private chat with `/access public` or `/access invite`, then `/confirm <token>`.
+Use comma-separated numeric IDs for more than one admin: `ADMIN_CHAT_IDS="123456,987654"`. Usernames are never authorization keys. `GUEST_ACCESS_MODE=public` accepts anyone; `invite` accepts only explicitly allowed active guests. Add one with `/allow <numeric user_id>` and confirm the action. Change mode from the admin's private chat with `/access public` or `/access invite`, then `/confirm <token>`.
 
-Admin controls are private-chat only: `/access`, `/block`, `/unblock`, `/jobs`, `/cancel`, `/reset`, `/doctor`, `/restart`, and `/confirm`. Mutating actions require a one-use confirmation. Guest command-looking text never reaches the control plane.
+Admin controls are private-chat only: `/access`, `/allow`, `/block`, `/unblock`, `/jobs`, `/cancel`, `/reset`, `/doctor`, `/restart`, and `/confirm`. Sensitive mutations require a one-use confirmation; `/unblock` is an immediate safe relaxation. Guest command-looking text never reaches the control plane.
 
 ## Verify and diagnose
 

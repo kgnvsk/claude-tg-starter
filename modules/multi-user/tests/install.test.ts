@@ -132,6 +132,24 @@ describe("multi-user installer", () => {
     expect(existsSync(join(home, "multi-user/state/transitioning"))).toBe(false);
   });
 
+  test("restarts active module services so an idempotent update loads new code", async () => {
+    const fx = fixture();
+    expect((await install("enable", fx.env)).exitCode).toBe(0);
+    writeFileSync(fx.log, "");
+
+    expect((await install("enable", fx.env)).exitCode).toBe(0);
+    const commands = readFileSync(fx.log, "utf8");
+    const receiver = commands.indexOf(
+      "systemctl --user restart claude-multi-user-receiver.service",
+    );
+    const dispatcher = commands.indexOf(
+      "systemctl --user restart claude-multi-user-dispatcher.service",
+    );
+    expect(receiver).toBeGreaterThanOrEqual(0);
+    expect(dispatcher).toBeGreaterThan(receiver);
+    expect(existsSync(join(fx.root, "home/claude/multi-user/state/transitioning"))).toBe(false);
+  });
+
   test("disable stops both module services before restoring the exact prior mode", async () => {
     const fx = fixture();
     expect((await install("enable", fx.env)).exitCode).toBe(0);

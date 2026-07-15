@@ -145,6 +145,8 @@ exec 9>"$LIFECYCLE_LOCK"
 mkdir -p "$STATE_DIR" "$WORKSPACES_DIR" "$USER_UNIT_DIR" "$ROOT_STATE_DIR"
 chmod 0700 "$STATE_DIR" "$WORKSPACES_DIR"
 chmod 0700 "$ROOT_STATE_DIR"
+WAS_ENABLED=0
+[[ -f "$ENABLED_FILE" ]] && WAS_ENABLED=1
 
 if [[ "$ACTION" == disable ]]; then
   if [[ ! -f "$ENABLED_FILE" && ! -f "$TRANSITIONING_FILE" && ! -f "$LEGACY_STATE_FILE" ]]; then
@@ -288,6 +290,10 @@ fi
 userctl daemon-reload
 userctl enable --now claude-multi-user-receiver.service
 userctl enable --now claude-multi-user-dispatcher.service
+if [[ "$WAS_ENABLED" == 1 ]]; then
+  userctl restart claude-multi-user-receiver.service
+  userctl restart claude-multi-user-dispatcher.service
+fi
 ENABLED_TMP="$STATE_DIR/.enabled.$$"
 printf '1\n' > "$ENABLED_TMP"
 chmod 0600 "$ENABLED_TMP"

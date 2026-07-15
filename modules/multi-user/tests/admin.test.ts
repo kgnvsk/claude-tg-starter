@@ -156,17 +156,18 @@ describe("AdminController", () => {
     expect(await admin.handle(update(1, "Покажи активные задачи"), identity())).toBe("handled");
     expect(store.listOutboundReplies().at(-1)?.text).toContain("dm:44");
     expect(await admin.handle(update(2, "Заблокируй пользователя 66"), identity())).toBe("handled");
-    expect(await admin.handle(update(3, "Разблокируй пользователя 55"), identity())).toBe("handled");
+    expect(await admin.handle(update(3, "Разреши доступ пользователю 77"), identity())).toBe("handled");
+    expect(await admin.handle(update(4, "Разблокируй пользователя 55"), identity())).toBe("handled");
     expect(store.isBlocked(55)).toBe(false);
-    expect(await admin.handle(update(4, "Отмени задачу 1"), identity())).toBe("handled");
-    expect(await admin.handle(update(5, "Сбрось диалог 44"), identity())).toBe("handled");
-    expect(await admin.handle(update(6, "покажи все активные задачи"), identity())).toBe("not_handled");
+    expect(await admin.handle(update(5, "Отмени задачу 1"), identity())).toBe("handled");
+    expect(await admin.handle(update(6, "Сбрось диалог 44"), identity())).toBe("handled");
+    expect(await admin.handle(update(7, "покажи все активные задачи"), identity())).toBe("not_handled");
 
     const actionTypes = store.db
       .query<{ action_type: string }, []>("SELECT action_type FROM pending_admin_actions ORDER BY rowid")
       .all()
       .map(({ action_type }) => action_type);
-    expect(actionTypes).toEqual(["block", "cancel", "reset"]);
+    expect(actionTypes).toEqual(["block", "allow", "cancel", "reset"]);
   });
 
   test("never interprets command-looking guest text as control-plane input", async () => {
@@ -187,6 +188,11 @@ describe("AdminController", () => {
     expect(store.db.query<{ count: number }, []>("SELECT count(*) AS count FROM pending_admin_actions").get()?.count)
       .toBe(0);
     expect(store.listOutboundReplies()[0]?.text).toContain("administrator");
+
+    expect(await admin.handle(update(2, "/allow 12"), identity(11))).toBe("handled");
+    expect(store.db.query<{ count: number }, []>("SELECT count(*) AS count FROM pending_admin_actions").get()?.count)
+      .toBe(0);
+    expect(store.listOutboundReplies().at(-1)?.text).toContain("administrator");
   });
 
   test("cancels a running job with fencing and allows the next sequence to run", async () => {
@@ -235,6 +241,37 @@ describe("AdminController", () => {
 
     expect(await admin.handle(update(8, "/jobs"), identity())).toBe("handled");
     expect(store.listOutboundReplies().at(-1)?.text).toBe("No active or queued jobs.");
+  });
+
+  test("explicitly grants a new guest for invitation-only mode", async () => {
+    const store = createStore();
+    store.blockUser(44, 11, "old block", 900);
+    const admin = new AdminController({ store, adminIds: new Set([11, 12]), clock: () => 1_000 });
+
+    expect(await admin.handle(update(1, "/allow 44"), identity())).toBe("handled");
+    expect(store.lookupIdentity(44)).toMatchObject({ status: "inactive", blocked: true });
+    expect(await admin.handle(update(2, `/confirm ${actionToken(store)}`), identity())).toBe("handled");
+    expect(store.lookupIdentity(44)).toEqual({ role: "guest", status: "active", blocked: false });
+    expect(store.listOutboundReplies().at(-1)?.text).toContain("allowed as a guest");
+
+    const config: MultiUserConfig = { adminChatIds: new Set([11, 12]), guestAccessMode: "invite" };
+    const receiver = new Receiver({
+      telegram: fakeTelegram(),
+      store,
+      config,
+      baseDirectory: directories.at(-1)!,
+    });
+    expect(await receiver.processUpdate({
+      update_id: 3,
+      message: {
+        message_id: 30,
+        date: 1_752_528_003,
+        text: "hello",
+        from: { id: 44 },
+        chat: { id: 44, type: "private" },
+      },
+    })).toBe("accepted");
+    expect(store.listJobs("dm:44")).toHaveLength(1);
   });
 
   test("running reset fences completion and retains the old lease until expiry", async () => {

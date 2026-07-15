@@ -92,6 +92,7 @@ export type OutboundReplyStatus = "pending" | "leased" | "delivered" | "failed";
 
 export type AdminMutationAction =
   | { type: "access"; mode: AccessMode }
+  | { type: "allow"; userId: number }
   | { type: "block"; userId: number; reason: string | null }
   | { type: "cancel"; jobId: number }
   | { type: "reset"; conversationKey: string }

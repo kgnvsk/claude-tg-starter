@@ -185,6 +185,10 @@ export function parseAdminActionJson(actionType: string, payloadJson: string): A
       requireExactKeys(value, ["type", "mode"]);
       if (value.mode !== "public" && value.mode !== "invite") break;
       return { type: "access", mode: value.mode };
+    case "allow":
+      requireExactKeys(value, ["type", "userId"]);
+      if (!isTelegramId(value.userId)) break;
+      return { type: "allow", userId: value.userId };
     case "block":
       requireExactKeys(value, ["type", "userId", "reason"]);
       if (!isTelegramId(value.userId) || (value.reason !== null && typeof value.reason !== "string")) break;
@@ -216,6 +220,8 @@ function parseAdminCommand(text: string, adminIds: ReadonlySet<number>): ParsedC
   if (alias === SHOW_JOBS_ALIAS) return { kind: "jobs" };
   const blockAlias = /^заблокируй пользователя ([1-9]\d*)$/.exec(alias);
   if (blockAlias) return blockMutation(Number(blockAlias[1]), null, adminIds);
+  const allowAlias = /^разреши доступ пользователю ([1-9]\d*)$/.exec(alias);
+  if (allowAlias) return allowMutation(Number(allowAlias[1]), adminIds);
   const unblockAlias = /^разблокируй пользователя ([1-9]\d*)$/.exec(alias);
   if (unblockAlias) {
     const userId = parseTelegramId(unblockAlias[1]);
@@ -250,6 +256,12 @@ function parseAdminCommand(text: string, adminIds: ReadonlySet<number>): ParsedC
       return args.length === 1 && (args[0] === "public" || args[0] === "invite")
         ? accessMutation(args[0])
         : usage("Usage: /access public|invite");
+    case "/allow": {
+      const userId = args.length === 1 ? parseTelegramId(args[0]) : null;
+      return userId === null
+        ? usage("Usage: /allow <numeric user_id>")
+        : allowMutation(userId, adminIds);
+    }
     case "/block": {
       const userId = parseTelegramId(args[0]);
       if (userId === null) return usage("Usage: /block <numeric user_id> [reason]");
@@ -288,6 +300,16 @@ function blockMutation(
     kind: "mutation",
     action: { type: "block", userId, reason },
     description: `Block Telegram user ${userId}${reason ? ` (${reason})` : ""}?`,
+  };
+}
+
+function allowMutation(userId: number, adminIds: ReadonlySet<number>): ParsedCommand {
+  if (!isTelegramId(userId)) return usage("Usage: /allow <numeric user_id>");
+  if (adminIds.has(userId)) return usage("That user is already a configured administrator.");
+  return {
+    kind: "mutation",
+    action: { type: "allow", userId },
+    description: `Allow Telegram user ${userId} as a guest?`,
   };
 }
 
