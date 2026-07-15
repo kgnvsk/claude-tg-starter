@@ -28,6 +28,7 @@ export interface NormalizedAttachment {
   fileName?: string;
   mimeType?: string;
   fileSize?: number;
+  localPath?: string;
 }
 
 export interface NormalizedMessage {
@@ -71,6 +72,7 @@ export interface RejectedIdentity {
 export type ResolvedIdentity = AcceptedIdentity | RejectedIdentity;
 
 export type JobStatus = "queued" | "running" | "completed" | "failed";
+export type OutboundReplyStatus = "pending" | "leased" | "delivered" | "failed";
 
 export interface StoredConversation {
   key: string;
@@ -100,4 +102,22 @@ export interface StoredJob {
   error: string | null;
   createdAt: number;
   updatedAt: number;
+}
+
+export interface StoredOutboundReply {
+  id: number;
+  updateId: number;
+  chatId: number;
+  text: string;
+  status: OutboundReplyStatus;
+  attempts: number;
+  nextChunkIndex: number;
+  nextAttemptAt: number;
+  leaseOwner: string | null;
+  leaseToken: string | null;
+  leaseUntil: number | null;
+  lastError: string | null;
+  createdAt: number;
+  updatedAt: number;
+  deliveredAt: number | null;
 }

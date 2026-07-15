@@ -114,7 +114,7 @@ describe("Store schema", () => {
       journal_mode: "wal",
     });
     expect(store.db.query("PRAGMA user_version").get()).toEqual({
-      user_version: 1,
+      user_version: 3,
     });
     expect(tables).toEqual(
       expect.arrayContaining([
@@ -123,6 +123,7 @@ describe("Store schema", () => {
         "conversations",
         "jobs",
         "memberships",
+        "outbound_replies",
         "pending_admin_actions",
         "settings",
         "updates",
@@ -176,11 +177,51 @@ describe("Store schema", () => {
 
   test("rejects schema versions newer than supported", () => {
     const path = createDatabasePath();
-    withDatabase(path, (db) => db.exec("PRAGMA user_version = 2"));
+    withDatabase(path, (db) => db.exec("PRAGMA user_version = 4"));
 
     expect(() => trackStore(new Store(path))).toThrow(
-      "database schema version 2 is newer than supported version 1",
+      "database schema version 4 is newer than supported version 3",
     );
+  });
+
+  test("migrates a valid version-one database by adding the durable outbox", () => {
+    const path = createDatabasePath();
+    initializeSchema(path);
+    withDatabase(path, (db) => {
+      db.exec("DROP TABLE outbound_replies");
+      db.exec("PRAGMA user_version = 1");
+    });
+
+    const store = trackStore(new Store(path));
+
+    expect(store.db.query("PRAGMA user_version").get()).toEqual({ user_version: 3 });
+    expect(
+      store.db
+        .query<{ name: string }, []>(`
+          SELECT name FROM sqlite_master
+          WHERE type = 'table' AND name = 'outbound_replies'
+        `)
+        .get(),
+    ).toEqual({ name: "outbound_replies" });
+  });
+
+  test("migrates version two outbox rows with zero chunk progress", () => {
+    const path = createDatabasePath();
+    initializeSchema(path);
+    withDatabase(path, (db) => {
+      db.exec("ALTER TABLE outbound_replies DROP COLUMN next_chunk_index");
+      db.exec("PRAGMA user_version = 2");
+    });
+
+    const store = trackStore(new Store(path));
+
+    expect(store.db.query("PRAGMA user_version").get()).toEqual({ user_version: 3 });
+    expect(
+      store.db
+        .query<{ name: string }, []>("PRAGMA table_info(outbound_replies)")
+        .all()
+        .map(({ name }) => name),
+    ).toContain("next_chunk_index");
   });
 
   test("rejects a version-one table with matching columns but missing primary key", () => {
@@ -380,6 +421,20 @@ describe("Store schema", () => {
 });
 
 describe("Store.acceptUpdate", () => {
+  test("durably deduplicates ignored and rejected terminal updates without jobs", () => {
+    const store = createStore();
+
+    expect(store.recordTerminalUpdate(90, "ignored", { update_id: 90 }, 1_000)).toBe(true);
+    expect(store.recordTerminalUpdate(90, "ignored", { update_id: 90 }, 1_001)).toBe(false);
+    expect(store.recordTerminalUpdate(91, "rejected", { update_id: 91 }, 1_002)).toBe(true);
+
+    expect(store.hasUpdate(90)).toBe(true);
+    expect(store.getUpdateState(90)).toBe("ignored");
+    expect(store.getUpdateState(91)).toBe("rejected");
+    expect(store.getUpdateState(92)).toBeNull();
+    expect(store.listJobs()).toHaveLength(0);
+  });
+
   test("rejects non-safe timestamp inputs before persistence", () => {
     const store = createStore();
     for (const now of [-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, 2 ** 53]) {
@@ -501,6 +556,235 @@ describe("Store.acceptUpdate", () => {
     });
     expect(store.getConversation(`group:${groupId}`)).toMatchObject({
       chatId: groupId,
+    });
+  });
+});
+
+describe("Store outbound replies", () => {
+  test("records a rejected update and one reply in the same transaction", () => {
+    const store = createStore();
+
+    expect(
+      store.recordRejectedUpdateWithReply(
+        100,
+        { update_id: 100 },
+        22,
+        "Access blocked",
+        1_000,
+      ),
+    ).toBe(true);
+    expect(
+      store.recordRejectedUpdateWithReply(
+        100,
+        { update_id: 100 },
+        22,
+        "Access blocked",
+        1_001,
+      ),
+    ).toBe(false);
+
+    expect(store.getUpdateState(100)).toBe("rejected");
+    expect(store.listOutboundReplies()).toHaveLength(1);
+    expect(store.listOutboundReplies()[0]).toMatchObject({
+      updateId: 100,
+      chatId: 22,
+      text: "Access blocked",
+      status: "pending",
+      attempts: 0,
+    });
+  });
+
+  test("rolls back the terminal update when outbox insertion fails", () => {
+    const store = createStore();
+    store.db.run(`
+      CREATE TRIGGER reject_outbox BEFORE INSERT ON outbound_replies
+      BEGIN
+        SELECT RAISE(ABORT, 'outbox failed');
+      END
+    `);
+
+    expect(() =>
+      store.recordRejectedUpdateWithReply(
+        101,
+        { update_id: 101 },
+        22,
+        "Access blocked",
+        1_000,
+      ),
+    ).toThrow("outbox failed");
+    expect(store.getUpdateState(101)).toBeNull();
+    expect(store.listOutboundReplies()).toHaveLength(0);
+  });
+
+  test("claims due replies and retries explicit failures with bounded attempts", () => {
+    const store = createStore();
+    store.recordRejectedUpdateWithReply(102, { update_id: 102 }, 22, "Blocked", 1_000);
+
+    const first = store.claimOutboundReply("receiver-a", 1_000, 100, 2)!;
+    expect(first).toMatchObject({ attempts: 1, leaseOwner: "receiver-a" });
+    expect(
+      store.retryOutboundReply(
+        first.id,
+        "receiver-a",
+        first.leaseToken!,
+        "network failed",
+        1_100,
+        2,
+        1_001,
+      ),
+    ).toBe(true);
+    expect(store.claimOutboundReply("receiver-a", 1_099, 100, 2)).toBeNull();
+
+    const second = store.claimOutboundReply("receiver-a", 1_100, 100, 2)!;
+    expect(second.attempts).toBe(2);
+    expect(
+      store.retryOutboundReply(
+        second.id,
+        "receiver-a",
+        second.leaseToken!,
+        "still failing",
+        1_200,
+        2,
+        1_101,
+      ),
+    ).toBe(true);
+    expect(store.listOutboundReplies()[0]).toMatchObject({
+      status: "failed",
+      attempts: 2,
+      lastError: "still failing",
+    });
+    expect(store.claimOutboundReply("receiver-a", 2_000, 100, 2)).toBeNull();
+  });
+
+  test("fences stale reply leases from delivery and retry acknowledgement", () => {
+    const store = createStore();
+    store.recordRejectedUpdateWithReply(103, { update_id: 103 }, 22, "Blocked", 1_000);
+    const stale = store.claimOutboundReply("receiver-a", 1_000, 100, 5)!;
+    const current = store.claimOutboundReply("receiver-b", 1_100, 100, 5)!;
+
+    expect(
+      store.markOutboundReplyDelivered(
+        stale.id,
+        "receiver-a",
+        stale.leaseToken!,
+        1_101,
+      ),
+    ).toBe(false);
+    expect(
+      store.retryOutboundReply(
+        stale.id,
+        "receiver-a",
+        stale.leaseToken!,
+        "stale",
+        1_200,
+        5,
+        1_101,
+      ),
+    ).toBe(false);
+    expect(
+      store.markOutboundReplyDelivered(
+        current.id,
+        "receiver-b",
+        current.leaseToken!,
+        1_102,
+      ),
+    ).toBe(true);
+    expect(store.listOutboundReplies()[0].status).toBe("delivered");
+  });
+
+  test("persists chunk progress only for the active fenced reply lease", () => {
+    const store = createStore();
+    store.recordRejectedUpdateWithReply(106, { update_id: 106 }, 22, "long reply", 1_000);
+    const stale = store.claimOutboundReply("receiver-a", 1_000, 100, 5)!;
+
+    expect(
+      store.advanceOutboundReplyChunk(
+        stale.id,
+        "receiver-a",
+        stale.leaseToken!,
+        1,
+        1_001,
+      ),
+    ).toBe(true);
+    const current = store.claimOutboundReply("receiver-b", 1_100, 100, 5)!;
+    expect(
+      store.advanceOutboundReplyChunk(
+        stale.id,
+        "receiver-a",
+        stale.leaseToken!,
+        2,
+        1_101,
+      ),
+    ).toBe(false);
+    expect(current.nextChunkIndex).toBe(1);
+  });
+
+  test("renews only the active token-fenced outbound reply lease", () => {
+    const store = createStore();
+    store.recordRejectedUpdateWithReply(107, { update_id: 107 }, 22, "reply", 1_000);
+    const stale = store.claimOutboundReply("receiver-a", 1_000, 100, 5)!;
+
+    expect(
+      store.renewOutboundReplyLease(
+        stale.id,
+        "receiver-a",
+        stale.leaseToken!,
+        1_050,
+        100,
+      ),
+    ).toBe(true);
+    const current = store.claimOutboundReply("receiver-b", 1_150, 100, 5)!;
+    expect(
+      store.renewOutboundReplyLease(
+        stale.id,
+        "receiver-a",
+        stale.leaseToken!,
+        1_151,
+        100,
+      ),
+    ).toBe(false);
+    expect(
+      store.renewOutboundReplyLease(
+        current.id,
+        "receiver-b",
+        current.leaseToken!,
+        1_151,
+        100,
+      ),
+    ).toBe(true);
+  });
+
+  test("allows only one receiver process to claim a pending reply", () => {
+    const path = createDatabasePath();
+    const firstStore = trackStore(new Store(path));
+    const secondStore = trackStore(new Store(path));
+    firstStore.recordRejectedUpdateWithReply(
+      104,
+      { update_id: 104 },
+      22,
+      "Blocked",
+      1_000,
+    );
+
+    const claims = [
+      firstStore.claimOutboundReply("receiver-a", 1_000, 100, 5),
+      secondStore.claimOutboundReply("receiver-b", 1_000, 100, 5),
+    ].filter((claim) => claim !== null);
+
+    expect(claims).toHaveLength(1);
+    expect(claims[0]!.leaseOwner).toBe("receiver-a");
+  });
+
+  test("marks an expired final attempt failed instead of leaving it pending", () => {
+    const store = createStore();
+    store.recordRejectedUpdateWithReply(105, { update_id: 105 }, 22, "Blocked", 1_000);
+    store.claimOutboundReply("receiver-a", 1_000, 100, 1);
+
+    expect(store.claimOutboundReply("receiver-b", 1_100, 100, 1)).toBeNull();
+    expect(store.listOutboundReplies()[0]).toMatchObject({
+      status: "failed",
+      attempts: 1,
+      lastError: "reply lease expired after final attempt",
     });
   });
 });

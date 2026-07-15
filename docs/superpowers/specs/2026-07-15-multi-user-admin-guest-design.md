@@ -268,13 +268,21 @@ command remains ordinary text and cannot mutate control-plane state.
   a concise status message.
 - **Server reboot:** systemd restores the receiver and dispatcher; queued jobs remain.
 - **Duplicate Telegram delivery:** unique `update_id` prevents duplicate execution and
-  duplicate final replies.
+  duplicate reply intents. The outbound acknowledgement gap below can still cause a
+  transport-level resend.
 - **Poison job:** after bounded retries it enters a failed state and no longer blocks the
   conversation; admin diagnostics retain the error.
 - **Overload:** receiver continues persisting updates while the scheduler delays new
   workers; users receive a queued status rather than silent loss.
-- **Reply failure:** outbound delivery is retried idempotently and recorded separately
-  from Claude execution.
+- **Reply failure:** terminal transport replies are recorded in a durable outbox and
+  delivered with at-least-once semantics. Explicit `sendMessage` failures retry with
+  bounded attempts and backoff, using fenced leases so only one receiver owns an attempt.
+- **Reply acknowledgement gap:** Telegram Bot API `sendMessage` has no idempotency key.
+  If Telegram accepts a reply and the receiver crashes before recording local delivery,
+  the durable retry may send the active chunk again. Successfully checkpointed earlier
+  chunks resume from their stored index after explicit failures and restarts, but the
+  active chunk remains honestly at-least-once. The system must not claim exactly-once
+  outbound delivery.
 
 ## 12. Migration and rollout
 

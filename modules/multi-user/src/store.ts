@@ -5,13 +5,17 @@ import type {
   IdentityLookup,
   JobStatus,
   NormalizedUpdate,
+  OutboundReplyStatus,
   Role,
   StoredConversation,
   StoredIdentity,
   StoredJob,
+  StoredOutboundReply,
 } from "./types";
 
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 3;
+
+export type UpdateState = "accepted" | "ignored" | "rejected";
 
 const REQUIRED_SCHEMA = {
   users: [
@@ -59,6 +63,23 @@ const REQUIRED_SCHEMA = {
     "processing_state",
     "payload_json",
     "created_at",
+  ],
+  outbound_replies: [
+    "id",
+    "update_id",
+    "chat_id",
+    "text",
+    "status",
+    "attempts",
+    "next_attempt_at",
+    "lease_owner",
+    "lease_token",
+    "lease_until",
+    "last_error",
+    "created_at",
+    "updated_at",
+    "delivered_at",
+    "next_chunk_index",
   ],
   jobs: [
     "id",
@@ -125,6 +146,24 @@ interface JobRow {
   updated_at: number;
 }
 
+interface OutboundReplyRow {
+  id: number;
+  update_id: number;
+  chat_id: number;
+  text: string;
+  status: OutboundReplyStatus;
+  attempts: number;
+  next_chunk_index: number;
+  next_attempt_at: number;
+  lease_owner: string | null;
+  lease_token: string | null;
+  lease_until: number | null;
+  last_error: string | null;
+  created_at: number;
+  updated_at: number;
+  delivered_at: number | null;
+}
+
 export class Store {
   readonly db: Database;
   private readonly adminChatIds: ReadonlySet<number>;
@@ -150,6 +189,299 @@ export class Store {
 
   close(): void {
     this.db.close();
+  }
+
+  hasUpdate(updateId: number): boolean {
+    validateUpdateId(updateId);
+    return this.getUpdateState(updateId) !== null;
+  }
+
+  getUpdateState(updateId: number): UpdateState | null {
+    validateUpdateId(updateId);
+    const row = this.db
+      .query<{ processing_state: string }, [number]>(`
+        SELECT processing_state FROM updates WHERE update_id = ?
+      `)
+      .get(updateId);
+    if (!row) return null;
+    if (
+      row.processing_state !== "accepted" &&
+      row.processing_state !== "ignored" &&
+      row.processing_state !== "rejected"
+    ) {
+      throw new Error(`stored update ${updateId} has an invalid processing state`);
+    }
+    return row.processing_state;
+  }
+
+  recordTerminalUpdate(
+    updateId: number,
+    state: Exclude<UpdateState, "accepted">,
+    payload: unknown,
+    now = Date.now(),
+  ): boolean {
+    validateUpdateId(updateId);
+    validateTimestamp(now);
+    const payloadJson = JSON.stringify(payload);
+    if (payloadJson === undefined) throw new Error("terminal update payload is not serializable");
+    return Boolean(
+      this.db
+        .query<{ update_id: number }, [number, string, string, number]>(`
+          INSERT INTO updates (
+            update_id, conversation_key, processing_state, payload_json, created_at
+          ) VALUES (?, '', ?, ?, ?)
+          ON CONFLICT(update_id) DO NOTHING
+          RETURNING update_id
+        `)
+        .get(updateId, state, payloadJson, now),
+    );
+  }
+
+  recordRejectedUpdateWithReply(
+    updateId: number,
+    payload: unknown,
+    chatId: number,
+    text: string,
+    now = Date.now(),
+  ): boolean {
+    // The update and reply intent commit together. Delivery is separately leased;
+    // Telegram has no idempotency key, so acknowledgement cannot be exactly once.
+    validateUpdateId(updateId);
+    validateTimestamp(now);
+    if (!Number.isSafeInteger(chatId)) throw new Error("Telegram chat ID must be a safe integer");
+    if (!text) throw new Error("outbound reply text is required");
+    const payloadJson = JSON.stringify(payload);
+    if (payloadJson === undefined) throw new Error("terminal update payload is not serializable");
+
+    const record = this.db.transaction(() => {
+      const inserted = this.db
+        .query<{ update_id: number }, [number, string, number]>(`
+          INSERT INTO updates (
+            update_id, conversation_key, processing_state, payload_json, created_at
+          ) VALUES (?, '', 'rejected', ?, ?)
+          ON CONFLICT(update_id) DO NOTHING
+          RETURNING update_id
+        `)
+        .get(updateId, payloadJson, now);
+      if (!inserted) return false;
+      this.db
+        .query(`
+          INSERT INTO outbound_replies (
+            update_id, chat_id, text, status, attempts, next_chunk_index,
+            next_attempt_at,
+            created_at, updated_at
+          ) VALUES (?, ?, ?, 'pending', 0, 0, ?, ?, ?)
+        `)
+        .run(updateId, chatId, text, now, now, now);
+      return true;
+    });
+    return record.immediate();
+  }
+
+  listOutboundReplies(): StoredOutboundReply[] {
+    return this.db
+      .query<OutboundReplyRow, []>("SELECT * FROM outbound_replies ORDER BY id")
+      .all()
+      .map(mapOutboundReply);
+  }
+
+  claimOutboundReply(
+    leaseOwner: string,
+    now = Date.now(),
+    leaseMs = 30_000,
+    maxAttempts = 5,
+  ): StoredOutboundReply | null {
+    if (!leaseOwner) throw new Error("outbound reply lease owner is required");
+    validateAttemptLimit(maxAttempts);
+    const leaseUntil = calculateLeaseUntil(now, leaseMs);
+    const claim = this.db.transaction(() => {
+      this.db
+        .query(`
+          UPDATE outbound_replies
+          SET status = CASE WHEN attempts >= ? THEN 'failed' ELSE 'pending' END,
+              lease_owner = NULL, lease_token = NULL, lease_until = NULL,
+              last_error = CASE
+                WHEN attempts >= ? THEN 'reply lease expired after final attempt'
+                ELSE last_error
+              END,
+              updated_at = ?
+          WHERE status = 'leased' AND lease_until <= ?
+        `)
+        .run(maxAttempts, maxAttempts, now, now);
+      const candidate = this.db
+        .query<{ id: number }, [number, number]>(`
+          SELECT id FROM outbound_replies
+          WHERE status = 'pending' AND next_attempt_at <= ? AND attempts < ?
+          ORDER BY next_attempt_at, id
+          LIMIT 1
+        `)
+        .get(now, maxAttempts);
+      if (!candidate) return null;
+      const leaseToken = crypto.randomUUID();
+      const row = this.db
+        .query<OutboundReplyRow, [string, string, number, number, number]>(`
+          UPDATE outbound_replies
+          SET status = 'leased', attempts = attempts + 1,
+              lease_owner = ?, lease_token = ?, lease_until = ?, updated_at = ?
+          WHERE id = ? AND status = 'pending'
+          RETURNING *
+        `)
+        .get(leaseOwner, leaseToken, leaseUntil, now, candidate.id);
+      if (!row) throw new Error("outbound reply lease acquisition failed");
+      return mapOutboundReply(row);
+    });
+    return claim.immediate();
+  }
+
+  markOutboundReplyDelivered(
+    replyId: number,
+    leaseOwner: string,
+    leaseToken: string,
+    now = Date.now(),
+  ): boolean {
+    validateTimestamp(now);
+    return (
+      this.db
+        .query(`
+          UPDATE outbound_replies
+          SET status = 'delivered', lease_owner = NULL, lease_token = NULL,
+              lease_until = NULL, last_error = NULL,
+              updated_at = ?, delivered_at = ?
+          WHERE id = ? AND status = 'leased' AND lease_owner = ?
+            AND lease_token = ? AND lease_until > ?
+        `)
+        .run(now, now, replyId, leaseOwner, leaseToken, now).changes > 0
+    );
+  }
+
+  advanceOutboundReplyChunk(
+    replyId: number,
+    leaseOwner: string,
+    leaseToken: string,
+    nextChunkIndex: number,
+    now = Date.now(),
+  ): boolean {
+    validateTimestamp(now);
+    if (!Number.isSafeInteger(nextChunkIndex) || nextChunkIndex < 0) {
+      throw new Error("outbound reply chunk index must be a non-negative safe integer");
+    }
+    return (
+      this.db
+        .query(`
+          UPDATE outbound_replies
+          SET next_chunk_index = ?, updated_at = ?
+          WHERE id = ? AND status = 'leased' AND lease_owner = ?
+            AND lease_token = ? AND lease_until > ?
+            AND next_chunk_index <= ?
+        `)
+        .run(
+          nextChunkIndex,
+          now,
+          replyId,
+          leaseOwner,
+          leaseToken,
+          now,
+          nextChunkIndex,
+        ).changes > 0
+    );
+  }
+
+  renewOutboundReplyLease(
+    replyId: number,
+    leaseOwner: string,
+    leaseToken: string,
+    now = Date.now(),
+    leaseMs = 30_000,
+  ): boolean {
+    const leaseUntil = calculateLeaseUntil(now, leaseMs);
+    return (
+      this.db
+        .query(`
+          UPDATE outbound_replies
+          SET lease_until = ?, updated_at = ?
+          WHERE id = ? AND status = 'leased' AND lease_owner = ?
+            AND lease_token = ? AND lease_until > ?
+        `)
+        .run(leaseUntil, now, replyId, leaseOwner, leaseToken, now).changes > 0
+    );
+  }
+
+  failOutboundReply(
+    replyId: number,
+    leaseOwner: string,
+    leaseToken: string,
+    error: string,
+    now = Date.now(),
+  ): boolean {
+    validateTimestamp(now);
+    return (
+      this.db
+        .query(`
+          UPDATE outbound_replies
+          SET status = 'failed', lease_owner = NULL, lease_token = NULL,
+              lease_until = NULL, last_error = ?, updated_at = ?
+          WHERE id = ? AND status = 'leased' AND lease_owner = ?
+            AND lease_token = ? AND lease_until > ?
+        `)
+        .run(error, now, replyId, leaseOwner, leaseToken, now).changes > 0
+    );
+  }
+
+  releaseOutboundReply(
+    replyId: number,
+    leaseOwner: string,
+    leaseToken: string,
+    error: string,
+    now = Date.now(),
+  ): boolean {
+    validateTimestamp(now);
+    return (
+      this.db
+        .query(`
+          UPDATE outbound_replies
+          SET status = 'pending', attempts = MAX(attempts - 1, 0),
+              next_attempt_at = ?, lease_owner = NULL, lease_token = NULL,
+              lease_until = NULL, last_error = ?, updated_at = ?
+          WHERE id = ? AND status = 'leased' AND lease_owner = ?
+            AND lease_token = ? AND lease_until > ?
+        `)
+        .run(now, error, now, replyId, leaseOwner, leaseToken, now).changes > 0
+    );
+  }
+
+  retryOutboundReply(
+    replyId: number,
+    leaseOwner: string,
+    leaseToken: string,
+    error: string,
+    nextAttemptAt: number,
+    maxAttempts: number,
+    now = Date.now(),
+  ): boolean {
+    validateTimestamp(now);
+    validateTimestamp(nextAttemptAt);
+    validateAttemptLimit(maxAttempts);
+    if (nextAttemptAt < now) throw new Error("outbound retry time may not be in the past");
+    const result = this.db
+      .query(`
+        UPDATE outbound_replies
+        SET status = CASE WHEN attempts >= ? THEN 'failed' ELSE 'pending' END,
+            next_attempt_at = ?, lease_owner = NULL, lease_token = NULL,
+            lease_until = NULL, last_error = ?, updated_at = ?
+        WHERE id = ? AND status = 'leased' AND lease_owner = ?
+          AND lease_token = ? AND lease_until > ?
+      `)
+      .run(
+        maxAttempts,
+        nextAttemptAt,
+        error,
+        now,
+        replyId,
+        leaseOwner,
+        leaseToken,
+        now,
+      );
+    return result.changes > 0;
   }
 
   acceptUpdate(
@@ -751,6 +1083,7 @@ export class Store {
         consumed_at INTEGER
       );
     `);
+    this.createOutboundRepliesSchema(db);
   }
 
   private migrateAndValidateSchema(): void {
@@ -775,11 +1108,52 @@ export class Store {
         }
         this.createSchema();
         this.db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+      } else if (version === 1) {
+        this.createOutboundRepliesSchema();
+        this.db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+      } else if (version === 2) {
+        this.db.exec(`
+          ALTER TABLE outbound_replies
+          ADD COLUMN next_chunk_index INTEGER NOT NULL DEFAULT 0
+            CHECK (next_chunk_index >= 0)
+        `);
+        this.db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
       }
 
       this.validateSchema();
     });
     migrate.immediate();
+  }
+
+  private createOutboundRepliesSchema(db: Database = this.db): void {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS outbound_replies (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        update_id INTEGER NOT NULL UNIQUE REFERENCES updates(update_id),
+        chat_id INTEGER NOT NULL,
+        text TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (
+          status IN ('pending', 'leased', 'delivered', 'failed')
+        ),
+        attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+        next_attempt_at INTEGER NOT NULL,
+        lease_owner TEXT,
+        lease_token TEXT,
+        lease_until INTEGER,
+        last_error TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        delivered_at INTEGER,
+        next_chunk_index INTEGER NOT NULL DEFAULT 0 CHECK (next_chunk_index >= 0),
+        CHECK (
+          (lease_owner IS NULL) = (lease_until IS NULL)
+          AND (lease_owner IS NULL) = (lease_token IS NULL)
+          AND ((status = 'leased') = (lease_owner IS NOT NULL))
+        )
+      );
+      CREATE INDEX IF NOT EXISTS outbound_replies_due_idx
+        ON outbound_replies (status, next_attempt_at, id);
+    `);
   }
 
   private readSchemaVersion(): number {
@@ -840,6 +1214,26 @@ function mapConversation(row: ConversationRow): StoredConversation {
   };
 }
 
+function mapOutboundReply(row: OutboundReplyRow): StoredOutboundReply {
+  return {
+    id: row.id,
+    updateId: row.update_id,
+    chatId: row.chat_id,
+    text: row.text,
+    status: row.status,
+    attempts: row.attempts,
+    nextChunkIndex: row.next_chunk_index,
+    nextAttemptAt: row.next_attempt_at,
+    leaseOwner: row.lease_owner,
+    leaseToken: row.lease_token,
+    leaseUntil: row.lease_until,
+    lastError: row.last_error,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    deliveredAt: row.delivered_at,
+  };
+}
+
 function calculateLeaseUntil(now: number, leaseMs: number): number {
   if (!Number.isSafeInteger(leaseMs) || leaseMs <= 0) {
     throw new Error("lease duration must be a positive safe integer");
@@ -851,6 +1245,18 @@ function calculateLeaseUntil(now: number, leaseMs: number): number {
     throw new Error("lease expiry exceeds safe integer range");
   }
   return leaseUntil;
+}
+
+function validateUpdateId(updateId: number): void {
+  if (!Number.isSafeInteger(updateId) || updateId < 0) {
+    throw new Error("Telegram update ID must be a non-negative safe integer");
+  }
+}
+
+function validateAttemptLimit(maxAttempts: number): void {
+  if (!Number.isSafeInteger(maxAttempts) || maxAttempts <= 0) {
+    throw new Error("outbound reply attempt limit must be a positive safe integer");
+  }
 }
 
 interface ColumnMetadata {
