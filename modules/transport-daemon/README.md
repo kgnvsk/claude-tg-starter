@@ -30,6 +30,10 @@ Telegram│ tg-receiver-daemon (bun) │ files  │ claude --channels + plugin  
   via `bot.handleUpdate`. All handlers, tools, and outbound sending stay byte-for-byte the
   same. The diff is one gated branch.
 - **Queue = filesystem.** No Redis, no extra deps — both processes already use `fs`.
+- **Delivery failures are retryable.** The plugin deletes an inbox item only after
+  Claude accepts the channel notification. If the MCP connection is temporarily down,
+  the item stays on disk and is retried in order after the session recovers. Malformed
+  queue files are still discarded so one poison item cannot block the queue forever.
 
 Result: receive never stops, no message loss on restart, **claude stays interactive →
 on the subscription** (not `claude -p`). Bonus: single consumer ⇒ no 409 two-poller

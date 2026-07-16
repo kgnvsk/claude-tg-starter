@@ -1,0 +1,111 @@
+#!/usr/bin/env python3
+"""Resolve a Codex image artifact by exact session ID and copy it atomically."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import sys
+import tempfile
+from pathlib import Path
+
+
+SESSION_RE = re.compile(
+    r"session id:\s*([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
+    re.IGNORECASE,
+)
+
+
+def fail() -> "NoReturn":
+    print("codex-image-result: no generated image artifact found", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def safe_png(candidate: Path, generated_root: Path) -> Path | None:
+    try:
+        resolved = candidate.expanduser().resolve(strict=True)
+        resolved.relative_to(generated_root)
+    except (FileNotFoundError, OSError, ValueError):
+        return None
+    if not resolved.is_file() or resolved.suffix.lower() != ".png":
+        return None
+    return resolved
+
+
+def structured_artifact(session_id: str, generated_root: Path, sessions_root: Path) -> Path | None:
+    for rollout in sorted(sessions_root.glob(f"**/rollout-*{session_id}*.jsonl"), reverse=True):
+        try:
+            with rollout.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    payload = event.get("payload")
+                    if not isinstance(payload, dict) or payload.get("type") != "image_generation_end":
+                        continue
+                    saved_path = payload.get("saved_path")
+                    if isinstance(saved_path, str):
+                        artifact = safe_png(Path(saved_path), generated_root)
+                        if artifact is not None:
+                            return artifact
+        except OSError:
+            continue
+    return None
+
+
+def session_directory_artifact(session_id: str, generated_root: Path) -> Path | None:
+    session_dir = generated_root / session_id
+    try:
+        candidates = sorted(session_dir.glob("*.png"), key=lambda path: path.stat().st_mtime, reverse=True)
+    except OSError:
+        return None
+    for candidate in candidates:
+        artifact = safe_png(candidate, generated_root)
+        if artifact is not None:
+            return artifact
+    return None
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--log", required=True, type=Path)
+    parser.add_argument("--output", required=True, type=Path)
+    args = parser.parse_args()
+
+    try:
+        log_text = args.log.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        fail()
+    match = SESSION_RE.search(log_text)
+    if match is None:
+        fail()
+
+    home = Path.home()
+    generated_root = (home / ".codex" / "generated_images").resolve()
+    artifact = structured_artifact(match.group(1), generated_root, home / ".codex" / "sessions")
+    if artifact is None:
+        artifact = session_directory_artifact(match.group(1), generated_root)
+    if artifact is None:
+        fail()
+
+    output = args.output.expanduser()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary_name = tempfile.mkstemp(prefix=f".{output.name}.", dir=output.parent)
+    os.close(fd)
+    temporary = Path(temporary_name)
+    try:
+        shutil.copy2(artifact, temporary)
+        os.replace(temporary, output)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+    print(output)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

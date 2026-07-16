@@ -12,13 +12,15 @@ description: Generate images via Codex CLI with model gpt-image-2. Use ALWAYS wh
 НИКОГДА не пиши большой промпт инлайном в `codex exec "<огромный промпт>"`. Длинный аргумент с кавычками срывает сериализацию tool_use на Opus 4.8 → вызов уходит ТЕКСТОМ → не выполняется → бот молчит. Это уже клало бота. Поэтому — ВСЕГДА в два шага:
 
 1. `Write` полный промпт в `/tmp/imgprompt.txt` (внутри текста промпта упомяни model gpt-image-2 + явный абсолютный путь сохранения).
-2. Запусти codex, читая промпт ИЗ файла — команда остаётся короткой:
+2. Запусти codex, читая промпт ИЗ файла, и сохрани полный лог. Команда остаётся короткой:
 
 ```bash
-~/.npm-global/bin/codex exec --skip-git-repo-check --sandbox danger-full-access -m gpt-5.5 "$(cat /tmp/imgprompt.txt)"
+LOG="$(mktemp /tmp/codex-image.XXXXXX.log)"
+timeout 420 ~/.npm-global/bin/codex exec --skip-git-repo-check --sandbox danger-full-access -m gpt-5.5 "$(cat /tmp/imgprompt.txt)" </dev/null >"$LOG" 2>&1
+~/bin/codex-image-result --log "$LOG" --output /absolute/final/path.png
 ```
 
-`$(cat ...)` подставляет текст в рантайме — в самом tool-вызове большого текста НЕТ, срываться нечему. Codex генерит картинку и сохраняет по указанному в промпте пути.
+`$(cat ...)` подставляет текст в рантайме — в самом tool-вызове большого текста НЕТ, срываться нечему. `codex-image-result` читает структурированный результат точной Codex-сессии и атомарно копирует PNG в нужный путь. Не верь фразе `Generated the image` и не ищи файл приблизительно по времени: успешной считается только команда с существующим итоговым PNG.
 
 ## CRITICAL: бинарь — /home/claude/.npm-global/bin/codex (не /usr/bin/codex)
 `/usr/bin/codex` застрял на 0.120.0 (нет gpt-5.5). npm-версия `~/.npm-global/bin/codex` (0.133+, сейчас 0.142) работает. Всегда полный путь.
@@ -32,14 +34,16 @@ ChatGPT-подписка задепрекейтила `gpt-5.2-codex`/`gpt-5`. �
 ## CRITICAL: --sandbox danger-full-access ОБЯЗАТЕЛЕН
 Без него codex read-only и падает на сохранении «Read-only file system».
 
-## CRITICAL: 401 — НЕ лезь в ключ, сообщи владельцу и жди
-Если codex вернул `401 Unauthorized` (auth протух) — **НЕ** логинься через `OPENAI_API_KEY` / `--with-api-key`. Правило: при отвале внешней авторизации ты СООБЩАЕШЬ владельцу («codex-auth отвалился, нужен перелогин codex») и ЖДЁШЬ. В ключи не лезешь молча — это жёсткое правило, без исключений. Перелогин делает владелец.
+## CRITICAL: 401 — проверяй только реальную ошибку команды
+Если сам `codex exec` завершился ошибкой и в его обычном сообщении об ошибке есть `401 Unauthorized`, **НЕ** логинься через `OPENAI_API_KEY` / `--with-api-key`. Сообщи владельцу: «codex-auth отвалился, нужен перелогин codex» — и жди. Никогда не делай `grep 401` по JSONL rollout: служебные и зашифрованные поля могут случайно содержать эти цифры и дают ложный диагноз.
 
 ## Rules
 - Модель **всегда** `gpt-image-2`. Никогда gpt-image-1 / dall-e-3.
 - Явный абсолютный путь сохранения — в тексте промпта (напр. `/home/claude/obsidian-vault/assets/images/hero.png`).
 - Всегда `--skip-git-repo-check --sandbox danger-full-access`.
 - Промпт — всегда через `/tmp/imgprompt.txt` + `"$(cat ...)"`, НИКОГДА инлайном.
+- Каждый запуск пишет отдельный лог и ОБЯЗАТЕЛЬНО завершает работу через `~/bin/codex-image-result`.
+- После успешного резолва сразу отправь итоговый файл через Telegram `reply(files: [...])` тому же `chat_id`, который запросил генерацию.
 - Никаких фоллбэков (thispersondoesnotexist / picsum / placeholder). Только codex.
 
 ## Пример (правильно — через файл)
@@ -49,12 +53,14 @@ ChatGPT-подписка задепрекейтила `gpt-5.2-codex`/`gpt-5`. �
 #   Slavic male entrepreneur in a navy suit, soft studio lighting, neutral grey
 #   background. Save to /home/claude/obsidian-vault/assets/portraits/founder.png
 # шаг 2:
-~/.npm-global/bin/codex exec --skip-git-repo-check --sandbox danger-full-access -m gpt-5.5 "$(cat /tmp/imgprompt.txt)"
+LOG="$(mktemp /tmp/codex-image.XXXXXX.log)"
+timeout 420 ~/.npm-global/bin/codex exec --skip-git-repo-check --sandbox danger-full-access -m gpt-5.5 "$(cat /tmp/imgprompt.txt)" </dev/null >"$LOG" 2>&1
+~/bin/codex-image-result --log "$LOG" --output /home/claude/obsidian-vault/assets/portraits/founder.png
 ```
 Картинка на диске за ~30-60 сек (сложный многоблочный креатив — до ~2 мин).
 
 ## Параллельная генерация (карусели)
-Для 5+ картинок — каждый промпт в свой файл (`/tmp/imgprompt-1.txt`, `-2`…), codex-вызовы параллельно с `run_in_background=true`. До 5 параллельно — без рейт-лимита.
+Для 5+ картинок — каждый промпт, лог и итоговый путь должны быть отдельными (`/tmp/imgprompt-1.txt`, `/tmp/codex-image-1.log` и т. д.). Codex-вызовы можно запускать параллельно с `run_in_background=true`; после каждого отдельно вызови `codex-image-result`. До 5 параллельно — без рейт-лимита.
 
 ## Креатив / текст в картинке — доверяй codex, НЕ арт-режиссируй (updated 2026-07-01)
 

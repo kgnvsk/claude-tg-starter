@@ -119,6 +119,29 @@ if [ "$MULTI_USER_ENABLED" -eq 1 ]; then
 STATE_EOF
 else
 
+# transport-daemon is optional. When enabled, keep its sole Telegram poller alive and
+# restart only the Claude drain if a durable update has waited more than two minutes.
+# The queued file survives the restart and is delivered after MCP reconnects.
+DAEMON_INBOX=/home/claude/.claude/channels/telegram/daemon-inbox
+if sudo systemctl show claude-telegram.service -p Environment --value 2>/dev/null \
+   | tr ' ' '\n' | grep -qx 'TG_TRANSPORT=daemon'; then
+    if ! XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user is-active cash-tg-receiver.service >/dev/null 2>&1; then
+        XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user reset-failed cash-tg-receiver.service 2>/dev/null || true
+        XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user start cash-tg-receiver.service 2>/dev/null || true
+        echo "[$(date -u +%FT%TZ)] transport daemon was down, tried restart" >> "$LOG"
+    fi
+    if [ -d "$DAEMON_INBOX" ] \
+       && find "$DAEMON_INBOX" -maxdepth 1 -type f -name '*.json' -mmin +2 -print -quit 2>/dev/null | grep -q .; then
+        DAEMON_STUCK_TS=/tmp/cash-daemon-inbox-restart.ts
+        NOW_D=$(date +%s); LAST_D=$(cat "$DAEMON_STUCK_TS" 2>/dev/null || echo 0)
+        if [ $(( NOW_D - LAST_D )) -ge 300 ]; then
+            echo "$NOW_D" > "$DAEMON_STUCK_TS"
+            echo "[$(date -u +%FT%TZ)] daemon inbox stalled, restarting Claude drain" >> "$LOG"
+            sudo systemctl restart claude-telegram.service 2>/dev/null || true
+        fi
+    fi
+fi
+
 # 0. Pin patched telegram plugin. claude 2.1.156 loads the plugin from the GitHub-synced
 #    marketplace dir, and that sync periodically reverts server.ts to upstream — which
 #    reintroduces the orphan-watchdog self-kill (process.ppid !== bootPpid) that killed the
