@@ -12,51 +12,18 @@ bad()  { printf '  ❌ %s\n' "$1"; }
 echo "🩺 {{AGENT_NAME}} doctor — $(date '+%F %T %Z')"
 echo
 
-MULTI_USER_ENABLED=0
-[ -f "$H/multi-user/state/enabled" ] && MULTI_USER_ENABLED=1
-if [ -f "$H/multi-user/state/transitioning" ]; then
-  TRANSITION_DIRECTION="$(cat "$H/multi-user/state/transitioning" 2>/dev/null)"
-  warn "transport transitioning: ${TRANSITION_DIRECTION:-unknown}; healthcheck recovery paused"
-elif [ "$MULTI_USER_ENABLED" -eq 1 ]; then
-  userctl() { XDG_RUNTIME_DIR="/run/user/$(id -u)" systemctl --user "$@"; }
-  if userctl is-active claude-multi-user-receiver.service >/dev/null 2>&1; then
-    ok "multi-user receiver активен"
-  else
-    bad "multi-user receiver НЕ активен"
-  fi
-  if userctl is-active claude-multi-user-dispatcher.service >/dev/null 2>&1; then
-    ok "multi-user dispatcher активен"
-  else
-    bad "multi-user dispatcher НЕ активен"
-  fi
-  ROUTER_DB="$H/multi-user/state/router.sqlite"
-  if ! command -v sqlite3 >/dev/null 2>&1; then
-    warn "router.sqlite integrity unchecked: sqlite3 is not installed"
-  elif [ -f "$ROUTER_DB" ] \
-     && [ "$(sqlite3 "$ROUTER_DB" 'PRAGMA quick_check;' 2>/dev/null)" = ok ]; then
-    ok "router.sqlite цела"
-  else
-    bad "router.sqlite отсутствует или повреждена"
-  fi
-  if ! systemctl is-active claude-telegram.service >/dev/null 2>&1 \
-     && ! userctl is-active cash-tg-receiver.service >/dev/null 2>&1 \
-     && userctl is-active claude-multi-user-receiver.service >/dev/null 2>&1; then
-    ok "sole poller: только multi-user receiver"
-  else
-    bad "sole poller нарушен: проверь legacy Telegram services"
-  fi
+# 1. systemd service
+if systemctl is-active claude-telegram.service >/dev/null 2>&1; then
+  ok "сервис claude-telegram активен"
 else
-  # Legacy owner-only transport checks are intentionally skipped in multi-user mode.
-  if systemctl is-active claude-telegram.service >/dev/null 2>&1; then
-    ok "сервис claude-telegram активен"
-  else
-    bad "сервис claude-telegram НЕ активен → sudo systemctl start claude-telegram"
-  fi
-  if pgrep -f "bun.*plugins-official.*telegram" >/dev/null 2>&1; then
-    ok "telegram-поллер (bun) жив"
-  else
-    warn "telegram-поллер не найден — если только что был рестарт, подожди 1-2 мин"
-  fi
+  bad "сервис claude-telegram НЕ активен → sudo systemctl start claude-telegram"
+fi
+
+# 2. telegram poller (bun MCP)
+if pgrep -f "bun.*plugins-official.*telegram" >/dev/null 2>&1; then
+  ok "telegram-поллер (bun) жив"
+else
+  warn "telegram-поллер не найден — если только что был рестарт, подожди 1-2 мин"
 fi
 
 # 3. Claude OAuth token freshness

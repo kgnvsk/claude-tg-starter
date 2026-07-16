@@ -134,40 +134,13 @@ runuser -l claude -c '~/bin/install-plugins'
 
 ## Фаза 4 — запуск
 
-Сначала проверь сохранённый режим. **Никогда не запускай legacy и multi-user одновременно:** оба читают один Telegram bot token и второй поллер получит 409.
-
 ```bash
-set -a; source /home/claude/.cash-agent.env; set +a
-if [[ "$MODULE_MULTI_USER" == 1 ]]; then
-  bash /opt/claude-tg-starter/modules/multi-user/install.sh status
-else
-  systemctl daemon-reload && systemctl enable --now claude-telegram
-fi
+systemctl daemon-reload && systemctl enable --now claude-telegram
 ```
-**Verify owner-only (все три):**
+**Verify (все три):**
 1. `pgrep -af 'bun server.ts'` — поллер жив, его ppid — claude, не 1.
 2. В `/home/claude/logs/claude-screen.log` появилось `polling as @<botname>`.
 3. Владелец пишет боту в TG → бот отвечает (он в allowlist через access.json, пейринг не нужен).
-
-**Verify multi-user:** `modules/multi-user/install.sh status` показывает `multi-user: enabled`; оба `claude-multi-user-*.service` active, а `claude-telegram.service` и `cash-tg-receiver.service` inactive. Затем выполни раздел Multi-user в `VERIFY.md`.
-
-### Фаза 4b — multi-user (опционально)
-
-Для нового сервера задай до `install-core`: `MODULE_MULTI_USER=1`, числовые `ADMIN_CHAT_IDS=123,456`, `GUEST_ACCESS_MODE=public` (любой может писать) или `invite` (только разрешённые). `OWNER_CHAT_ID` автоматически становится админом, если `ADMIN_CHAT_IDS` пуст.
-
-Для уже установленного агента сначала пройди live canary из `VERIFY.md`, затем:
-
-```bash
-set -a; source /home/claude/.cash-agent.env; set +a
-export MODULE_MULTI_USER=1 ADMIN_CHAT_IDS="${ADMIN_CHAT_IDS:-$OWNER_CHAT_ID}"
-bash /opt/claude-tg-starter/modules/multi-user/install.sh enable
-```
-
-Installer сначала проверяет Bun, Claude CLI и авторизацию, затем атомарно переключает единственного Telegram-поллера. При ошибке он восстанавливает точные прежние enabled/active состояния. Быстрый откат без удаления очереди и конфигурации:
-
-```bash
-bash /opt/claude-tg-starter/modules/multi-user/install.sh disable
-```
 
 ## Фаза 5 — устойчивость
 

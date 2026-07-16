@@ -23,42 +23,6 @@ OPENAI_API_KEY="${OPENAI_API_KEY:-}"     # voice transcription
 CALENDAR_EMAIL="${CALENDAR_EMAIL:-}"     # morning calendar (read locally via gcalcli; owner OAuth in Phase 6)
 OWNER_EMAIL="${OWNER_EMAIL:-}"           # vault-web: vault repo git author (Vercel COMMIT_AUTHOR_REQUIRED)
 VAULT_LOCALE="${VAULT_LOCALE:-en-US}"    # vault-web: Quartz locale (e.g. uk-UA). Default en-US.
-MODULE_DESIGN_PACK="${MODULE_DESIGN_PACK:-0}"
-MODULE_TRANSPORT_DAEMON="${MODULE_TRANSPORT_DAEMON:-0}"
-MODULE_VAULT_WEB="${MODULE_VAULT_WEB:-0}"
-MODULE_MULTI_USER="${MODULE_MULTI_USER:-0}"
-ADMIN_CHAT_IDS="${ADMIN_CHAT_IDS:-$OWNER_CHAT_ID}"
-[[ "$ADMIN_CHAT_IDS" =~ ^[[:space:]]*-?[0-9]+[[:space:]]*(,[[:space:]]*-?[0-9]+[[:space:]]*)*$ ]] || {
-  echo "FATAL: ADMIN_CHAT_IDS must contain comma-separated numeric Telegram IDs" >&2; exit 1;
-}
-ADMIN_CHAT_IDS="${ADMIN_CHAT_IDS//[[:space:]]/}"
-GUEST_ACCESS_MODE="${GUEST_ACCESS_MODE:-public}"
-MAX_WORKERS="${MAX_WORKERS:-4}"
-GUEST_RETENTION_DAYS="${GUEST_RETENTION_DAYS:-7}"
-RETENTION_CLEANUP_INTERVAL_MS="${RETENTION_CLEANUP_INTERVAL_MS:-21600000}"
-CLAUDE_EXECUTABLE="${CLAUDE_EXECUTABLE:-/home/claude/.local/bin/claude}"
-WORKER_TIMEOUT_MS="${WORKER_TIMEOUT_MS:-300000}"
-MAX_ATTEMPTS="${MAX_ATTEMPTS:-3}"
-RETRY_INITIAL_MS="${RETRY_INITIAL_MS:-1000}"
-RETRY_MAX_MS="${RETRY_MAX_MS:-60000}"
-
-for v in MODULE_DESIGN_PACK MODULE_TRANSPORT_DAEMON MODULE_VAULT_WEB MODULE_MULTI_USER; do
-  [[ "${!v}" == 0 || "${!v}" == 1 ]] || { echo "FATAL: $v must be 0 or 1" >&2; exit 1; }
-done
-[[ "$GUEST_ACCESS_MODE" == public || "$GUEST_ACCESS_MODE" == invite ]] || {
-  echo "FATAL: GUEST_ACCESS_MODE must be public or invite" >&2; exit 1;
-}
-for v in MAX_WORKERS GUEST_RETENTION_DAYS RETENTION_CLEANUP_INTERVAL_MS WORKER_TIMEOUT_MS MAX_ATTEMPTS RETRY_INITIAL_MS RETRY_MAX_MS; do
-  [[ "${!v}" =~ ^[1-9][0-9]*$ ]] || { echo "FATAL: $v must be a positive integer" >&2; exit 1; }
-done
-if (( RETENTION_CLEANUP_INTERVAL_MS < 60000 || RETENTION_CLEANUP_INTERVAL_MS > 86400000 )); then
-  echo "FATAL: RETENTION_CLEANUP_INTERVAL_MS must be between 60000 and 86400000" >&2
-  exit 1
-fi
-if [[ "$MODULE_MULTI_USER" == 1 && "$MODULE_TRANSPORT_DAEMON" == 1 ]]; then
-  echo "FATAL: MODULE_MULTI_USER=1 conflicts with MODULE_TRANSPORT_DAEMON=1" >&2
-  exit 1
-fi
 DEPLOY_DATE="$(date +%F)"
 
 echo "[1/6] user + dirs"
@@ -137,12 +101,8 @@ chmod 600 "$H"/.claude/channels/telegram/.env
 # (source-of-truth flow). chmod 600 — it holds the bot token.
 install -m600 -o claude -g claude /dev/null "$H"/.cash-agent.env
 { for v in AGENT_NAME OWNER_NAME OWNER_TG_USERNAME OWNER_CHAT_ID OWNER_EMAIL BOT_USERNAME TIMEZONE \
-           TELEGRAM_BOT_TOKEN OPENAI_API_KEY CALENDAR_EMAIL VAULT_LOCALE \
-           MODULE_DESIGN_PACK MODULE_TRANSPORT_DAEMON MODULE_VAULT_WEB MODULE_MULTI_USER \
-           ADMIN_CHAT_IDS GUEST_ACCESS_MODE MAX_WORKERS GUEST_RETENTION_DAYS \
-           RETENTION_CLEANUP_INTERVAL_MS CLAUDE_EXECUTABLE WORKER_TIMEOUT_MS \
-           MAX_ATTEMPTS RETRY_INITIAL_MS RETRY_MAX_MS; do
-    printf '%s=%q\n' "$v" "${!v}"
+           TELEGRAM_BOT_TOKEN OPENAI_API_KEY CALENDAR_EMAIL VAULT_LOCALE; do
+    printf '%s=%s\n' "$v" "${!v}"
   done; } > "$H"/.cash-agent.env
 chmod 600 "$H"/.cash-agent.env
 
@@ -172,11 +132,5 @@ if [ ! -d "$H"/obsidian-vault/.git ]; then
   runuser -l claude -c "cd ~/obsidian-vault && git init -q && git config user.email '${OWNER_EMAIL:-claude@localhost}' && git config user.name '${AGENT_NAME:-Claude Agent}' && git add -A && git commit -q -m 'init: vault skeleton'" \
     && echo "  vault: git initialized (история памяти включена)" \
     || echo "  ! vault git init не удался — вручную: cd ~/obsidian-vault && git init && git add -A && git commit -m init"
-fi
-if [[ "$MODULE_MULTI_USER" == 1 ]]; then
-  bash "$KIT/modules/multi-user/install.sh" enable
-elif [[ "$MODULE_MULTI_USER" == 0 ]] \
-  && [[ -f "$H/multi-user/state/enabled" || -f "$H/multi-user/state/transitioning" ]]; then
-  bash "$KIT/modules/multi-user/install.sh" disable
 fi
 echo "✅ install-core OK: user+dirs+assets+render+secrets+crontab done, gate passed."

@@ -10,7 +10,7 @@
 #   1. update the kit (git pull if this is a clone; otherwise tells you to re-sync)
 #   2. re-run install-core with the SAME owner inputs (from the saved agent.env)
 #   3. re-apply the golden telegram patch over the installed plugin
-#   4. re-apply multi-user when enabled; otherwise restart claude-telegram
+#   4. restart claude-telegram so the new code/config takes effect
 #
 # Usage:
 #   ssh root@<SERVER>
@@ -20,9 +20,6 @@ set -euo pipefail
 KIT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 H=/home/claude
 ENV_SAVED="$H/.cash-agent.env"   # install-core inputs, saved at first deploy (chmod 600)
-WAS_MULTI_USER=0
-[[ -f "$H/multi-user/state/enabled" || -f "$H/multi-user/state/transitioning" ]] \
-  && WAS_MULTI_USER=1
 
 echo "==> Обновление из кита — $KIT"
 
@@ -84,23 +81,11 @@ fi
 [ "$patched" -eq 0 ] && echo "      golden already in place (or plugin not installed yet)"
 chown -R claude:claude "$H"
 
-# ---- 4. restart the selected transport ----
+# ---- 4. restart the service ----
+echo "[4/4] restart claude-telegram"
 systemctl daemon-reload
-if [[ "${MODULE_MULTI_USER:-0}" == 1 ]]; then
-  echo "[4/4] re-apply multi-user services"
-  bash "$KIT/modules/multi-user/install.sh" enable
-else
-  if [[ -f "$H/multi-user/state/enabled" || -f "$H/multi-user/state/transitioning" ]]; then
-    bash "$KIT/modules/multi-user/install.sh" disable
-  fi
-  if [[ "$WAS_MULTI_USER" == 1 ]]; then
-    echo "[4/4] multi-user disabled; exact legacy state already restored"
-  else
-    echo "[4/4] restart claude-telegram"
-    systemctl restart claude-telegram.service || {
-      echo "WARN: restart failed — is the service installed? (first deploy not done?)" >&2
-    }
-  fi
-fi
+systemctl restart claude-telegram.service || {
+  echo "WARN: restart failed — is the service installed? (first deploy not done?)" >&2
+}
 
 echo "✅ update done. Verify: pgrep -af 'bun.*telegram' ; tail ~claude/logs/claude-screen.log"
