@@ -173,6 +173,13 @@ function defaultAccess(): Access {
 const MAX_CHUNK_LIMIT = 4096
 const MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
 
+class RetryableInboundDeliveryError extends Error {
+  constructor(cause: unknown) {
+    super(`failed to deliver inbound to Claude: ${cause}`)
+    this.name = 'RetryableInboundDeliveryError'
+  }
+}
+
 // reply's files param takes any path. .env is ~60 bytes and ships as a
 // document. Claude can already Read+paste file contents, so this isn't a new
 // exfil channel for arbitrary paths — but the server's own state is the one
@@ -1150,6 +1157,9 @@ async function handleInbound(
     })
   } catch (err) {
     process.stderr.write(`telegram channel: failed to deliver inbound to Claude: ${err}\n`)
+    if (process.env.TG_TRANSPORT === 'daemon') {
+      throw new RetryableInboundDeliveryError(err)
+    }
   }
 }
 
@@ -1157,6 +1167,7 @@ async function handleInbound(
 // (grammy's default error handler calls bot.stop() and rethrows).
 bot.catch(err => {
   process.stderr.write(`telegram channel: handler error (polling continues): ${err.error}\n`)
+  if (err.error instanceof RetryableInboundDeliveryError) throw err.error
 })
 
 // Retry polling with backoff on any error. Previously only 409 was retried —
@@ -1195,6 +1206,11 @@ void (async () => {
           await bot.handleUpdate(update)     // run ALL existing handlers unchanged
           rmSync(f, { force: true })         // delete only after success → at-least-once, no loss on crash
         } catch (e) {
+          if (e instanceof RetryableInboundDeliveryError) {
+            process.stderr.write(`telegram channel: Claude unavailable; retaining daemon inbox item ${n}\n`)
+            await new Promise(r => setTimeout(r, 1000))
+            break // keep the update on disk
+          }
           rmSync(f, { force: true })         // drop poison/half item, keep draining
           process.stderr.write(`telegram channel: daemon inbox item ${n} failed: ${e}\n`)
         }
