@@ -109,8 +109,13 @@ echo "[5/6] crontab (утренний дайджест китом НЕ став�
   echo "* * * * * /usr/bin/timeout 55 $H/bin/cash-reminder-tick"
   echo "*/2 * * * * /usr/bin/timeout 110 $H/bin/cash-healthcheck"
   echo "17 4 * * * find $H/.claude/channels/telegram/inbox/ -type f -mtime +2 -delete"
-  echo "*/5 * * * * /usr/bin/timeout 60 $H/bin/vault-sync"   # автокоммит памяти-вольта в git (історія; хук ненадійний - тому крон)
+  echo "*/5 * * * * /usr/bin/timeout 60 $H/bin/vault-sync"
+  echo "* * * * * /usr/bin/timeout 55 $H/bin/unstick-watch"   # автокоммит памяти-вольта в git (історія; хук ненадійний - тому крон)
 } | crontab -u claude -
+
+# The command menu has to match what actually works, or the owner is guessing.
+runuser -u "${AGENT_USER:-claude}" -- env HOME="$H" "$H/bin/set-tg-commands" || \
+  echo "      WARN: could not publish the Telegram command menu"
 
 echo "[6/6] GATE: no leftover {{PLACEHOLDER}} in deployed files"
 # The real failure mode is an unrendered placeholder (a missing/typo'd input). Any
