@@ -29,6 +29,21 @@ if [ "$ACTION" = "disable" ]; then
   exit 0
 fi
 
+# Retired 2026-07-29. On Claude Code 2.1.208+ the channel plugin does not start in
+# this mode: the daemon keeps filing incoming updates into its inbox and nothing
+# drains them, so the agent answers nobody while sending (crons, alerts) still
+# works — it looks alive from every angle. `disable` above stays available so a box
+# that already has it can be cleaned up; enabling is refused.
+cat >&2 <<'RETIRED'
+FATAL: the daemon transport is retired and must not be enabled.
+  Why: on Claude Code 2.1.208+ the channel plugin never starts in this mode.
+       Incoming messages queue up unread while outgoing still works, so the bot
+       looks healthy and answers nobody.
+  Use the standard transport (the default — nothing to do).
+  To remove it from a box that has it:  bash "$0" disable
+RETIRED
+exit 2
+
 echo "==> transport-daemon: ENABLE"
 
 # 1. daemon code next to the channel secrets (the unit's EnvironmentFile lives there)
