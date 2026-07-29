@@ -4,6 +4,26 @@
 set -u
 
 LOG=/home/claude/logs/healthcheck.log
+
+# The owner can park automatic restarts with /fix when the watchdog itself is what
+# keeps killing the bot. Every automatic restart goes through here, so one hold
+# covers all of them. A stale file cannot wedge recovery: it expires.
+RESTART_HOLD="$H/logs/restart-hold.until"
+restart_service() {
+  local until
+  until=$(cat "$RESTART_HOLD" 2>/dev/null || true)
+  case "$until" in
+    ''|*[!0-9]*) rm -f "$RESTART_HOLD" ;;
+    *)
+      if [ "$(date +%s)" -lt "$until" ]; then
+        echo "[$(date -u +%FT%TZ)] restart suppressed until $until (/fix hold)" >> "$LOG"
+        return 1
+      fi
+      rm -f "$RESTART_HOLD"
+      ;;
+  esac
+  sudo systemctl restart "${SVC:-claude-telegram.service}" 2>/dev/null
+}
 STATE=/home/claude/logs/health-state.json
 ALERT_COOLDOWN=600  # 10 min between repeat alerts
 mkdir -p /home/claude/logs
@@ -164,7 +184,7 @@ if ! pgrep -f "bun.*plugins-official.*telegram" >/dev/null 2>&1; then
         DEAD_FOR=$((NOW - DEAD_SINCE))
         if [ "$DEAD_FOR" -ge 240 ]; then
             echo "[$(date -u +%FT%TZ)] bun MCP dead ${DEAD_FOR}s, restarting claude-telegram" >> "$LOG"
-            sudo systemctl restart claude-telegram.service 2>/dev/null
+            restart_service
             rm -f "$BUN_DEAD_TS"
         else
             echo "[$(date -u +%FT%TZ)] bun MCP dead ${DEAD_FOR}s, within grace period (240s)" >> "$LOG"
@@ -240,7 +260,7 @@ if [ "${EXP:-0}" -gt 0 ]; then
         if [ $(( NOW_S2 - LAST_R )) -ge 900 ]; then
             echo "$NOW_S2" > "$RESTART_TS"
             echo "[$(date -u +%FT%TZ)] token expired — restarting claude-telegram to re-read refreshed creds" >> "$LOG"
-            sudo systemctl restart claude-telegram.service 2>/dev/null
+            restart_service
             alert "claude-token-expired" "Claude OAuth токен протух — авто-рестарт бота (подхватит свежий токен из файла). Если через 5 мин молчит — нужен /login." 3600
         fi
     elif [ "$LEFT_MIN" -le 30 ]; then
@@ -277,7 +297,7 @@ if [ -f "$DB" ]; then
             AGE_MIN=$(( (NOW_MS3 - LAST_IN) / 60000 ))
             echo "[$(date -u +%FT%TZ)] stuck-turn: unanswered incoming ${AGE_MIN}m, sessions idle — restarting" >> "$LOG"
             XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user restart cash-tg-receiver 2>/dev/null
-            sudo systemctl restart claude-telegram.service 2>/dev/null
+            restart_service
         fi
     fi
 fi
