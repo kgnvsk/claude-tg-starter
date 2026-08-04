@@ -13,13 +13,14 @@ leading `VAR=val` and `env` prefixes), so it catches path-qualified forms like
 NOT false-positive on `claude` appearing as an argument (`pgrep -af claude`,
 `grep claude`, `which claude`).
 
-Denies when that executable's basename is `claude` and either:
-  • the next token is `mcp`  (the classic self-kill), or
-  • it is a nested session (`claude` / `claude -p …`) WITHOUT
-    ATARAX_SUPPRESS_TELEGRAM=1 in the command (the suppress env makes the plugin
-    inert, so the morning/evening crons that call
-    `ATARAX_SUPPRESS_TELEGRAM=1 claude -p …` are allowed).
-`claude plugin …` is allowed (it manages plugins, doesn't start a poller).
+Denies interactive nesting and every `claude mcp …` invocation. The non-session commands `claude plugin …` and
+`claude auth status` are allowed.
+
+`ATARAX_SUPPRESS_TELEGRAM=1 claude -p …` is allowed on purpose: that env keeps
+the telegram plugin inert, so the nested session cannot reach the poller. It is
+how auto-publisher has run in production since June and how scheduled agent
+tasks (RUN=1) execute. Interactive nesting and `claude mcp …` stay blocked —
+the latter is what killed Cash on 2026-06-25.
 
 The matching CLAUDE.md rule ("НИКОГДА не запускай claude mcp …") is the soft
 guard; this hook is the hard backstop the model can't talk itself past.
@@ -41,26 +42,30 @@ def segments(cmd: str):
 
 
 def first_executable(seg: str):
-    """Return (exe_basename, rest_tokens) for a segment, skipping VAR=val / env prefixes.
-    Returns (None, []) if the segment has no command token."""
+    """Return (exe_basename, rest_tokens, env_prefix) for a segment.
+    Skips VAR=val / env prefixes but hands them back, because one of them
+    decides whether a nested run is safe. Returns (None, [], {}) if empty."""
     try:
         toks = shlex.split(seg)
     except ValueError:
         toks = seg.split()
     i = 0
+    assigned = {}
     while i < len(toks):
         t = toks[i]
         if t == "env":          # `env claude …`
             i += 1
             continue
         if re.match(r"^\w+=", t):  # `VAR=val claude …`
+            key, _, value = t.partition("=")
+            assigned[key] = value
             i += 1
             continue
         break
     if i >= len(toks):
-        return None, []
+        return None, [], {}
     exe = os.path.basename(toks[i])
-    return exe, toks[i + 1:]
+    return exe, toks[i + 1:], assigned
 
 
 def main() -> None:
@@ -76,15 +81,23 @@ def main() -> None:
         sys.exit(0)
 
     cmd = (data.get("tool_input") or {}).get("command") or ""
-    suppressed = "ATARAX_SUPPRESS_TELEGRAM=1" in cmd
 
     for seg in segments(cmd):
-        exe, rest = first_executable(seg)
+        exe, rest, assigned = first_executable(seg)
         if exe != "claude":
             continue
         nxt = rest[0] if rest else ""
+        # A suppressed headless run is the one nested form that is safe: the
+        # telegram plugin stays inert, so the live poller is never touched.
+        # This is what auto-publisher and scheduled agent tasks rely on.
+        if assigned.get("ATARAX_SUPPRESS_TELEGRAM") == "1" and (
+            "-p" in rest or "--print" in rest
+        ):
+            continue
         if nxt == "plugin":
             continue  # plugin management — safe
+        if nxt == "auth" and rest[1:2] == ["status"]:
+            continue  # read-only auth health check
         if nxt == "mcp":
             deny(
                 "🚫 SELF-KILL GUARD: `claude mcp …` запрещён на живом боте.\n\n"
@@ -94,14 +107,14 @@ def main() -> None:
                 "Поставить/настроить MCP → правь .mcp.json / settings файлом + рестарт "
                 "сервиса, НЕ `claude mcp add` вживую."
             )
-        # bare `claude` or `claude -p …` (nested session) without the suppress env
-        if not suppressed:
-            deny(
-                "🚫 SELF-KILL GUARD: вложенный `claude` без ATARAX_SUPPRESS_TELEGRAM=1.\n\n"
-                "Любой вложенный `claude`/`claude -p` поднимает второй инстанс и убивает "
-                "твой живой поллер. Если реально нужен headless-вызов — префикс "
-                "`ATARAX_SUPPRESS_TELEGRAM=1 claude -p …` (делает плагин инертным)."
-            )
+        deny(
+            "🚫 SELF-KILL GUARD: вложенная интерактивная `claude`-сессия запрещена.\n\n"
+            "Она конфликтует с живым Telegram-агентом. Что делать вместо этого:\n"
+            "• подзадача сейчас → нативный Agent (Task);\n"
+            "• разовый headless-прогон → `ATARAX_SUPPRESS_TELEGRAM=1 claude -p …` "
+            "(разрешён: плагин остаётся спящим, поллер цел);\n"
+            "• работа по расписанию → `reminder-task … --run`."
+        )
 
     sys.exit(0)
 

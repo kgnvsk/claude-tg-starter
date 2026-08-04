@@ -1,62 +1,436 @@
 #!/bin/bash
-# Fires every minute. Scans ~/.atarax/reminders/ for due reminder files,
-# sends them via Telegram Bot API, and removes.
+# Fires every minute. Scans ~/.atarax/reminders/ for due reminder files and
+# sends them via Telegram Bot API.
 #
-# Reminder file format: plain text
-#   Line 1: EPOCH=<unix_timestamp_when_to_fire>
-#   Line 2: CHAT=<chat_id>
-#   Line 3: PARSE=<markdown|markdownv2|html|text>  (optional, default: text)
-#   Line 4 onwards: message body (raw)
-#
-# File name convention: <epoch>-<slug>.rem  (slug is just for human browsing)
+# Required headers:
+#   EPOCH=<unix_timestamp_when_to_fire>
+#   CHAT=<chat_id>
+# Optional headers:
+#   PARSE=<markdown|markdownv2|html|text>  (default: text)
+#   RUN=1  → the body is a task for the agent, not a message for the owner:
+#            run it headless and send the RESULT. Everything else (repeat,
+#            quiet hours, until, dedup) behaves exactly the same.
+#   TASK=<stable_task_identifier>
+#   REPEAT_SECONDS=<positive_interval>
+#   TIMEZONE=<safe_IANA_timezone>
+#   QUIET_START=<hour_or_HH:MM>
+#   QUIET_END=<hour_or_HH:MM>
+#   UNTIL_EPOCH=<last_allowed_send_boundary>
+#   COUNT=<successful_send_count>
+# Header lines form the leading KEY=value block. Everything after that block
+# is the message body. Unknown optional headers are preserved but not sent.
 
 set -u
 
-REM_DIR="$HOME/.atarax/reminders"
-LOG="$HOME/logs/reminder-tick.log"
-TOKEN_FILE="$HOME/.claude/channels/telegram/.env"
+REM_DIR="${REM_DIR:-$HOME/.atarax/reminders}"
+LOG="${LOG:-$HOME/logs/reminder-tick.log}"
+TOKEN_FILE="${TOKEN_FILE:-$HOME/.claude/channels/telegram/.env}"
+PROFILE_FILE="${PROFILE_FILE:-$HOME/.agent-profile.env}"
+LOCK_FILE="${LOCK_FILE:-${REM_DIR}.worker.lock}"
 
 mkdir -p "$REM_DIR" "$(dirname "$LOG")"
 
+# macOS has no flock(1), while Python's non-blocking kernel flock is portable
+# across macOS and Ubuntu. The inheritable fd survives exec and remains held by
+# curl if the Bash worker dies during delivery.
+if [ "${REMINDER_TICK_LOCK_HELD:-0}" != "1" ]; then
+  exec python3 - "$LOCK_FILE" "$0" "$@" <<'PY'
+import fcntl
+import os
+import sys
+
+lock_path, worker, *worker_args = sys.argv[1:]
+os.makedirs(os.path.dirname(lock_path) or ".", exist_ok=True)
+lock = open(lock_path, "a+", encoding="utf-8")
+try:
+    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except BlockingIOError:
+    lock.close()
+    raise SystemExit(0)
+
+os.set_inheritable(lock.fileno(), True)
+env = os.environ.copy()
+env["REMINDER_TICK_LOCK_HELD"] = "1"
+os.execvpe("bash", ["bash", worker, *worker_args], env)
+PY
+fi
+
+log_message() {
+  printf '%s %s\n' "$(date '+%F %T')" "$*" >> "$LOG"
+}
+
+header_value() {
+  local file="$1" wanted="$2"
+  awk -v wanted="$wanted" '
+    /^[A-Z][A-Z0-9_]*=/ {
+      key = $0
+      sub(/=.*/, "", key)
+      if (key == wanted) {
+        print substr($0, length(key) + 2)
+        exit
+      }
+      next
+    }
+    { exit }
+  ' "$file"
+}
+
+has_header() {
+  local file="$1" wanted="$2"
+  awk -v wanted="$wanted" '
+    BEGIN { found = 0 }
+    /^[A-Z][A-Z0-9_]*=/ {
+      key = $0
+      sub(/=.*/, "", key)
+      if (key == wanted) {
+        found = 1
+        exit
+      }
+      next
+    }
+    { exit }
+    END { exit(found ? 0 : 1) }
+  ' "$file"
+}
+
+is_uint() {
+  [[ "$1" =~ ^[0-9]{1,18}$ ]]
+}
+
+decimal_value() {
+  printf '%s\n' "$((10#$1))"
+}
+
+quiet_minutes() {
+  local value="$1" hour minute
+  if [[ "$value" =~ ^([0-9]{1,2})(:([0-9]{2}))?$ ]]; then
+    hour="${BASH_REMATCH[1]}"
+    minute="${BASH_REMATCH[3]:-0}"
+    hour=$((10#$hour))
+    minute=$((10#$minute))
+    if [ "$hour" -le 23 ] && [ "$minute" -le 59 ]; then
+      printf '%s\n' "$((hour * 60 + minute))"
+      return 0
+    fi
+  fi
+  return 1
+}
+
+valid_timezone() {
+  local timezone="$1" root
+  [[ "$timezone" =~ ^[A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+)*$ ]] || return 1
+  for root in /usr/share/zoneinfo /var/db/timezone/zoneinfo; do
+    [ -f "$root/$timezone" ] && return 0
+  done
+  return 1
+}
+
+timezone_date() {
+  local timezone="$1"
+  shift
+  if [ -n "$timezone" ]; then
+    TZ="$timezone" date "$@"
+  else
+    date "$@"
+  fi
+}
+
+next_quiet_end_epoch() {
+  local now="$1" timezone="$2" end_minutes="$3" tomorrow="$4"
+  local local_date target_date hour minute
+
+  if date -d '@0' '+%s' >/dev/null 2>&1; then
+    local_date=$(timezone_date "$timezone" -d "@$now" '+%Y-%m-%d') || return 1
+    if [ "$tomorrow" -eq 1 ]; then
+      target_date=$(timezone_date "$timezone" -d "$local_date +1 day" '+%Y-%m-%d') || return 1
+    else
+      target_date="$local_date"
+    fi
+    hour=$((end_minutes / 60))
+    minute=$((end_minutes % 60))
+    timezone_date "$timezone" -d "$(printf '%s %02d:%02d:00' "$target_date" "$hour" "$minute")" '+%s'
+  else
+    local_date=$(timezone_date "$timezone" -r "$now" '+%Y-%m-%d') || return 1
+    if [ "$tomorrow" -eq 1 ]; then
+      target_date=$(timezone_date "$timezone" -j -v+1d -f '%Y-%m-%d' "$local_date" '+%Y-%m-%d') || return 1
+    else
+      target_date="$local_date"
+    fi
+    hour=$((end_minutes / 60))
+    minute=$((end_minutes % 60))
+    timezone_date "$timezone" -j -f '%Y-%m-%d %H:%M:%S' \
+      "$(printf '%s %02d:%02d:00' "$target_date" "$hour" "$minute")" '+%s'
+  fi
+}
+
+atomic_update_repeat() {
+  local file="$1" next_epoch="$2" next_count="$3" temp
+  temp=$(mktemp "${file}.tmp.XXXXXX") || return 1
+  if ! awk -v next_epoch="$next_epoch" -v next_count="$next_count" '
+    BEGIN { headers = 1; count_written = 0 }
+    headers && /^EPOCH=/ {
+      print "EPOCH=" next_epoch
+      next
+    }
+    headers && /^COUNT=/ {
+      if (!count_written) print "COUNT=" next_count
+      count_written = 1
+      next
+    }
+    headers && !/^[A-Z][A-Z0-9_]*=/ {
+      if (!count_written) print "COUNT=" next_count
+      count_written = 1
+      headers = 0
+    }
+    { print }
+    END {
+      if (headers && !count_written) print "COUNT=" next_count
+    }
+  ' "$file" > "$temp"; then
+    rm -f "$temp"
+    return 1
+  fi
+  mv -f "$temp" "$file"
+}
+
+message_body() {
+  awk '
+    BEGIN { headers = 1 }
+    headers && /^[A-Z][A-Z0-9_]*=/ { next }
+    headers && /^[[:space:]]*$/ { headers = 0; next }
+    { headers = 0; print }
+  ' "$1"
+}
+
+
+# A RUN=1 body is work for the agent, not a message for the owner. It runs in a
+# headless session so the live poller keeps answering the whole time —
+# ATARAX_SUPPRESS_TELEGRAM keeps that nested session from touching the plugin,
+# which is what auto-publisher has done in production since June.
+run_agent_task() {
+  local file="$1" prompt="$2" out rc
+  local workdir="${AGENT_TASK_DIR:-$HOME/.atarax/agent-task}"
+  mkdir -p "$workdir"
+  # `timeout` is missing on macOS, where the tests also run; the cap is a
+  # safety net, not a requirement.
+  local limit=""
+  command -v timeout >/dev/null && limit="timeout ${AGENT_TASK_TIMEOUT:-900}"
+  out=$(cd "$workdir" && ATARAX_SUPPRESS_TELEGRAM=1 $limit "$HOME/.local/bin/claude" -p --output-format text <<<"$prompt" 2>&1)
+  rc=$?
+  if [ $rc -ne 0 ]; then
+    log_message "run $(basename "$file") failed rc=$rc: $(printf '%s' "$out" | tail -c 200 | tr '\n' ' ')"
+    # The owner hears about it rather than facing silence.
+    printf '⚠️ Автозадача не выполнилась (%s). Причина в логе: %s' \
+      "$(header_value "$file" TASK)" "$LOG"
+    return 0
+  fi
+  out=$(printf '%s' "$out" | sed -e 's/[[:space:]]*$//')
+  [ -n "$out" ] || return 1
+  # Telegram rejects anything over 4096 characters outright.
+  printf '%s' "$out" | cut -c1-3900
+}
+
 [ -d "$REM_DIR" ] || exit 0
-[ -f "$TOKEN_FILE" ] || { echo "$(date '+%F %T') no token file" >> "$LOG"; exit 0; }
+[ -f "$TOKEN_FILE" ] || { log_message "no token file"; exit 0; }
 
-token=$(grep '^TELEGRAM_BOT_TOKEN=' "$TOKEN_FILE" | cut -d= -f2-)
-[ -n "$token" ] || { echo "$(date '+%F %T') empty token" >> "$LOG"; exit 0; }
+token=$(grep '^TELEGRAM_BOT_TOKEN=' "$TOKEN_FILE" | head -n1 | cut -d= -f2-)
+[ -n "$token" ] || { log_message "empty token"; exit 0; }
 
-now=$(date +%s)
+now="${NOW_EPOCH:-$(date +%s)}"
+if ! is_uint "$now"; then
+  log_message "invalid NOW_EPOCH: $now"
+  exit 0
+fi
+now=$(decimal_value "$now")
 
 shopt -s nullglob
 for f in "$REM_DIR"/*.rem; do
-  epoch=$(grep -m1 '^EPOCH=' "$f" | cut -d= -f2-)
-  chat=$(grep -m1 '^CHAT=' "$f" | cut -d= -f2-)
-  parse=$(grep -m1 '^PARSE=' "$f" | cut -d= -f2-)
-  [ -z "$epoch" ] || [ -z "$chat" ] && { echo "$(date '+%F %T') skip $f: missing header" >> "$LOG"; continue; }
+  epoch=$(header_value "$f" EPOCH)
+  chat=$(header_value "$f" CHAT)
+  parse=$(header_value "$f" PARSE)
+  run_mode=$(header_value "$f" RUN)
 
-  # Fire if due or overdue (but not more than 10 min late — stale)
-  if [ "$now" -ge "$epoch" ] && [ $((now - epoch)) -lt 600 ]; then
-    # Extract body (everything after first blank-line-looking separator: skip lines matching ^(EPOCH|CHAT|PARSE)=)
-    body=$(sed '/^\(EPOCH\|CHAT\|PARSE\)=/d' "$f")
+  if [ -z "$epoch" ] || [ -z "$chat" ]; then
+    log_message "skip $f: missing header"
+    continue
+  fi
+  if ! is_uint "$epoch"; then
+    log_message "skip $f: invalid EPOCH=$epoch"
+    continue
+  fi
+  epoch=$(decimal_value "$epoch")
 
-    args=(-s -m 10 -X POST "https://api.telegram.org/bot${token}/sendMessage"
-          --data-urlencode "chat_id=${chat}"
-          --data-urlencode "text=${body}")
-    if [ -n "${parse:-}" ] && [ "$parse" != "text" ]; then
-      args+=(--data-urlencode "parse_mode=${parse}")
+  repeat=""
+  repeat_job=0
+  if has_header "$f" REPEAT_SECONDS; then
+    repeat_job=1
+    repeat=$(header_value "$f" REPEAT_SECONDS)
+    if ! is_uint "$repeat" || [ "$(decimal_value "$repeat")" -eq 0 ]; then
+      log_message "skip $f: invalid REPEAT_SECONDS=$repeat"
+      continue
     fi
+    repeat=$(decimal_value "$repeat")
+  fi
 
-    resp=$(curl "${args[@]}" 2>&1)
-    if echo "$resp" | grep -q '"ok":true'; then
-      echo "$(date '+%F %T') fired $(basename "$f") → chat=$chat" >> "$LOG"
-      rm -f "$f"
+  count=0
+  if has_header "$f" COUNT; then
+    count=$(header_value "$f" COUNT)
+    if ! is_uint "$count"; then
+      log_message "skip $f: invalid COUNT=$count"
+      continue
+    fi
+    count=$(decimal_value "$count")
+  fi
+
+  until=""
+  if has_header "$f" UNTIL_EPOCH; then
+    until=$(header_value "$f" UNTIL_EPOCH)
+    if ! is_uint "$until"; then
+      log_message "skip $f: invalid UNTIL_EPOCH=$until"
+      continue
+    fi
+    until=$(decimal_value "$until")
+  fi
+
+  quiet_start=""
+  quiet_end=""
+  quiet_start_present=0
+  quiet_end_present=0
+  has_header "$f" QUIET_START && quiet_start_present=1
+  has_header "$f" QUIET_END && quiet_end_present=1
+  if [ "$quiet_start_present" -ne "$quiet_end_present" ]; then
+    log_message "skip $f: invalid QUIET_START/QUIET_END pair"
+    continue
+  fi
+  if [ "$quiet_start_present" -eq 1 ]; then
+    quiet_start_raw=$(header_value "$f" QUIET_START)
+    quiet_end_raw=$(header_value "$f" QUIET_END)
+    if ! quiet_start=$(quiet_minutes "$quiet_start_raw"); then
+      log_message "skip $f: invalid QUIET_START=$quiet_start_raw"
+      continue
+    fi
+    if ! quiet_end=$(quiet_minutes "$quiet_end_raw"); then
+      log_message "skip $f: invalid QUIET_END=$quiet_end_raw"
+      continue
+    fi
+    if [ "$quiet_start" -eq "$quiet_end" ]; then
+      log_message "skip $f: invalid QUIET_START/QUIET_END equal boundary"
+      continue
+    fi
+  fi
+
+  timezone=""
+  timezone_fallback_needed=0
+  if has_header "$f" TIMEZONE; then
+    timezone=$(header_value "$f" TIMEZONE)
+    if ! valid_timezone "$timezone"; then
+      log_message "invalid TIMEZONE=$timezone in $f; falling back to profile"
+      timezone=""
+      timezone_fallback_needed=1
+    fi
+  elif [ "$quiet_start_present" -eq 1 ]; then
+    timezone_fallback_needed=1
+  fi
+  if [ "$timezone_fallback_needed" -eq 1 ]; then
+    profile_timezone=""
+    if [ -f "$PROFILE_FILE" ]; then
+      profile_timezone=$(grep '^TIMEZONE=' "$PROFILE_FILE" | head -n1 | cut -d= -f2-)
+    fi
+    if [ -n "$profile_timezone" ] && valid_timezone "$profile_timezone"; then
+      timezone="$profile_timezone"
+    elif [ -n "$profile_timezone" ]; then
+      log_message "invalid TIMEZONE=$profile_timezone from profile; falling back to host timezone"
+    elif [ -f "$PROFILE_FILE" ]; then
+      log_message "missing TIMEZONE in profile; falling back to host timezone"
     else
-      echo "$(date '+%F %T') FAILED $(basename "$f"): $resp" >> "$LOG"
-      # Still remove so we don't spam on parse errors
-      rm -f "$f"
+      log_message "missing profile $PROFILE_FILE; falling back to host timezone"
     fi
+  fi
+
+  if [ "$repeat_job" -eq 1 ]; then
+    if [ -n "$until" ] && { [ "$epoch" -gt "$until" ] || [ "$now" -gt "$until" ]; }; then
+      log_message "expired $(basename "$f") at UNTIL_EPOCH=$until, removing"
+      rm -f "$f"
+      continue
+    fi
+    [ "$now" -ge "$epoch" ] || continue
+
+    if [ "$quiet_start_present" -eq 1 ]; then
+      if date -d '@0' '+%s' >/dev/null 2>&1; then
+        local_hour=$(timezone_date "$timezone" -d "@$now" '+%H')
+        local_minute=$(timezone_date "$timezone" -d "@$now" '+%M')
+      else
+        local_hour=$(timezone_date "$timezone" -r "$now" '+%H')
+        local_minute=$(timezone_date "$timezone" -r "$now" '+%M')
+      fi
+      local_minutes=$((10#$local_hour * 60 + 10#$local_minute))
+      in_quiet=0
+      quiet_end_tomorrow=0
+      if [ "$quiet_start" -lt "$quiet_end" ]; then
+        if [ "$local_minutes" -ge "$quiet_start" ] && [ "$local_minutes" -lt "$quiet_end" ]; then
+          in_quiet=1
+        fi
+      elif [ "$local_minutes" -ge "$quiet_start" ] || [ "$local_minutes" -lt "$quiet_end" ]; then
+        in_quiet=1
+        [ "$local_minutes" -ge "$quiet_start" ] && quiet_end_tomorrow=1
+      fi
+      if [ "$in_quiet" -eq 1 ]; then
+        if ! next_epoch=$(next_quiet_end_epoch "$now" "$timezone" "$quiet_end" "$quiet_end_tomorrow"); then
+          log_message "skip $f: failed to calculate quiet end"
+          continue
+        fi
+        if [ -n "$until" ] && [ "$next_epoch" -gt "$until" ]; then
+          log_message "expired $(basename "$f") before next quiet end, removing"
+          rm -f "$f"
+        elif atomic_update_repeat "$f" "$next_epoch" "$count"; then
+          log_message "deferred $(basename "$f") to quiet end EPOCH=$next_epoch"
+        else
+          log_message "FAILED to defer $(basename "$f"): atomic update failed"
+        fi
+        continue
+      fi
+    fi
+  elif [ "$now" -lt "$epoch" ]; then
+    continue
   elif [ $((now - epoch)) -ge 600 ]; then
-    echo "$(date '+%F %T') stale $(basename "$f") (>10min late), removing" >> "$LOG"
-    rm -f "$f"
+    log_message "late $(basename "$f") (>10min); delivering instead of dropping"
+  fi
+
+  body=$(message_body "$f")
+  if [ "${run_mode:-}" = "1" ]; then
+    body=$(run_agent_task "$f" "$body") || {
+      log_message "FAILED to run $(basename "$f"): agent returned nothing"
+      continue
+    }
+    parse=text
+  fi
+  args=(-s -m 10 -X POST "https://api.telegram.org/bot${token}/sendMessage"
+        --data-urlencode "chat_id=${chat}"
+        --data-urlencode "text=${body}")
+  if [ -n "${parse:-}" ] && [ "$parse" != "text" ]; then
+    args+=(--data-urlencode "parse_mode=${parse}")
+  fi
+
+  resp=$(curl "${args[@]}" 2>&1)
+  if echo "$resp" | grep -Eq '"ok"[[:space:]]*:[[:space:]]*true'; then
+    if [ "$repeat_job" -eq 0 ]; then
+      log_message "fired $(basename "$f") → chat=$chat"
+      rm -f "$f"
+      continue
+    fi
+
+    next_epoch=$((now + repeat))
+    next_count=$((count + 1))
+    if [ -n "$until" ] && [ "$next_epoch" -gt "$until" ]; then
+      log_message "fired final $(basename "$f") → chat=$chat count=$next_count"
+      rm -f "$f"
+    elif atomic_update_repeat "$f" "$next_epoch" "$next_count"; then
+      log_message "fired $(basename "$f") → chat=$chat; next=$next_epoch count=$next_count"
+    else
+      log_message "FAILED to advance $(basename "$f"): atomic update failed"
+    fi
+  else
+    log_message "FAILED $(basename "$f"): $resp"
   fi
 done
 
