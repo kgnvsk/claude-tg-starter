@@ -91,6 +91,20 @@ def recent_restarts() -> int:
         return -1
 
 
+def restart_hold_active() -> bool:
+    """Is somebody else — an update — holding restarts right now?"""
+    if not RESTART_HOLD.exists() and not RESTART_HOLD.is_symlink():
+        return False
+    try:
+        raw = RESTART_HOLD.read_text(encoding="ascii").strip()
+    except OSError:
+        raw = ""
+    if raw.isdigit() and len(raw) <= 10 and int(time.time()) < int(raw):
+        note(f"/unstick: restart hold active until {raw} — refusing to restart")
+        return True
+    return False
+
+
 def main() -> int:
     if not MESSAGES_DB.exists():
         return 0
@@ -121,6 +135,12 @@ def main() -> int:
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
     STATE_FILE.write_text(json.dumps({"ts": newest}))
     if not fired:
+        return 0
+
+    if restart_hold_active():
+        send(chat, "🛠 Сейчас идёт обновление — перезапускать меня прямо сейчас "
+                   "опасно, это оборвёт его на полпути. Напиши ещё раз через "
+                   "несколько минут.")
         return 0
 
     loops = recent_restarts()
