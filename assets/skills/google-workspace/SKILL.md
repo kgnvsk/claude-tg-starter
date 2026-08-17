@@ -28,7 +28,10 @@ description: Google для владельца через gog CLI — кален�
 > 1. Открой console.cloud.google.com → создай проект (любое имя).
 > 2. Слева «APIs & Services» → «Library» → включи: Google Calendar API, Gmail API, Google Docs API, Google Sheets API, Google Drive API, Google Meet API.
 > 3. «APIs & Services» → «Credentials» → «Create credentials» → «OAuth client ID» → тип **Desktop app** → Create → скачай JSON.
-> 4. «OAuth consent screen» (Audience) → «Publish app» → Confirm (иначе доступ будет слетать каждые 7 дней).
+> 4. «OAuth consent screen» → «Audience». Тут три варианта, и от выбора зависит, проживёт ли доступ:
+>    - **почта на корпоративном домене Google Workspace** → создавай приложение как **Internal**. Тестеров добавлять не нужно, доступ не истекает, разрешить сможет любой сотрудник домена. Это лучший вариант;
+>    - **обычная почта (External)** → нажми **«Publish app» → Confirm**. Тогда доступ постоянный;
+>    - **оставить в режиме Testing** → работает только для адресов из списка «Test users», и refresh-токен умирает **через 7 дней**. Через неделю агент молча потеряет Google, а владелец подумает, что «бот сломался». Тестеры — это временный костыль на один вечер, а не рабочий режим.
 > 5. Пришли мне скачанный JSON-файл сюда в чат.
 
 Получив файл: скачай его (`download_attachment`), затем:
