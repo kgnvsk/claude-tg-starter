@@ -31,8 +31,9 @@ for uk in ("fullscreenUpsellSeenCount", "remoteControlUpsellSeenCount", "passesU
     if not isinstance(d.get(uk), int) or d[uk] < 3:
         d[uk] = 3; ch = True
 # «Make auto mode your default permission mode?» — тот же класс: висит ДО старта поллера
-if d.get("hasResetAutoModeOptInForDefaultOffer") is not True:
-    d["hasResetAutoModeOptInForDefaultOffer"] = True; ch = True
+for offer in ("hasSeenAutoDefaultNudge", "hasResetAutoModeOptInForDefaultOffer"):
+    if d.get(offer) is not True:
+        d[offer] = True; ch = True
 proj = d.setdefault("projects", {})
 for k in trust:
     e = proj.setdefault(k, {})
