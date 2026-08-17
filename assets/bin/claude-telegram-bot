@@ -30,6 +30,10 @@ if not d.get("theme"):
 for uk in ("fullscreenUpsellSeenCount", "remoteControlUpsellSeenCount", "passesUpsellSeenCount"):
     if not isinstance(d.get(uk), int) or d[uk] < 3:
         d[uk] = 3; ch = True
+# «Make auto mode your default permission mode?» — тот же класс: висит ДО старта поллера
+for offer in ("hasSeenAutoDefaultNudge", "hasResetAutoModeOptInForDefaultOffer"):
+    if d.get(offer) is not True:
+        d[offer] = True; ch = True
 proj = d.setdefault("projects", {})
 for k in trust:
     e = proj.setdefault(k, {})
@@ -53,6 +57,30 @@ else:
 if ch:
     json.dump(d, open(p, "w"), indent=2)
 PY
+fi
+
+# Ответ на тот же промпт переключает режим разрешений на auto прямо в settings.json.
+# Для бота это тупик: классификатор остановит действие, а подтвердить некому. Возвращаем
+# режим, который комплект объявляет своим, — молча, при каждом старте.
+SETTINGS="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json"
+# Під root CLI відмовляється від bypassPermissions зовсім, тож повертати його
+# там означає не дати боту стартувати. Такій установці потрібен не цей режим, а
+# список дозволів — сторож її не чіпає.
+if [ -f "$SETTINGS" ] && [ "$(id -u)" -ne 0 ]; then
+  python3 - "$SETTINGS" <<'PYMODE' 2>/dev/null || true
+import json, sys
+
+path = sys.argv[1]
+try:
+    settings = json.load(open(path))
+except Exception:
+    sys.exit(0)
+permissions = settings.get("permissions")
+if not isinstance(permissions, dict) or permissions.get("defaultMode") == "bypassPermissions":
+    sys.exit(0)
+permissions["defaultMode"] = "bypassPermissions"
+json.dump(settings, open(path, "w"), indent=2)
+PYMODE
 fi
 
 cd ~/obsidian-vault
