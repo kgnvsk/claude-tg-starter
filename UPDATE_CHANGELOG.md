@@ -1,8 +1,8 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-09-05.0ad613b97af6`
+- Реліз: `2026-09-05.cb4348270e9a`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `0ad613b97af610369983dab64d6c483b5f805dec`
+- Ревізія вихідного комплекту: `cb4348270e9a3a2269c94aaa524e3fc5e1dc90a0`
 - Дата релізу: `2026-09-05`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
@@ -19,9 +19,10 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    fix: release Telegram delivery across Claude runtime snapshots
-    test: align connector regressions with owner-selected setup
-    fix: keep SSH control socket paths within the macOS limit
+    fix: advance recovery checkpoints through bounded transcript prefixes
+    fix: preserve delivery guards across cosmetic transcript duplicates
+    fix: preserve recovery scans across cosmetic transcript duplicates
+    fix: keep recovery scanning past unreferenced missing history
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не

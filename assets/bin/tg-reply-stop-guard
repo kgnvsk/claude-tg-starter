@@ -478,7 +478,14 @@ def transcript_uuid_map(events: list[object]) -> dict[str, dict] | None:
         if not isinstance(event_uuid, str) or not event_uuid:
             continue
         if event_uuid in by_uuid:
-            return None
+            # Runtime copies may add only a cosmetic top-level session slug.
+            # Any other content, ancestry, provenance or JSON-type change is
+            # ambiguous. Keep the last equivalent object to match the leaf
+            # selected by newest_active_assistant and its identity check.
+            previous = {key: value for key, value in by_uuid[event_uuid].items() if key != "slug"}
+            repeated = {key: value for key, value in event.items() if key != "slug"}
+            if json.dumps(previous, sort_keys=True) != json.dumps(repeated, sort_keys=True):
+                return None
         by_uuid[event_uuid] = event
     return by_uuid
 

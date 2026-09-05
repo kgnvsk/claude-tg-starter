@@ -1194,10 +1194,6 @@ def _scan_transcript(
         or expected_stat.st_ino != metadata["inode"]
     ):
         raise StateError("transcript identity changed")
-    increment_size = expected_stat.st_size - offset
-    if increment_size > MAX_INCREMENT_BYTES:
-        raise StateError("transcript increment exceeds size limit")
-
     flags = os.O_RDONLY
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
@@ -1214,8 +1210,6 @@ def _scan_transcript(
             or opened_stat.st_size < offset
         ):
             raise StateError("transcript changed while opening")
-        if opened_stat.st_size - offset > MAX_INCREMENT_BYTES:
-            raise StateError("transcript increment exceeds size limit")
         if offset and _read_range(descriptor, offset - 1, 1) != b"\n":
             raise StateError("transcript checkpoint is not a row boundary")
         if opened_stat.st_size == offset:
@@ -1241,10 +1235,21 @@ def _scan_transcript(
         new_payload = _read_range(
             descriptor,
             offset,
-            opened_stat.st_size - offset,
+            min(opened_stat.st_size - offset, MAX_INCREMENT_BYTES),
         )
-        last_boundary = new_payload.rfind(b"\n")
-        complete_new = b"" if last_boundary < 0 else new_payload[: last_boundary + 1]
+        # Large valid backlogs are budgets, not permanent failures. Consume only
+        # complete rows in this tick; retain the rest behind the exact offset.
+        complete_end = 0
+        for _ in range(MAX_INCREMENT_EVENTS):
+            line_end = new_payload.find(b"\n", complete_end)
+            if line_end < 0:
+                if len(new_payload) - complete_end > MAX_TRANSCRIPT_LINE_BYTES:
+                    raise StateError("transcript row exceeds size limit")
+                break
+            if line_end - complete_end > MAX_TRANSCRIPT_LINE_BYTES:
+                raise StateError("transcript row exceeds size limit")
+            complete_end = line_end + 1
+        complete_new = new_payload[:complete_end]
         context_events = _decode_jsonl(
             _tail_jsonl(context_payload, MAX_ANCESTRY_EVENTS),
             is_new=False,
@@ -1257,6 +1262,10 @@ def _scan_transcript(
             ordinal=metadata["ordinal"],
             max_events=MAX_INCREMENT_EVENTS,
         )
+        # A prefix read must not hide truncation of the unread snapshot suffix.
+        # Appends are safe: bytes beyond this snapshot wait for the next tick.
+        if os.fstat(descriptor).st_size < opened_stat.st_size:
+            raise StateError("transcript changed while reading")
         next_metadata = {
             "offset": offset + len(complete_new),
             "device": opened_stat.st_dev,
@@ -1268,15 +1277,45 @@ def _scan_transcript(
         os.close(descriptor)
 
 
+def _confirm_checkpoint_absent(projects_dir: Path, relative: str) -> None:
+    """Distinguish absent history from a skipped unsafe path or discovery race."""
+    candidate = projects_dir
+    parts = PurePosixPath(relative).parts
+    for index, part in enumerate(parts):
+        candidate = candidate / part
+        try:
+            observed = candidate.lstat()
+        except FileNotFoundError:
+            return
+        except OSError as error:
+            raise StateError("cannot verify missing checkpoint") from error
+        if index == len(parts) - 1 or not stat.S_ISDIR(observed.st_mode):
+            # Discovery intentionally excludes symlinks and nonregular files.
+            # They are not absent history, nor is a file appearing mid-scan.
+            raise StateError("checkpointed transcript path is unsafe or changed")
+
+
 def scan_incremental(projects_dir: Path, state: dict) -> tuple[dict, list[dict]]:
     """Read complete new JSONL rows without mutating the caller's checkpoint."""
     projects_dir = Path(projects_dir)
     current = copy.deepcopy(state)
     _validate_state(current)
     discovered = _discover_transcripts(projects_dir)
+    incident = current["incident"]
+    if (
+        incident is not None
+        and not incident["resolved"]
+        and incident["transcript"] not in discovered
+    ):
+        # Expiry suppresses retries; it does not prove the queued work resolved.
+        raise StateError("unresolved incident transcript is unavailable")
     missing = set(current["transcripts"]) - set(discovered)
-    if missing:
-        raise StateError("checkpointed transcript is unavailable")
+    for relative in sorted(missing):
+        _confirm_checkpoint_absent(projects_dir, relative)
+    # Keep unreferenced missing checkpoints as immutable tombstones. Existing
+    # offsets/dedupe/incident state are not reset, and a reappearing file must
+    # still pass the original inode, offset and JSONL checks below. Legacy
+    # checkpoints have no age field, so this is not an age-based exemption.
 
     batches: list[dict] = []
     for relative in sorted(discovered):
@@ -1311,7 +1350,15 @@ def _batch_uuid_map(events: list[dict]) -> dict[str, dict]:
         if not isinstance(event_uuid, str) or not event_uuid:
             raise StateError("invalid transcript event identifier")
         if event_uuid in result:
-            raise StateError("duplicate transcript event identifier")
+            # Claude may append the same event with a cosmetic session slug.
+            # Ignore only that top-level field; all ancestry, content and
+            # provenance must remain identical, including JSON value types.
+            previous = {key: value for key, value in result[event_uuid].items() if key != "slug"}
+            repeated = {key: value for key, value in record.items() if key != "slug"}
+            if json.dumps(previous, sort_keys=True) != json.dumps(repeated, sort_keys=True):
+                raise StateError("duplicate transcript event identifier")
+            # Keep the first object so an appended copy cannot become new work.
+            continue
         result[event_uuid] = record
     return result
 
