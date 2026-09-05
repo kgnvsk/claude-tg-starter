@@ -1,0 +1,36 @@
+[Unit]
+Description=Isolated Playwright MCP browser for Claude
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=claude-browser
+Group=claude-browser
+Environment=HOME=/var/lib/claude-browser
+Environment=PLAYWRIGHT_BROWSERS_PATH=/var/lib/claude-browser/ms-playwright
+ExecStart=/opt/claude-browser/node_modules/.bin/playwright-mcp --headless --browser=chromium --host=127.0.0.1 --port=8931 --user-data-dir=/var/lib/claude-browser/profile --output-dir=/srv/claude-browser-share --output-max-size=52428800
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+UMask=0007
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+ReadWritePaths=/var/lib/claude-browser /srv/claude-browser-share
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

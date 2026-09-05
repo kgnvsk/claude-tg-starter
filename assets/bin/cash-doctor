@@ -4,26 +4,27 @@
 #   ssh root@server 'sudo -u claude /home/claude/bin/cash-doctor'
 # The bot can also run it via Bash to self-check when the owner asks "ты в порядке?".
 set -u
-H=/home/claude
+H="${HOME:-/home/claude}"
+SVC="${CLAUDE_TELEGRAM_SERVICE:-claude-telegram.service}"
 ok()   { printf '  ✅ %s\n' "$1"; }
 warn() { printf '  ⚠️  %s\n' "$1"; }
 bad()  { printf '  ❌ %s\n' "$1"; }
 
-echo "🩺 {{AGENT_NAME}} doctor — $(date '+%F %T %Z')"
+echo "🩺 {{AGENT_NAME}} — діагностика — $(date '+%F %T %Z')"
 echo
 
 # 1. systemd service
-if systemctl is-active claude-telegram.service >/dev/null 2>&1; then
-  ok "сервис claude-telegram активен"
+if systemctl is-active "$SVC" >/dev/null 2>&1; then
+  ok "служба ${SVC%.service} активна"
 else
-  bad "сервис claude-telegram НЕ активен → sudo systemctl start claude-telegram"
+  bad "служба ${SVC%.service} НЕАКТИВНА → sudo systemctl start $SVC"
 fi
 
-# 2. telegram poller (bun MCP)
-if pgrep -f "bun.*plugins-official.*telegram" >/dev/null 2>&1; then
-  ok "telegram-поллер (bun) жив"
+# 2. telegram poller (bun MCP) — свой юзер, чтобы соседний инстанс не маскировал смерть
+if pgrep -u "$(id -u)" -f "bun.*plugins-official.*telegram" >/dev/null 2>&1; then
+  ok "Telegram-полер (bun) працює"
 else
-  warn "telegram-поллер не найден — если только что был рестарт, подожди 1-2 мин"
+  warn "Telegram-полер не знайдено — якщо щойно був перезапуск, зачекай 1–2 хв"
 fi
 
 # 3. Claude OAuth token freshness
@@ -31,41 +32,41 @@ EXP=$(jq -r '.claudeAiOauth.expiresAt // 0' "$H/.claude/.credentials.json" 2>/de
 NOW_MS=$(( $(date +%s) * 1000 ))
 if [ "${EXP:-0}" -gt 0 ]; then
   LEFT=$(( (EXP - NOW_MS) / 60000 ))
-  if   [ "$LEFT" -le 0 ];  then bad  "Claude OAuth токен протух → нужен /login (healthcheck тоже попробует рестарт)"
-  elif [ "$LEFT" -le 30 ]; then warn "Claude OAuth токен умирает через ${LEFT} мин"
-  else ok "Claude OAuth токен свеж (${LEFT} мин в запасе)"; fi
+  if   [ "$LEFT" -le 0 ];  then bad  "OAuth-токен Claude прострочено → потрібен /login (healthcheck також спробує перезапуск)"
+  elif [ "$LEFT" -le 30 ]; then warn "термін дії OAuth-токена Claude завершиться за ${LEFT} хв"
+  else ok "OAuth-токен Claude дійсний (ще ${LEFT} хв)"; fi
 else
-  warn "не прочитал срок OAuth токена (.credentials.json)"
+  warn "не вдалося прочитати термін дії OAuth-токена (.credentials.json)"
 fi
 
 # 4. telegram bot token configured
 if grep -q '^TELEGRAM_BOT_TOKEN=.' "$H/.claude/channels/telegram/.env" 2>/dev/null; then
-  ok "токен бота настроен"
+  ok "токен бота налаштовано"
 else
-  bad "токен бота пуст в telegram/.env"
+  bad "токен бота порожній у telegram/.env"
 fi
 
 # 5. codex (картинки) — только если модуль установлен
 if [ -x "$H/.npm-global/bin/codex" ]; then
   if timeout 20 "$H/.npm-global/bin/codex" login status 2>&1 | grep -q "Logged in"; then
-    ok "codex авторизован (картинки работают)"
+    ok "Codex авторизовано (зображення працюють)"
   else
-    warn "codex не авторизован → gpt-image-2 не работает (codex login --device-auth)"
+    warn "Codex не авторизовано → gpt-image-2 не працює (codex login --device-auth)"
   fi
 fi
 
 # 6. субагенты + скиллы
 AG=$(find "$H/.claude/agents" -maxdepth 1 -name '*.md' ! -name 'README.md' 2>/dev/null | wc -l | tr -d ' ')
-ok "субагентов установлено: $AG  (добавить: положи .md в ~/.claude/agents/ + рестарт)"
+ok "субагентів встановлено: $AG  (додати: поклади .md у ~/.claude/agents/ + перезапуск)"
 SK=$(find "$H/.claude/skills" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')
-ok "скиллов установлено: $SK"
+ok "навичок встановлено: $SK"
 
 # 7. диск
 DF=$(df /home | awk 'NR==2 {gsub("%",""); print 100-$5}')
-if   [ "$DF" -lt 10 ]; then bad  "мало места на /home: ${DF}% свободно"
-elif [ "$DF" -lt 20 ]; then warn "место на /home: ${DF}% свободно"
-else ok "место на /home: ${DF}% свободно"; fi
+if   [ "$DF" -lt 10 ]; then bad  "мало місця на /home: ${DF}% вільно"
+elif [ "$DF" -lt 20 ]; then warn "місце на /home: ${DF}% вільно"
+else ok "місце на /home: ${DF}% вільно"; fi
 
 echo
-echo "Готово. ⚠️/❌ — подсказка по фиксу рядом. Полные логи: $H/logs/healthcheck.log"
+echo "Завершено. ⚠️/❌ — поряд є підказка щодо виправлення. Повний журнал: $H/logs/healthcheck.log"
 exit 0

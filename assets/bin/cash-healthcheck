@@ -3,16 +3,248 @@
 # Checks 7 signals + can auto-recover + alerts via Bot API bypass
 set -u
 
-LOG=/home/claude/logs/healthcheck.log
-STATE=/home/claude/logs/health-state.json
+# Instance-aware: on a multi-agent box each bot has its own user, home and unit
+# (claude-telegram@<user>.service); the crontab/unit provide CLAUDE_TELEGRAM_SERVICE.
+H="${HOME:-/home/claude}"
+SVC="${CLAUDE_TELEGRAM_SERVICE:-claude-telegram.service}"
+ME_UID="$(id -u)"
+TELEGRAM_PLUGIN_COMPATIBLE=0
+SERVICE_RESTARTED=0
+# Runtime stamps live under $H/logs, not /tmp: /tmp names collide between instances.
+STAMP="$H/logs"
+# Every project the agent works in, not one guessed path: an agent that does most
+# of its work in another project directory read as idle here, which cleared the way
+# for an immediate restart of a busy bot (Cash 2026-07-29).
+SESS_DIR="$H/.claude/projects"
+
+# Linux exposes the channel child as only `bun server.ts`; the plugin path lives
+# in /proc/<pid>/cwd. Match the owning user and a direct version directory in
+# this instance's Telegram cache; liveness must not depend on the release that
+# the separate source-replacement verifier supports. readlink resolves escapes.
+TRANSPORT_CACHE_ROOT="$H/.claude/plugins/cache/claude-plugins-official/telegram"
+telegram_poller_alive() {
+  local pid cwd version
+  while IFS= read -r pid; do
+    [ -n "$pid" ] || continue
+    cwd=$(readlink -f "/proc/$pid/cwd" 2>/dev/null || true)
+    [ "${cwd%/*}" = "$TRANSPORT_CACHE_ROOT" ] || continue
+    version="${cwd##*/}"
+    [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][[:alnum:]_.-]+)?$ ]] && return 0
+  done < <(pgrep -u "$ME_UID" -f 'bun server.ts$' 2>/dev/null || true)
+  return 1
+}
+
+# The owner can park automatic service recovery with /fix when the watchdog itself
+# is what keeps killing the bot. Valid expired holds are cleared; a current hold
+# that cannot be validated fails closed until it can be inspected safely.
+RESTART_HOLD="$H/logs/restart-hold.until"
+service_mutation_allowed() {
+  local until now
+  if [ ! -e "$RESTART_HOLD" ] && [ ! -L "$RESTART_HOLD" ]; then
+    return 0
+  fi
+  if ! until=$(cat "$RESTART_HOLD" 2>/dev/null); then
+    echo "[$(date -u +%FT%TZ)] automatic service mutation suppressed: restart hold is unreadable" >> "$LOG"
+    return 1
+  fi
+  case "$until" in
+    ''|*[!0-9]*|???????????*)
+      echo "[$(date -u +%FT%TZ)] automatic service mutation suppressed: restart hold is malformed" >> "$LOG"
+      return 1
+      ;;
+    *)
+      now=$(date +%s)
+      if [ "$now" -lt "$until" ]; then
+        echo "[$(date -u +%FT%TZ)] automatic service mutation suppressed until $until (/fix hold)" >> "$LOG"
+        return 1
+      fi
+      rm -f "$RESTART_HOLD"
+      ;;
+  esac
+  return 0
+}
+
+restart_service() {
+  local reason="${1:-healthcheck}"
+  if [ "$SERVICE_RESTARTED" -eq 1 ]; then
+    echo "[$(date -u +%FT%TZ)] duplicate service restart suppressed in the same health tick" >> "$LOG"
+    return 0
+  fi
+  if ! service_mutation_allowed; then
+    echo "[$(date -u +%FT%TZ)] recovery restart suppressed: service=$SVC reason=$reason" >> "$LOG"
+    return 1
+  fi
+  restart_service_after_preflight "$reason"
+}
+
+# Used only while the lifecycle lock is held and immediately after the caller
+# completed service_mutation_allowed. Keeping the systemctl call
+# separate lets a durable restart authorization be written only after the
+# safety preflight, without checking the hold again after consuming it.
+restart_service_after_preflight() {
+  local reason="${1:-healthcheck}" status
+  if sudo systemctl restart "$SVC" 2>/dev/null; then
+    SERVICE_RESTARTED=1
+    echo "[$(date -u +%FT%TZ)] recovery restart succeeded: service=$SVC reason=$reason" >> "$LOG"
+    return 0
+  else
+    status=$?
+    echo "[$(date -u +%FT%TZ)] recovery restart failed: service=$SVC reason=$reason exit=$status" >> "$LOG"
+    return "$status"
+  fi
+}
+
+tg_send() {
+  "$H/bin/tg-send" "$@"
+}
+
+LOG=$H/logs/healthcheck.log
+STATE=$H/logs/health-state.json
 ALERT_COOLDOWN=600  # 10 min between repeat alerts
-mkdir -p /home/claude/logs
+umask 077
+[ ! -L "$H/logs" ] || exit 0
+mkdir -p "$H/logs" 2>/dev/null || exit 0
+chmod 0700 "$H/logs" 2>/dev/null || exit 0
+[ ! -L "$LOG" ] || exit 0
+: >> "$LOG" 2>/dev/null || exit 0
+chmod 0600 "$LOG" 2>/dev/null || exit 0
+# Refresh the transcript-backed limit evidence before taking the shared lifecycle
+# lock. A concurrent recovery tick makes this status unknown; unknown fails closed
+# for the destructive stuck-turn restart, then the next health tick tries again.
+LIMIT_RECOVERY_STATUS=unknown
+if [ -x "$H/bin/claude-limit-recovery" ]; then
+    LIMIT_STATUS_JSON=$(timeout 30 env HOME="$H" "$H/bin/claude-limit-recovery" --status 2>/dev/null || true)
+    case "$LIMIT_STATUS_JSON" in
+        '{"active":true,"schemaVersion":1}') LIMIT_RECOVERY_STATUS=active ;;
+        '{"active":false,"schemaVersion":1}') LIMIT_RECOVERY_STATUS=clear ;;
+    esac
+fi
+LIFECYCLE_LOCK=$H/logs/transport-lifecycle.lock
+touch "$LIFECYCLE_LOCK" 2>/dev/null || exit 0
+chmod 0600 "$LIFECYCLE_LOCK" 2>/dev/null || exit 0
+command -v flock >/dev/null 2>&1 || exit 0
+exec 9>"$LIFECYCLE_LOCK"
+flock -n -x 9 || exit 0
+# Expiry is housekeeping, independent of plugin provenance or a recovery trigger.
+service_mutation_allowed || true
+
+# install-core intentionally leaves the Telegram service disabled until OAuth,
+# plugins, and browser setup are verified. Cron must not cross that launch gate.
+if ! systemctl is-enabled --quiet "$SVC" 2>/dev/null; then
+    echo "[$(date -u +%FT%TZ)] service is disabled; skipping health recovery until launch" >> "$LOG"
+    exit 0
+fi
+
+# Auto-relogin is recovery, not onboarding. Do not send an OAuth link until a
+# successful Claude login has been observed at least once on this agent.
+AUTH_ESTABLISHED="$H/.claude/auth-established"
+if [ ! -f "$AUTH_ESTABLISHED" ]; then
+    INITIAL_AUTH_STATUS=$(timeout 20 env HOME="$H" ATARAX_SUPPRESS_TELEGRAM=1 \
+        "$H/.local/bin/claude" auth status 2>/dev/null || true)
+    if printf '%s' "$INITIAL_AUTH_STATUS" | grep -Fq '"loggedIn": true'; then
+        (umask 077; : > "$AUTH_ESTABLISHED")
+        chmod 0600 "$AUTH_ESTABLISHED"
+    else
+        echo "[$(date -u +%FT%TZ)] initial Claude auth pending; auto-rescue disabled" >> "$LOG"
+        exit 0
+    fi
+fi
 
 # Load bot credentials for alerts
-BOT_TOKEN=$(grep "^TELEGRAM_BOT_TOKEN=" /home/claude/.claude/channels/telegram/.env 2>/dev/null | cut -d= -f2)
-USER_ID={{OWNER_CHAT_ID}}  # owner chat id (rendered by install-core)
+BOT_TOKEN=$(grep "^TELEGRAM_BOT_TOKEN=" "$H/.claude/channels/telegram/.env" 2>/dev/null | cut -d= -f2)
+RENDERED_OWNER_ID={{OWNER_CHAT_ID}}  # compatibility fallback rendered by install-core
+PROFILE_FILE=$H/.agent-profile.env
+ACCESS_FILE=$H/.claude/channels/telegram/access.json
+
+alert_recipients() {
+    python3 - "$PROFILE_FILE" "$ACCESS_FILE" "$RENDERED_OWNER_ID" <<'PY'
+import json
+from pathlib import Path
+import re
+import sys
+
+profile_path = Path(sys.argv[1])
+access_path = Path(sys.argv[2])
+rendered_owner = sys.argv[3]
+valid_id = re.compile(r"^[1-9][0-9]*$").fullmatch
+
+
+def profile_value(name: str) -> str:
+    try:
+        if profile_path.stat().st_size > 65_536:
+            return ""
+        lines = profile_path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError):
+        return ""
+    prefix = name + "="
+    for line in lines:
+        if not line.startswith(prefix):
+            continue
+        value = line[len(prefix):].strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+            value = value[1:-1]
+        return value
+    return ""
+
+
+def access_owner() -> str:
+    try:
+        if access_path.stat().st_size > 1_048_576:
+            return ""
+        access = json.loads(access_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return ""
+    admins = access.get("admins") if isinstance(access, dict) else None
+    if not isinstance(admins, list):
+        return ""
+    for candidate in admins:
+        value = str(candidate)
+        if valid_id(value):
+            return value
+    return ""
+
+
+owner = profile_value("OWNER_CHAT_ID")
+if not valid_id(owner):
+    owner = access_owner()
+if not valid_id(owner):
+    owner = rendered_owner if valid_id(rendered_owner) else ""
+
+seen: set[str] = set()
+for candidate in [owner, *profile_value("ALERT_COPY_CHAT_IDS").split(",")]:
+    chat_id = candidate.strip()
+    if not valid_id(chat_id) or chat_id in seen:
+        continue
+    seen.add(chat_id)
+    print(chat_id)
+PY
+}
 
 # Alert function (with cooldown per alert-key)
+real_auth_verdict() {
+    # Поле "loggedIn" лишається true при простроченому токені, а справжній виклик
+    # уже віддає 401. Один обмежений виклик коштує менше, ніж клієнт, який добу
+    # думає, що бот працює.
+    local out
+    if [ "$LIMIT_RECOVERY_STATUS" = active ]; then
+        printf 'Уперся в ліміт акаунта. Він сам відпустить; напиши /health, щоб побачити коли.'
+        return
+    fi
+    out=$(ATARAX_SUPPRESS_TELEGRAM=1 timeout 90 "$H/.local/bin/claude" -p "ok" 2>&1 | head -3)
+    case "$out" in
+        *529*|*503*|*500*|*Overloaded*|*overloaded*)
+            printf 'Це збій на боці Anthropic, не в мене: моделі відповідають помилкою. Я повернусь сам, коли їх полагодять — статус на status.anthropic.com.' ;;
+        *401*|*"OAuth"*|*"Re-authenticate"*)
+            printf 'Мене розлогінило — потрібен новий вхід. Напиши /relogin, і я надішлю посилання.' ;;
+        *"session limit"*|*"usage limit"*|*"weekly limit"*|*"rate"*|*429*)
+            printf 'Уперся в ліміт акаунта. Він сам відпустить; напиши /health, щоб побачити коли.' ;;
+        "")
+            printf 'Перешли останнє повідомлення ще раз або напиши /unstick.' ;;
+        *)
+            printf 'Логін і ліміт живі — схоже, загубився хід. Перешли повідомлення ще раз або напиши /unstick.' ;;
+    esac
+}
+
 alert() {
     local key="$1"
     local msg="$2"
@@ -21,122 +253,689 @@ alert() {
     # token-reread), so routine alerts (token dying/expired, service restarted, bun
     # respawned, codex) are pure noise to the owner. Ping ONLY for states it genuinely
     # can't auto-fix — crash-loop (auto-recovery gave up) and low disk.
-    case "$key" in crash-loop|low-disk) ;; *) return 0 ;; esac
-    local last_file="/tmp/cash-alert-${key}.ts"
+    # auth-lost and telegram-plugin-incompatible left this list once their
+    # branches stopped alerting: the login link the rescue sends is the whole
+    # message, and a suppressed restart is our refusal, not the owner's task.
+    # service-down joined it because it now fires only after several minutes of
+    # failed starts, which is a dead assistant and worth saying out loud.
+    # corporate-paused / corporate-unavailable: employees are unanswered while
+    # the owner's own chat works, so nothing else would ever tell him.
+    case "$key" in browser-down|crash-loop|low-disk|service-down|stuck-escalate|corporate-paused|corporate-unavailable) ;; *) return 0 ;; esac
+    local last_file="$STAMP/cash-alert-${key}.ts"
     local now=$(date +%s)
     local last=$(cat "$last_file" 2>/dev/null || echo 0)
     local delta=$((now - last))
     if [ "$delta" -lt "$cooldown" ]; then
         return 0
     fi
+    local recipients
+    if ! recipients="$(alert_recipients)"; then
+        echo "[$(date -u +%FT%TZ)] ALERT [${key}]: recipient resolution failed" >> "$LOG"
+        return 0
+    fi
+    if [ -z "$recipients" ]; then
+        echo "[$(date -u +%FT%TZ)] ALERT [${key}]: no valid recipient configured" >> "$LOG"
+        return 0
+    fi
     echo "$now" > "$last_file"
-    curl -sS --max-time 10 -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
-        --data-urlencode "chat_id=${USER_ID}" \
-        --data-urlencode "text=🚨 {{AGENT_NAME}} healthcheck: ${msg}" \
-        --data-urlencode "parse_mode=HTML" >/dev/null 2>&1
+    local chat_id
+    while IFS= read -r chat_id; do
+        [ -n "$chat_id" ] || continue
+        if ! curl -sS --max-time 10 -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${chat_id}" \
+            --data-urlencode "text=🚨 {{AGENT_NAME}}, перевірка стану: ${msg}" \
+            --data-urlencode "parse_mode=HTML" >/dev/null 2>&1; then
+            echo "[$(date -u +%FT%TZ)] ALERT [${key}]: delivery failed for one configured recipient" >> "$LOG"
+        fi
+    done <<ALERT_RECIPIENTS_EOF
+$recipients
+ALERT_RECIPIENTS_EOF
     echo "[$(date -u +%FT%TZ)] ALERT [${key}]: ${msg}" >> "$LOG"
 }
 
-# 0. Pin patched telegram plugin. claude 2.1.156 loads the plugin from the GitHub-synced
-#    marketplace dir, and that sync periodically reverts server.ts to upstream — which
-#    reintroduces the orphan-watchdog self-kill (process.ppid !== bootPpid) that killed the
-#    bun MCP every few min. Restore from the golden copy on drift. No restart here: the
-#    running process keeps its good in-memory code; this just guarantees the NEXT launch
-#    uses the patched file. (added 2026-05-29)
-GOLDEN=/home/claude/telegram-server-fixed.ts
-for SRV in \
-    /home/claude/.claude/plugins/cache/claude-plugins-official/telegram/0.0.6/server.ts \
-    /home/claude/.claude/plugins/marketplaces/claude-plugins-official/external_plugins/telegram/server.ts; do
-    if [ -f "$GOLDEN" ] && [ -f "$SRV" ] && ! cmp -s "$GOLDEN" "$SRV"; then
-        cp "$GOLDEN" "$SRV"
-        echo "[$(date -u +%FT%TZ)] restored patched telegram server.ts (sync had reverted ${SRV})" >> "$LOG"
+# The plugin marketplace may restore the exact official 0.0.7 server.ts. Only
+# the provenance-aware helper may turn that known upstream file back into the
+# reviewed golden. Unknown versions, hashes, links, owners or package commands
+# leave the plugin untouched. Recovery can still restart the installed service;
+# it never installs a different plugin or bypasses the reconciler's checks.
+if [ -x "$H/bin/reconcile-telegram-plugin" ]; then
+    if TELEGRAM_RECONCILE_RECEIPT=$(
+        "$H/bin/reconcile-telegram-plugin" --apply --json 2>>"$LOG"
+    ); then
+        TELEGRAM_PLUGIN_COMPATIBLE=1
+        if printf '%s' "$TELEGRAM_RECONCILE_RECEIPT" | grep -Fq '"changed":true'; then
+            echo "[$(date -u +%FT%TZ)] restored verified Telegram 0.0.7 golden" >> "$LOG"
+        fi
+    else
+        echo "[$(date -u +%FT%TZ)] Telegram plugin repair refused by compatibility check; installed service recovery remains available" >> "$LOG"
     fi
-done
-
-# 1. Service active?
-if ! sudo systemctl is-active claude-telegram.service >/dev/null 2>&1; then
-    alert "service-down" "claude-telegram.service is NOT active. Auto-recovering..."
-    sudo systemctl reset-failed claude-telegram.service 2>/dev/null
-    sudo systemctl start claude-telegram.service 2>/dev/null
-    echo "[$(date -u +%FT%TZ)] service was down, tried restart" >> "$LOG"
+else
+    echo "[$(date -u +%FT%TZ)] Telegram plugin reconciler is missing" >> "$LOG"
 fi
 
-# 2. Claude process alive?
-if ! pgrep -f "^claude $" >/dev/null 2>&1 && ! pgrep -af "/usr/bin/claude " | grep -v grep >/dev/null 2>&1; then
+# Stop recovery before handling any restart request when the service is already
+# crash-looping. Keeping this guard below an early-exit recovery branch let one
+# poisoned FIFO item restart the agent forever without ever reaching the guard.
+RESTARTS=$(journalctl -u "$SVC" --since "10 min ago" --no-pager 2>/dev/null | grep -c "Started Claude Code")
+if [ "$RESTARTS" -gt 4 ]; then
+    if service_mutation_allowed; then
+        if sudo systemctl stop "$SVC" 2>/dev/null; then
+            echo "[$(date -u +%FT%TZ)] CRASH LOOP — stopped service (${RESTARTS} restarts)" >> "$LOG"
+            alert "crash-loop" "Цикл збоїв: ${RESTARTS} перезапусків за 10 хв. Службу зупинено — потрібна ручна перевірка."
+        else
+            echo "[$(date -u +%FT%TZ)] CRASH LOOP — service stop failed exit=$?" >> "$LOG"
+            alert "crash-loop" "Цикл збоїв: ${RESTARTS} перезапусків за 10 хв. Автоматична зупинка не вдалася — потрібна ручна перевірка."
+        fi
+        exit 0
+    fi
+fi
+
+# A direct Telegram poller persists every inbound update before handing it to
+# Claude. If the MCP pipe itself stops settling, the plugin leaves this marker
+# and exits; restart the service so the same FIFO row can be retried cleanly.
+MCP_INBOUND_MARKER="$STAMP/mcp-inbound-restart.json"
+if [ ! -e "$MCP_INBOUND_MARKER" ] && [ ! -L "$MCP_INBOUND_MARKER" ]; then
+    MCP_INBOUND_ORPHAN=$(find "$STAMP" -xdev -maxdepth 1 -type f \
+        -name 'mcp-inbound-restart.json.processing-*' -print -quit 2>/dev/null)
+    if [ -n "$MCP_INBOUND_ORPHAN" ]; then
+        mv "$MCP_INBOUND_ORPHAN" "$MCP_INBOUND_MARKER" 2>/dev/null || true
+    fi
+fi
+if [ -L "$MCP_INBOUND_MARKER" ]; then
+    echo "[$(date -u +%FT%TZ)] discarded unsafe MCP inbound restart marker" >> "$LOG"
+    rm -f "$MCP_INBOUND_MARKER"
+    exit 0
+fi
+if [ -s "$MCP_INBOUND_MARKER" ]; then
+    MCP_INBOUND_PROCESSING="$MCP_INBOUND_MARKER.processing-$$"
+    if mv "$MCP_INBOUND_MARKER" "$MCP_INBOUND_PROCESSING" 2>/dev/null; then
+        if restart_service mcp_inbound_delivery_timeout; then
+            rm -f "$MCP_INBOUND_PROCESSING"
+            find "$STAMP" -xdev -maxdepth 1 -type f \
+                -name 'mcp-inbound-restart.json.processing-*' -delete 2>/dev/null || true
+            exit 0
+        elif [ ! -e "$MCP_INBOUND_MARKER" ] && [ ! -L "$MCP_INBOUND_MARKER" ]; then
+            mv "$MCP_INBOUND_PROCESSING" "$MCP_INBOUND_MARKER" 2>/dev/null || \
+                rm -f "$MCP_INBOUND_PROCESSING"
+        else
+            rm -f "$MCP_INBOUND_PROCESSING"
+        fi
+    fi
+fi
+
+# BEGIN browser service recovery
+# Playwright is a separate host service. Probe the same endpoint/status contract
+# as browser-doctor, and delegate the sole privileged mutation to a root-owned,
+# no-argument helper. Never restart the Telegram agent for a browser incident.
+browser_probe() {
+    local code
+    code=$(curl --max-time 3 -sS -o /dev/null -w '%{http_code}' \
+        http://localhost:8931/mcp 2>/dev/null || true)
+    case "$code" in 200|400|405) return 0 ;; *) return 1 ;; esac
+}
+
+# Gate on the service, not on browser-doctor: install-core copies every file in
+# assets/bin to the agent, so the doctor lands on installs that never ran
+# scripts/install-browser.sh. There the probe hits a port nobody serves, the
+# recovery helper is missing too, and every tick reports a broken browser that
+# was never part of the install.
+if [ -f "${HEALTHCHECK_BROWSER_UNIT:-/etc/systemd/system/claude-browser.service}" ] && ! browser_probe; then
+    echo "[$(date -u +%FT%TZ)] browser MCP endpoint is unavailable" >> "$LOG"
+    if service_mutation_allowed; then
+        # Repairs stay silent. The owner cannot restart a service or install a
+        # helper from the phone, so telling them costs attention and buys
+        # nothing; a browser that comes back needed no message at all. Only a
+        # browser that is still down after BROWSER_DOWN_ALERT_AFTER of repair
+        # attempts is worth an interruption, and then just once.
+        if [ ! -x /usr/local/sbin/claude-browser-recover ]; then
+            echo "[$(date -u +%FT%TZ)] browser recovery helper is missing" >> "$LOG"
+        else
+            browser_recovery_status=0
+            sudo /usr/local/sbin/claude-browser-recover >/dev/null 2>&1 \
+                || browser_recovery_status=$?
+            case "$browser_recovery_status" in
+                0) echo "[$(date -u +%FT%TZ)] browser service recovered" >> "$LOG" ;;
+                75) echo "[$(date -u +%FT%TZ)] browser recovery already in progress" >> "$LOG" ;;
+                76) echo "[$(date -u +%FT%TZ)] browser recovery cooldown is active" >> "$LOG" ;;
+                *) echo "[$(date -u +%FT%TZ)] browser recovery did not restore the endpoint" >> "$LOG" ;;
+            esac
+        fi
+    fi
+    if browser_probe; then
+        rm -f "$STAMP/browser-down-since.epoch"
+    else
+        browser_down_since="$(cat "$STAMP/browser-down-since.epoch" 2>/dev/null)"
+        case "$browser_down_since" in
+            ''|*[!0-9]*)
+                browser_down_since="$(date -u +%s)"
+                printf '%s\n' "$browser_down_since" > "$STAMP/browser-down-since.epoch"
+                ;;
+        esac
+        if [ "$(( $(date -u +%s) - browser_down_since ))" -ge "${BROWSER_DOWN_ALERT_AFTER:-1800}" ]; then
+            alert "browser-down" "Браузер не працює вже пів години, і перезапуск не допомагає. Напиши нам — це треба дивитися руками." 86400
+        fi
+    fi
+else
+    rm -f "$STAMP/browser-down-since.epoch"
+fi
+# END browser service recovery
+
+# A model can occasionally emit textual <invoke> markup instead of a real tool call.
+# The Stop hook records a marker after two such failures. Recover outside Claude so a
+# poisoned session cannot keep retrying its own malformed output indefinitely.
+MALFORMED_TOOL_MARKER="$STAMP/malformed-tool-restart.json"
+if [ -s "$MALFORMED_TOOL_MARKER" ]; then
+    MALFORMED_TOOL_PROCESSING="$MALFORMED_TOOL_MARKER.processing-$$"
+    if mv "$MALFORMED_TOOL_MARKER" "$MALFORMED_TOOL_PROCESSING" 2>/dev/null; then
+        if find "$MALFORMED_TOOL_PROCESSING" -mmin +15 -print -quit 2>/dev/null | grep -q .; then
+            echo "[$(date -u +%FT%TZ)] discarded stale malformed tool-call marker" >> "$LOG"
+            rm -f "$MALFORMED_TOOL_PROCESSING"
+            exit 0
+        fi
+
+        MALFORMED_CHAT_ID=$(jq -r '.chat_id // empty' "$MALFORMED_TOOL_PROCESSING" 2>/dev/null)
+        case "$MALFORMED_CHAT_ID" in
+            ''|*[!0-9-]*) MALFORMED_CHAT_ID=$(alert_recipients | head -n 1) ;;
+        esac
+        case "$MALFORMED_CHAT_ID" in
+            ''|*[!0-9-]*)
+                echo "[$(date -u +%FT%TZ)] malformed tool-call recovery has no valid recipient" >> "$LOG"
+                rm -f "$MALFORMED_TOOL_PROCESSING"
+                exit 0
+                ;;
+        esac
+        if restart_service malformed_tool_call_loop; then
+            tg_send "$MALFORMED_CHAT_ID" "Після технічного збою виклику інструментів службу перезапущено; пам’ять збережено. Будь ласка, повтори останнє повідомлення за хвилину." \
+                >/dev/null 2>&1 || true
+        else
+            tg_send "$MALFORMED_CHAT_ID" "Автоперезапуск не спрацював. Збій зафіксовано без повторного спаму; потрібна технічна перевірка." \
+                >/dev/null 2>&1 || true
+            echo "[$(date -u +%FT%TZ)] malformed tool-call recovery restart failed; marker consumed" >> "$LOG"
+        fi
+        rm -f "$MALFORMED_TOOL_PROCESSING"
+        exit 0
+    fi
+fi
+
+# transport-daemon is optional. When enabled, keep its sole Telegram poller alive and
+# restart only the Claude drain if a durable update has waited more than two minutes.
+# The queued file survives the restart and is delivered after MCP reconnects.
+if systemctl show "$SVC" -p Environment --value 2>/dev/null | tr ' ' '\n' | grep -qx 'TG_TRANSPORT=daemon'; then
+    echo "[$(date -u +%FT%TZ)] WARN: retired daemon transport is still configured — incoming messages are not read; remove the transport-daemon drop-in" >> "$LOG"
+fi
+DAEMON_INBOX=$H/.claude/channels/telegram/daemon-inbox
+if systemctl show "$SVC" -p Environment --value 2>/dev/null \
+   | tr ' ' '\n' | grep -qx 'TG_TRANSPORT=daemon'; then
+    if ! XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user is-active cash-tg-receiver.service >/dev/null 2>&1; then
+        XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user reset-failed cash-tg-receiver.service 2>/dev/null || true
+        XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user start cash-tg-receiver.service 2>/dev/null || true
+        echo "[$(date -u +%FT%TZ)] transport daemon was down, tried restart" >> "$LOG"
+    fi
+    # Busy-guard (same class as the stuck-turn fix): during a long render the
+    # session can't drain notifications, so queued items aging >2 min is normal —
+    # they are retained by design and deliver when the turn ends. Restart the
+    # drain only on an IDLE box (no session-jsonl writes for 20 min); a truly hung
+    # busy session is handled by the stuck-turn detector instead.
+    if [ -d "$DAEMON_INBOX" ] \
+       && find "$DAEMON_INBOX" -maxdepth 1 -type f -name '*.json' -mmin +2 -print -quit 2>/dev/null | grep -q . \
+       && [ -z "$(find "$SESS_DIR" -name '*.jsonl' -newermt '-1200 seconds' 2>/dev/null | head -1)" ]; then
+        DAEMON_STUCK_TS=$STAMP/cash-daemon-inbox-restart.item
+        DAEMON_STUCK_ITEM=$(find "$DAEMON_INBOX" -maxdepth 1 -type f -name '*.json' -mmin +2 -printf '%f\n' 2>/dev/null | sort -n | head -1)
+        LAST_DAEMON_STUCK_ITEM=$(cat "$DAEMON_STUCK_TS" 2>/dev/null || true)
+        if [ -n "$DAEMON_STUCK_ITEM" ] && [ "$DAEMON_STUCK_ITEM" != "$LAST_DAEMON_STUCK_ITEM" ]; then
+            if restart_service daemon_inbox_stalled; then
+                printf '%s\n' "$DAEMON_STUCK_ITEM" > "$DAEMON_STUCK_TS"
+            fi
+        fi
+    fi
+fi
+
+# 1. Service active?
+if ! sudo systemctl is-active "$SVC" >/dev/null 2>&1; then
+    echo "[$(date -u +%FT%TZ)] service is not active" >> "$LOG"
+    if service_mutation_allowed; then
+        sudo systemctl reset-failed "$SVC" 2>/dev/null
+        if sudo systemctl start "$SVC" 2>/dev/null; then
+            SERVICE_RESTARTED=1
+            echo "[$(date -u +%FT%TZ)] recovery start succeeded: service=$SVC" >> "$LOG"
+        else
+            echo "[$(date -u +%FT%TZ)] recovery start failed: service=$SVC exit=$?" >> "$LOG"
+        fi
+    fi
+    # A start that works needs no announcement — the owner sees a bot that
+    # answers. Saying "restarting..." first only taught them that the normal
+    # state of their assistant is an incident. Judging the attempt costs no
+    # sleeping here: this runs every two minutes, so the next tick is the
+    # retry, and only a service still down across several of them is worth
+    # a message.
+    service_down_since="$(cat "$STAMP/service-down-since.epoch" 2>/dev/null)"
+    case "$service_down_since" in
+        ''|*[!0-9]*)
+            service_down_since="$(date -u +%s)"
+            printf '%s\n' "$service_down_since" > "$STAMP/service-down-since.epoch"
+            ;;
+    esac
+    if [ "$(( $(date -u +%s) - service_down_since ))" -ge "${SERVICE_DOWN_ALERT_AFTER:-300}" ]; then
+        alert "service-down" "Не можу запуститися: служба ${SVC} лежить вже кілька хвилин, автоматичний старт не допомагає. Напиши нам."
+    fi
+else
+    rm -f "$STAMP/service-down-since.epoch"
+fi
+
+# 2. Claude process alive? (-u: only THIS instance's user — a neighbour bot's process
+# must not mask a dead one on multi-agent boxes)
+if ! pgrep -u "$ME_UID" -f "^claude $" >/dev/null 2>&1 && ! pgrep -u "$ME_UID" -af "/usr/bin/claude " | grep -v grep >/dev/null 2>&1; then
     # Fallback: check by screen session existence
     if ! screen -S claude-bot -ls 2>/dev/null | grep -q claude-bot; then
-        alert "no-claude-process" "No claude process found. Service says active but no process."
+        # Log only. Restarting here as well was tried and reverted: the checks
+        # below (MCP liveness, malformed-tool marker, stuck-turn watchdog) own
+        # the restart for a wedged process, and a second trigger just doubled
+        # the restarts. What the owner would notice — silence — is reported by
+        # the stuck-turn escalation with the wait time in it.
+        echo "[$(date -u +%FT%TZ)] unit is active but no Claude process" >> "$LOG"
     fi
+fi
+
+# 2a. A live PID is not enough: Claude can receive Telegram updates while logged out.
+AUTH_STATUS=$(timeout 20 env HOME="$H" ATARAX_SUPPRESS_TELEGRAM=1 \
+    $H/.local/bin/claude auth status 2>/dev/null || true)
+if printf '%s' "$AUTH_STATUS" | grep -Fq '"loggedIn": true'; then
+    CLAUDE_AUTHENTICATED=true
+else
+    CLAUDE_AUTHENTICATED=false
+    # No preamble: claude-auth-rescue below sends the login link itself, and the
+    # link is the only part the owner can act on. Announcing the rescue first
+    # just doubled the interruption.
+    echo "[$(date -u +%FT%TZ)] Claude auth status: logged out" >> "$LOG"
+    # Self-service re-login: владельцу уходит OAuth-ссылка в TG, код он присылает
+    # обратно боту сообщением, скрипт вставляет его в CLI и рестартит сервис.
+    # Скрипт сам дебаунсится (20 мин) — безопасно звать каждые 2 минуты.
+    nohup "$H/bin/claude-auth-rescue" >/dev/null 2>&1 &
 fi
 
 # 3. Bun telegram MCP alive? Grace-period 4 min before restart — restarting claude-telegram
 # kills any active TG session in progress, so we wait to see if claude respawns bun on its own.
 # Most bun MCP deaths self-heal within 1-2 min. (added 2026-06-17 after restart-mid-task issue)
-BUN_DEAD_TS=/home/claude/logs/bun-mcp-dead-since.ts
-if ! pgrep -f "bun.*plugins-official.*telegram" >/dev/null 2>&1; then
-    if sudo systemctl is-active claude-telegram.service >/dev/null 2>&1; then
+BUN_DEAD_TS=$H/logs/bun-mcp-dead-since.ts
+if ! telegram_poller_alive; then
+    if sudo systemctl is-active "$SVC" >/dev/null 2>&1; then
         NOW=$(date +%s)
         DEAD_SINCE=$(cat "$BUN_DEAD_TS" 2>/dev/null || echo "$NOW")
         # First detection: record timestamp, do nothing
         [ ! -f "$BUN_DEAD_TS" ] && echo "$NOW" > "$BUN_DEAD_TS"
         DEAD_FOR=$((NOW - DEAD_SINCE))
-        if [ "$DEAD_FOR" -ge 240 ]; then
-            echo "[$(date -u +%FT%TZ)] bun MCP dead ${DEAD_FOR}s, restarting claude-telegram" >> "$LOG"
-            sudo systemctl restart claude-telegram.service 2>/dev/null
-            rm -f "$BUN_DEAD_TS"
+        # Idle-aware fast restore: reply-tool is dead the whole time bun is down.
+        # If claude is IDLE (no session activity in 60s), restore fast (~60s) — nothing
+        # to interrupt. If BUSY (recent jsonl), keep the 240s cap so we don't kill a
+        # long task. Recovery becomes near-invisible without risking work-in-progress.
+        # Busy = any session-jsonl write in the last 20 min, NOT 60s: a long tool
+        # call (codex/video render) writes nothing while working, so a short window
+        # reads a busy turn as idle and the restart kills it (Mani 2026-07-16).
+        # Idle box: restart 60s after bun death (fast, invisible). Busy box: defer
+        # to a 20-min cap — the turn still delivers via the tg-send fallback, and
+        # unconfirmed Telegram updates redeliver after the restart anyway.
+        RECENT_ACT=$(find "$SESS_DIR" -name "*.jsonl" -newermt "-1200 seconds" 2>/dev/null | head -1)
+        if { [ -z "$RECENT_ACT" ] && [ "$DEAD_FOR" -ge 60 ]; } || [ "$DEAD_FOR" -ge 1200 ]; then
+            if restart_service "bun_mcp_dead_${DEAD_FOR}s"; then
+                rm -f "$BUN_DEAD_TS"
+            fi
         else
-            echo "[$(date -u +%FT%TZ)] bun MCP dead ${DEAD_FOR}s, within grace period (240s)" >> "$LOG"
+            echo "[$(date -u +%FT%TZ)] bun MCP dead ${DEAD_FOR}s, within grace period" >> "$LOG"
         fi
     fi
 else
     rm -f "$BUN_DEAD_TS"
 fi
 
-# 4. Crash loop?
-RESTARTS=$(journalctl -u claude-telegram --since "10 min ago" --no-pager 2>/dev/null | grep -c "Started Claude Code")
-if [ "$RESTARTS" -gt 4 ]; then
-    alert "crash-loop" "Crash loop: ${RESTARTS} restarts in 10 min. Stopping auto-restart — investigate manually."
-    sudo systemctl stop claude-telegram.service 2>/dev/null
-    echo "[$(date -u +%FT%TZ)] CRASH LOOP — stopped service (${RESTARTS} restarts)" >> "$LOG"
-fi
-
 # 5. MCP connectivity — DO NOT use "claude mcp list" (spawns new Claude instance
 # which re-spawns all MCP servers, causing primary bun to receive SIGTERM via 
 # plugin"s stale-PID replace logic). Rely on process checks in steps 2-3 instead.
 
-# 6. Claude Max proxy (:3456) — ONLY if that optional module is installed (skip on base install).
-if systemctl list-unit-files claude-max-proxy.service --no-legend 2>/dev/null | grep -q claude-max-proxy; then
-    if ! curl -sS --max-time 5 http://localhost:3456/health | grep -q "\"status\":\"ok\""; then
-        alert "proxy-down" "Claude Max proxy (:3456) not responding. Auto-publisher LLM calls will fail."
-        sudo systemctl restart claude-max-proxy 2>/dev/null
-    fi
-fi
-
-# 7. Auto-publisher — ONLY if that optional module is installed (skip on base install).
-if systemctl list-unit-files auto-publisher.service --no-legend 2>/dev/null | grep -q auto-publisher; then
-    if ! pgrep -f "auto_publisher.py" >/dev/null 2>&1; then
-        alert "auto-publisher-down" "Auto-publisher is not running. TG channel not being fed."
-        sudo systemctl start auto-publisher.service 2>/dev/null
+# 6. StreamPost is optional; supervise it only when installed.
+if systemctl list-unit-files streampost.service --no-legend 2>/dev/null | grep -q streampost; then
+    if ! systemctl is-active streampost.service >/dev/null 2>&1; then
+        sudo systemctl start streampost.service 2>/dev/null
     fi
 fi
 
 # 8. Disk space (< 5% free = critical)
 DISK_PCT=$(df /home | awk 'NR==2 {gsub("%",""); print 100-$5}')
 if [ "$DISK_PCT" -lt 10 ]; then
-    alert "low-disk" "Low disk space: ${DISK_PCT}% free on /home. Check /home/claude/auto-publisher/data/tg_media/"
+    alert "low-disk" "Мало місця на диску: на /home вільно ${DISK_PCT}%. Перевір /opt/streampost/data та файли браузера."
 fi
 
-# 9. Write state (for diagnostics)
-cat > "$STATE" <<STATE_EOF
-{
-  "timestamp": "$(date -u +%FT%TZ)",
-  "service_active": $(sudo systemctl is-active claude-telegram.service >/dev/null 2>&1 && echo true || echo false),
-  "restarts_10min": ${RESTARTS},
-  "disk_free_pct": ${DISK_PCT},
-  "auto_publisher_alive": $(pgrep -f auto_publisher.py >/dev/null 2>&1 && echo true || echo false),
-  "proxy_alive": $(curl -sS --max-time 3 http://localhost:3456/health 2>/dev/null | grep -q ok && echo true || echo false)
+# Corporate work has its own durable queue. Never infer a global Telegram hang
+# from one employee conversation: the gateway reports that queue separately and
+# scoped /unstick handles it without restarting the owner session.
+DB=$H/.claude/channels/telegram/messages.db
+STARTED_RECOVERY_STAMP=$STAMP/runtime-started-head-restart.json
+
+write_started_recovery_checkpoint() {
+    python3 - "$STARTED_RECOVERY_STAMP" "$1" "$2" "$3" "$4" <<'PY'
+import json
+import os
+from pathlib import Path
+import stat
+import sys
+import tempfile
+
+target = Path(sys.argv[1])
+phase, delivery_id, started_at, invocation_id = sys.argv[2:]
+if phase not in {"prepared", "issued"}:
+    raise SystemExit(1)
+try:
+    existing = target.lstat()
+except FileNotFoundError:
+    existing = None
+if existing is not None and not stat.S_ISREG(existing.st_mode):
+    raise SystemExit(1)
+
+payload = json.dumps(
+    {
+        "schemaVersion": 1,
+        "phase": phase,
+        "deliveryId": delivery_id,
+        "startedAt": int(started_at),
+        "serviceInvocationId": invocation_id,
+    },
+    separators=(",", ":"),
+).encode("utf-8") + b"\n"
+descriptor = None
+temporary = None
+try:
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=".runtime-started-head-restart.",
+        dir=target.parent,
+    )
+    os.fchmod(descriptor, 0o600)
+    with os.fdopen(descriptor, "wb") as handle:
+        descriptor = None
+        handle.write(payload)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, target)
+    temporary = None
+    directory = os.open(target.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+except (OSError, TypeError, ValueError):
+    if descriptor is not None:
+        os.close(descriptor)
+    if temporary is not None:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+    raise SystemExit(1)
+PY
 }
-STATE_EOF
+
+read_started_recovery_checkpoint() {
+    python3 - "$STARTED_RECOVERY_STAMP" <<'PY'
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import sys
+
+target = Path(sys.argv[1])
+flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+try:
+    descriptor = os.open(target, flags)
+except OSError:
+    raise SystemExit(1)
+try:
+    opened = os.fstat(descriptor)
+    if not stat.S_ISREG(opened.st_mode) or opened.st_size > 4096:
+        raise SystemExit(1)
+    payload = os.read(descriptor, 4097)
+finally:
+    os.close(descriptor)
+try:
+    def unique_object(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError("duplicate checkpoint key")
+            value[key] = item
+        return value
+
+    value = json.loads(payload.decode("utf-8"), object_pairs_hook=unique_object)
+except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+    raise SystemExit(1)
+if set(value) != {
+    "schemaVersion",
+    "phase",
+    "deliveryId",
+    "startedAt",
+    "serviceInvocationId",
+}:
+    raise SystemExit(1)
+if (
+    type(value["schemaVersion"]) is not int
+    or value["schemaVersion"] != 1
+    or value["phase"] not in {"prepared", "issued"}
+):
+    raise SystemExit(1)
+if not isinstance(value["deliveryId"], str) or re.fullmatch(
+    r"-?[0-9]+:[0-9]+", value["deliveryId"]
+) is None:
+    raise SystemExit(1)
+if type(value["startedAt"]) is not int or value["startedAt"] <= 0:
+    raise SystemExit(1)
+if not isinstance(value["serviceInvocationId"], str) or re.fullmatch(
+    r"[0-9A-Fa-f]{32}", value["serviceInvocationId"]
+) is None:
+    raise SystemExit(1)
+print(
+    f'{value["phase"]}|{value["deliveryId"]}|{value["startedAt"]}|'
+    f'{value["serviceInvocationId"]}'
+)
+PY
+}
+
+rollback_started_recovery() {
+    local changed
+    changed=$(sqlite3 "$DB" \
+        "UPDATE pending_inbound_deliveries SET state='started' WHERE delivery_id='$STARTED_DELIVERY_ID' AND state='recovering' AND started_at=$STARTED_AT; SELECT changes();" \
+        2>/dev/null || true)
+    [ "$changed" = 1 ]
+}
+
+# A direct FIFO head becomes `started` in UserPromptSubmit, before Claude writes
+# the carrier to its transcript. Claude Code can occasionally display that
+# notification in the TUI but never start the turn. The normal drain must not
+# replay a `started` row, so recover only when the exact carrier is provably
+# absent after a bounded lease. `started_at` avoids mistaking old queue wait time
+# for a stale claim after a legitimate long turn.
+if [ "$SERVICE_RESTARTED" -eq 0 ] \
+   && [ -f "$DB" ] && command -v sqlite3 >/dev/null 2>&1 \
+   && [ "$CLAUDE_AUTHENTICATED" = true ] \
+   && [ "$LIMIT_RECOVERY_STATUS" = clear ] \
+   && [ -x "$H/bin/claude-limit-recovery" ]; then
+    STARTED_HEAD_COLUMNS=$(sqlite3 "$DB" \
+        "SELECT COUNT(*) FROM pragma_table_info('pending_inbound_deliveries') WHERE name IN ('delivery_id','payload','created_at','state','attempts','next_attempt_at','started_at');" \
+        2>/dev/null || echo 0)
+    if [ "$STARTED_HEAD_COLUMNS" = 7 ]; then
+        STARTED_HEAD=$(sqlite3 "$DB" \
+            "SELECT delivery_id,started_at,state FROM pending_inbound_deliveries WHERE state IN ('started','recovering') AND started_at>0 AND rowid=(SELECT rowid FROM pending_inbound_deliveries ORDER BY created_at ASC,rowid ASC LIMIT 1);" \
+            2>/dev/null || true)
+        IFS='|' read -r STARTED_DELIVERY_ID STARTED_AT STARTED_ROW_STATE STARTED_EXTRA <<STARTED_HEAD_EOF
+$STARTED_HEAD
+STARTED_HEAD_EOF
+        if [ -z "${STARTED_EXTRA:-}" ] \
+           && [[ "${STARTED_DELIVERY_ID:-}" =~ ^(-?[0-9]+):([0-9]+)$ ]]; then
+            STARTED_CHAT_ID=${BASH_REMATCH[1]}
+            STARTED_MESSAGE_ID=${BASH_REMATCH[2]}
+        else
+            STARTED_CHAT_ID=
+            STARTED_MESSAGE_ID=
+        fi
+        if [ -n "$STARTED_CHAT_ID" ] \
+           && [[ "${STARTED_AT:-}" =~ ^[0-9]{1,13}$ ]] \
+           && { [ "$STARTED_ROW_STATE" = started ] \
+                || [ "$STARTED_ROW_STATE" = recovering ]; }; then
+            NOW_STARTED_MS=$(( $(date +%s) * 1000 ))
+            if [ "$STARTED_AT" -le "$NOW_STARTED_MS" ] \
+               && [ $(( NOW_STARTED_MS - STARTED_AT )) -ge 360000 ]; then
+                STARTED_INVOCATION=$(systemctl show "$SVC" -p InvocationID \
+                    --value 2>/dev/null || true)
+                if [[ "$STARTED_INVOCATION" =~ ^[0-9A-Fa-f]{32}$ ]]; then
+                    STARTED_CHECKPOINT=$(read_started_recovery_checkpoint \
+                        2>/dev/null || true)
+                    IFS='|' read -r STARTED_CHECKPOINT_PHASE \
+                        STARTED_CHECKPOINT_ID STARTED_CHECKPOINT_AT \
+                        STARTED_CHECKPOINT_INVOCATION \
+                        STARTED_CHECKPOINT_EXTRA <<STARTED_CHECKPOINT_EOF
+$STARTED_CHECKPOINT
+STARTED_CHECKPOINT_EOF
+                    STARTED_CHECKPOINT_EXACT=0
+                    if [ -z "${STARTED_CHECKPOINT_EXTRA:-}" ] \
+                       && [ "$STARTED_CHECKPOINT_ID" = "$STARTED_DELIVERY_ID" ] \
+                       && [ "$STARTED_CHECKPOINT_AT" = "$STARTED_AT" ]; then
+                        STARTED_CHECKPOINT_EXACT=1
+                    fi
+
+                    if [ "$STARTED_CHECKPOINT_EXACT" -eq 1 ] \
+                       && [ "$STARTED_CHECKPOINT_PHASE" = issued ]; then
+                        : # Restart authorization was already consumed; never retry it.
+                    elif [ "$STARTED_ROW_STATE" = recovering ] \
+                       && { [ "$STARTED_CHECKPOINT_EXACT" -ne 1 ] \
+                            || [ "$STARTED_CHECKPOINT_PHASE" != prepared ] \
+                            || [ "$STARTED_CHECKPOINT_INVOCATION" \
+                                 != "$STARTED_INVOCATION" ]; }; then
+                        : # An orphan without exact prepared proof is ambiguous.
+                    else
+                        STARTED_ACCEPTANCE=$(timeout 30 env HOME="$H" \
+                            "$H/bin/claude-limit-recovery" --turn-acceptance \
+                            "$STARTED_CHAT_ID" "$STARTED_MESSAGE_ID" \
+                            "$STARTED_AT" 2>/dev/null || true)
+                        STARTED_RESERVED=0
+                        if [ "$STARTED_ROW_STATE" = recovering ]; then
+                            STARTED_RESERVED=1
+                        elif [ "$STARTED_ACCEPTANCE" = absent ] \
+                           && write_started_recovery_checkpoint prepared \
+                                "$STARTED_DELIVERY_ID" "$STARTED_AT" \
+                                "$STARTED_INVOCATION"; then
+                            STARTED_RESERVED=$(sqlite3 "$DB" \
+                                "UPDATE pending_inbound_deliveries SET state='recovering' WHERE delivery_id='$STARTED_DELIVERY_ID' AND state='started' AND started_at=$STARTED_AT AND rowid=(SELECT rowid FROM pending_inbound_deliveries ORDER BY created_at ASC,rowid ASC LIMIT 1); SELECT changes();" \
+                                2>/dev/null || true)
+                            if [ "$STARTED_RESERVED" != 1 ]; then
+                                rm -f "$STARTED_RECOVERY_STAMP"
+                            fi
+                        fi
+
+                        if [ "$STARTED_RESERVED" = 1 ]; then
+                            if [ "$STARTED_ROW_STATE" = started ]; then
+                                STARTED_ACCEPTANCE=$(timeout 30 env HOME="$H" \
+                                    "$H/bin/claude-limit-recovery" \
+                                    --turn-acceptance "$STARTED_CHAT_ID" \
+                                    "$STARTED_MESSAGE_ID" "$STARTED_AT" \
+                                    2>/dev/null || true)
+                            fi
+                            if [ "$STARTED_ACCEPTANCE" = absent ]; then
+                                STARTED_STILL_RESERVED=$(sqlite3 "$DB" \
+                                    "SELECT COUNT(*) FROM pending_inbound_deliveries WHERE delivery_id='$STARTED_DELIVERY_ID' AND state='recovering' AND started_at=$STARTED_AT AND rowid=(SELECT rowid FROM pending_inbound_deliveries ORDER BY created_at ASC,rowid ASC LIMIT 1);" \
+                                    2>/dev/null || true)
+                                if [ "$STARTED_STILL_RESERVED" = 1 ]; then
+                                    if ! service_mutation_allowed; then
+                                        if rollback_started_recovery; then
+                                            rm -f "$STARTED_RECOVERY_STAMP"
+                                        fi
+                                    elif write_started_recovery_checkpoint issued \
+                                            "$STARTED_DELIVERY_ID" "$STARTED_AT" \
+                                            "$STARTED_INVOCATION"; then
+                                        if restart_service_after_preflight runtime_started_head_carrier_absent; then
+                                            exit 0
+                                        fi
+                                        echo "[$(date -u +%FT%TZ)] runtime started-head restart outcome ambiguous; issued checkpoint retained" >> "$LOG"
+                                    elif rollback_started_recovery; then
+                                        rm -f "$STARTED_RECOVERY_STAMP"
+                                    fi
+                                elif rollback_started_recovery; then
+                                    rm -f "$STARTED_RECOVERY_STAMP"
+                                fi
+                            elif rollback_started_recovery; then
+                                rm -f "$STARTED_RECOVERY_STAMP"
+                            fi
+                        fi
+                    fi
+                fi
+            fi
+        fi
+    fi
+fi
+
+CORPORATE_MARKER=$H/.claude/channels/telegram/corporate-isolation-activated
+CORPORATE_ACTIVATED=0
+CORPORATE_ADMISSION=legacy
+CORPORATE_ACTIVE=0
+CORPORATE_QUEUED=0
+CORPORATE_BLOCKED=0
+if [ -e "$CORPORATE_MARKER" ] || [ -L "$CORPORATE_MARKER" ]; then
+    CORPORATE_ACTIVATED=1
+elif [ -f "$DB" ] && command -v sqlite3 >/dev/null 2>&1 \
+    && [ "$(sqlite3 "$DB" "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='corporate_runtime_state';" 2>/dev/null || echo 0)" = 1 ]; then
+    CORPORATE_LATCH=$(sqlite3 "$DB" \
+        "SELECT isolation_activated FROM corporate_runtime_state WHERE singleton=1;" \
+        2>/dev/null || true)
+    case "$CORPORATE_LATCH" in
+        0) CORPORATE_ACTIVATED=0 ;;
+        1) CORPORATE_ACTIVATED=1 ;;
+        *) CORPORATE_ACTIVATED=1; CORPORATE_ADMISSION=paused ;;
+    esac
+fi
+if [ "$CORPORATE_ACTIVATED" -eq 1 ] && [ -f "$DB" ] \
+    && command -v sqlite3 >/dev/null 2>&1; then
+    CORPORATE_ADMISSION=$(sqlite3 "$DB" \
+        "SELECT admission_state FROM corporate_runtime_state WHERE singleton=1;" \
+        2>/dev/null || true)
+    case "$CORPORATE_ADMISSION" in active|paused) ;; *) CORPORATE_ADMISSION=paused ;; esac
+    CORPORATE_ACTIVE=$(sqlite3 "$DB" \
+        "SELECT COUNT(*) FROM conversation_jobs WHERE state IN ('leased','prompt_submitted');" \
+        2>/dev/null || echo 0)
+    CORPORATE_QUEUED=$(sqlite3 "$DB" \
+        "SELECT COUNT(*) FROM conversation_jobs WHERE state='queued';" \
+        2>/dev/null || echo 0)
+    CORPORATE_BLOCKED=$(sqlite3 "$DB" \
+        "SELECT COUNT(*) FROM conversation_jobs WHERE state='blocked';" \
+        2>/dev/null || echo 0)
+fi
+case "$CORPORATE_ACTIVE" in ''|*[!0-9]*) CORPORATE_ACTIVE=0 ;; esac
+case "$CORPORATE_QUEUED" in ''|*[!0-9]*) CORPORATE_QUEUED=0 ;; esac
+case "$CORPORATE_BLOCKED" in ''|*[!0-9]*) CORPORATE_BLOCKED=0 ;; esac
+# Admission that stays paused for anything but a Claude usage limit (that one
+# resumes itself) leaves every employee unanswered while the owner's chat keeps
+# working. A legacy box whose corporate schema fails closed does the same to
+# guests and groups with "тимчасово недоступний" replies. Say both out loud.
+if [ -f "$DB" ] && command -v sqlite3 >/dev/null 2>&1; then
+    if [ "$CORPORATE_ACTIVATED" -eq 1 ] && [ "$CORPORATE_ADMISSION" = paused ]; then
+        PAUSE_REASON=$(sqlite3 "$DB" "SELECT COALESCE(pause_reason,'') FROM corporate_runtime_state WHERE singleton=1;" 2>/dev/null || true)
+        PAUSED_MS=$(sqlite3 "$DB" "SELECT COALESCE(updated_at,0) FROM corporate_runtime_state WHERE singleton=1;" 2>/dev/null || echo 0)
+        case "$PAUSED_MS" in ''|*[!0-9]*) PAUSED_MS=0 ;; esac
+        PAUSED_MIN=$(( ($(date +%s) - PAUSED_MS / 1000) / 60 ))
+        if [ "$PAUSE_REASON" != usage_limit ] && [ "$PAUSED_MIN" -ge 10 ]; then
+            alert "corporate-paused" "⏸ Корпоративний приймач на паузі вже ~${PAUSED_MIN} хв (причина: ${PAUSE_REASON:-невідома}) — співробітникам бот не відповідає, твій чат працює. Напиши мені «віднови корпоративний приймач» або через SSH: corporate-control probe --json && corporate-control resume." 3600
+        fi
+    fi
+    if [ "$CORPORATE_ACTIVATED" -eq 0 ]; then
+        UNAVAILABLE_15M=$(sqlite3 "$DB" "SELECT COUNT(*) FROM messages WHERE direction='out' AND ts > (strftime('%s','now') - 900) * 1000 AND text LIKE '%Корпоративний режим тимчасово недоступний%';" 2>/dev/null || echo 0)
+        case "$UNAVAILABLE_15M" in ''|*[!0-9]*) UNAVAILABLE_15M=0 ;; esac
+        if [ "$UNAVAILABLE_15M" -gt 0 ]; then
+            alert "corporate-unavailable" "⚠️ За 15 хв ${UNAVAILABLE_15M} відповідей «Корпоративний режим тимчасово недоступний», хоча корпоративний режим не активовано — гості й групи лишаються без відповіді. Перевір маркер corporate-isolation-activated і таблицю corporate_runtime_state у messages.db (або напиши мені «перевір корпоративний стан»)." 3600
+        fi
+    fi
+fi
+OWNER_QUEUE=0
+if [ -f "$DB" ] && command -v sqlite3 >/dev/null 2>&1; then
+    OWNER_QUEUE=$(sqlite3 "$DB" \
+        "SELECT COUNT(*) FROM pending_inbound_deliveries;" 2>/dev/null || echo 0)
+fi
+case "$OWNER_QUEUE" in ''|*[!0-9]*) OWNER_QUEUE=0 ;; esac
+OWNER_STUCK=false
 
 # Log heartbeat (only on anomaly — to avoid log spam)
 if [ "$RESTARTS" -gt 1 ] || [ "$DISK_PCT" -lt 20 ]; then
@@ -144,60 +943,327 @@ if [ "$RESTARTS" -gt 1 ] || [ "$DISK_PCT" -lt 20 ]; then
 fi
 
 # 10. Claude OAuth token freshness + auto-recovery (added 2026-06-09; restart-on-expiry 2026-06-12).
-# Несколько процессов (бот, max-proxy, claude -p краны) делят один .credentials.json, а рефреш
-# РОТИРУЕТ refresh-токен — у долгоживущего бота in-memory токен протухает, хотя в ФАЙЛЕ уже лежит
-# свежий (его записал тот, кто рефрешнул последним). Рестарт заставляет бота перечитать файл и
+# OAuth refresh can rotate the token while the long-lived bot keeps stale in-memory state.
+# A restart forces the bot to reread the current credentials file and
 # взять валидный токен. Кулдаун 15м, чтобы не словить crash-loop guard (#4).
-EXP=$(jq -r ".claudeAiOauth.expiresAt // 0" /home/claude/.claude/.credentials.json 2>/dev/null)
+# Same silent-failure class as the sqlite3 watchdog: without jq the expiry reads
+# as 0, the whole token-recovery block below is skipped and nothing says so.
+if ! command -v jq >/dev/null 2>&1; then
+    echo "[$(date -u +%FT%TZ)] WARN: jq missing — OAuth token auto-recovery disabled; apt-get install -y jq" >> "$LOG"
+fi
+EXP=$(jq -r ".claudeAiOauth.expiresAt // 0" "$H/.claude/.credentials.json" 2>/dev/null)
 NOW_MS=$(( $(date +%s) * 1000 ))
 if [ "${EXP:-0}" -gt 0 ]; then
     LEFT_MIN=$(( (EXP - NOW_MS) / 60000 ))
     if [ "$LEFT_MIN" -le 0 ]; then
-        RESTART_TS=/tmp/cash-token-restart.ts
+        RESTART_TS=$STAMP/cash-token-restart.ts
         NOW_S2=$(date +%s); LAST_R=$(cat "$RESTART_TS" 2>/dev/null || echo 0)
+        # Restart PROMPTLY on an expired token — do NOT idle-gate this. An expired
+        # in-memory token means every model call 401s ("Please run /login"), so the
+        # session writes error lines and *looks busy*; gating on that busyness (tried
+        # 2026-07-22) deferred the very restart that fixes it and wedged the bot for
+        # ~20 min. A dead token has no useful work to protect. (Message-in-window
+        # drops belong to the transport's on-disk retention, not here.)
         if [ $(( NOW_S2 - LAST_R )) -ge 900 ]; then
-            echo "$NOW_S2" > "$RESTART_TS"
-            echo "[$(date -u +%FT%TZ)] token expired — restarting claude-telegram to re-read refreshed creds" >> "$LOG"
-            sudo systemctl restart claude-telegram.service 2>/dev/null
-            alert "claude-token-expired" "Claude OAuth токен протух — авто-рестарт бота (подхватит свежий токен из файла). Если через 5 мин молчит — нужен /login." 3600
+            # Silent by design: the refreshed token is already on disk and the
+            # restart makes the bot read it. Almost every one of these ended in
+            # a working bot, so the message only said "something was wrong"
+            # after it no longer was. If the restart does not help, the auth
+            # check above catches it on the next tick and sends a login link —
+            # the one thing the owner can actually do.
+            if restart_service token_expired; then
+                echo "$NOW_S2" > "$RESTART_TS"
+            fi
         fi
-    elif [ "$LEFT_MIN" -le 30 ]; then
-        alert "claude-token-dying" "Claude OAuth токен умирает через ${LEFT_MIN} мин. При протухании healthcheck сам рестартнёт бота; если не поможет — /login." 7200
     fi
 fi
 
 # 11. Codex auth (картинки gpt-image-2) — проверка раз в 30 мин, лёгкая.
-CODEX_STAMP=/tmp/cash-codex-check.ts
+CODEX_STAMP=$STAMP/cash-codex-check.ts
 NOW_S=$(date +%s)
 LAST_CODEX=$(cat "$CODEX_STAMP" 2>/dev/null || echo 0)
 # Only if the images option is installed (codex present) — else base installs false-alert.
-if [ -x /home/claude/.npm-global/bin/codex ] && [ $(( NOW_S - LAST_CODEX )) -ge 1800 ]; then
+if [ -x "$H/.npm-global/bin/codex" ] && [ $(( NOW_S - LAST_CODEX )) -ge 1800 ]; then
     echo "$NOW_S" > "$CODEX_STAMP"
-    if ! timeout 20 /home/claude/.npm-global/bin/codex login status 2>&1 | grep -q "Logged in"; then
-        alert "codex-auth-dead" "Codex auth отвалился — gpt-image-2 не работает. Нужен: codex login --device-auth (или скажи десктопному Клоду)." 7200
+    if ! timeout 20 "$H/.npm-global/bin/codex" login status 2>&1 | grep -q "Logged in"; then
+        alert "codex-auth-dead" "Авторизацію Codex втрачено — gpt-image-2 не працює. Потрібно: codex login --device-auth (або скажи десктопному Claude)." 7200
     fi
 fi
 
 # 12. Stuck-turn watchdog (added 2026-07-06 after 23:38->00:13 hang: poller alive, turn hung,
 # voices sat unanswered 35 min; none of checks 1-11 fire in this mode). Unanswered incoming
 # >=6 min AND no session jsonl activity >=3 min (claude idle, not a long legit task) -> restart.
-DB=/home/claude/.claude/channels/telegram/messages.db
-if [ -f "$DB" ]; then
-    LAST_IN=$(sqlite3 "$DB" "SELECT COALESCE(MAX(ts),0) FROM messages WHERE direction='in' AND chat_id='${USER_ID}'" 2>/dev/null || echo 0)
-    LAST_OUT=$(sqlite3 "$DB" "SELECT COALESCE(MAX(ts),0) FROM messages WHERE direction='out' AND chat_id='${USER_ID}'" 2>/dev/null || echo 0)
+# This watchdog reads the message log through the sqlite3 CLI. When that binary is
+# absent the queries yield 0, the comparison below is never true and the watchdog
+# is silently disabled — exactly how a client bot sat 1h40m on unanswered messages
+# (field case, 2026-07-26) while every other check reported healthy. Never fail quietly.
+if [ -f "$DB" ] && ! command -v sqlite3 >/dev/null 2>&1; then
+    echo "[$(date -u +%FT%TZ)] WARN: sqlite3 missing — stuck-turn watchdog disabled; apt-get install -y sqlite3" >> "$LOG"
+fi
+if [ -f "$DB" ] && command -v sqlite3 >/dev/null 2>&1; then
+    # Before corporate isolation is activated, every private chat still shares
+    # the legacy owner process and needs the old watchdog. Afterwards employee
+    # DMs have independent workers, so only the exact owner may trigger a global
+    # service restart. Corporate failures remain visible in their own counters.
+    if [ "$CORPORATE_ACTIVATED" -eq 1 ]; then
+        OWNER_CHAT_ID=$(alert_recipients | head -n 1)
+        case "$OWNER_CHAT_ID" in
+            ''|*[!0-9]*) PRIVATE_CHATS="0" ;;
+            *) PRIVATE_CHATS="chat_id = '$OWNER_CHAT_ID'" ;;
+        esac
+    else
+        PRIVATE_CHATS="chat_id NOT LIKE '-%'"
+    fi
+    # Compare input and output inside EACH private chat. Global MAX(in)/MAX(out)
+    # lets an answer in chat B hide an unanswered message in chat A. Return each
+    # candidate's metadata (never its text), oldest first, so an exact handled
+    # turn cannot hide a later genuinely unknown turn in the same chat.
+    if [ "$(sqlite3 "$DB" "SELECT COUNT(*) FROM pragma_table_info('messages') WHERE name='message_id'" 2>/dev/null || echo 0)" = 1 ]; then
+        MESSAGE_ID_EXPR="COALESCE(CAST(m.message_id AS TEXT), '')"
+    else
+        # Legacy databases have no Telegram message ID. Preserve the existing
+        # bounded recovery path by classifying those rows as unknown.
+        MESSAGE_ID_EXPR="''"
+    fi
+    PRIVATE_CHAT_ACTIVITY=$(sqlite3 "$DB" "
+        WITH activity AS (
+            SELECT chat_id,
+                   COALESCE(MAX(CASE WHEN direction='in' THEN ts END), 0) AS last_in,
+                   COALESCE(MAX(CASE WHEN direction='out' THEN ts END), 0) AS last_out
+            FROM messages
+            WHERE $PRIVATE_CHATS
+            GROUP BY chat_id
+            HAVING last_in > last_out
+        )
+        SELECT m.chat_id,
+               activity.last_in,
+               activity.last_out,
+               m.ts,
+               $MESSAGE_ID_EXPR
+        FROM messages m
+        JOIN activity ON activity.chat_id = m.chat_id
+        WHERE m.direction='in'
+          AND m.ts > activity.last_out
+        ORDER BY m.chat_id, m.ts, m.rowid
+    " 2>/dev/null || true)
     NOW_MS3=$(( $(date +%s) * 1000 ))
-    if [ "$LAST_IN" -gt "$LAST_OUT" ] && [ $(( NOW_MS3 - LAST_IN )) -ge 360000 ]; then
-        RECENT_JSONL=$(find /home/claude/.claude/projects -name "*.jsonl" -newermt "-180 seconds" 2>/dev/null | head -1)
-        STUCK_TS=/tmp/cash-stuck-restart.ts
-        NOW_S3=$(date +%s); LAST_SR=$(cat "$STUCK_TS" 2>/dev/null || echo 0)
-        if [ -z "$RECENT_JSONL" ] && [ $(( NOW_S3 - LAST_SR )) -ge 900 ]; then
-            echo "$NOW_S3" > "$STUCK_TS"
-            AGE_MIN=$(( (NOW_MS3 - LAST_IN) / 60000 ))
-            echo "[$(date -u +%FT%TZ)] stuck-turn: unanswered incoming ${AGE_MIN}m, sessions idle — restarting" >> "$LOG"
-            XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user restart cash-tg-receiver 2>/dev/null
-            sudo systemctl restart claude-telegram.service 2>/dev/null
+    # 1200s, not 180s: a long tool call (codex/video render, 5-15 min) writes
+    # nothing to the session jsonl while working — a few quiet minutes is a BUSY
+    # turn, not a hang. A 180s window false-fired mid-render on Mani (2026-07-16)
+    # and the restart killed the live turn, losing the owner's task.
+    # A fresh file is not proof of a working agent: Telegram appends
+    # queue-operation rows even while Claude is wedged. Parse complete outer
+    # JSON records instead of depending on whitespace or cutting through a
+    # large tool result. Unsafe input fails BUSY so recovery never destroys
+    # work it cannot classify.
+    RECENT_JSONL=$(python3 - "$SESS_DIR" <<'PY'
+import json
+import sys
+import time
+from datetime import datetime, timezone
+from heapq import nlargest
+from pathlib import Path
+
+RECENT_SECONDS = 1200
+# Transcripts of headless scheduled tasks and of corporate employee workers are
+# not the owner's session: a Threads-monitoring task that hung for 15 minutes
+# kept the owner's wedged turn looking "busy", and Ilya waited 22 minutes for a
+# restart the watchdog was built to do (Menni, 2026-09-03).
+IGNORED_SESSION_DIR_PARTS = ("-atarax-agent-task", "corporate-workers")
+MAX_RECORD_BYTES = 16 * 1024 * 1024
+
+
+def has_recent_real_turn(path: Path, now: float) -> bool:
+    try:
+        size = path.stat().st_size
+        start = max(0, size - MAX_RECORD_BYTES)
+        with path.open("rb") as handle:
+            handle.seek(start)
+            data = handle.read(MAX_RECORD_BYTES)
+    except OSError:
+        return True
+
+    truncated = start > 0
+    if truncated:
+        boundary = data.find(b"\n")
+        if boundary < 0:
+            return True
+        data = data[boundary + 1:]
+
+    position = len(data)
+    while position > 0:
+        newline = data.rfind(b"\n", 0, position)
+        raw = data[newline + 1 : position]
+        position = newline
+        if not raw.strip():
+            continue
+        try:
+            event = json.loads(raw)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return True
+        if not isinstance(event, dict):
+            return True
+        if event.get("type") == "queue-operation":
+            continue
+        stamp = event.get("timestamp")
+        if not isinstance(stamp, str):
+            return True
+        try:
+            moment = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+            if moment.tzinfo is None:
+                return True
+            age = now - moment.astimezone(timezone.utc).timestamp()
+        except (OverflowError, ValueError):
+            return True
+        return age < RECENT_SECONDS
+
+    return truncated
+
+
+root = Path(sys.argv[1])
+now = time.time()
+try:
+    def recent_paths():
+        for path in root.rglob("*.jsonl"):
+            if any(part in path.parent.name for part in IGNORED_SESSION_DIR_PARTS):
+                continue
+            mtime = path.stat().st_mtime
+            if now - mtime < RECENT_SECONDS:
+                yield mtime, path
+
+    candidates = [
+        path for _, path in nlargest(20, recent_paths(), key=lambda item: item[0])
+    ]
+except OSError:
+    print(root)
+    raise SystemExit(0)
+
+for candidate in candidates:
+    if has_recent_real_turn(candidate, now):
+        print(candidate)
+        break
+PY
+    )
+    SHOULD_RESTART_STUCK=0
+    STUCK_STAMP_FILES=()
+    STUCK_STAMP_VALUES=()
+    ACTIVITY_CHAT_ID=
+    CHAT_INCIDENT_SELECTED=0
+    while IFS='|' read -r CHAT_ID LAST_IN LAST_OUT FIRST_UNANSWERED FIRST_MESSAGE_ID; do
+        case "$CHAT_ID" in ''|*[!0-9]*) continue ;; esac
+        if [ "$CHAT_ID" != "$ACTIVITY_CHAT_ID" ]; then
+            ACTIVITY_CHAT_ID=$CHAT_ID
+            CHAT_INCIDENT_SELECTED=0
+        fi
+        [ "$CHAT_INCIDENT_SELECTED" -eq 0 ] || continue
+        case "$LAST_IN" in ''|*[!0-9]*) continue ;; esac
+        case "$LAST_OUT" in ''|*[!0-9]*) LAST_OUT=0 ;; esac
+        case "$FIRST_UNANSWERED" in ''|*[!0-9]*) FIRST_UNANSWERED=0 ;; esac
+        [ "$FIRST_UNANSWERED" -gt 0 ] || FIRST_UNANSWERED="$LAST_IN"
+
+        # tg-send/tg-send-file record a verified fallback delivery per target.
+        # Reading only the owner's marker misclassifies successful guest replies.
+        LAST_FALLBACK_OUT=$(cat "$H/.claude/channels/telegram/fallback-outbound/${CHAT_ID}.ts" 2>/dev/null || echo 0)
+        case "$LAST_FALLBACK_OUT" in ''|*[!0-9]*) LAST_FALLBACK_OUT=0 ;; esac
+        [ "$LAST_FALLBACK_OUT" -le "$LAST_OUT" ] || LAST_OUT="$LAST_FALLBACK_OUT"
+        [ "$FIRST_UNANSWERED" -gt "$LAST_OUT" ] || continue
+        # Пауза рахується від першого повідомлення без відповіді, а не від
+        # найновішого: інакше кожне нове питання власника відсуває поріг,
+        # і чим наполегливіше він пише, тим довше сторож мовчить.
+        if [ $(( NOW_MS3 - FIRST_UNANSWERED )) -lt 360000 ]; then
+            CHAT_INCIDENT_SELECTED=1
+            continue
+        fi
+        OWNER_STUCK=true
+
+        # Only exact, main-chain transcript evidence may suppress recovery.
+        # Missing legacy message IDs stay unknown; a broken helper fails closed
+        # rather than restarting a potentially healthy in-flight agent.
+        case "$FIRST_MESSAGE_ID" in
+            ''|*[!0-9]*) TURN_STATUS=unknown ;;
+            *)
+                TURN_STATUS=$("$H/bin/claude-limit-recovery" --turn-status "$CHAT_ID" "$FIRST_MESSAGE_ID" 2>/dev/null) || TURN_STATUS=invalid
+                ;;
+        esac
+        case "$TURN_STATUS" in
+            handled|interrupted)
+                continue
+                ;;
+            unknown)
+                CHAT_INCIDENT_SELECTED=1
+                ;;
+            *)
+                CHAT_INCIDENT_SELECTED=1
+                echo "[$(date -u +%FT%TZ)] stuck-turn mutation suppressed: exact transcript status unavailable" >> "$LOG"
+                continue
+                ;;
+        esac
+
+        # Від ПЕРШОГО повідомлення без відповіді: інакше кожне нове питання
+        # власника скидає лічильник, і сторож мовчить, поки той пише.
+        AGE_MIN=$(( (NOW_MS3 - FIRST_UNANSWERED) / 60000 ))
+        STUCK_TS=$STAMP/cash-stuck-restart-${CHAT_ID}.ts
+        # The old global stamp is a one-time migration fallback, preventing this
+        # upgrade from replaying a restart for an already-handled ghost.
+        LAST_SR_IN=$(cat "$STUCK_TS" 2>/dev/null || cat "$STAMP/cash-stuck-restart.ts" 2>/dev/null || echo 0)
+        # ONE restart per ghost, and only for a fresh hang: the stamp keys on LAST_IN —
+        # a restart never re-delivers the stuck message (poller offset is past it), so
+        # repeating it can't help and only risks killing new in-flight work. Mark all
+        # new chat incidents only after the recovery succeeds, so a hold or failed
+        # systemctl call cannot consume the one permitted restart for an incident.
+        if [ -z "$RECENT_JSONL" ] && [ "$AGE_MIN" -le 90 ] && [ "$LAST_SR_IN" != "$LAST_IN" ] && [ "$LIMIT_RECOVERY_STATUS" = clear ]; then
+            SHOULD_RESTART_STUCK=1
+            STUCK_STAMP_FILES+=("$STUCK_TS")
+            STUCK_STAMP_VALUES+=("$LAST_IN")
+        elif [ -z "$RECENT_JSONL" ] && [ "$AGE_MIN" -le 90 ] && [ "$LAST_SR_IN" != "$LAST_IN" ]; then
+            echo "[$(date -u +%FT%TZ)] stuck-turn restart suppressed: Claude limit status is ${LIMIT_RECOVERY_STATUS}" >> "$LOG"
+        fi
+
+        # Escalate honestly: an old unanswered message is usually a shared-account
+        # usage limit or a lost message — NOT a dead login and NOT a ban. Never guess
+        # "banned" (false alarm class); tell the owner what actually helps.
+        # ONCE per ghost message and only while acting on it still helps: keyed on
+        # chat + LAST_IN with the same 90-minute window as the restart above.
+        ESCALATE_TS=$STAMP/cash-stuck-escalate-${CHAT_ID}.ts
+        LAST_ESC_IN=$(cat "$ESCALATE_TS" 2>/dev/null || cat "$STAMP/cash-stuck-escalate.ts" 2>/dev/null || echo 0)
+        # Стеля добою: старіше — це вже історія чату, а не аварія. Без неї
+        # сторож почав скаржитись на повідомлення тритижневої давнини.
+        if [ "$AGE_MIN" -ge 30 ] && [ "$AGE_MIN" -le 1440 ] && [ "$LAST_ESC_IN" != "$FIRST_UNANSWERED" ]; then
+            echo "$FIRST_UNANSWERED" > "$ESCALATE_TS"
+            AUTH_VERDICT="$(real_auth_verdict)"
+            alert "stuck-escalate" "Не відповідаю вже ${AGE_MIN} хв: вхідне повідомлення не отримало підтвердженої відповіді. ${AUTH_VERDICT}" 10800
+        fi
+    done <<PRIVATE_CHAT_ACTIVITY_EOF
+$PRIVATE_CHAT_ACTIVITY
+PRIVATE_CHAT_ACTIVITY_EOF
+    if [ "$SHOULD_RESTART_STUCK" -eq 1 ]; then
+        if restart_service unanswered_private_incoming; then
+            for ((i=0; i<${#STUCK_STAMP_FILES[@]}; i++)); do
+                printf '%s\n' "${STUCK_STAMP_VALUES[$i]}" > "${STUCK_STAMP_FILES[$i]}"
+            done
         fi
     fi
 fi
+
+# 9. Write one machine-readable snapshot after both owner and corporate queues
+# have been inspected. The legacy top-level fields stay for existing tooling.
+GATEWAY_POLLER=down
+telegram_poller_alive && GATEWAY_POLLER=ok
+CORPORATE_ENABLED=false
+[ "$CORPORATE_ACTIVATED" -eq 1 ] && CORPORATE_ENABLED=true
+cat > "$STATE" <<STATE_EOF
+{
+  "timestamp": "$(date -u +%FT%TZ)",
+  "service_active": $(sudo systemctl is-active "$SVC" >/dev/null 2>&1 && echo true || echo false),
+  "telegram_plugin_compatible": $([ "$TELEGRAM_PLUGIN_COMPATIBLE" -eq 1 ] && echo true || echo false),
+  "claude_authenticated": ${CLAUDE_AUTHENTICATED},
+  "restarts_10min": ${RESTARTS},
+  "disk_free_pct": ${DISK_PCT},
+  "streampost_active": $(systemctl is-active streampost.service >/dev/null 2>&1 && echo true || echo false),
+  "gateway": {"poller": "${GATEWAY_POLLER}"},
+  "owner": {"queue": ${OWNER_QUEUE}, "stuck": ${OWNER_STUCK}},
+  "corporate": {"enabled": ${CORPORATE_ENABLED}, "admissionState": "${CORPORATE_ADMISSION}", "active": ${CORPORATE_ACTIVE}, "queued": ${CORPORATE_QUEUED}, "blocked": ${CORPORATE_BLOCKED}, "maxWorkers": 3}
+}
+STATE_EOF
 
 exit 0

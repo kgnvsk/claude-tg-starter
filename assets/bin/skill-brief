@@ -1,0 +1,237 @@
+#!/usr/bin/env python3
+"""Перевіряє, чи описи навичок уміщуються в список, доступний моделі.
+
+Команда лише читає метадані. Вона ніколи не змінює навички власника або кеш
+плагінів: керовані описи скорочуються у вихідному коді кита, а сторонні пакети
+залишаються байт-точно такими, якими їх установив постачальник.
+"""
+from pathlib import Path
+import argparse
+import json
+import re
+import sys
+
+DEFAULT_BUDGET_FRACTION = 0.01
+# Claude Code's conservative fallback is a 200k-token context window and four
+# listing characters per token. Larger model windows only increase the budget.
+DEFAULT_CONTEXT_CHARS = 200_000 * 4
+SKILLS_DIR = Path.home() / ".claude" / "skills"
+PLUGINS_DIR = Path.home() / ".claude" / "plugins" / "cache"
+SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
+INSTALLED_PLUGINS_PATH = (
+    Path.home() / ".claude" / "plugins" / "installed_plugins.json"
+)
+FRONTMATTER = re.compile(r"\A---\n(.*?)\n---", re.S)
+FIELD = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*:")
+
+
+def read_description(front: str) -> str | None:
+    """Return the normalized description field inside frontmatter."""
+    lines = front.split("\n")
+    start = next((i for i, l in enumerate(lines) if l.startswith("description:")), None)
+    if start is None:
+        return None
+    end = len(lines)
+    for i in range(start + 1, len(lines)):
+        if FIELD.match(lines[i]):
+            end = i
+            break
+    text = " ".join(" ".join(lines[start:end]).split())[len("description:"):].strip()
+    return text.lstrip("|>").strip().strip("\"'")
+
+
+def read_name(front: str, fallback: str) -> str:
+    """Return the effective skill name, falling back to its directory."""
+    for line in front.split("\n"):
+        if line.startswith("name:"):
+            name = line[len("name:"):].strip().strip("\"'")
+            return name or fallback
+    return fallback
+
+
+def load_settings(project_root: Path) -> dict[str, object]:
+    """Merge the settings fields this command consumes in precedence order."""
+    settings: dict[str, object] = {}
+    paths = [
+        SETTINGS_PATH,
+        project_root / ".claude" / "settings.json",
+        project_root / ".claude" / "settings.local.json",
+    ]
+    for path in paths:
+        if not path.is_file():
+            continue
+        value = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(value, dict):
+            raise ValueError(f"{path} має містити об’єкт")
+        for key in ("skillOverrides", "enabledPlugins"):
+            if key not in value:
+                continue
+            incoming = value[key]
+            if not isinstance(incoming, dict):
+                settings[key] = incoming
+                continue
+            previous = settings.get(key, {})
+            merged = dict(previous) if isinstance(previous, dict) else {}
+            merged.update(incoming)
+            settings[key] = merged
+        if "skillListingBudgetFraction" in value:
+            settings["skillListingBudgetFraction"] = value[
+                "skillListingBudgetFraction"
+            ]
+    return settings
+
+
+def listing_cap(settings: dict[str, object]) -> int:
+    fraction = settings.get("skillListingBudgetFraction", DEFAULT_BUDGET_FRACTION)
+    if (
+        isinstance(fraction, bool)
+        or not isinstance(fraction, (int, float))
+        or not 0 < fraction <= 1
+    ):
+        raise ValueError("skillListingBudgetFraction має бути числом від 0 до 1")
+    return max(1, int(DEFAULT_CONTEXT_CHARS * fraction))
+
+
+def active_plugin_roots(settings: dict[str, object]) -> list[tuple[Path, str]]:
+    enabled = settings.get("enabledPlugins", {})
+    if not isinstance(enabled, dict):
+        raise ValueError("enabledPlugins має містити об’єкт")
+    active = {name for name, value in enabled.items() if value is True}
+    if not active:
+        return []
+    installed = json.loads(INSTALLED_PLUGINS_PATH.read_text(encoding="utf-8"))
+    plugins = installed.get("plugins") if isinstance(installed, dict) else None
+    if (
+        not isinstance(installed, dict)
+        or installed.get("version") != 2
+        or not isinstance(plugins, dict)
+    ):
+        raise ValueError("installed_plugins.json має некоректний формат")
+    cache = PLUGINS_DIR.resolve(strict=True)
+    roots = []
+    for plugin_id in sorted(active):
+        records = plugins.get(plugin_id)
+        if not isinstance(records, list) or len(records) != 1:
+            raise ValueError(
+                f"плагін {plugin_id} не має єдиного активного встановлення"
+            )
+        record = records[0]
+        if not isinstance(record, dict) or record.get("scope") != "user":
+            raise ValueError(f"метадані плагіна {plugin_id} некоректні")
+        raw_path = record.get("installPath")
+        if not isinstance(raw_path, str):
+            raise ValueError(f"шлях плагіна {plugin_id} некоректний")
+        root = Path(raw_path).resolve(strict=True)
+        try:
+            root.relative_to(cache)
+        except ValueError:
+            raise ValueError(f"шлях плагіна {plugin_id} поза кешем") from None
+        plugin_name, separator, _ = plugin_id.rpartition("@")
+        if not separator or not plugin_name:
+            raise ValueError(f"ідентифікатор плагіна {plugin_id} некоректний")
+        manifest_path = root / ".claude-plugin" / "plugin.json"
+        if manifest_path.is_file():
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest_name = manifest.get("name") if isinstance(manifest, dict) else None
+            if not isinstance(manifest_name, str) or not manifest_name:
+                raise ValueError(f"маніфест плагіна {plugin_id} некоректний")
+            plugin_name = manifest_name
+        roots.append((root, plugin_name))
+    return roots
+
+
+def inventory(settings: dict[str, object]) -> list[tuple[str, int, bool]]:
+    overrides = settings.get("skillOverrides", {})
+    allowed_states = {"on", "name-only", "user-invocable-only", "off"}
+    if not isinstance(overrides, dict) or any(
+        not isinstance(name, str) or state not in allowed_states
+        for name, state in overrides.items()
+    ):
+        raise ValueError(
+            "skillOverrides має зіставляти назви навичок із коректними режимами"
+        )
+    rows = []
+    for root, prefix in [(SKILLS_DIR, ""), *active_plugin_roots(settings)]:
+        if not root.is_dir():
+            continue
+        for path in root.rglob("SKILL.md"):
+            m = FRONTMATTER.match(path.read_text(encoding="utf-8", errors="replace"))
+            front = m.group(1) if m else ""
+            found = read_description(front) if m else None
+            name = read_name(front, path.parent.name)
+            if prefix:
+                name = f"{prefix}:{name}"
+                show_description = True
+            else:
+                state = overrides.get(name, "on")
+                if state in {"user-invocable-only", "off"}:
+                    continue
+                show_description = state == "on"
+            rows.append((name, len(found) if found else 0, show_description))
+    unique: dict[str, tuple[int, bool]] = {}
+    for name, length, show_description in rows:
+        previous = unique.get(name)
+        if previous is None or length > previous[0]:
+            unique[name] = (length, show_description)
+    return sorted((name, *details) for name, details in unique.items())
+
+
+def report(project_root: Path) -> int:
+    try:
+        settings = load_settings(project_root)
+        rows = inventory(settings)
+        cap = listing_cap(settings)
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        print(
+            f"ПОМИЛКА: не вдалося визначити активні навички: {error}",
+            file=sys.stderr,
+        )
+        return 2
+    used = 0
+    lost = []
+    required = 0
+    for name, length, show_description in rows:
+        entry = len(f"- {name}") + 1
+        if show_description:
+            entry += len(": ") + length
+        required += entry
+        if used + entry > cap:
+            lost.append(name)
+        else:
+            used += entry
+    print(f"навичок: {len(rows)}")
+    print(
+        f"потрібно для списку: {required} символів за межі {cap} "
+        f"({required * 100 // cap}%)"
+    )
+    print(f"уміщується: {used} символів")
+    if lost:
+        print(f"НЕ ВМІЩУЮТЬСЯ ({len(lost)}) — агент побачить лише назву без опису:")
+        print("  " + ", ".join(lost[:20]) + (" …" if len(lost) > 20 else ""))
+        return 1
+    if any(not show_description for _, _, show_description in rows):
+        print("усі видимі навички потрапляють до списку")
+        return 0
+    print("усі навички потрапляють до списку з описом")
+    return 0
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument(
+        "--check",
+        action="store_true",
+        help="перевірити бюджет списку (це також типова дія)",
+    )
+    ap.add_argument(
+        "--project-root",
+        type=Path,
+        default=Path.cwd(),
+        help="корінь проєкту Claude Code для налаштувань .claude",
+    )
+    args = ap.parse_args()
+    raise SystemExit(report(args.project_root))
+
+
+if __name__ == "__main__":
+    main()

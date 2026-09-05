@@ -1,0 +1,947 @@
+#!/usr/bin/env python3
+"""Print and refresh a redacted onboarding checklist."""
+
+from __future__ import annotations
+
+from contextlib import closing
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import shlex
+import sqlite3
+import subprocess
+import sys
+import tempfile
+
+HOME = Path.home()
+STATE = HOME / ".claude/onboarding-state.json"
+ENV_FILE = HOME / ".claude/channels/telegram/.env"
+RUNTIME = HOME / ".claude/product/runtime.json"
+VOICE_MODEL = "gpt-4o-mini-transcribe"
+PINNED_BIGQUERY_VERSION = "3.42.2"
+SQL_READONLY_DOCTOR_TIMEOUT = 20
+PLUGIN_DOCTOR_TIMEOUT = 5
+SKILL_DOCTOR_TIMEOUT = 5
+BACKUP_STATUS_TIMEOUT = 20
+CLAUDE_BIN = HOME / ".local/bin/claude"
+CODEX_BIN = HOME / ".npm-global/bin/codex"
+GOG_BIN = HOME / "bin/gog"
+GOOGLE_SERVICES = {
+    "calendar",
+    "contacts",
+    "docs",
+    "drive",
+    "gmail",
+    "meet",
+    "sheets",
+    "tasks",
+}
+DEFAULT_REQUIRED_CHECKS = (
+    "core",
+    "claude_auth",
+    "codex_auth",
+    "telegram_service",
+    "browser",
+    "google_workspace",
+    "vercel_cli",
+    "vercel_auth",
+)
+DEFAULT_OPTIONAL_CHECKS = (
+    "apify_social_data",
+    "asana_tasks",
+    "growth_analytics",
+    "hubspot_crm",
+    "meta_ads",
+    "sec_edgar",
+    "voice_transcription",
+    "meeting_secretary",
+    "memory_backup",
+)
+KNOWN_CHECKS = {
+    *DEFAULT_REQUIRED_CHECKS,
+    *DEFAULT_OPTIONAL_CHECKS,
+    "sql_readonly",
+    "plugins",
+    "video_edit",
+    "memory",
+    "memory_semantic_search",
+}
+FOUNDATION_CHECKS = ("memory", "memory_semantic_search", "voice_transcription")
+ENV_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def load_check_contract() -> tuple[tuple[str, ...], tuple[str, ...]]:
+    if not RUNTIME.exists():
+        return DEFAULT_REQUIRED_CHECKS, DEFAULT_OPTIONAL_CHECKS
+    try:
+        runtime = json.loads(RUNTIME.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"cannot read product runtime: {error}") from error
+    if not isinstance(runtime, dict):
+        raise ValueError("product runtime must be an object")
+    values: dict[str, tuple[str, ...]] = {}
+    for field in ("requiredChecks", "optionalChecks"):
+        raw = runtime.get(field)
+        if (
+            not isinstance(raw, list)
+            or any(not isinstance(value, str) for value in raw)
+            or len(raw) != len(set(raw))
+        ):
+            raise ValueError(f"product runtime {field} must be a unique string list")
+        unknown = sorted(set(raw) - KNOWN_CHECKS)
+        if unknown:
+            raise ValueError(
+                f"product runtime {field} contains unknown check: {unknown[0]}"
+            )
+        values[field] = tuple(raw)
+    overlap = sorted(
+        set(values["requiredChecks"]) & set(values["optionalChecks"])
+    )
+    if overlap:
+        raise ValueError(f"product runtime check appears twice: {overlap[0]}")
+    return values["requiredChecks"], values["optionalChecks"]
+
+
+def service_active(name: str) -> bool:
+    return subprocess.run(
+        ["systemctl", "is-active", "--quiet", name],
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    ).returncode == 0
+
+
+def strict_env_values() -> dict[str, str]:
+    if not ENV_FILE.exists():
+        return {}
+    values: dict[str, str] = {}
+    for number, line in enumerate(
+        ENV_FILE.read_text(encoding="utf-8").splitlines(), 1
+    ):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped.startswith("export "):
+            stripped = stripped[7:].lstrip()
+        name, separator, raw = stripped.partition("=")
+        if not separator or not ENV_ASSIGNMENT.fullmatch(name) or name in values:
+            raise ValueError(f"invalid environment assignment on line {number}")
+        if raw.startswith("$'"):
+            raise ValueError(f"unsupported ANSI-C quoting for {name}")
+        if raw == "":
+            value = ""
+        else:
+            lexer = shlex.shlex(raw, posix=True)
+            lexer.whitespace_split = True
+            lexer.commenters = ""
+            parsed = list(lexer)
+            if len(parsed) != 1:
+                raise ValueError(f"invalid value for {name} on line {number}")
+            value = parsed[0]
+        values[name] = value
+    return values
+
+
+def strict_env_value(name: str) -> str:
+    return strict_env_values().get(name, "")
+
+
+def env_value(name: str) -> str:
+    try:
+        return strict_env_value(name)
+    except (OSError, UnicodeError, ValueError):
+        return ""
+
+
+def env_has(name: str) -> bool:
+    return bool(env_value(name))
+
+
+def stock_template(name: str) -> str | None:
+    """Вміст файла, який інсталятор кладе при встановленні, якщо комплект поруч.
+
+    Порівняння зі змістом — єдиний чесний спосіб сказати «власник сюди не писав».
+    Розмір цього не показує: ядро на три рядки буває цілком осмисленим.
+    """
+    for kit in (
+        Path("/opt/claude-tg-starter"),
+        Path("/opt/claude-premium"),
+        Path("/opt/cash-deploy"),
+        HOME / "claude-premium",
+    ):
+        try:
+            return (kit / "assets/templates" / name).read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            continue
+    return None
+
+
+def memory_core_details() -> dict[str, object]:
+    """Стан трьох файлів, які хук вставляє в кожну сесію.
+
+    Порожнє ядро означає, що власник жодного разу не проходив `learning-review`, а
+    переповнене — що частину його фактів ріже перед вставкою. Обидва стани зовні
+    виглядають однаково: агент «забуває» те, що власник вважає записаним.
+    """
+    # hot.md інсталятор не створює з шаблону, тож «сток» для нього не існує:
+    # єдиний його зрив — вилізти за межу.
+    files = (
+        ("USER.md", HOME / ".claude/memory/USER.md", 1375, True),
+        ("MEMORY.md", HOME / ".claude/memory/MEMORY.md", 2200, True),
+        ("hot.md", HOME / "obsidian-vault/wiki/hot.md", 2400, False),
+    )
+    report: dict[str, object] = {}
+    for name, path, limit, from_template in files:
+        try:
+            content = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            report[name] = {"state": "missing", "limit": limit}
+            continue
+        size = len(content)
+        template = stock_template(name) if from_template else ""
+        if template is None:
+            # Порівняти нема з чим. Сказати «все гаразд» тут означало б сховати
+            # порожнє ядро — саме те, заради чого ця перевірка й існує.
+            state = "over-limit" if size > limit else "unknown"
+        elif content == template:
+            state = "empty"
+        elif size > limit:
+            state = "over-limit"
+        else:
+            state = "ok"
+        report[name] = {"state": state, "size": size, "limit": limit}
+    return report
+
+
+def memory_semantic_details() -> dict[str, object]:
+    try:
+        values = strict_env_values()
+        consent = values.get("MEMORY_EMBEDDINGS_OPENAI", "") or "disabled"
+        if consent not in {"enabled", "disabled"}:
+            raise ValueError("invalid MEMORY_EMBEDDINGS_OPENAI setting")
+        consented = consent == "enabled"
+        primary_key = values.get("OPENAI_API_KEY", "")
+        fallback_key = values.get("OPENAI_API_KEY_FALLBACK", "")
+        key_present = bool(primary_key or fallback_key)
+    except (OSError, UnicodeError, ValueError):
+        return {
+            "status": "invalid-config",
+            "provider": "local-keyword",
+            "ownerConsent": False,
+            "keyConfigured": False,
+            "disableCommand": "~/bin/memory-embeddings-config disable",
+        }
+    status = "configured" if consented and key_present else "disabled"
+    if consented and not key_present:
+        status = "needs-key"
+    return {
+        "status": status,
+        "provider": "openai" if consented else "local-keyword",
+        "ownerConsent": consented,
+        "keyConfigured": key_present,
+        "disableCommand": "~/bin/memory-embeddings-config disable",
+    }
+
+
+def command_output(
+    command: list[str],
+    *,
+    timeout: int = 20,
+) -> tuple[int, str]:
+    try:
+        result = subprocess.run(
+            command,
+            check=False,
+            cwd=HOME,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return 1, ""
+    return result.returncode, result.stdout
+
+
+def memory_ready() -> bool:
+    for relative in (
+        ".claude/memory/USER.md", ".claude/memory/MEMORY.md",
+        "obsidian-vault/wiki/hot.md", ".claude/memory/index.sqlite3",
+        "bin/memory-doctor", "bin/memory-search", "bin/memory-open",
+    ):
+        if not (HOME / relative).is_file():
+            return False
+    code, output = command_output([str(HOME / "bin/memory-doctor")])
+    try:
+        result = json.loads(output)
+    except (json.JSONDecodeError, RecursionError):
+        return False
+    return (
+        code == 0 and isinstance(result, dict)
+        and result.get("ok") is True and result.get("integrity") == "ok"
+        and isinstance(result.get("documents"), dict)
+        and isinstance(result["documents"].get("vault"), int)
+        and result["documents"]["vault"] > 0
+    )
+
+
+def semantic_index_details() -> dict[str, object]:
+    """Local evidence only: a saved key does not prove vectors were created."""
+    unavailable = {"indexStatus": "needs-index", "indexedNotes": 0}
+    database = HOME / ".claude/memory/index.sqlite3"
+    if not database.is_file():
+        return unavailable
+    code, _ = command_output([sys.executable, "-c", "import numpy"])
+    if code != 0:
+        return {**unavailable, "indexStatus": "runtime-unavailable"}
+    try:
+        with closing(sqlite3.connect(database.as_uri() + "?mode=ro", uri=True, timeout=5)) as connection:
+            if connection.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+                return {**unavailable, "indexStatus": "invalid-index"}
+            # The shared index uses 512 float32 dimensions for this model.
+            total, valid = connection.execute(
+                "SELECT count(*), coalesce(sum(CASE WHEN length(e.vector)=2048 THEN 1 ELSE 0 END), 0) "
+                "FROM documents d LEFT JOIN embeddings e ON e.doc_id=d.doc_id AND e.model=? "
+                "WHERE d.source='vault'",
+                ("text-embedding-3-small",),
+            ).fetchone()
+    except (OSError, sqlite3.Error, ValueError, TypeError):
+        return {**unavailable, "indexStatus": "invalid-index"}
+    return {
+        "indexStatus": "ready" if total > 0 and total == valid else "needs-index",
+        "indexedNotes": valid,
+    }
+
+
+def voice_runtime_ready() -> bool:
+    return (
+        env_has("OPENAI_API_KEY")
+        and all(os.access(HOME / "bin" / name, os.X_OK) for name in ("transcribe", "transcribe-telegram"))
+        and all(shutil.which(name) for name in ("curl", "jq"))
+    )
+
+
+def claude_authenticated() -> bool:
+    command = str(CLAUDE_BIN) if CLAUDE_BIN.is_file() else "claude"
+    _, output = command_output([command, "auth", "status"])
+    try:
+        return bool(json.loads(output).get("loggedIn"))
+    except (json.JSONDecodeError, AttributeError):
+        return False
+
+
+def codex_authenticated() -> bool:
+    command = str(CODEX_BIN) if CODEX_BIN.is_file() else "codex"
+    code, output = command_output([command, "login", "status"])
+    return code == 0 and "Logged in" in output
+
+
+def vercel_authenticated() -> bool:
+    wrapper = HOME / "bin/vc"
+    if not wrapper.is_file():
+        return False
+    code, output = command_output([str(wrapper), "whoami"])
+    return code == 0 and bool(output.strip())
+
+
+def gog_authenticated() -> bool:
+    command = str(GOG_BIN) if GOG_BIN.is_file() else "gog"
+    code, output = command_output([command, "auth", "list", "--json"])
+    if code != 0:
+        return False
+    try:
+        accounts = json.loads(output).get("accounts", [])
+    except (json.JSONDecodeError, AttributeError):
+        return False
+    return any(
+        isinstance(account, dict)
+        and GOOGLE_SERVICES.issubset(set(account.get("services", [])))
+        for account in accounts
+    )
+
+
+def video_edit_ready() -> bool:
+    command = HOME / "bin/video-edit"
+    if not command.is_file():
+        return False
+    code, output = command_output([str(command), "doctor"])
+    return code == 0 and "video-edit doctor: OK" in output
+
+
+def growth_analytics_ready() -> bool:
+    command = HOME / "bin/growth-analytics-doctor"
+    if not command.is_file():
+        return False
+    code, output = command_output([str(command)])
+    return code == 0 and "growth-analytics doctor: OK" in output
+
+
+def unavailable_sql_readonly_details() -> dict[str, object]:
+    return {
+        "runtime": {
+            "status": "unavailable",
+            "sqlite": "unknown",
+            "bigqueryClient": "unavailable",
+            "version": "unknown",
+        },
+        "authorization": {
+            "status": "deferred",
+            "adc": "unknown",
+            "project": "unknown",
+        },
+    }
+
+
+def sql_readonly_status() -> tuple[bool, dict[str, object]]:
+    helper = HOME / "bin/sql-readonly"
+    if not helper.is_file():
+        return False, unavailable_sql_readonly_details()
+    code, output = command_output(
+        [str(helper), "doctor"],
+        timeout=SQL_READONLY_DOCTOR_TIMEOUT,
+    )
+    if code != 0:
+        return False, unavailable_sql_readonly_details()
+    try:
+        payload = json.loads(output)
+    except (json.JSONDecodeError, RecursionError):
+        return False, unavailable_sql_readonly_details()
+    if not isinstance(payload, dict) or set(payload) != {
+        "schemaVersion",
+        "runtime",
+        "authorization",
+    }:
+        return False, unavailable_sql_readonly_details()
+    runtime = payload.get("runtime")
+    authorization = payload.get("authorization")
+    if (
+        payload.get("schemaVersion") != 1
+        or not isinstance(runtime, dict)
+        or set(runtime) != {"sqlite", "bigqueryClient"}
+        or not isinstance(authorization, dict)
+        or set(authorization) != {"status", "adc", "project"}
+    ):
+        return False, unavailable_sql_readonly_details()
+    sqlite_status = runtime.get("sqlite")
+    client_status = runtime.get("bigqueryClient")
+    if (
+        not isinstance(sqlite_status, dict)
+        or set(sqlite_status) != {"status"}
+        or sqlite_status.get("status") not in {"ready", "unavailable"}
+        or not isinstance(client_status, dict)
+        or set(client_status) != {"status", "version"}
+        or client_status.get("status") not in {"ready", "unavailable"}
+        or not isinstance(client_status.get("version"), str)
+        or authorization.get("status") not in {"configured", "deferred"}
+        or authorization.get("adc") not in {"visible", "absent", "unknown"}
+        or authorization.get("project") not in {"visible", "absent", "unknown"}
+    ):
+        return False, unavailable_sql_readonly_details()
+    configured = (
+        authorization["adc"] == "visible"
+        and authorization["project"] == "visible"
+    )
+    if (authorization["status"] == "configured") != configured:
+        return False, unavailable_sql_readonly_details()
+    local_ready = (
+        sqlite_status["status"] == "ready"
+        and client_status["status"] == "ready"
+        and client_status["version"] == PINNED_BIGQUERY_VERSION
+    )
+    return local_ready, {
+        "runtime": {
+            "status": "ready" if local_ready else "unavailable",
+            "sqlite": sqlite_status["status"],
+            "bigqueryClient": client_status["status"],
+            "version": (
+                client_status["version"]
+                if local_ready
+                else "unknown"
+            ),
+        },
+        "authorization": {
+            "status": authorization["status"],
+            "adc": authorization["adc"],
+            "project": authorization["project"],
+        },
+    }
+
+
+def plugins_ready() -> bool:
+    helper = HOME / "bin/plugin-doctor"
+    if not helper.is_file():
+        return False
+    code, output = command_output(
+        [str(helper), "--json"],
+        timeout=PLUGIN_DOCTOR_TIMEOUT,
+    )
+    if code != 0 or len(output.encode("utf-8")) > 1024 * 1024:
+        return False
+    try:
+        payload = json.loads(output)
+    except (json.JSONDecodeError, RecursionError):
+        return False
+    if not isinstance(payload, dict) or set(payload) != {
+        "schemaVersion",
+        "status",
+        "pluginCount",
+        "plugins",
+    }:
+        return False
+    plugins = payload.get("plugins")
+    if (
+        payload.get("schemaVersion") != 1
+        or payload.get("status") != "ready"
+        or isinstance(payload.get("pluginCount"), bool)
+        or not isinstance(payload.get("pluginCount"), int)
+        or payload.get("pluginCount", 0) <= 0
+        or not isinstance(plugins, list)
+        or len(plugins) > 128
+        or payload["pluginCount"] != len(plugins)
+    ):
+        return False
+    seen: set[str] = set()
+    ordered_ids: list[str] = []
+    for plugin in plugins:
+        if not isinstance(plugin, dict) or set(plugin) != {
+            "id",
+            "version",
+            "skills",
+        }:
+            return False
+        plugin_id = plugin.get("id")
+        version = plugin.get("version")
+        skills = plugin.get("skills")
+        if (
+            not isinstance(plugin_id, str)
+            or not plugin_id
+            or len(plugin_id) > 257
+            or plugin_id in seen
+            or not isinstance(version, str)
+            or not version
+            or len(version) > 128
+            or not isinstance(skills, list)
+            or not skills
+            or len(skills) > 256
+            or any(not isinstance(skill, str) or not skill for skill in skills)
+            or len(skills) != len(set(skills))
+            or skills != sorted(skills)
+        ):
+            return False
+        seen.add(plugin_id)
+        ordered_ids.append(plugin_id)
+    return ordered_ids == sorted(ordered_ids)
+
+
+def skills_ready() -> bool:
+    helper = HOME / "bin/skill-doctor"
+    if not helper.is_file():
+        return False
+    code, _ = command_output(
+        [str(helper), "--root", str(HOME / ".claude/skills")],
+        timeout=SKILL_DOCTOR_TIMEOUT,
+    )
+    return code == 0
+
+
+def backup_ready() -> bool:
+    backup_tool = HOME / "bin/agent-github-backup"
+    if not backup_tool.is_file() or backup_tool.is_symlink():
+        return False
+    code, output = command_output(
+        [str(backup_tool), "status", "--json"],
+        timeout=BACKUP_STATUS_TIMEOUT,
+    )
+    if code != 0 or len(output.encode("utf-8")) > 4096:
+        return False
+    try:
+        payload = json.loads(output)
+    except (json.JSONDecodeError, RecursionError):
+        return False
+    return (
+        isinstance(payload, dict)
+        and set(payload) == {"status", "revision", "containsSecrets"}
+        and payload.get("status") == "configured"
+        and isinstance(payload.get("revision"), str)
+        and re.fullmatch(r"[0-9a-f]{40}", payload["revision"]) is not None
+        and payload.get("containsSecrets") is False
+    )
+
+
+def load_state() -> dict:
+    if STATE.exists():
+        try:
+            return json.loads(STATE.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            pass
+    return {"schemaVersion": 1, "completedSteps": [], "optionalFeatures": {}}
+
+
+def save_state(state: dict) -> None:
+    STATE.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix="onboarding-state-", dir=STATE.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(state, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, STATE)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+try:
+    REQUIRED_CHECKS, OPTIONAL_CHECKS = load_check_contract()
+except ValueError as error:
+    print(f"Помилка контракту онбордингу: {error}", file=sys.stderr)
+    raise SystemExit(2)
+foundation_only = "--foundation-only" in sys.argv
+if foundation_only:
+    REQUIRED_CHECKS, OPTIONAL_CHECKS = FOUNDATION_CHECKS, ()
+ACTIVE_CHECKS = tuple(dict.fromkeys((*REQUIRED_CHECKS, *OPTIONAL_CHECKS)))
+ALWAYS_REQUIRED_CHECKS = () if foundation_only else ("skills",)
+ALL_REQUIRED_CHECKS = tuple(
+    dict.fromkeys((*REQUIRED_CHECKS, *ALWAYS_REQUIRED_CHECKS))
+)
+
+has_backup = False
+if "memory_backup" in ACTIVE_CHECKS:
+    has_backup = backup_ready()
+
+sql_readonly_details = unavailable_sql_readonly_details()
+
+
+def sql_readonly_ready() -> bool:
+    global sql_readonly_details
+    ready, sql_readonly_details = sql_readonly_status()
+    return ready
+
+
+semantic_memory = memory_semantic_details()
+if "memory_semantic_search" in ACTIVE_CHECKS:
+    semantic_memory.update(semantic_index_details())
+
+
+check_values = {
+    "skills": skills_ready,
+    "core": lambda: (
+        (HOME / "CLAUDE.md").exists()
+        and (HOME / ".claude/channels/telegram/access.json").exists()
+    ),
+    "claude_auth": claude_authenticated,
+    "codex_auth": codex_authenticated,
+    "telegram_service": lambda: service_active(
+        os.environ.get("CLAUDE_TELEGRAM_SERVICE", "claude-telegram.service")
+    ),
+    "browser": lambda: service_active("claude-browser.service"),
+    "google_workspace": gog_authenticated,
+    "growth_analytics": growth_analytics_ready,
+    "vercel_cli": lambda: (
+        shutil.which("vercel") is not None
+        or (HOME / ".npm-global/bin/vercel").is_file()
+    ),
+    "vercel_auth": vercel_authenticated,
+    "memory": memory_ready,
+    "memory_semantic_search": lambda: (
+        semantic_memory["status"] == "configured"
+        and semantic_memory.get("indexStatus") == "ready"
+    ),
+    "voice_transcription": (
+        voice_runtime_ready if "voice_transcription" in REQUIRED_CHECKS
+        else lambda: env_has("OPENAI_API_KEY")
+    ),
+    "meeting_secretary": lambda: env_has("RECALL_API_KEY"),
+    "memory_backup": lambda: has_backup,
+    "apify_social_data": lambda: (
+        (HOME / ".config/apify-token").is_file()
+        and bool(
+            (HOME / ".config/apify-token").read_text(encoding="utf-8").strip()
+        )
+    ),
+    "asana_tasks": lambda: (
+        (HOME / ".config/asana-token").is_file()
+        and (HOME / "bin/asana-tasks").is_file()
+    ),
+    "meta_ads": lambda: (
+        (HOME / ".config/meta-ads.json").is_file()
+        and (HOME / "bin/meta-ads").is_file()
+    ),
+    "video_edit": video_edit_ready,
+    "sec_edgar": lambda: (
+        (HOME / ".config/sec-edgar.json").is_file()
+        and (HOME / "bin/sec-edgar").is_file()
+    ),
+    "hubspot_crm": lambda: (
+        (HOME / ".config/hubspot-token").is_file()
+        and (HOME / "bin/hubspot-crm").is_file()
+    ),
+    "sql_readonly": sql_readonly_ready,
+    "plugins": plugins_ready,
+}
+checks = {
+    name: bool(check_values[name]())
+    for name in (*ALWAYS_REQUIRED_CHECKS, *ACTIVE_CHECKS)
+}
+check_details = (
+    {"sql_readonly": sql_readonly_details}
+    if "sql_readonly" in ACTIVE_CHECKS
+    else {}
+)
+check_details["memory_semantic_search"] = semantic_memory
+check_details["memory_core"] = memory_core_details()
+if "voice_transcription" in REQUIRED_CHECKS:
+    check_details["voice_transcription"] = {
+        "runtimeReady": checks["voice_transcription"],
+        "providerVerification": "not-checked",
+    }
+
+state = load_state()
+features = state.setdefault("optionalFeatures", {})
+state_names = {
+    "voice_transcription": "voice_transcription",
+    "meeting_secretary": "meeting_secretary",
+    "google_workspace": "calendar",
+    "memory_backup": "memory_backup",
+    "apify_social_data": "social_data",
+    "asana_tasks": "task_system",
+    "growth_analytics": "growth_analytics",
+    "meta_ads": "paid_media",
+    "sec_edgar": "regulatory_data",
+    "hubspot_crm": "crm",
+}
+active_optional_state_names = {
+    state_names[name] for name in OPTIONAL_CHECKS if name in state_names
+}
+for name in tuple(features):
+    if name in set(state_names.values()) and name not in active_optional_state_names:
+        features.pop(name, None)
+if "voice_transcription" in OPTIONAL_CHECKS:
+    voice = features.setdefault("voice_transcription", {})
+    voice.update({
+        "status": (
+            "configured" if checks["voice_transcription"] else "deferred"
+        ),
+        "model": VOICE_MODEL,
+        "remindAfterDays": 7,
+    })
+if "meeting_secretary" in OPTIONAL_CHECKS:
+    meeting = features.setdefault("meeting_secretary", {})
+    meeting.update({
+        "status": (
+            "configured" if checks["meeting_secretary"] else "deferred"
+        ),
+        "remindAfterDays": 7,
+    })
+if "memory_backup" in OPTIONAL_CHECKS:
+    memory = features.setdefault(
+        "memory_backup",
+        {"status": "deferred", "remindAfterDays": 7},
+    )
+    memory["status"] = "configured" if has_backup else "deferred"
+semantic = features.setdefault("memory_semantic_search", {})
+semantic.update({
+    "status": semantic_memory["status"],
+    "provider": semantic_memory["provider"],
+    "remindAfterDays": 0,
+})
+if "apify_social_data" in OPTIONAL_CHECKS:
+    social_data = features.setdefault(
+        "social_data",
+        {"status": "deferred", "remindAfterDays": 7},
+    )
+    social_data["status"] = (
+        "configured" if checks["apify_social_data"] else "deferred"
+    )
+if "asana_tasks" in OPTIONAL_CHECKS:
+    task_system = features.setdefault(
+        "task_system",
+        {"status": "deferred", "remindAfterDays": 7},
+    )
+    task_system["status"] = (
+        "configured" if checks["asana_tasks"] else "deferred"
+    )
+if "growth_analytics" in OPTIONAL_CHECKS:
+    growth_analytics = features.setdefault(
+        "growth_analytics",
+        {"status": "deferred", "remindAfterDays": 7},
+    )
+    growth_analytics["status"] = (
+        "configured" if checks["growth_analytics"] else "deferred"
+    )
+if "meta_ads" in OPTIONAL_CHECKS:
+    paid_media = features.setdefault(
+        "paid_media",
+        {"status": "deferred", "remindAfterDays": 7},
+    )
+    paid_media["status"] = (
+        "configured" if checks["meta_ads"] else "deferred"
+    )
+if "sec_edgar" in OPTIONAL_CHECKS:
+    regulatory = features.setdefault(
+        "regulatory_data",
+        {"status": "deferred", "remindAfterDays": 7},
+    )
+    regulatory["status"] = (
+        "configured" if checks["sec_edgar"] else "deferred"
+    )
+if "hubspot_crm" in OPTIONAL_CHECKS:
+    crm = features.setdefault(
+        "crm",
+        {"status": "deferred", "remindAfterDays": 7},
+    )
+    crm["status"] = (
+        "configured" if checks["hubspot_crm"] else "deferred"
+    )
+if "google_workspace" in OPTIONAL_CHECKS:
+    calendar = features.setdefault(
+        "calendar",
+        {"status": "deferred", "remindAfterDays": 7},
+    )
+    calendar["status"] = (
+        "configured" if checks["google_workspace"] else "deferred"
+    )
+
+state["completedSteps"] = [name for name, ok in checks.items() if ok]
+if not foundation_only:
+    save_state(state)
+
+strict = "--strict" in sys.argv
+missing_required = [name for name in ALL_REQUIRED_CHECKS if not checks[name]]
+
+if "--json" in sys.argv:
+    print(json.dumps(
+        {"checks": checks, "checkDetails": check_details, "state": state},
+        ensure_ascii=False,
+        indent=2,
+    ))
+    raise SystemExit(1 if strict and missing_required else 0)
+
+authorization_status_labels = {
+    "configured": "налаштовано",
+    "deferred": "відкладено",
+}
+adc_status_labels = {
+    "visible": "наявні",
+    "absent": "відсутні",
+    "unknown": "стан невідомий",
+}
+project_status_labels = {
+    "visible": "наявний",
+    "absent": "відсутній",
+    "unknown": "стан невідомий",
+}
+semantic_provider_labels = {
+    "openai": "OpenAI",
+    "local-keyword": "локальний пошук за ключовими словами",
+}
+labels = {
+    "skills": "керовані навички",
+    "core": "ядро та доступ до Telegram",
+    "memory": "довготривала пам’ять і Novsky Vault",
+    "memory_semantic_search": "векторний індекс Novsky Vault",
+    "claude_auth": "Claude Max OAuth (основний інтелект)",
+    "codex_auth": "ChatGPT/Codex OAuth (генерація зображень)",
+    "telegram_service": "служба Telegram",
+    "browser": "ізольований браузер",
+    "google_workspace": "Google Workspace OAuth (Calendar/Gmail/Drive)",
+    "growth_analytics": "GA4 + Search Console (аналітика з актуальними даними)",
+    "vercel_cli": "Vercel CLI",
+    "vercel_auth": "Vercel token (розгортання сайтів)",
+    "voice_transcription": f"голосові повідомлення ({VOICE_MODEL})",
+    "meeting_secretary": "секретар зустрічей Recall.ai",
+    "memory_backup": "зовнішня резервна копія пам’яті",
+    "apify_social_data": "Apify social-data (публічні соцмережі)",
+    "asana_tasks": "проєкти й завдання Asana",
+    "meta_ads": "Meta Ads (статистика + підтверджувані зміни статусу/бюджету)",
+    "video_edit": "локальний відеомонтаж і smoke-перевірка рендерера",
+    "sec_edgar": "SEC EDGAR/XBRL (офіційна звітність)",
+    "hubspot_crm": "HubSpot CRM (актуальна воронка + підтверджувані оновлення угод)",
+    "sql_readonly": "середовище SQL (SQLite + зафіксований клієнт BigQuery)",
+    "plugins": "плагіни та експортовані навички",
+}
+print("Стан онбордингу (секрети приховано):")
+for name, ok in checks.items():
+    marker = "OK" if ok else "--"
+    print(f"  [{marker}] {labels[name]}")
+    if name == "voice_transcription" and name in REQUIRED_CHECKS:
+        print("       Це перевірка налаштування; роботу API перевіряє тестове голосове повідомлення.")
+    if name == "sql_readonly":
+        authorization = sql_readonly_details["authorization"]
+        print(
+            "       Авторизація BigQuery: "
+            f"{authorization_status_labels[authorization['status']]} "
+            f"(ADC: {adc_status_labels[authorization['adc']]}; "
+            f"проєкт: {project_status_labels[authorization['project']]})"
+        )
+semantic_marker = "OK" if checks.get("memory_semantic_search", semantic_memory["status"] == "configured") else "--"
+print(
+    f"  [{semantic_marker}] семантична пам’ять: "
+    f"{semantic_provider_labels[semantic_memory['provider']]} "
+    "(локальний пошук за ключовими словами завжди увімкнено; вимкнути: "
+    "~/bin/memory-embeddings-config disable)"
+)
+required_hints = {
+    "skills": "повторно запустити встановлення керованих навичок",
+    "core": "повторно запустити встановлення ядра",
+    "memory": "перевірити Novsky Vault і запустити ~/bin/memory-index index та ~/bin/memory-doctor",
+    "memory_semantic_search": (
+        "перевірити OpenAI API key, доступ і баланс API, увімкнення векторної пам’яті "
+        "та повторити ~/bin/memory-index index"
+    ),
+    "voice_transcription": "перевірити OpenAI API key та інструменти голосових; після налаштування надіслати тестове голосове",
+    "claude_auth": "увійти до Claude Max через ~/bin/claude-login",
+    "codex_auth": "увійти до ChatGPT/Codex через codex login --device-auth",
+    "telegram_service": "запустити службу Telegram",
+    "browser": "запустити ізольований браузер",
+    "google_workspace": "підключити Google Workspace OAuth через gog",
+    "growth_analytics": (
+        "додати analytics,searchconsole до Google OAuth і запустити "
+        "~/bin/growth-analytics-doctor"
+    ),
+    "vercel_cli": "встановити Vercel CLI",
+    "vercel_auth": (
+        "зберегти Vercel token у ~/.config/vercel-token (chmod 600)"
+    ),
+    "video_edit": "перевстановити та перевірити середовище video-edit",
+    "sec_edgar": "налаштувати ідентифікацію SEC через ~/bin/set-sec-identity",
+    "hubspot_crm": "підключити HubSpot через ~/bin/set-hubspot-token",
+    "asana_tasks": "підключити Asana через ~/bin/set-asana-token",
+    "sql_readonly": "перевстановити та перевірити середовище sql-readonly",
+    "plugins": "повторно запустити ~/bin/install-plugins",
+}
+optional_hints = {
+    "google_workspace": "підключити Google Workspace OAuth через gog",
+    "growth_analytics": (
+        "додати analytics,searchconsole до Google OAuth і запустити "
+        "~/bin/growth-analytics-doctor"
+    ),
+    "voice_transcription": (
+        "підключити OpenAI API key для розпізнавання голосових повідомлень"
+    ),
+    "meeting_secretary": "підключити Recall.ai API key",
+    "memory_backup": "налаштувати зовнішній git remote для пам’яті",
+    "vercel_auth": (
+        "зберегти Vercel token у ~/.config/vercel-token (chmod 600)"
+    ),
+    "apify_social_data": "підключити Apify API token через ~/bin/set-apify-token",
+    "asana_tasks": "підключити Asana через ~/bin/set-asana-token",
+    "meta_ads": "підключити Meta Ads через ~/bin/set-meta-ads-config",
+    "sec_edgar": "налаштувати ідентифікацію SEC через ~/bin/set-sec-identity",
+    "hubspot_crm": "підключити HubSpot через ~/bin/set-hubspot-token",
+}
+for name in ALL_REQUIRED_CHECKS:
+    if not checks[name]:
+        print(f"\nНаступний обов’язковий крок: {required_hints[name]}.")
+        break
+else:
+    for name in OPTIONAL_CHECKS:
+        if not checks[name]:
+            print(f"\nНаступний необов’язковий крок: {optional_hints[name]}.")
+            break
+
+if strict and missing_required:
+    print("\nОбов’язковий онбординг не завершено: " + ", ".join(missing_required), file=sys.stderr)
+    raise SystemExit(1)

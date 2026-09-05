@@ -1,0 +1,126 @@
+#!/usr/bin/env python3
+"""Require owner-reviewed replacements for the always-injected memory cores."""
+
+from pathlib import Path
+import json
+import os
+import re
+import sys
+
+
+HOME = Path(os.environ.get("HOME") or "/home/claude").expanduser().resolve()
+CORE_PATHS = {
+    (HOME / ".claude/memory/USER.md").resolve(),
+    (HOME / ".claude/memory/MEMORY.md").resolve(),
+}
+MEMORY_DIR = (HOME / ".claude/memory").resolve()
+USER_PATH = (HOME / ".claude/memory/USER.md").resolve()
+FIRST_CONTACT_MARKER = HOME / ".claude/memory/first-contact.done"
+STOCK_USER_SENTINEL = "Keep this file under 1,375 characters."
+USER_CHAR_LIMIT = 1375
+# Only shell forms that change files count as mutation. Reading the memory
+# directory with sed -n, python3, bash -c cat or ls 2>/dev/null is fine — the
+# guard protects the always-injected cores from silent edits, not from being
+# looked at.
+SHELL_MUTATION_RE = re.compile(
+    r"(?<![0-9&])>>?(?!&)|"
+    r"\b(?:tee|truncate|rm|mv|cp|ln|link|unlink|install|touch|dd|sponge|shred)\b|"
+    r"\bsed\s+(?:-[A-Za-z]*i|--in-place)\b|"
+    r"\bperl\s+-[A-Za-z]*i\b",
+    re.IGNORECASE,
+)
+
+
+def normalize_path(value: object) -> Path | None:
+    if not isinstance(value, str) or not value:
+        return None
+    expanded = (
+        value.replace("${HOME}", str(HOME))
+        .replace("$HOME", str(HOME))
+        .replace("~", str(HOME), 1)
+    )
+    try:
+        return Path(expanded).expanduser().resolve()
+    except OSError:
+        return None
+
+
+def block(detail: str = "") -> None:
+    suffix = f" {detail}" if detail else ""
+    print(
+        json.dumps(
+            {
+                "decision": "block",
+                "reason": (
+                    f"Direct changes to active core memory are blocked.{suffix} "
+                    "Store detailed facts in Novsky Vault. A global USER.md or MEMORY.md "
+                    "change must go through learning-review: propose a complete "
+                    "replacement, show the diff, obtain explicit owner approval, "
+                    "then apply the reviewed bytes with rollback available."
+                ),
+            }
+        )
+    )
+
+
+def first_fill_allowed(tool_input: dict) -> bool:
+    """The owner's profile may be written once, during the first conversation:
+    the core is still the stock template, so there is nothing to review yet."""
+    if FIRST_CONTACT_MARKER.exists():
+        return False
+    try:
+        current = USER_PATH.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    if STOCK_USER_SENTINEL not in current:
+        return False
+    content = tool_input.get("content")
+    return isinstance(content, str) and len(content) <= USER_CHAR_LIMIT
+
+
+def main() -> None:
+    try:
+        payload = json.load(sys.stdin)
+    except (json.JSONDecodeError, OSError):
+        return
+
+    tool_name = str(payload.get("tool_name") or "")
+    tool_input = payload.get("tool_input") or {}
+    if not isinstance(tool_input, dict):
+        return
+
+    if tool_name == "Bash":
+        command = str(tool_input.get("command") or "")
+        normalized = (
+            command.replace("${HOME}", str(HOME))
+            .replace("$HOME", str(HOME))
+            .replace("~", str(HOME))
+        )
+        references_memory_dir = re.search(
+            rf"(?<![\w./-]){re.escape(str(MEMORY_DIR))}(?![\w./-])",
+            normalized,
+        )
+        references_core = any(
+            re.search(
+                rf"(?<![\w./-]){re.escape(str(path))}(?![\w./-])",
+                normalized,
+            )
+            for path in CORE_PATHS
+        )
+        if (references_memory_dir or references_core) and SHELL_MUTATION_RE.search(
+            normalized
+        ):
+            block("Shell mutation of the memory directory is disabled.")
+        return
+
+    if tool_name not in {"Edit", "Write", "MultiEdit"}:
+        return
+    path = normalize_path(tool_input.get("file_path") or tool_input.get("path"))
+    if path == USER_PATH and tool_name == "Write" and first_fill_allowed(tool_input):
+        return
+    if path in CORE_PATHS:
+        block()
+
+
+if __name__ == "__main__":
+    main()

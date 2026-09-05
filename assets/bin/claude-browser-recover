@@ -1,0 +1,217 @@
+#!/usr/bin/env python3
+"""Root-owned, no-argument bounded recovery for claude-browser.service."""
+
+from __future__ import annotations
+
+import fcntl
+import os
+from pathlib import Path
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+
+
+COOLDOWN_SECONDS = 600
+# playwright-mcp binds its port about ten seconds after systemd reports the unit
+# active, so probing once right after the restart called a working recovery a
+# failure. Wait for the endpoint the way a person would before giving up.
+SETTLE_SECONDS = 20
+SETTLE_POLL_SECONDS = 2
+INSTALLED_PATH = Path("/usr/local/sbin/claude-browser-recover")
+SERVICE = "claude-browser.service"
+ENDPOINT = "http://localhost:8931/mcp"
+HEALTHY_CODES = {"200", "400", "405"}
+
+
+def stop(message: str, code: int = 1) -> int:
+    print(f"claude-browser-recover: {message}", file=sys.stderr)
+    return code
+
+
+def test_mode() -> bool:
+    return (
+        os.environ.get("CLAUDE_BROWSER_RECOVER_TESTING") == "1"
+        and Path(__file__).resolve() != INSTALLED_PATH
+    )
+
+
+def settle_window() -> tuple[float, float]:
+    if test_mode():
+        return (
+            float(os.environ.get("CLAUDE_BROWSER_RECOVER_TEST_SETTLE", "0.6")),
+            float(os.environ.get("CLAUDE_BROWSER_RECOVER_TEST_POLL", "0.1")),
+        )
+    return (SETTLE_SECONDS, SETTLE_POLL_SECONDS)
+
+
+def paths() -> tuple[Path, Path, Path, Path]:
+    if test_mode():
+        root = Path(os.environ["CLAUDE_BROWSER_RECOVER_TEST_ROOT"])
+        command_root = Path(os.environ["CLAUDE_BROWSER_RECOVER_TEST_BIN"])
+        return (
+            root / "run/lock/claude-browser-recover.lock",
+            root / "var/lib/claude-browser/recovery",
+            command_root / "systemctl",
+            command_root / "curl",
+        )
+    return (
+        Path("/run/lock/claude-browser-recover.lock"),
+        Path("/var/lib/claude-browser/recovery"),
+        Path("/usr/bin/systemctl"),
+        Path("/usr/bin/curl"),
+    )
+
+
+def private_directory(path: Path) -> None:
+    if path.is_symlink():
+        raise OSError("unsafe recovery state directory")
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    metadata = path.lstat()
+    expected_uid = os.geteuid()
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != expected_uid
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+    ):
+        raise OSError("unsafe recovery state directory")
+
+
+def read_cooldown(path: Path) -> int | None:
+    if not path.exists():
+        return None
+    if path.is_symlink():
+        raise OSError("unsafe recovery cooldown")
+    metadata = path.stat()
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or metadata.st_size > 16
+    ):
+        raise OSError("unsafe recovery cooldown")
+    value = path.read_text(encoding="ascii")
+    if not value.endswith("\n") or not value[:-1].isdigit() or len(value[:-1]) > 10:
+        raise OSError("invalid recovery cooldown")
+    return int(value[:-1])
+
+
+def write_cooldown(directory: Path, value: int) -> None:
+    descriptor, name = tempfile.mkstemp(prefix=".last-restart.", dir=directory)
+    temporary = Path(name)
+    try:
+        os.fchmod(descriptor, 0o600)
+        payload = f"{value}\n".encode("ascii")
+        os.write(descriptor, payload)
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        os.replace(temporary, directory / "last-restart.epoch")
+        directory_fd = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def probe(curl: Path) -> bool:
+    try:
+        result = subprocess.run(
+            [
+                str(curl),
+                "--max-time",
+                "5",
+                "-sS",
+                "-o",
+                "/dev/null",
+                "-w",
+                "%{http_code}",
+                ENDPOINT,
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=8,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0 and result.stdout.strip() in HEALTHY_CODES
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) != 1:
+        return stop("arguments are not accepted", 64)
+    if not test_mode() and os.geteuid() != 0:
+        return stop("must run as root", 77)
+
+    try:
+        lock_path, state_dir, systemctl, curl = paths()
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_fd = os.open(
+            lock_path,
+            os.O_RDWR
+            | os.O_CREAT
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        lock_metadata = os.fstat(lock_fd)
+        if (
+            not stat.S_ISREG(lock_metadata.st_mode)
+            or lock_metadata.st_uid != os.geteuid()
+        ):
+            raise OSError("unsafe recovery lock")
+        os.fchmod(lock_fd, 0o600)
+    except (KeyError, OSError):
+        return stop("recovery lock is unavailable")
+
+    try:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return stop("another recovery is already running", 75)
+        try:
+            private_directory(state_dir)
+            stamp = state_dir / "last-restart.epoch"
+            previous = read_cooldown(stamp)
+            now = int(time.time())
+            if previous is not None and now - previous < COOLDOWN_SECONDS:
+                return stop("restart cooldown is active", 76)
+            write_cooldown(state_dir, now)
+        except (OSError, UnicodeError, ValueError):
+            return stop("recovery state is invalid")
+
+        try:
+            restarted = subprocess.run(
+                [str(systemctl), "restart", SERVICE],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=30,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return stop("browser service restart failed")
+        if restarted.returncode != 0:
+            return stop("browser service restart failed")
+        settle, poll = settle_window()
+        deadline = time.monotonic() + settle
+        while True:
+            if probe(curl):
+                return 0
+            if time.monotonic() >= deadline:
+                return stop("browser endpoint is still unavailable")
+            time.sleep(poll)
+    finally:
+        os.close(lock_fd)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))

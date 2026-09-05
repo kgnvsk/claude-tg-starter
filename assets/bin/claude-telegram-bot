@@ -1,18 +1,33 @@
 #!/bin/bash
 set -eu
-if [ -f "$HOME/.claude/channels/telegram/.env" ]; then set -a; . "$HOME/.claude/channels/telegram/.env"; set +a; fi
+CLAUDE_CONFIG_ROOT="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+export TELEGRAM_STATE_DIR="${TELEGRAM_STATE_DIR:-$CLAUDE_CONFIG_ROOT/channels/telegram}"
+if [ -f "$TELEGRAM_STATE_DIR/.env" ]; then
+  set -a
+  . "$TELEGRAM_STATE_DIR/.env"
+  set +a
+fi
 export BUN_INSTALL="$HOME/.bun"
 export PATH="$HOME/.local/bin:$BUN_INSTALL/bin:$HOME/bin:/usr/local/bin:/usr/bin:/bin"
+# Opus extended-context sessions can remain below the 1M hard limit while tool-call
+# quality has already degraded. Compact around 270K by default; SessionStart hooks
+# restore bounded hot memory and recent Telegram context after compaction.
+export CLAUDE_CODE_AUTO_COMPACT_WINDOW="${CLAUDE_CODE_AUTO_COMPACT_WINDOW:-300000}"
+export CLAUDE_AUTOCOMPACT_PCT_OVERRIDE="${CLAUDE_AUTOCOMPACT_PCT_OVERRIDE:-90}"
 
 # Preflight: погасить ВСЕ интерактивные промпты первого старта claude, чтобы `claude --channels`
 # поднимал Telegram-поллер, а не блокировался в ожидании ввода. `claude auth login` ставит auth,
 # но НЕ эти флаги; без них свежий бокс упирается в:
 #   1) онбординг (выбор темы «Choose the text style») — hasCompletedOnboarding/theme
 #   2) «trust this folder?» — projects[cwd].hasTrustDialogAccepted
-#   3) upsell-промпты («Try the new fullscreen renderer? 1.Yes/2.Not now», remote control, passes)
+#   3) внешний импорт управляемого CLAUDE.premium.md — projects[cwd].hasClaudeMdExternalIncludes*
+#   4) upsell-промпты («Try the new fullscreen renderer? 1.Yes/2.Not now», remote control, passes)
 #      — claude капит их показ на 3; ставим *UpsellSeenCount=3 = «уже видел, не показывай».
+#   5) предложение сделать auto mode режимом по умолчанию — новый экран свежего CLI.
+#      Для бота без человека за терминалом auto mode опасен: классификатор рисков
+#      заблокирует действие, а подтвердить его некому — бот встанет навсегда.
 # Идемпотентно, self-healing на каждый старт. No-op пока не залогинен (нет ~/.claude.json).
-CJ="${CLAUDE_CONFIG_DIR:-$HOME}/.claude.json"  # уважаем per-bot CLAUDE_CONFIG_DIR
+CJ="${CLAUDE_CONFIG_DIR:-$HOME}/.claude.json"  # уважаем per-bot CLAUDE_CONFIG_DIR (мульти-бот фермы)
 if [ -f "$CJ" ]; then
   python3 - "$CJ" "$HOME" "$HOME/obsidian-vault" <<'PY' 2>/dev/null || true
 import json, sys
@@ -41,19 +56,10 @@ for k in trust:
         e["hasTrustDialogAccepted"] = True; ch = True
     if e.get("hasCompletedProjectOnboarding") is not True:
         e["hasCompletedProjectOnboarding"] = True; ch = True
-# playwright-MCP: гарантируем наличие + ПИН версии (дрейф @latest ломал браузер —
-# новые версии требуют собственный chrome-for-testing). Нет → добавляем пиненый;
-# @latest → заменяем на пин; ручной другой пин уважаем.
-mcp = d.setdefault("mcpServers", {})
-pw = mcp.get("playwright")
-if not isinstance(pw, dict):
-    mcp["playwright"] = {"type": "stdio", "command": "npx",
-        "args": ["-y", "@playwright/mcp@0.0.78", "--headless", "--isolated"]}; ch = True
-else:
-    args = pw.get("args") or []
-    na = [a.replace("@playwright/mcp@latest", "@playwright/mcp@0.0.78") for a in args]
-    if na != args:
-        pw["args"] = na; ch = True
+    if e.get("hasClaudeMdExternalIncludesApproved") is not True:
+        e["hasClaudeMdExternalIncludesApproved"] = True; ch = True
+    if e.get("hasClaudeMdExternalIncludesWarningShown") is not True:
+        e["hasClaudeMdExternalIncludesWarningShown"] = True; ch = True
 if ch:
     json.dump(d, open(p, "w"), indent=2)
 PY
@@ -62,7 +68,7 @@ fi
 # Ответ на тот же промпт переключает режим разрешений на auto прямо в settings.json.
 # Для бота это тупик: классификатор остановит действие, а подтвердить некому. Возвращаем
 # режим, который комплект объявляет своим, — молча, при каждом старте.
-SETTINGS="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json"
+SETTINGS="$CLAUDE_CONFIG_ROOT/settings.json"
 # Під root CLI відмовляється від bypassPermissions зовсім, тож повертати його
 # там означає не дати боту стартувати. Такій установці потрібен не цей режим, а
 # список дозволів — сторож її не чіпає.
@@ -83,5 +89,60 @@ json.dump(settings, open(path, "w"), indent=2)
 PYMODE
 fi
 
+# A noninteractive auth probe can cache the local Telegram MCP as
+# "needs-auth". The next interactive --channels launch then trusts that cache
+# and skips the poller even though both Claude and the bot token are valid.
+# Forget only this local channel verdict; unrelated integration cache survives.
+AUTH_CACHE="$CLAUDE_CONFIG_ROOT/mcp-needs-auth-cache.json"
+if [ -f "$AUTH_CACHE" ]; then
+  python3 - "$AUTH_CACHE" <<'PYCACHE' 2>/dev/null || true
+import json, os, pathlib, sys, tempfile
+
+path = pathlib.Path(sys.argv[1])
+try:
+    cache = json.loads(path.read_text(encoding="utf-8"))
+except (OSError, UnicodeError, json.JSONDecodeError):
+    sys.exit(0)
+if not isinstance(cache, dict):
+    sys.exit(0)
+if cache.pop("plugin:telegram:telegram", None) is None:
+    sys.exit(0)
+
+try:
+    fd, raw_tmp = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)
+except OSError:
+    sys.exit(0)
+tmp = pathlib.Path(raw_tmp)
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        os.fchmod(handle.fileno(), 0o600)
+        json.dump(cache, handle, separators=(",", ":"))
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, path)
+except OSError:
+    pass
+finally:
+    try:
+        tmp.unlink()
+    except FileNotFoundError:
+        pass
+PYCACHE
+fi
+
 cd ~/obsidian-vault
-exec $HOME/.local/bin/claude --channels plugin:telegram@claude-plugins-official
+# No forced --effort: the model picks its own depth per turn (owner decision
+# 2026-09-01 — a pinned "low" made every agent shallow). AGENT_EFFORT in the
+# channel .env still overrides when someone really wants a fixed level.
+# The permission mode is passed on the command line, not left to
+# settings.json: CLI 2.1.260 stopped applying the file's defaultMode to a
+# --channels launch, so every Bash call started asking the owner for
+# approval in Telegram (Paradox, 04.09). Under root the CLI refuses
+# bypassPermissions outright — that install runs on its allow list, exactly
+# as the settings block above already decided.
+PERMISSION_MODE=""
+if [ "$(id -u)" -ne 0 ]; then
+  PERMISSION_MODE="--permission-mode bypassPermissions"
+fi
+exec $HOME/.local/bin/claude $PERMISSION_MODE ${AGENT_EFFORT:+--effort "$AGENT_EFFORT"} --channels plugin:telegram@claude-plugins-official

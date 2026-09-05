@@ -1,0 +1,122 @@
+#!/usr/bin/env python3
+"""Publish the bot's command menu to Telegram so it matches what actually works.
+
+Without this the menu is empty and the owner has to remember which words the bot
+answers to — and the difference that matters is invisible: /fix and /relogin are
+handled by cron watchers, while corporate /health and /unstick are answered by
+the Telegram gateway without spending a model turn.
+"""
+from __future__ import annotations
+
+import http.client
+import json
+import os
+from pathlib import Path
+import sys
+import time
+import urllib.parse
+import urllib.error
+import urllib.request
+
+HOME = Path(os.environ.get("HOME", "/home/claude"))
+ENV_FILE = Path(os.environ.get("TELEGRAM_STATE_DIR")
+                or (HOME / ".claude/channels/telegram")) / ".env"
+
+COMMANDS = [
+    {"command": "fix",
+     "description": "Оживити бота, якщо мовчить — працює навіть коли він не відповідає"},
+    {"command": "relogin",
+     "description": "Надіслати свіже посилання для входу — працює навіть коли бот не відповідає"},
+    {"command": "health",
+     "description": "Стан Telegram і черги; у корпоративному режимі — без моделі"},
+    {"command": "unstick",
+     "description": "Розблокувати запит; у корпоративному режимі — лише цю сесію"},
+    {"command": "restart",
+     "description": "Перезапустити бота (потрібен активний бот)"},
+]
+
+
+def token() -> str:
+    for line in ENV_FILE.read_text(encoding="utf-8").splitlines():
+        if line.startswith("TELEGRAM_BOT_TOKEN="):
+            return line.split("=", 1)[1].strip()
+    return ""
+
+
+def call(method: str, payload: dict | None = None, attempts: int = 4) -> dict:
+    """Telegram rate-limits setMyCommands hard — it expects a menu to be set once,
+    not on every restart. A burst of restarts across several bots earns a 429 with
+    retry_after, and the menu silently stays wrong. Wait the interval it asks for
+    instead of failing."""
+    body = urllib.parse.urlencode(payload).encode() if payload else None
+    for attempt in range(attempts):
+        request = urllib.request.Request(
+            f"https://api.telegram.org/bot{token()}/{method}", data=body)
+        try:
+            with urllib.request.urlopen(request, timeout=20) as response:
+                return json.load(response)
+        except urllib.error.HTTPError as error:
+            if error.code != 429:
+                reason = http.client.responses.get(error.code, "Unknown")
+                print(
+                    f"Telegram API повернув HTTP {error.code} {reason}; меню не змінено",
+                    file=sys.stderr,
+                )
+                raise SystemExit(1)
+            details = json.loads(error.read() or b"{}")
+            wait = int(details.get("parameters", {}).get("retry_after", 5))
+            # A short cooldown is worth waiting out. A long one is not: the channel
+            # plugin republishes this menu every time it starts, so the next restart
+            # fixes it on its own. Say so plainly instead of blocking an install for
+            # a quarter of an hour, or dying with a stack trace over a menu.
+            if wait > 90 or attempt == attempts - 1:
+                print(
+                    f"Telegram обмежив частоту: просить зачекати {wait // 60} хв "
+                    f"{wait % 60} с. Меню не змінено — бот опублікує його сам під час "
+                    "наступного перезапуску.",
+                    file=sys.stderr,
+                )
+                raise SystemExit(0)
+            print(f"Telegram просить зачекати {wait} с, чекаю", file=sys.stderr)
+            time.sleep(wait + 1)
+        except urllib.error.URLError as error:
+            print(
+                f"Telegram API недоступний ({type(error).__name__}); меню не змінено",
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
+        except (TimeoutError, OSError) as error:
+            print(
+                f"Telegram API недоступний ({type(error).__name__}); меню не змінено",
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
+    raise SystemExit(1)
+
+
+if not token():
+    print("TELEGRAM_BOT_TOKEN не знайдено; нічого публікувати", file=sys.stderr)
+    raise SystemExit(1)
+
+# Telegram resolves the narrowest matching scope, and the channel plugin publishes
+# to all_private_chats on every start. A menu written to the default scope is
+# therefore invisible in exactly the place the owner uses — their own chat with the
+# bot. Write to both: the private-chat scope so it is what they actually see, and
+# the default so groups get it too.
+SCOPES = ({"type": "all_private_chats"}, {"type": "default"})
+
+published = []
+for scope in SCOPES:
+    payload = {
+        "commands": json.dumps(COMMANDS, ensure_ascii=False),
+        "scope": json.dumps(scope),
+    }
+    result = call("setMyCommands", payload)
+    if not result.get("ok"):
+        print(f"не вдалося опублікувати меню команд для {scope['type']}: {result}", file=sys.stderr)
+        raise SystemExit(1)
+    seen = call("getMyCommands", {"scope": json.dumps(scope)}).get("result") or []
+    published.append(f"{scope['type']}: {', '.join('/' + c['command'] for c in seen)}")
+
+for line in published:
+    print(f"меню команд опубліковано — {line}")

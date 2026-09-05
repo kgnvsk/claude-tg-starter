@@ -11,21 +11,21 @@ status: evergreen
 
 # PDF-генерація — детальний гайд
 
-Деталі до правила з `CLAUDE.md`: «PDF/КП/звіти: HTML → `~/bin/html-to-pdf` → відправити через reply.files».
+Деталі до правила з `CLAUDE.md`: «PDF/КП/звіти: HTML → `~/bin/html-to-pdf` → скопіювати у `~/telegram-outbox` → відправити через reply.files, передавши абсолютний шлях».
 
 ## Коли треба
 
-владелец просить: «зроби КП для клієнта X на $10k», «напиши звіт у PDF», «інвойс».
+Власник просить: «зроби КП для клієнта X на $10k», «напиши звіт у PDF», «інвойс».
 
 ## Розрізняй одразу: клієнтський чи ні
 
 **Wrapper `html-to-pdf` додає date+`file:///` штамп у footer.** Для клієнтських документів це неприпустимо. Тому спочатку визнач тип:
 
-### Неклієнтські PDF (внутрішні звіти, drafts, вольт-експорти)
+### Неклієнтські PDF (внутрішні звіти, drafts, vault-експорти)
 
 1. Написати HTML у `/tmp/<name>.html`.
 2. `~/bin/html-to-pdf /tmp/<name>.html /tmp/<name>.pdf` — норм, footer не критичний.
-3. Відправити через `reply files:["/tmp/<name>.pdf"]`.
+3. Скопіювати у `~/telegram-outbox/<name>.pdf` і відправити через `reply files:["/home/<agent-user>/telegram-outbox/<name>.pdf"]` (саме абсолютний шлях, не `~`).
 
 ### Клієнтські PDF (КП, інвойс, контракт, публічна пропозиція)
 
@@ -37,7 +37,7 @@ status: evergreen
      --print-to-pdf=/tmp/<name>.pdf file:///tmp/<name>.html
    ```
    Ключовий флаг: `--no-pdf-header-footer`.
-4. Відправити через `reply files:["/tmp/<name>.pdf"]`.
+4. Скопіювати у `~/telegram-outbox/<name>.pdf` і відправити через `reply files:["/home/<agent-user>/telegram-outbox/<name>.pdf"]` (саме абсолютний шлях, не `~`).
 
 Cleanup `/tmp/*.html` і `/tmp/*.pdf` якщо не потрібні далі.
 
@@ -49,7 +49,7 @@ Cleanup `/tmp/*.html` і `/tmp/*.pdf` якщо не потрібні далі.
 
 - A4 page: `@page { size: A4; margin: 20mm; }`
 - Hero section з назвою компанії + logo placeholder.
-- Чіткі секції: Задача, Рішення, Ціна, Терміни, Команда.
+- Чіткі секції: Завдання, Рішення, Ціна, Терміни, Команда.
 - `-webkit-print-color-adjust: exact` — зберігає background-и.
 - Sans-serif сучасні шрифти: Inter, SF Pro, або system-ui.
 - Розрив між секціями: `page-break-after: always` де треба.

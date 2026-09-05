@@ -1,0 +1,197 @@
+#!/usr/bin/env python3
+"""Enable, disable, or inspect explicitly consented OpenAI memory embeddings."""
+
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import sys
+import tempfile
+
+
+HOME = Path.home()
+ENV = HOME / ".codex/channels/telegram/.env"
+STATE = HOME / ".codex/onboarding-state.json"
+SETTING = "MEMORY_EMBEDDINGS_OPENAI"
+ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def parse_assignment(line: str, number: int) -> tuple[str, str] | None:
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#"):
+        return None
+    if stripped.startswith("export "):
+        stripped = stripped[7:].lstrip()
+    name, separator, raw = stripped.partition("=")
+    if not separator or not ASSIGNMENT.fullmatch(name):
+        raise ValueError(f"некоректне присвоєння змінної середовища в рядку {number}")
+    if raw.startswith("$'"):
+        raise ValueError(f"непідтримуване ANSI-C-квотування для {name}")
+    if raw == "":
+        return name, ""
+    lexer = shlex.shlex(raw, posix=True)
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    values = list(lexer)
+    if len(values) != 1:
+        raise ValueError(f"некоректне значення {name} в рядку {number}")
+    return name, values[0]
+
+
+def parse_values(lines: list[str]) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for number, line in enumerate(lines, 1):
+        parsed = parse_assignment(line, number)
+        if parsed is None:
+            continue
+        name, value = parsed
+        if name in values:
+            raise ValueError(f"налаштування {name} повторюється")
+        values[name] = value
+    return values
+
+
+def replace_setting(lines: list[str], value: str) -> list[str]:
+    replacement = f"{SETTING}={value}"
+    updated: list[str] = []
+    found = False
+    for number, line in enumerate(lines, 1):
+        parsed = parse_assignment(line, number)
+        if parsed is not None and parsed[0] == SETTING:
+            if not found:
+                updated.append(replacement)
+                found = True
+        else:
+            updated.append(line)
+    if not found:
+        updated.append(replacement)
+    return updated
+
+
+def load_state() -> dict | None:
+    if not STATE.exists():
+        return None
+    try:
+        value = json.loads(STATE.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError, RecursionError):
+        return None
+    if not isinstance(value, dict):
+        return None
+    return value
+
+
+def normalized_state_text(state: dict | None, configured: bool) -> str | None:
+    if state is None:
+        return None
+    features = state.get("optionalFeatures")
+    if not isinstance(features, dict):
+        features = {}
+        state["optionalFeatures"] = features
+    feature = features.get("memory_semantic_search")
+    if not isinstance(feature, dict):
+        feature = {}
+        features["memory_semantic_search"] = feature
+    feature.update(
+        {
+            "status": "configured" if configured else "disabled",
+            "provider": "openai" if configured else "local-keyword",
+            "remindAfterDays": 0,
+        }
+    )
+    return json.dumps(state, ensure_ascii=False, indent=2) + "\n"
+
+
+def atomic_text(path: Path, text: str, mode: int = 0o600) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}-", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, mode)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def main() -> int:
+    if len(sys.argv) != 2 or sys.argv[1] not in {"enable", "disable", "status"}:
+        print("Використання: memory-embeddings-config <enable|disable|status>", file=sys.stderr)
+        return 2
+    action = sys.argv[1]
+    try:
+        lines = ENV.read_text(encoding="utf-8").splitlines() if ENV.exists() else []
+        values = parse_values(lines)
+        primary_key = values.get("OPENAI_API_KEY", "")
+        fallback_key = values.get("OPENAI_API_KEY_FALLBACK", "")
+        key_present = bool(primary_key or fallback_key)
+        current = values.get(SETTING, "") or "disabled"
+        if current not in {"enabled", "disabled"}:
+            raise ValueError(f"некоректне налаштування {SETTING}")
+        state = load_state()
+    except (OSError, UnicodeError, ValueError) as error:
+        print(f"Налаштування семантичної пам’яті: {error}", file=sys.stderr)
+        return 2
+
+    if action == "status":
+        status = "увімкнено" if current == "enabled" and key_present else "вимкнено"
+        if current == "enabled" and not key_present:
+            status = "увімкнено, але ключ відсутній"
+        print(f"Семантична пам’ять OpenAI: {status}. Локальний пошук за ключовими словами увімкнено.")
+        return 0
+
+    if action == "enable" and not key_present:
+        print(
+            "Семантичну пам’ять OpenAI не ввімкнено: спочатку налаштуйте OpenAI-ключ для голосових повідомлень.",
+            file=sys.stderr,
+        )
+        return 1
+
+    configured = action == "enable"
+    value = "enabled" if configured else "disabled"
+    state_text = normalized_state_text(state, configured)
+    env_text = "\n".join(replace_setting(lines, value)) + "\n"
+    try:
+        if configured:
+            # Enabling writes derived status first and authoritative consent
+            # last, so a partial failure can never start memory egress.
+            if state_text is not None:
+                atomic_text(STATE, state_text)
+            atomic_text(ENV, env_text)
+        else:
+            # Disabling revokes authoritative consent first. A later derived
+            # status failure cannot leave embeddings enabled behind a disabled
+            # onboarding-state marker.
+            atomic_text(ENV, env_text)
+            if state_text is not None:
+                atomic_text(STATE, state_text)
+    except OSError:
+        print(
+            "Налаштування семантичної пам’яті: не вдалося оновити локальну конфігурацію",
+            file=sys.stderr,
+        )
+        return 2
+
+    if configured:
+        print(
+            "Семантичну пам’ять OpenAI увімкнено за згодою власника. Індексування може "
+            "надсилати до OpenAI Embeddings фрагменти тексту з vault і Telegram (до 8 000 символів кожен; "
+            "до 400 нових документів за один запуск індексації), а також кожен пошуковий запит; "
+            "використання може тарифікуватися. Щоб вимкнути без видалення ключа для голосових повідомлень: "
+            "~/bin/memory-embeddings-config disable."
+        )
+    else:
+        print(
+            "Семантичну пам’ять OpenAI вимкнено. Текст пам’яті та пошукові запити не "
+            "надсилаються для ембедингів; локальний пошук за ключовими словами залишається увімкненим."
+        )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

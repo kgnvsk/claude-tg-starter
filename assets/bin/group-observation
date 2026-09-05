@@ -1,0 +1,41 @@
+#!/usr/bin/env python3
+"""Owner-only conversational control for Telegram group observation."""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) < 4 or argv[2].lower() not in {"on", "off", "status"}:
+        print(
+            "Використання: group-observation <requester_chat_id> <on|off|status> <group_id|group_name>",
+            file=sys.stderr,
+        )
+        return 2
+
+    state_dir = os.environ.get("TELEGRAM_STATE_DIR") or os.path.expanduser(
+        "~/.claude/channels/telegram"
+    )
+    access_file = os.path.join(state_dir, "access.json")
+    helper = Path(__file__).with_name("access-update")
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(helper),
+            "group-observation",
+            access_file,
+            argv[1],
+            argv[2].lower(),
+            " ".join(argv[3:]),
+        ],
+        check=False,
+    )
+    return result.returncode
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))

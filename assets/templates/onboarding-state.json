@@ -1,0 +1,64 @@
+{
+  "schemaVersion": 1,
+  "completedSteps": [
+    "core_config"
+  ],
+  "optionalFeatures": {
+    "voice_transcription": {
+      "status": "deferred",
+      "model": "gpt-4o-mini-transcribe",
+      "remindAfterDays": 7,
+      "lastReminderAt": null
+    },
+    "memory_semantic_search": {
+      "status": "disabled",
+      "provider": "local-keyword",
+      "remindAfterDays": 0
+    },
+    "meeting_secretary": {
+      "status": "deferred",
+      "remindAfterDays": 7,
+      "lastReminderAt": null
+    },
+    "calendar": {
+      "status": "deferred",
+      "remindAfterDays": 7,
+      "lastReminderAt": null
+    },
+    "memory_backup": {
+      "status": "deferred",
+      "remindAfterDays": 7,
+      "lastReminderAt": null
+    },
+    "social_data": {
+      "status": "deferred",
+      "remindAfterDays": 7,
+      "lastReminderAt": null
+    },
+    "task_system": {
+      "status": "deferred",
+      "remindAfterDays": 7,
+      "lastReminderAt": null
+    },
+    "growth_analytics": {
+      "status": "deferred",
+      "remindAfterDays": 7,
+      "lastReminderAt": null
+    },
+    "paid_media": {
+      "status": "deferred",
+      "remindAfterDays": 7,
+      "lastReminderAt": null
+    },
+    "regulatory_data": {
+      "status": "deferred",
+      "remindAfterDays": 7,
+      "lastReminderAt": null
+    },
+    "crm": {
+      "status": "deferred",
+      "remindAfterDays": 7,
+      "lastReminderAt": null
+    }
+  }
+}

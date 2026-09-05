@@ -1,0 +1,27 @@
+{
+  "schemaVersion": 1,
+  "productId": "starter",
+  "displayName": "Novsky Starter",
+  "updateOrigin": "https://github.com/kgnvsk/claude-tg-starter.git",
+  "verificationPolicySha256": "01466bbcf76759ca1c6e1cfe3095b56bba746517389b32368beb5a457bae0d48",
+  "features": [
+    "browser"
+  ],
+  "firstPartySkills": [
+    "research"
+  ],
+  "externalSkills": [],
+  "requiredChecks": [
+    "browser",
+    "claude_auth",
+    "core",
+    "memory",
+    "memory_semantic_search",
+    "plugins",
+    "telegram_service",
+    "voice_transcription"
+  ],
+  "optionalChecks": [
+    "memory_backup"
+  ]
+}

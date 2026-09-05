@@ -1,0 +1,747 @@
+#!/usr/bin/env python3
+"""Перевіряє керовані продуктом плагіни Claude лише за локальними файлами."""
+
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import sys
+from typing import Any
+
+
+MAX_JSON_BYTES = 1024 * 1024
+MAX_SKILL_BYTES = 1024 * 1024
+MAX_PLUGINS = 128
+MAX_SKILLS_PER_PLUGIN = 256
+PLUGIN_PART = re.compile(r"^[a-z0-9]+(?:[._-][a-z0-9]+)*$")
+SKILL_NAME = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+VERSION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$")
+RECORD_FIELDS = {
+    "scope",
+    "installPath",
+    "version",
+    "installedAt",
+    "lastUpdated",
+}
+# The CLI writes this for some marketplaces and not others — on one live box
+# impeccable and marketing-skills carry it while superpowers, installed in the
+# same second, does not. Demanding it rejected a healthy install and blocked the
+# whole update, so it is checked only when the CLI actually wrote it.
+OPTIONAL_RECORD_FIELDS = {"gitCommitSha"}
+
+
+class DoctorError(ValueError):
+    """Controlled, customer-safe verification failure."""
+
+
+class DuplicateKeyError(ValueError):
+    pass
+
+
+def reject_duplicate_keys(
+    pairs: list[tuple[str, Any]],
+) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise DuplicateKeyError(key)
+        value[key] = item
+    return value
+
+
+def read_json(path: Path, label: str) -> dict[str, Any]:
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+        try:
+            value = read_json_descriptor(descriptor, label)
+        finally:
+            os.close(descriptor)
+    except DoctorError:
+        raise
+    except OSError:
+        raise DoctorError(f"{label}: некоректний об’єкт") from None
+    return value
+
+
+def trusted_stat(info: os.stat_result, expected: str, label: str) -> None:
+    if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) & 0o022:
+        raise DoctorError(f"{label}: небезпечний власник або дозволи")
+    if expected == "file" and not stat.S_ISREG(info.st_mode):
+        raise DoctorError(f"{label}: некоректний об’єкт")
+    if expected == "directory" and not stat.S_ISDIR(info.st_mode):
+        raise DoctorError(f"{label}: некоректний об’єкт")
+
+
+def read_stable_file(
+    descriptor: int,
+    label: str,
+    maximum_bytes: int,
+) -> bytes:
+    try:
+        info = os.fstat(descriptor)
+        trusted_stat(info, "file", label)
+        if info.st_size > maximum_bytes:
+            raise DoctorError(f"{label}: некоректний об’єкт")
+        chunks: list[bytes] = []
+        remaining = maximum_bytes + 1
+        while remaining:
+            chunk = os.read(descriptor, min(65536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw_bytes = b"".join(chunks)
+        if len(raw_bytes) > maximum_bytes:
+            raise DoctorError(f"{label}: некоректний об’єкт")
+        after = os.fstat(descriptor)
+        trusted_stat(after, "file", label)
+        if (
+            info.st_dev,
+            info.st_ino,
+            info.st_size,
+            info.st_mtime_ns,
+        ) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+        ):
+            raise DoctorError(f"{label}: змінено під час перевірки")
+        return raw_bytes
+    except DoctorError:
+        raise
+    except OSError:
+        raise DoctorError(f"{label}: некоректний об’єкт") from None
+
+
+def read_json_descriptor(descriptor: int, label: str) -> dict[str, Any]:
+    try:
+        raw_bytes = read_stable_file(descriptor, label, MAX_JSON_BYTES)
+        raw = raw_bytes.decode("utf-8")
+        value = json.loads(raw, object_pairs_hook=reject_duplicate_keys)
+    except DoctorError:
+        raise
+    except (OSError, UnicodeDecodeError, ValueError, RecursionError):
+        raise DoctorError(f"{label}: некоректний об’єкт") from None
+    if not isinstance(value, dict):
+        raise DoctorError(f"{label}: некоректний об’єкт")
+    return value
+
+
+def exact_keys(
+    value: dict[str, Any],
+    expected: set[str],
+    label: str,
+    optional: set[str] = frozenset(),
+) -> None:
+    if set(value) - optional != expected:
+        raise DoctorError(f"{label}: некоректний об’єкт")
+
+
+def open_trusted_directory(
+    path: str | Path,
+    label: str,
+    *,
+    directory_fd: int | None = None,
+) -> int:
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY
+    try:
+        descriptor = os.open(path, flags, dir_fd=directory_fd)
+        trusted_stat(os.fstat(descriptor), "directory", label)
+        return descriptor
+    except DoctorError:
+        try:
+            os.close(descriptor)
+        except (NameError, OSError):
+            pass
+        raise
+    except OSError:
+        raise DoctorError(f"{label}: некоректний об’єкт") from None
+
+
+def open_trusted_file_at(directory_fd: int, name: str, label: str) -> int:
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+    try:
+        descriptor = os.open(name, flags, dir_fd=directory_fd)
+        trusted_stat(os.fstat(descriptor), "file", label)
+        return descriptor
+    except DoctorError:
+        try:
+            os.close(descriptor)
+        except (NameError, OSError):
+            pass
+        raise
+    except OSError:
+        raise DoctorError(f"{label}: некоректний об’єкт") from None
+
+
+def entry_exists(directory_fd: int, name: str) -> bool:
+    # Only decides which manifest to open; the open itself still goes through
+    # the trusted path, so a symlink planted here is rejected there.
+    try:
+        os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except OSError:
+        return False
+    return True
+
+
+def read_json_at(directory_fd: int, name: str, label: str) -> dict[str, Any]:
+    descriptor = open_trusted_file_at(directory_fd, name, label)
+    try:
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        return read_json_descriptor(descriptor, label)
+    finally:
+        os.close(descriptor)
+
+
+def verify_skill_file(descriptor: int, expected_name: str) -> None:
+    try:
+        raw = read_stable_file(
+            descriptor,
+            "обов’язковий файл навички плагіна",
+            MAX_SKILL_BYTES,
+        )
+        if not raw:
+            raise DoctorError("обов’язковий файл навички плагіна некоректний")
+        lines = raw.decode("utf-8").splitlines()
+    except DoctorError:
+        raise
+    except UnicodeDecodeError:
+        raise DoctorError("обов’язковий файл навички плагіна некоректний") from None
+    if not lines or lines[0].strip() != "---":
+        raise DoctorError("обов’язковий файл навички плагіна некоректний")
+    names: list[str] = []
+    closed = False
+    for line in lines[1:]:
+        if line.strip() == "---":
+            closed = True
+            break
+        if line.startswith("name:"):
+            name = line.split(":", 1)[1].strip()
+            if (
+                len(name) >= 2
+                and name[0] == name[-1]
+                and name[0] in {"'", '"'}
+            ):
+                name = name[1:-1]
+            names.append(name)
+    if not closed or names != [expected_name]:
+        raise DoctorError("обов’язковий файл навички плагіна некоректний")
+
+
+def close_descriptors(descriptors: tuple[int, ...] | list[int]) -> None:
+    for descriptor in reversed(descriptors):
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+
+
+def open_metadata_snapshot(home: Path) -> tuple[int, int, int, int, int]:
+    descriptors: list[int] = []
+    try:
+        home_fd = open_trusted_directory(home, "домашній каталог")
+        descriptors.append(home_fd)
+        claude_fd = open_trusted_directory(
+            ".claude",
+            "каталог Claude",
+            directory_fd=home_fd,
+        )
+        descriptors.append(claude_fd)
+        product_fd = open_trusted_directory(
+            "product",
+            "каталог політики продукту",
+            directory_fd=claude_fd,
+        )
+        descriptors.append(product_fd)
+        plugins_fd = open_trusted_directory(
+            "plugins",
+            "каталог метаданих плагінів",
+            directory_fd=claude_fd,
+        )
+        descriptors.append(plugins_fd)
+        cache_fd = open_trusted_directory(
+            "cache",
+            "каталог кешу плагінів",
+            directory_fd=plugins_fd,
+        )
+        descriptors.append(cache_fd)
+        return home_fd, claude_fd, product_fd, plugins_fd, cache_fd
+    except BaseException:
+        close_descriptors(descriptors)
+        raise
+
+
+def plugin_parts(plugin_id: str) -> tuple[str, str]:
+    if (
+        not isinstance(plugin_id, str)
+        or len(plugin_id) > 257
+        or plugin_id.count("@") != 1
+    ):
+        raise DoctorError("контракт плагінів некоректний")
+    plugin, marketplace = plugin_id.split("@")
+    if not PLUGIN_PART.fullmatch(plugin) or not PLUGIN_PART.fullmatch(
+        marketplace
+    ):
+        raise DoctorError("контракт плагінів некоректний")
+    return plugin, marketplace
+
+
+def string_array(
+    value: Any,
+    label: str,
+    *,
+    maximum: int = MAX_PLUGINS,
+) -> list[str]:
+    if (
+        not isinstance(value, list)
+        or len(value) > maximum
+        or any(not isinstance(item, str) or not item for item in value)
+        or len(value) != len(set(value))
+    ):
+        raise DoctorError(f"{label}: некоректний об’єкт")
+    return value
+
+
+def validate_source(value: Any) -> dict[str, str]:
+    if not isinstance(value, dict):
+        raise DoctorError("контракт плагінів некоректний")
+    source_type = value.get("source")
+    if source_type == "github":
+        exact_keys(value, {"source", "repo"}, "контракт плагінів")
+        repo = value.get("repo")
+        if (
+            not isinstance(repo, str)
+            or len(repo) > 256
+            or repo.count("/") != 1
+            or any(not PLUGIN_PART.fullmatch(part) for part in repo.split("/"))
+        ):
+            raise DoctorError("контракт плагінів некоректний")
+    elif source_type == "git":
+        exact_keys(value, {"source", "url"}, "контракт плагінів")
+        url = value.get("url")
+        if (
+            not isinstance(url, str)
+            or len(url) > 512
+            or not url.startswith("https://github.com/")
+            or not url.endswith(".git")
+        ):
+            raise DoctorError("контракт плагінів некоректний")
+    else:
+        raise DoctorError("контракт плагінів некоректний")
+    return value
+
+
+def read_metadata_json(
+    source: Path | int,
+    name: str,
+    label: str,
+) -> dict[str, Any]:
+    if isinstance(source, int):
+        return read_json_at(source, name, label)
+    return read_json(source, label)
+
+
+def load_policy(source: Path | int) -> tuple[list[str], list[str], list[str]]:
+    policy = read_metadata_json(
+        source,
+        "managed-plugins.json",
+        "політика керованих плагінів",
+    )
+    exact_keys(
+        policy,
+        {"schemaVersion", "enabled", "managed"},
+        "політика керованих плагінів",
+        optional={"required"},
+    )
+    if policy.get("schemaVersion") != 1 or isinstance(
+        policy.get("schemaVersion"), bool
+    ):
+        raise DoctorError("політика керованих плагінів некоректна")
+    enabled = string_array(policy.get("enabled"), "політика керованих плагінів")
+    managed = string_array(policy.get("managed"), "політика керованих плагінів")
+    # Which of the shipped plugins the agent cannot run without. Everything else
+    # is the owner's call: a plugin they switch off must stay off, and must not
+    # take their next update down with it. Metadata written before this key
+    # existed keeps the old reading, where every shipped plugin was mandatory.
+    required = (
+        string_array(policy.get("required"), "політика керованих плагінів")
+        if "required" in policy
+        else list(enabled)
+    )
+    for plugin_id in (*enabled, *managed, *required):
+        plugin_parts(plugin_id)
+    if not set(enabled).issubset(managed) or not set(required).issubset(enabled):
+        raise DoctorError("політика керованих плагінів некоректна")
+    return enabled, managed, required
+
+
+def load_contract(source: Path | int) -> dict[str, dict[str, Any]]:
+    contract = read_metadata_json(
+        source,
+        "plugin-contract.json",
+        "контракт плагінів",
+    )
+    exact_keys(contract, {"schemaVersion", "plugins"}, "контракт плагінів")
+    if contract.get("schemaVersion") != 1 or isinstance(
+        contract.get("schemaVersion"), bool
+    ):
+        raise DoctorError("контракт плагінів некоректний")
+    plugins = contract.get("plugins")
+    if not isinstance(plugins, dict) or len(plugins) > MAX_PLUGINS:
+        raise DoctorError("контракт плагінів некоректний")
+    validated: dict[str, dict[str, Any]] = {}
+    for plugin_id in sorted(plugins):
+        plugin_parts(plugin_id)
+        entry = plugins[plugin_id]
+        if not isinstance(entry, dict):
+            raise DoctorError("контракт плагінів некоректний")
+        exact_keys(entry, {"source", "requiredSkills"}, "контракт плагінів")
+        source = validate_source(entry.get("source"))
+        skills = string_array(
+            entry.get("requiredSkills"),
+            "контракт плагінів",
+            maximum=MAX_SKILLS_PER_PLUGIN,
+        )
+        if not skills or any(not SKILL_NAME.fullmatch(skill) for skill in skills):
+            raise DoctorError("контракт плагінів некоректний")
+        validated[plugin_id] = {
+            "source": source,
+            "requiredSkills": skills,
+        }
+    return validated
+
+
+def load_settings(source: Path | int) -> dict[str, Any]:
+    settings = read_metadata_json(source, "settings.json", "налаштування")
+    enabled = settings.get("enabledPlugins")
+    marketplaces = settings.get("extraKnownMarketplaces", {})
+    if (
+        not isinstance(enabled, dict)
+        or len(enabled) > MAX_PLUGINS * 4
+        or any(
+            not isinstance(name, str) or not isinstance(value, bool)
+            for name, value in enabled.items()
+        )
+        or not isinstance(marketplaces, dict)
+        or len(marketplaces) > MAX_PLUGINS
+    ):
+        raise DoctorError("налаштування некоректні")
+    return settings
+
+
+def load_known(source: Path | int) -> dict[str, Any]:
+    known = read_metadata_json(
+        source,
+        "known_marketplaces.json",
+        "відомі каталоги плагінів",
+    )
+    if len(known) > MAX_PLUGINS * 2:
+        raise DoctorError("список відомих каталогів плагінів некоректний")
+    return known
+
+
+def load_installed(source: Path | int) -> dict[str, list[dict[str, Any]]]:
+    installed = read_metadata_json(
+        source,
+        "installed_plugins.json",
+        "метадані встановлених плагінів",
+    )
+    exact_keys(installed, {"version", "plugins"}, "метадані встановлених плагінів")
+    if installed.get("version") != 2 or isinstance(
+        installed.get("version"), bool
+    ):
+        raise DoctorError("метадані встановлених плагінів некоректні")
+    plugins = installed.get("plugins")
+    if not isinstance(plugins, dict) or len(plugins) > MAX_PLUGINS * 4:
+        raise DoctorError("метадані встановлених плагінів некоректні")
+    for plugin_id, records in plugins.items():
+        if not isinstance(plugin_id, str) or not isinstance(records, list):
+            raise DoctorError("метадані встановлених плагінів некоректні")
+        if len(records) > 8 or any(not isinstance(record, dict) for record in records):
+            raise DoctorError("метадані встановлених плагінів некоректні")
+    return plugins
+
+
+def open_install_directory(
+    cache_fd: int,
+    marketplace: str,
+    plugin: str,
+    version: str,
+) -> int:
+    descriptors: list[int] = []
+    try:
+        descriptor = os.dup(cache_fd)
+        descriptors.append(descriptor)
+        trusted_stat(
+            os.fstat(descriptor),
+            "directory",
+            "каталог кешу плагінів",
+        )
+        for component, label in (
+            (marketplace, "каталог кешу каталогу плагінів"),
+            (plugin, "каталог кешу плагіна"),
+            (version, "каталог версії плагіна"),
+        ):
+            child = open_trusted_directory(
+                component,
+                label,
+                directory_fd=descriptor,
+            )
+            descriptors.append(child)
+            os.close(descriptor)
+            descriptors.remove(descriptor)
+            descriptor = child
+        descriptors.remove(descriptor)
+        return descriptor
+    except BaseException as error:
+        close_descriptors(descriptors)
+        if isinstance(error, OSError):
+            raise DoctorError("каталог кешу плагінів некоректний") from None
+        raise
+
+
+def validate_install(
+    cache: Path,
+    cache_fd: int,
+    plugin_id: str,
+    record: dict[str, Any],
+    required_skills: list[str],
+) -> dict[str, Any]:
+    exact_keys(
+        record,
+        RECORD_FIELDS,
+        "метадані встановлених плагінів",
+        OPTIONAL_RECORD_FIELDS,
+    )
+    declared = (RECORD_FIELDS | (OPTIONAL_RECORD_FIELDS & set(record))) - {"scope"}
+    if record.get("scope") != "user" or any(
+        not isinstance(record.get(field), str) or not record[field]
+        for field in declared
+    ):
+        raise DoctorError("метадані встановлених плагінів некоректні")
+    plugin, marketplace = plugin_parts(plugin_id)
+    version = record["version"]
+    if not VERSION.fullmatch(version):
+        raise DoctorError("метадані встановлених плагінів некоректні")
+    raw_path = record["installPath"]
+    if not os.path.isabs(raw_path) or "\x00" in raw_path:
+        raise DoctorError("шлях установлення плагіна некоректний")
+    install_path = Path(os.path.abspath(raw_path))
+    expected = cache / marketplace / plugin / version
+    if install_path != expected:
+        raise DoctorError("шлях установлення плагіна некоректний")
+    install_fd = open_install_directory(cache_fd, marketplace, plugin, version)
+    try:
+        manifest_directory_fd = open_trusted_directory(
+            ".claude-plugin",
+            "каталог метаданих плагіна",
+            directory_fd=install_fd,
+        )
+        try:
+            # A marketplace may publish several plugins out of one repository —
+            # anthropics/skills does, with every entry sharing "source": "./".
+            # Each cached plugin is then a copy of that repository root, which
+            # carries marketplace.json and no plugin.json at all, and its
+            # recorded version is the repository sha rather than a release. The
+            # payload is identified there by name, so that is what we match.
+            if entry_exists(manifest_directory_fd, "plugin.json"):
+                manifest = read_json_at(
+                    manifest_directory_fd,
+                    "plugin.json",
+                    "маніфест плагіна",
+                )
+                # A manifest need not declare a version: frontend-design ships
+                # plugin.json with none, and the ledger then records the sha the
+                # CLI installed. Requiring equality rejected that valid install.
+                # The name identifies the payload; the version is checked only
+                # when the manifest actually states one, and the install path is
+                # bound to the ledger version above either way.
+                declared = manifest.get("version")
+                if not isinstance(declared, str) or not declared:
+                    declared = None
+                matches = manifest.get("name") == plugin and (
+                    declared is None or declared == version
+                )
+            else:
+                manifest = read_json_at(
+                    manifest_directory_fd,
+                    "marketplace.json",
+                    "маніфест набору плагінів",
+                )
+                entries = manifest.get("plugins")
+                matches = isinstance(entries, list) and any(
+                    isinstance(entry, dict) and entry.get("name") == plugin
+                    for entry in entries
+                )
+        finally:
+            os.close(manifest_directory_fd)
+        if not matches:
+            raise DoctorError("маніфест плагіна не відповідає встановленню")
+        skills_fd = open_trusted_directory(
+            "skills",
+            "каталог навичок плагіна",
+            directory_fd=install_fd,
+        )
+        try:
+            for skill in required_skills:
+                skill_fd = open_trusted_directory(
+                    skill,
+                    "каталог обов’язкової навички плагіна",
+                    directory_fd=skills_fd,
+                )
+                try:
+                    skill_file_fd = open_trusted_file_at(
+                        skill_fd,
+                        "SKILL.md",
+                        "обов’язковий файл навички плагіна",
+                    )
+                    try:
+                        verify_skill_file(skill_file_fd, skill)
+                    finally:
+                        os.close(skill_file_fd)
+                finally:
+                    os.close(skill_fd)
+        finally:
+            os.close(skills_fd)
+    finally:
+        os.close(install_fd)
+    return {
+        "id": plugin_id,
+        "version": version,
+        "skills": required_skills,
+    }
+
+
+def verify(home: Path) -> dict[str, Any]:
+    claude = home / ".claude"
+    cache = claude / "plugins/cache"
+    descriptors = open_metadata_snapshot(home)
+    _, claude_fd, product_fd, plugins_fd, cache_fd = descriptors
+    try:
+        enabled, managed, required = load_policy(product_fd)
+        contract = load_contract(product_fd)
+        if set(contract) != set(enabled):
+            raise DoctorError("контракт плагінів не відповідає активній політиці")
+        settings = load_settings(claude_fd)
+        configured = settings["enabledPlugins"]
+        for plugin_id in required:
+            if configured.get(plugin_id) is not True:
+                raise DoctorError(f"обов’язковий плагін вимкнено: {plugin_id}")
+        # A plugin the owner switched off is not installed either, so it is
+        # checked no further. Demanding an install record for it turned "I do not
+        # want this one" into a failed update with nothing the owner could do.
+        active = [plugin_id for plugin_id in enabled if configured.get(plugin_id) is True]
+        stale = set(managed) - set(enabled)
+        if any(configured.get(plugin_id) is True for plugin_id in stale):
+            raise DoctorError("застарілий керований плагін увімкнено")
+
+        known = load_known(plugins_fd)
+        installed = load_installed(plugins_fd)
+        if any(installed.get(plugin_id) for plugin_id in stale):
+            raise DoctorError("застарілий керований плагін наявний у системі")
+
+        receipt_plugins: list[dict[str, Any]] = []
+        for plugin_id in sorted(active):
+            _, marketplace = plugin_parts(plugin_id)
+            marketplace_record = known.get(marketplace)
+            if not isinstance(marketplace_record, dict) or (
+                marketplace_record.get("source")
+                != contract[plugin_id]["source"]
+            ):
+                raise DoctorError(f"джерело каталогу плагінів не збігається: {marketplace}")
+            settings_marketplace = settings["extraKnownMarketplaces"].get(
+                marketplace
+            )
+            if settings_marketplace is not None:
+                if (
+                    not isinstance(settings_marketplace, dict)
+                    or settings_marketplace.get("source")
+                    != contract[plugin_id]["source"]
+                ):
+                    raise DoctorError(
+                        f"налаштований каталог плагінів не збігається: {marketplace}"
+                    )
+
+            records = installed.get(plugin_id)
+            if not isinstance(records, list) or len(records) != 1:
+                raise DoctorError(
+                    f"обов’язковий плагін не має єдиного встановлення: {plugin_id}"
+                )
+            try:
+                receipt_plugins.append(
+                    validate_install(
+                        cache,
+                        cache_fd,
+                        plugin_id,
+                        records[0],
+                        contract[plugin_id]["requiredSkills"],
+                    )
+                )
+            except (DoctorError, OSError, RuntimeError) as error:
+                # Name the plugin without naming the reason. A deployer read a
+                # bare "check failed", saw the Telegram plugin in the log, and
+                # spent hours there — the failure was the first contract entry
+                # and the run never reached Telegram.
+                error.failed_plugin = plugin_id
+                raise
+        return {
+            "schemaVersion": 1,
+            "status": "ready",
+            "pluginCount": len(receipt_plugins),
+            "plugins": receipt_plugins,
+        }
+    finally:
+        close_descriptors(descriptors)
+
+
+def main(argv: list[str] | None = None) -> int:
+    arguments = sys.argv[1:] if argv is None else argv
+    if arguments not in ([], ["--json"]):
+        print("plugin-doctor: використання: plugin-doctor [--json]", file=sys.stderr)
+        return 2
+    try:
+        receipt = verify(Path.home())
+    except (DoctorError, OSError, RuntimeError) as error:
+        failed = getattr(error, "failed_plugin", "")
+        message = "plugin-doctor: локальна перевірка плагінів не пройдена"
+        try:
+            plugin_parts(failed)
+        except DoctorError:
+            failed = ""
+        else:
+            message = f"{message}: {failed}"
+        print(message, file=sys.stderr)
+        if arguments == ["--json"]:
+            # A caller can only repair what it can read. The exit code alone said
+            # nothing, so a plugin whose contract had grown by one skill stopped
+            # an owner's update with no way to see which plugin, or why.
+            print(
+                json.dumps(
+                    {
+                        "schemaVersion": 1,
+                        "status": "failed",
+                        "plugin": failed,
+                        # Only our own wording travels. A filesystem error carries
+                        # the paths it failed on, and nothing here is worth
+                        # printing a private path into a log the owner may share.
+                        "reason": str(error) if isinstance(error, DoctorError) else "",
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+            )
+        return 2
+    if arguments == ["--json"]:
+        print(json.dumps(receipt, ensure_ascii=False, separators=(",", ":")))
+    else:
+        print(f"plugin-doctor: перевірку пройдено (плагінів: {receipt['pluginCount']})")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

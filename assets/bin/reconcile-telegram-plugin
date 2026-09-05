@@ -1,0 +1,890 @@
+#!/usr/bin/env python3
+"""Safely reconcile the supported Claude Telegram plugin with the kit golden."""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass
+import fcntl
+import grp
+import hashlib
+import json
+import os
+from pathlib import Path
+import pwd
+import re
+import stat
+import sys
+from typing import Literal
+import uuid
+
+
+PLUGIN_ID = "telegram@claude-plugins-official"
+SUPPORTED_VERSION = "0.0.7"
+UPSTREAM_REPOSITORY = "anthropics/claude-plugins-official"
+UPSTREAM_COMMIT = "1e96c6b0a0f06cad576086243f3d06397c4ddf44"
+UPSTREAM_SERVER_SHA256 = (
+    "d902d7195a527b579b889cfdbf251fc24fd224a68e319ac6b7c3b691515c3458"
+)
+UPSTREAM_PACKAGE_START = "bun install --no-summary 1>&2 && bun server.ts"
+GOLDEN_SERVER_SHA256 = (
+    "b3f1d5b1a720d3776774d6a848c7ff69ed20a38c7cb199affe6a58a7080b84d7"
+)
+PREVIOUS_GOLDEN_SERVER_SHA256S = frozenset(
+    {
+        "b0e7b72748db389edd643627360c48a16b9fe7a1c6d2b0b18818ce432f980d43",
+        "12e99e186710b227930f003bba213d177a03161e148a11af9991380331babd0d",
+        "37b74df2e9e878f3c7b646be2b409df3570f3c5236be599af8c591eac04a2004",
+        "a6b66564f9df371e77bf02a2656255bde50262ec44dc36bf51ecc75046b24fe8",
+        "90aba9ed597db10ad0d14369fbd44e203725e1d69e7e17a9dd73af3ae644a67e",
+        "92dd98e522f1c2368163bef40ce464f951410943bee8a4ee2ef2b63f83d51a3a",
+        "2fae052c1773196ad88420bf84a658cf6656ebfc878104a0b625bd25bfd71dab",
+        "15cef9d76e86b1ccefd01a64ba4b2bf3480c28d6c90b38cb60239d8ccdf06333",
+        "520b2356b73f0cd00db8167c80b03e3497ffbca83e7d38074c1a3d6a3ef5aaed",
+        "f05ce36a05c64b662a4d2ee52f4c8044e262b674e1c1383ca27967553b357022",
+        "2abf0b22b93632f6f56e689f6a76444058de903f85d43c5c54af9ef245a42bb0",
+        "15c517abffcb99274d6df560323065101d7efa6eea509a8e9a68f3994bcdc4c7",
+        "a3dd55262fc5af17b51c312403d0289b38da37a2ea5345bc8561de16c5f2b12e",
+        "d107e9b7bb65a50c2330076ab68e48ffeddbb75b40a7398c8da1e0f7430634ca",
+        "dcc2c537fe57d68b554e0f97a454bd77a2cf4c50bcc6633bcccf377307835f72",
+        "ed5c0f060185bfa64a42fa033d453ed99adf69e19b419efe225b5ff876d846c3",
+        "67396aad4fa7d42f4f14d868c00828b7413fcc28a54e2eea180b13bd8dfffd08",
+        # The 10 August golden (kit d82194757310): still live on boxes installed
+        # from that kit, and "unknown origin" there aborted the whole update.
+        "b4485d15e7f9458f65d6a22274eeff8b44defe239b012505aca0881e73a98f01",
+    }
+)
+UPSTREAM_FILE_SHA256 = {
+    ".claude-plugin/plugin.json": "6df50f47d8f57b50cedbf034e2a7a5ec5fe49295cd530ff4d351803490f2f0b0",
+    ".mcp.json": "0ee637b9a76aa35b3b9eb9a76b4b8fb036bc61651711e1af72badedde5e3c875",
+    ".npmrc": "3a951f66e7e0f3e2dd1832473a871357c4a507b51100636b73bcf6ff0dd78b6c",
+    "ACCESS.md": "093616a1e8d23d84ab241c406ab6c183578f6c760d697d01976a6594fc901fc3",
+    "LICENSE": "dfd016a63459229ceb791be757c3bede084fb22303c36b61342db1b8f58cc450",
+    "README.md": "dc0acf9f6d784e711ac3b239506b7b9239f9bec82961aabf3115ad2621f8e085",
+    "bun.lock": "39eac7ce248c09f338abcb6f682137ae4bf0dce19672b1c9be2fb7eb16bfcbe2",
+    "package.json": "5e8b32eab6f4e168524204955a9458158401bc1c369816076b1a8dc9f9727c72",
+    "server.ts": UPSTREAM_SERVER_SHA256,
+    "skills/access/SKILL.md": "6c87f59841c55a4a4f1b732c7427959581e47234f1b8c6fd633e4a5256ce6a3c",
+    "skills/configure/SKILL.md": "16b06bf2ac5ede250d0c620ce4e6cf3878c9704246b8f52390fde5f280a17f73",
+}
+DYNAMIC_ROOTS = {".in_use", "node_modules"}
+RUNTIME_ORPHAN_MARKER = ".orphaned_at"
+MAX_JSON_BYTES = 256 * 1024
+MAX_SERVER_BYTES = 4 * 1024 * 1024
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+EPOCH_MILLISECONDS_RE = re.compile(rb"^[0-9]{13}$")
+
+
+class CompatibilityError(RuntimeError):
+    """A sanitized compatibility-boundary failure."""
+
+
+@dataclass(frozen=True)
+class CompatibilityContract:
+    plugin_id: str
+    supported_version: str
+    upstream_server_sha256: str
+    upstream_package_start: str
+    upstream_files: dict[str, str]
+    golden_server_sha256: str
+
+
+@dataclass(frozen=True)
+class ActiveInstall:
+    root: Path
+    server: Path
+    package: Path
+    manifest: Path
+
+
+@dataclass(frozen=True)
+class ReconcileResult:
+    status: Literal["official", "golden", "patched"]
+    version: str
+    changed: bool
+
+
+def _fail(message: str) -> CompatibilityError:
+    return CompatibilityError(message)
+
+
+def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise _fail("JSON-контракт містить повторюваний ключ")
+        result[key] = value
+    return result
+
+
+def _strict_json(contents: bytes, label: str) -> dict[str, object]:
+    try:
+        value = json.loads(
+            contents.decode("utf-8"),
+            object_pairs_hook=_reject_duplicate_keys,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise _fail(f"{label} має некоректний JSON") from None
+    if not isinstance(value, dict):
+        raise _fail(f"{label} має некоректну структуру")
+    return value
+
+
+def _home_identity(home: Path) -> tuple[Path, int]:
+    if not home.is_absolute():
+        raise _fail("домашній каталог має бути абсолютним шляхом")
+    try:
+        metadata = home.lstat()
+        resolved = home.resolve(strict=True)
+    except OSError:
+        raise _fail("домашній каталог недоступний") from None
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        raise _fail("домашній каталог має бути звичайним каталогом")
+    if resolved != home:
+        raise _fail("домашній каталог не може проходити через посилання")
+    if metadata.st_mode & 0o022:
+        raise _fail("домашній каталог має небезпечні права запису")
+    return resolved, metadata.st_uid
+
+
+def _private_primary_group(uid: int, gid: int) -> bool:
+    try:
+        owner = pwd.getpwuid(uid)
+        group = grp.getgrgid(gid)
+        if owner.pw_gid != gid:
+            return False
+        members = set(group.gr_mem)
+        members.update(entry.pw_name for entry in pwd.getpwall() if entry.pw_gid == gid)
+        return members <= {owner.pw_name}
+    except (KeyError, OSError):
+        return False
+
+
+def _owned_mode_is_safe(metadata: os.stat_result, uid: int) -> bool:
+    if metadata.st_uid != uid or metadata.st_mode & 0o002:
+        return False
+    if metadata.st_mode & 0o020:
+        return _private_primary_group(uid, metadata.st_gid)
+    return True
+
+
+def _require_contained(home: Path, path: Path, label: str) -> Path:
+    if not path.is_absolute():
+        raise _fail(f"{label} має бути абсолютним шляхом")
+    try:
+        if not path.is_relative_to(home):
+            raise _fail(f"{label} виходить за межі домашнього каталогу")
+    except ValueError:
+        raise _fail(f"{label} виходить за межі домашнього каталогу") from None
+    return path
+
+
+def _verify_directory_chain(home: Path, directory: Path, uid: int) -> None:
+    _require_contained(home, directory, "каталог plugin")
+    current = home
+    for component in directory.relative_to(home).parts:
+        current = current / component
+        try:
+            metadata = current.lstat()
+        except OSError:
+            raise _fail("каталог plugin недоступний") from None
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+            raise _fail("шлях plugin містить небезпечне посилання")
+        if not _owned_mode_is_safe(metadata, uid):
+            raise _fail("каталог plugin має небезпечного власника або права")
+
+
+def _read_regular(
+    home: Path,
+    path: Path,
+    uid: int,
+    *,
+    label: str,
+    limit: int,
+) -> bytes:
+    _require_contained(home, path, label)
+    _verify_directory_chain(home, path.parent, uid)
+    try:
+        before = path.lstat()
+    except OSError:
+        raise _fail(f"{label} недоступний") from None
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+        raise _fail(f"{label} має бути звичайним файлом")
+    if not _owned_mode_is_safe(before, uid) or before.st_nlink != 1:
+        raise _fail(f"{label} має небезпечного власника або права")
+    descriptor = -1
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or not _owned_mode_is_safe(opened, uid)
+            or opened.st_nlink != 1
+            or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+        ):
+            raise _fail(f"{label} змінився під час перевірки")
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(descriptor, min(65536, limit + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > limit:
+                raise _fail(f"{label} перевищує дозволений розмір")
+        return b"".join(chunks)
+    except CompatibilityError:
+        raise
+    except OSError:
+        raise _fail(f"{label} недоступний") from None
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _open_directory_chain_fd(home: Path, directory: Path, uid: int) -> int:
+    _require_contained(home, directory, "каталог plugin")
+    descriptor = -1
+    try:
+        descriptor = os.open(home, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISDIR(metadata.st_mode) or not _owned_mode_is_safe(
+            metadata, uid
+        ):
+            raise _fail("домашній каталог змінився під час перевірки")
+        for component in directory.relative_to(home).parts:
+            next_descriptor = os.open(
+                component,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=descriptor,
+            )
+            next_metadata = os.fstat(next_descriptor)
+            if not stat.S_ISDIR(next_metadata.st_mode) or not _owned_mode_is_safe(
+                next_metadata, uid
+            ):
+                os.close(next_descriptor)
+                raise _fail("каталог plugin має небезпечного власника або права")
+            os.close(descriptor)
+            descriptor = next_descriptor
+        return descriptor
+    except CompatibilityError:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise
+    except OSError:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise _fail("каталог plugin змінився під час перевірки") from None
+
+
+def _read_regular_at(
+    directory_fd: int,
+    name: str,
+    uid: int,
+    *,
+    label: str,
+    limit: int,
+) -> bytes:
+    descriptor = -1
+    try:
+        before = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if not stat.S_ISREG(before.st_mode) or not _owned_mode_is_safe(
+            before, uid
+        ) or before.st_nlink != 1:
+            raise _fail(f"{label} має небезпечного власника або права")
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | os.O_NOFOLLOW,
+            dir_fd=directory_fd,
+        )
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or not _owned_mode_is_safe(opened, uid)
+            or opened.st_nlink != 1
+            or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+        ):
+            raise _fail(f"{label} змінився під час перевірки")
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(descriptor, min(65536, limit + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > limit:
+                raise _fail(f"{label} перевищує дозволений розмір")
+        return b"".join(chunks)
+    except CompatibilityError:
+        raise
+    except OSError:
+        raise _fail(f"{label} недоступний") from None
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _read_json_file(
+    home: Path,
+    path: Path,
+    uid: int,
+    *,
+    label: str,
+) -> dict[str, object]:
+    return _strict_json(
+        _read_regular(home, path, uid, label=label, limit=MAX_JSON_BYTES),
+        label,
+    )
+
+
+def _exact_keys(value: dict[str, object], expected: set[str], label: str) -> None:
+    if set(value) != expected:
+        raise _fail(f"{label} має неочікувані поля")
+
+
+def load_contract(path: Path) -> CompatibilityContract:
+    home = path
+    while home.parent != home and home.name != ".claude":
+        home = home.parent
+    if home.name != ".claude":
+        raise _fail("контракт має бути в керованому каталозі product")
+    return _contract_for_home(home.parent, path)
+
+
+def _contract_for_home(home: Path, path: Path) -> CompatibilityContract:
+    resolved_home, uid = _home_identity(home)
+    value = _read_json_file(
+        resolved_home,
+        path,
+        uid,
+        label="контракт сумісності Telegram",
+    )
+    _exact_keys(
+        value,
+        {"schemaVersion", "pluginId", "supportedVersion", "upstream", "golden"},
+        "контракт сумісності Telegram",
+    )
+    upstream = value.get("upstream")
+    golden = value.get("golden")
+    if not isinstance(upstream, dict) or not isinstance(golden, dict):
+        raise _fail("контракт сумісності Telegram має некоректну структуру")
+    _exact_keys(
+        upstream,
+        {"repository", "commit", "serverSha256", "packageStart", "files"},
+        "upstream-контракт Telegram",
+    )
+    _exact_keys(golden, {"serverSha256"}, "golden-контракт Telegram")
+    if (
+        value.get("schemaVersion") != 2
+        or value.get("pluginId") != PLUGIN_ID
+        or value.get("supportedVersion") != SUPPORTED_VERSION
+        or upstream.get("repository") != UPSTREAM_REPOSITORY
+        or upstream.get("commit") != UPSTREAM_COMMIT
+        or upstream.get("serverSha256") != UPSTREAM_SERVER_SHA256
+        or upstream.get("packageStart") != UPSTREAM_PACKAGE_START
+        or upstream.get("files") != UPSTREAM_FILE_SHA256
+        or golden.get("serverSha256") != GOLDEN_SERVER_SHA256
+    ):
+        raise _fail("контракт Telegram не відповідає підтримуваній версії")
+    upstream_sha = upstream.get("serverSha256")
+    golden_sha = golden.get("serverSha256")
+    if (
+        not isinstance(upstream_sha, str)
+        or not SHA256_RE.fullmatch(upstream_sha)
+        or not isinstance(golden_sha, str)
+        or not SHA256_RE.fullmatch(golden_sha)
+    ):
+        raise _fail("контракт Telegram містить некоректний SHA-256")
+    return CompatibilityContract(
+        plugin_id=PLUGIN_ID,
+        supported_version=SUPPORTED_VERSION,
+        upstream_server_sha256=upstream_sha,
+        upstream_package_start=UPSTREAM_PACKAGE_START,
+        upstream_files=dict(UPSTREAM_FILE_SHA256),
+        golden_server_sha256=golden_sha,
+    )
+
+
+def _validate_source_tree(
+    home: Path,
+    uid: int,
+    root: Path,
+    contract: CompatibilityContract,
+    *,
+    source_only: bool,
+) -> Literal["official", "previous-golden", "golden"]:
+    expected_files = set(contract.upstream_files)
+    expected_directories = {
+        parent.as_posix()
+        for relative in expected_files
+        for parent in Path(relative).parents
+        if parent.as_posix() != "."
+    }
+    actual_files: set[str] = set()
+    actual_directories: set[str] = set()
+    for dynamic_root in DYNAMIC_ROOTS:
+        dynamic_path = root / dynamic_root
+        try:
+            metadata = dynamic_path.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError:
+            raise _fail(
+                "динамічний каталог Telegram plugin недоступний"
+            ) from None
+        if not stat.S_ISDIR(metadata.st_mode) or not _owned_mode_is_safe(
+            metadata, uid
+        ):
+            raise _fail(
+                "динамічний каталог Telegram plugin має небезпечний тип або права"
+            )
+    for path in root.rglob("*"):
+        relative = path.relative_to(root).as_posix()
+        if relative.split("/", 1)[0] in DYNAMIC_ROOTS:
+            continue
+        if relative == RUNTIME_ORPHAN_MARKER and not source_only:
+            marker = _read_regular(
+                home,
+                path,
+                uid,
+                label="службова мітка Telegram plugin",
+                limit=13,
+            )
+            if EPOCH_MILLISECONDS_RE.fullmatch(marker) is None:
+                raise _fail("службова мітка Telegram plugin має некоректний формат")
+            continue
+        try:
+            metadata = path.lstat()
+        except OSError:
+            raise _fail("дерево Telegram plugin змінилося під час перевірки") from None
+        if stat.S_ISDIR(metadata.st_mode):
+            actual_directories.add(relative)
+        elif stat.S_ISREG(metadata.st_mode):
+            actual_files.add(relative)
+        else:
+            raise _fail("дерево Telegram plugin містить неочікуваний тип шляху")
+    if actual_files != expected_files or actual_directories != expected_directories:
+        raise _fail("дерево Telegram plugin не відповідає official 0.0.7")
+
+    server_status: Literal["official", "previous-golden", "golden"] = "official"
+    for relative, expected_digest in contract.upstream_files.items():
+        contents = _read_regular(
+            home,
+            root / relative,
+            uid,
+            label=f"{relative} Telegram plugin",
+            limit=MAX_SERVER_BYTES,
+        )
+        digest = hashlib.sha256(contents).hexdigest()
+        if relative == "server.ts" and not source_only:
+            if digest == contract.golden_server_sha256:
+                server_status = "golden"
+                continue
+            if digest in PREVIOUS_GOLDEN_SERVER_SHA256S:
+                server_status = "previous-golden"
+                continue
+        if digest != expected_digest:
+            raise _fail(f"{relative} Telegram plugin має невідоме походження")
+    return server_status
+
+
+def _validate_plugin_files(
+    home: Path,
+    uid: int,
+    root: Path,
+    contract: CompatibilityContract,
+    *,
+    source_only: bool,
+) -> tuple[ActiveInstall, Literal["official", "previous-golden", "golden"]]:
+    _require_contained(home, root, "корінь Telegram plugin")
+    _verify_directory_chain(home, root, uid)
+    install = ActiveInstall(
+        root=root,
+        server=root / "server.ts",
+        package=root / "package.json",
+        manifest=root / ".claude-plugin/plugin.json",
+    )
+    status = _validate_source_tree(
+        home,
+        uid,
+        root,
+        contract,
+        source_only=source_only,
+    )
+    manifest = _read_json_file(
+        home,
+        install.manifest,
+        uid,
+        label="manifest Telegram plugin",
+    )
+    package = _read_json_file(
+        home,
+        install.package,
+        uid,
+        label="package Telegram plugin",
+    )
+    if manifest.get("name") != "telegram" or manifest.get("version") != SUPPORTED_VERSION:
+        raise _fail("установлена версія Telegram plugin не підтримується")
+    scripts = package.get("scripts")
+    if (
+        not isinstance(scripts, dict)
+        or scripts.get("start") != contract.upstream_package_start
+    ):
+        raise _fail("команда запуску Telegram plugin не відповідає 0.0.7")
+    return install, status
+
+
+def resolve_active_install(
+    home: Path,
+    contract: CompatibilityContract,
+) -> ActiveInstall:
+    resolved_home, uid = _home_identity(home)
+    ledger_path = resolved_home / ".claude/plugins/installed_plugins.json"
+    ledger = _read_json_file(
+        resolved_home,
+        ledger_path,
+        uid,
+        label="ledger установлених plugin",
+    )
+    plugins = ledger.get("plugins")
+    records = plugins.get(PLUGIN_ID) if isinstance(plugins, dict) else None
+    if ledger.get("version") != 2 or not isinstance(records, list) or len(records) != 1:
+        raise _fail("ledger Telegram plugin має некоректну структуру")
+    record = records[0]
+    if not isinstance(record, dict):
+        raise _fail("ledger Telegram plugin має некоректний запис")
+    if record.get("scope") != "user" or record.get("version") != SUPPORTED_VERSION:
+        raise _fail("активний Telegram plugin не має підтримуваної user-версії")
+    raw_install = record.get("installPath")
+    if not isinstance(raw_install, str) or not raw_install:
+        raise _fail("ledger Telegram plugin не містить installPath")
+    install_root = Path(raw_install)
+    expected_parent = (
+        resolved_home
+        / ".claude/plugins/cache/claude-plugins-official/telegram"
+    )
+    if install_root.parent != expected_parent or install_root.name != SUPPORTED_VERSION:
+        raise _fail("installPath Telegram plugin не відповідає активному cache")
+    install, _status = _validate_plugin_files(
+        resolved_home,
+        uid,
+        install_root,
+        contract,
+        source_only=False,
+    )
+    return install
+
+
+def validate_marketplace_source(
+    root: Path,
+    contract: CompatibilityContract,
+) -> ReconcileResult:
+    home = root
+    while home.parent != home and home.name != ".claude":
+        home = home.parent
+    if home.name != ".claude":
+        raise _fail("marketplace Telegram має бути в домашньому каталозі")
+    resolved_home, uid = _home_identity(home.parent)
+    _install, status = _validate_plugin_files(
+        resolved_home,
+        uid,
+        root,
+        contract,
+        source_only=True,
+    )
+    return ReconcileResult(status=status, version=SUPPORTED_VERSION, changed=False)
+
+
+def _lock(home: Path, uid: int) -> int:
+    lock_path = home / ".claude/product/telegram-plugin-reconcile.lock"
+    _verify_directory_chain(home, lock_path.parent, uid)
+    try:
+        descriptor = os.open(
+            lock_path,
+            os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW,
+            0o600,
+        )
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != uid
+            or metadata.st_nlink != 1
+            or metadata.st_mode & 0o077
+        ):
+            os.close(descriptor)
+            raise _fail("lock Telegram plugin має небезпечні права")
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        return descriptor
+    except CompatibilityError:
+        raise
+    except OSError:
+        raise _fail("не вдалося заблокувати reconciler Telegram") from None
+
+
+def _atomic_replace_server(
+    home: Path,
+    uid: int,
+    install: ActiveInstall,
+    golden_bytes: bytes,
+    expected_source_sha: str | frozenset[str],
+    expected_golden_sha: str,
+) -> None:
+    directory_fd = -1
+    temporary_name = f".server.ts.reconcile-{os.getpid()}-{uuid.uuid4().hex}"
+    temporary_fd = -1
+    try:
+        directory_fd = _open_directory_chain_fd(home, install.root, uid)
+        before = _read_regular_at(
+            directory_fd,
+            "server.ts",
+            uid,
+            label="server.ts Telegram plugin",
+            limit=MAX_SERVER_BYTES,
+        )
+        expected_source_shas = (
+            frozenset({expected_source_sha})
+            if isinstance(expected_source_sha, str)
+            else expected_source_sha
+        )
+        if hashlib.sha256(before).hexdigest() not in expected_source_shas:
+            raise _fail("server.ts Telegram plugin змінився перед записом")
+        temporary_fd = os.open(
+            temporary_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o644,
+            dir_fd=directory_fd,
+        )
+        os.fchmod(temporary_fd, 0o644)
+        view = memoryview(golden_bytes)
+        while view:
+            written = os.write(temporary_fd, view)
+            view = view[written:]
+        os.fsync(temporary_fd)
+        os.close(temporary_fd)
+        temporary_fd = -1
+        latest = _read_regular_at(
+            directory_fd,
+            "server.ts",
+            uid,
+            label="server.ts Telegram plugin",
+            limit=MAX_SERVER_BYTES,
+        )
+        if hashlib.sha256(latest).hexdigest() not in expected_source_shas:
+            raise _fail("server.ts Telegram plugin змінився перед записом")
+        os.replace(
+            temporary_name,
+            "server.ts",
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        os.fsync(directory_fd)
+        written_bytes = _read_regular_at(
+            directory_fd,
+            "server.ts",
+            uid,
+            label="server.ts Telegram plugin",
+            limit=MAX_SERVER_BYTES,
+        )
+        if hashlib.sha256(written_bytes).hexdigest() != expected_golden_sha:
+            raise _fail("записаний golden Telegram не пройшов SHA-256 перевірку")
+    except CompatibilityError:
+        raise
+    except OSError:
+        raise _fail("не вдалося атомарно записати golden Telegram") from None
+    finally:
+        if temporary_fd >= 0:
+            os.close(temporary_fd)
+        if directory_fd >= 0:
+            try:
+                os.unlink(temporary_name, dir_fd=directory_fd)
+            except FileNotFoundError:
+                pass
+            os.close(directory_fd)
+
+
+def _inspect_active(
+    home: Path,
+    golden: Path,
+    contract_path: Path,
+) -> tuple[
+    CompatibilityContract,
+    ActiveInstall,
+    Literal["official", "previous-golden", "golden"],
+    bytes,
+    int,
+]:
+    resolved_home, uid = _home_identity(home)
+    contract = _contract_for_home(resolved_home, contract_path)
+    golden_bytes = _read_regular(
+        resolved_home,
+        golden,
+        uid,
+        label="golden Telegram server.ts",
+        limit=MAX_SERVER_BYTES,
+    )
+    if hashlib.sha256(golden_bytes).hexdigest() != contract.golden_server_sha256:
+        raise _fail("golden Telegram не відповідає контракту SHA-256")
+    install = resolve_active_install(resolved_home, contract)
+    _same_install, status = _validate_plugin_files(
+        resolved_home,
+        uid,
+        install.root,
+        contract,
+        source_only=False,
+    )
+    return contract, install, status, golden_bytes, uid
+
+
+def _reconcile_detailed(
+    home: Path,
+    golden: Path,
+    contract_path: Path,
+    *,
+    apply: bool,
+) -> tuple[ReconcileResult, ActiveInstall]:
+    resolved_home, _uid = _home_identity(home)
+    contract, install, status, _golden_bytes, uid = _inspect_active(
+        resolved_home,
+        golden,
+        contract_path,
+    )
+    if not apply:
+        public_status = "golden" if status == "golden" else "official"
+        return (
+            ReconcileResult(
+                status=public_status,
+                version=SUPPORTED_VERSION,
+                changed=False,
+            ),
+            install,
+        )
+    if status == "golden":
+        return (
+            ReconcileResult(status=status, version=SUPPORTED_VERSION, changed=False),
+            install,
+        )
+    lock_fd = _lock(resolved_home, uid)
+    try:
+        contract, install, status, golden_bytes, _uid = _inspect_active(
+            resolved_home,
+            golden,
+            contract_path,
+        )
+        if status == "golden":
+            return (
+                ReconcileResult(
+                    status="golden",
+                    version=SUPPORTED_VERSION,
+                    changed=False,
+                ),
+                install,
+            )
+        expected_source_sha = (
+            contract.upstream_server_sha256
+            if status == "official"
+            else PREVIOUS_GOLDEN_SERVER_SHA256S
+        )
+        _atomic_replace_server(
+            resolved_home,
+            uid,
+            install,
+            golden_bytes,
+            expected_source_sha,
+            contract.golden_server_sha256,
+        )
+        return (
+            ReconcileResult(
+                status="patched",
+                version=SUPPORTED_VERSION,
+                changed=True,
+            ),
+            install,
+        )
+    finally:
+        os.close(lock_fd)
+
+
+def reconcile(
+    home: Path,
+    golden: Path,
+    contract_path: Path,
+    *,
+    apply: bool,
+) -> ReconcileResult:
+    result, _install = _reconcile_detailed(
+        home,
+        golden,
+        contract_path,
+        apply=apply,
+    )
+    return result
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Перевіряє сумісність Telegram plugin 0.0.7 і golden patch.",
+    )
+    parser.add_argument("--home", type=Path, default=Path.home())
+    parser.add_argument("--contract", type=Path)
+    parser.add_argument("--golden", type=Path)
+    parser.add_argument("--apply", action="store_true")
+    parser.add_argument("--json", action="store_true")
+    parser.add_argument("--marketplace-source-check", action="store_true")
+    return parser
+
+
+def main(arguments: list[str] | None = None) -> int:
+    options = _parser().parse_args(arguments)
+    home = options.home.absolute()
+    contract_path = options.contract or (
+        home / ".claude/product/telegram-plugin-compat.json"
+    )
+    golden = options.golden or (home / "telegram-server-fixed.ts")
+    try:
+        if options.marketplace_source_check:
+            if options.apply:
+                raise _fail("marketplace source check не виконує запис")
+            contract = _contract_for_home(home, contract_path)
+            marketplace_root = (
+                home
+                / ".claude/plugins/marketplaces/claude-plugins-official/"
+                "external_plugins/telegram"
+            )
+            result = validate_marketplace_source(marketplace_root, contract)
+            install = ActiveInstall(
+                root=marketplace_root,
+                server=marketplace_root / "server.ts",
+                package=marketplace_root / "package.json",
+                manifest=marketplace_root / ".claude-plugin/plugin.json",
+            )
+        else:
+            result, install = _reconcile_detailed(
+                home,
+                golden,
+                contract_path,
+                apply=options.apply,
+            )
+        relative_server = install.server.relative_to(home).as_posix()
+        receipt = {
+            "schemaVersion": 1,
+            "status": result.status,
+            "version": result.version,
+            "changed": result.changed,
+            "serverRelativePath": relative_server,
+        }
+        if options.json:
+            print(json.dumps(receipt, ensure_ascii=False, separators=(",", ":")))
+        elif result.changed:
+            print("✅ Telegram plugin 0.0.7 узгоджено з перевіреним golden patch")
+        else:
+            print("✅ Telegram plugin 0.0.7 пройшов перевірку сумісності")
+        return 0
+    except CompatibilityError as error:
+        print(f"reconcile-telegram-plugin: {error}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

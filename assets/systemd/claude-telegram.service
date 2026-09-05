@@ -7,6 +7,7 @@ Wants=network-online.target
 Type=simple
 User=claude
 Group=claude
+UMask=0077
 WorkingDirectory=/home/claude
 Environment=HOME=/home/claude
 Environment=USER=claude
@@ -17,6 +18,8 @@ Environment=PATH=/home/claude/.local/bin:/home/claude/.bun/bin:/home/claude/bin:
 # screen -Dm: detach+stay foreground, -S name
 ExecStart=/usr/bin/screen -L -Logfile /home/claude/logs/claude-screen.log -Dm -S claude-bot /home/claude/bin/claude-telegram-bot
 ExecStop=-/usr/bin/screen -S claude-bot -X quit
+# GNU screen exits with 1 after a requested quit; for this unit that is a clean stop.
+SuccessExitStatus=0 1
 
 StandardInput=null
 StandardOutput=journal

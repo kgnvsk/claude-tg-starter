@@ -1,29 +1,51 @@
-#!/bin/bash
-# Auto-commit+push vault changes. Idempotent, silent on no-change.
-set -e
+#!/usr/bin/env bash
+# Serialize vault commits and surface offsite sync failures.
+set -euo pipefail
 
-VAULT=~/obsidian-vault
+VAULT="$HOME/obsidian-vault"
+LOCK_DIR="$HOME/.claude/memory"
+LOG_DIR="$HOME/logs"
+LOCK_FILE="$LOCK_DIR/vault-sync.lock"
+LOG_FILE="$LOG_DIR/vault-sync.log"
+
 [ -d "$VAULT/.git" ] || exit 0
+install -d -m 700 "$LOCK_DIR" "$LOG_DIR"
+touch "$LOG_FILE"
+chmod 600 "$LOG_FILE"
+
+exec 9>"$LOCK_FILE"
+flock -n 9 || exit 0
+exec >>"$LOG_FILE" 2>&1
 
 cd "$VAULT"
+git add -A -- . ':(exclude)learning'
+committed=0
+if ! git diff --cached --quiet; then
+  git commit -m "auto: vault update $(date -u +%Y-%m-%dT%H:%M:%SZ)" --quiet
+  committed=1
+fi
 
-# Skip if nothing changed
-if git diff --quiet && git diff --staged --quiet && [ -z "$(git status --porcelain)" ]; then
+# Shared team vault: with a remote configured the vault can have several
+# writers (multi-instance boxes) — pull teammates' notes first (rebase keeps
+# our commit on top), then push our own. Without a remote nothing changes.
+if git remote get-url origin >/dev/null 2>&1; then
+  before="$(git rev-parse HEAD)"
+  branch="$(git rev-parse --abbrev-ref HEAD)"
+  if ! git pull --rebase --quiet origin "$branch"; then
+    git rebase --abort >/dev/null 2>&1 || true
+    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) ERROR: vault pull --rebase failed (conflict?); local commit kept, will retry"
+    exit 1
+  fi
+  # Always push after the rebase, even when this tick created no commit. A
+  # previous tick may have committed locally and then lost connectivity; gating
+  # on `committed` would strand that commit forever until another file changed.
+  if ! git push --quiet origin HEAD; then
+    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) ERROR: local vault commits were not pushed"
+    exit 1
+  fi
+  [ "$committed" = 1 ] || [ "$before" != "$(git rev-parse HEAD)" ] || exit 0
+elif [ "$committed" = 0 ]; then
   exit 0
 fi
 
-# Load token
-[ -f ~/.claude/channels/telegram/.env ] && export $(grep -v '^#' ~/.claude/channels/telegram/.env | xargs)
-
-# Get summary of what changed (first file name)
-CHANGED=$(git status --porcelain | head -3 | awk '{print $2}' | xargs basename -a 2>/dev/null | paste -sd ", ")
-[ -z "$CHANGED" ] && CHANGED="vault update"
-
-# Commit + push (async, won't block Claude)
-{
-  git add -A
-  git commit -m "auto: $CHANGED" --quiet
-  git push --quiet 2>&1 | head -3 > /tmp/vault-sync.log
-} >> ~/logs/vault-sync.log 2>&1
-
-exit 0
+echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) vault sync complete"

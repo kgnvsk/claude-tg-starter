@@ -22,7 +22,8 @@ B) LIST-LIKE WITHOUT MARKDOWNV2:
 
 Короткие реплики ("ок", "погнали", статусы "🔄 ...") НЕ триггерят.
 
-Bypass: touch ~/.claude/state/tg-format-enforcer.bypass
+Одноразовий bypass (не довше 5 хв):
+touch ~/.claude/state/tg-format-enforcer.bypass
 """
 import json
 import os
@@ -30,8 +31,10 @@ import re
 import sys
 import time
 
-LOG_FILE = os.path.expanduser("~/.claude/state/tg-format-enforcer.log")
-BYPASS_FILE = os.path.expanduser("~/.claude/state/tg-format-enforcer.bypass")
+AGENT_ROOT = os.environ.get("AGENT_ROOT") or os.path.expanduser("~")
+LOG_FILE = os.path.join(AGENT_ROOT, ".claude/state/tg-format-enforcer.log")
+BYPASS_FILE = os.path.join(AGENT_ROOT, ".claude/state/tg-format-enforcer.bypass")
+BYPASS_MAX_AGE_SECONDS = 300
 
 
 def log(msg: str) -> None:
@@ -44,8 +47,32 @@ def log(msg: str) -> None:
 
 
 def is_bypassed() -> bool:
-    """Тумблер для выключения hook вручную: touch ~/.claude/state/tg-format-enforcer.bypass"""
-    return os.path.exists(BYPASS_FILE)
+    """Споживає один свіжий bypass-файл; строк дії — не довше 5 хв."""
+    try:
+        metadata = os.stat(BYPASS_FILE)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        log("bypass ignored: stat failed")
+        return False
+
+    age = time.time() - metadata.st_mtime
+    try:
+        os.unlink(BYPASS_FILE)
+    except FileNotFoundError:
+        log("bypass ignored: consume race")
+        return False
+    except OSError:
+        log("bypass ignored: consume failed")
+        return False
+
+    if age < 0:
+        log("bypass ignored: future timestamp")
+        return False
+    if age > BYPASS_MAX_AGE_SECONDS:
+        log("bypass ignored: stale")
+        return False
+    return True
 
 
 def count_bullets(text: str) -> int:
@@ -80,7 +107,7 @@ def has_double_escape(text: str) -> tuple[bool, str]:
     pattern = r"\\[\-\.\(\)\+\=\!\|\{\}\#\>\~]"
     hits = re.findall(pattern, text)
     if len(hits) >= 3:
-        return True, f"{len(hits)} ручных escape-последовательностей (\\. \\- \\( ...)"
+        return True, f"{len(hits)} ручних escape-послідовностей (\\. \\- \\( ...)"
     return False, ""
 
 
@@ -97,23 +124,23 @@ def is_list_like(text: str) -> tuple[bool, str]:
 
     # Чек 1: явный список буллетами
     if b >= 4:
-        return True, f"{b} буллетов — list-like"
+        return True, f"{b} маркерів списку — list-like"
 
     # Чек 2: нумерация
     if n >= 3:
-        return True, f"{n} нумерованных пунктов"
+        return True, f"{n} нумерованих пунктів"
 
     # Чек 3: множественные bold-заголовки = структурное сообщение
     if bold >= 2:
-        return True, f"{bold} bold-секций — структурное сообщение"
+        return True, f"{bold} bold-секцій — структуроване повідомлення"
 
     # Чек 4: много ссылок + много строк = отчёт/research
     if links >= 3 and lines >= 5:
-        return True, f"{links} ссылок + {lines} строк — отчёт"
+        return True, f"{links} посилань + {lines} рядків — звіт"
 
     # Чек 5: длинное сообщение со структурой
     if len(text) > 400 and (b + n + bold) >= 2:
-        return True, f"{len(text)} символов + {b+n+bold} признаков структуры"
+        return True, f"{len(text)} символів + {b+n+bold} ознак структури"
 
     return False, "ok"
 
@@ -141,25 +168,26 @@ def main() -> None:
     if de_block:
         log(f"BLOCK double-escape: {de_reason} len={len(text)} fmt={fmt}")
         msg = (
-            f"❌ FORMAT ENFORCER (double-escape guard): reply заблокирован.\n"
+            f"❌ FORMAT ENFORCER (double-escape guard): reply заблоковано.\n"
             f"\n"
-            f"Найдено: {de_reason}.\n"
+            f"Знайдено: {de_reason}.\n"
             f"\n"
-            f"С 2026-06-23 reply-tool САМ всегда прогоняет text через "
-            f"~/bin/tg-escape. Если ты ручно заэкранировал `.`, `-`, `(`, `+` "
-            f"и т.п. — tool сделает escape ВТОРОЙ раз, парсер MarkdownV2 "
-            f"упадёт, и сообщение улетит plain-текстом с литеральными `*`.\n"
+            f"Із 2026-06-23 reply-tool ЗАВЖДИ сам пропускає text через "
+            f"~/bin/tg-escape. Якщо ти вручну екранував `.`, `-`, `(`, `+` "
+            f"тощо — tool зробить escape ВДРУГЕ, парсер MarkdownV2 "
+            f"впаде, а повідомлення піде plain-текстом із буквальними `*`.\n"
             f"\n"
-            f"ЧТО ДЕЛАТЬ:\n"
-            f"1. Убери ВСЕ обратные слэши перед `.`, `-`, `(`, `)`, `+`, `=`, "
-            f"`!`, `|`, `{{`, `}}`, `#`, `>`, `~` в твоём text.\n"
-            f"2. Оставь только *bold*, _italic_, `code`, [label](url) — "
-            f"остальное голым текстом.\n"
-            f"3. Передай в reply с format='markdownv2' (или без format — "
-            f"это дефолт). Tool сам всё корректно заэкранирует ОДИН раз.\n"
+            f"ЩО РОБИТИ:\n"
+            f"1. Прибери ВСІ зворотні слеші перед `.`, `-`, `(`, `)`, `+`, `=`, "
+            f"`!`, `|`, `{{`, `}}`, `#`, `>`, `~` у своєму text.\n"
+            f"2. Залиш тільки *bold*, _italic_, `code`, [label](url) — "
+            f"решту передавай звичайним текстом.\n"
+            f"3. Передай у reply з format='markdownv2' (або без format — "
+            f"це значення за замовчуванням). Tool сам коректно виконає екранування ОДИН раз.\n"
             f"\n"
-            f"Правило в ~/CLAUDE.md секция 'КОРНЕВОЕ РЕШЕНИЕ' (updated 2026-06-23).\n"
-            f"Bypass: touch ~/.claude/state/tg-format-enforcer.bypass"
+            f"Правило в ~/CLAUDE.md, розділ 'КОРЕНЕВЕ РІШЕННЯ' (updated 2026-06-23).\n"
+            f"Одноразовий bypass (діє не довше 5 хв): "
+            f"touch ~/.claude/state/tg-format-enforcer.bypass"
         )
         print(json.dumps({"decision": "block", "reason": msg}))
         sys.exit(0)
@@ -178,20 +206,21 @@ def main() -> None:
     log(f"BLOCK list-like: {reason} len={len(text)} fmt={fmt}")
 
     msg = (
-        f"❌ FORMAT ENFORCER: reply заблокирован — {reason}, но format='{fmt}'.\n"
+        f"❌ FORMAT ENFORCER: reply заблоковано — {reason}, але format='{fmt}'.\n"
         f"\n"
-        f"Это list-like сообщение, оно ОБЯЗАНО идти как markdownv2 "
-        f"с жирными заголовками и буллетами. Plain-полотно запрещено "
-        f"(правило CLAUDE.md + обсуждение 2026-06-23).\n"
+        f"Це list-like повідомлення МАЄ надсилатися як markdownv2 "
+        f"із жирними заголовками та маркерами списку. Plain-полотно заборонено "
+        f"(правило CLAUDE.md + обговорення 2026-06-23).\n"
         f"\n"
-        f"ЧТО ДЕЛАТЬ:\n"
-        f"1. Перепиши текст с *bold* заголовками и буллетами `-` или `•`.\n"
-        f"2. БЕЗ ручного экранирования (никаких \\. \\- \\( и т.п.).\n"
-        f"3. Передай в reply с format='markdownv2'. Tool сам всё заэкранирует.\n"
+        f"ЩО РОБИТИ:\n"
+        f"1. Перепиши текст із *bold* заголовками та маркерами `-` або `•`.\n"
+        f"2. БЕЗ ручного екранування (жодних \\. \\- \\( тощо).\n"
+        f"3. Передай у reply з format='markdownv2'. Tool сам усе екранує.\n"
         f"\n"
-        f"Если хук ошибся (это реально не list-like) — touch "
-        f"~/.claude/state/tg-format-enforcer.bypass и повтори, потом убери "
-        f"bypass-файл."
+        f"Якщо hook помилився (це справді не list-like), створи одноразовий "
+        f"bypass (діє не довше 5 хв): touch "
+        f"~/.claude/state/tg-format-enforcer.bypass і повтори один раз. "
+        f"Файл буде спожито автоматично."
     )
 
     print(json.dumps({"decision": "block", "reason": msg}))

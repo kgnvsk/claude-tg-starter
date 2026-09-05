@@ -1,0 +1,27 @@
+{
+  "schemaVersion": 2,
+  "pluginId": "telegram@claude-plugins-official",
+  "supportedVersion": "0.0.7",
+  "upstream": {
+    "repository": "anthropics/claude-plugins-official",
+    "commit": "1e96c6b0a0f06cad576086243f3d06397c4ddf44",
+    "serverSha256": "d902d7195a527b579b889cfdbf251fc24fd224a68e319ac6b7c3b691515c3458",
+    "packageStart": "bun install --no-summary 1>&2 && bun server.ts",
+    "files": {
+      ".claude-plugin/plugin.json": "6df50f47d8f57b50cedbf034e2a7a5ec5fe49295cd530ff4d351803490f2f0b0",
+      ".mcp.json": "0ee637b9a76aa35b3b9eb9a76b4b8fb036bc61651711e1af72badedde5e3c875",
+      ".npmrc": "3a951f66e7e0f3e2dd1832473a871357c4a507b51100636b73bcf6ff0dd78b6c",
+      "ACCESS.md": "093616a1e8d23d84ab241c406ab6c183578f6c760d697d01976a6594fc901fc3",
+      "LICENSE": "dfd016a63459229ceb791be757c3bede084fb22303c36b61342db1b8f58cc450",
+      "README.md": "dc0acf9f6d784e711ac3b239506b7b9239f9bec82961aabf3115ad2621f8e085",
+      "bun.lock": "39eac7ce248c09f338abcb6f682137ae4bf0dce19672b1c9be2fb7eb16bfcbe2",
+      "package.json": "5e8b32eab6f4e168524204955a9458158401bc1c369816076b1a8dc9f9727c72",
+      "server.ts": "d902d7195a527b579b889cfdbf251fc24fd224a68e319ac6b7c3b691515c3458",
+      "skills/access/SKILL.md": "6c87f59841c55a4a4f1b732c7427959581e47234f1b8c6fd633e4a5256ce6a3c",
+      "skills/configure/SKILL.md": "16b06bf2ac5ede250d0c620ce4e6cf3878c9704246b8f52390fde5f280a17f73"
+    }
+  },
+  "golden": {
+    "serverSha256": "b3f1d5b1a720d3776774d6a848c7ff69ed20a38c7cb199affe6a58a7080b84d7"
+  }
+}

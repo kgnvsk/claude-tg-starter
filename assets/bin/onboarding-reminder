@@ -1,0 +1,182 @@
+#!/usr/bin/env python3
+"""Send one bounded weekly reminder for a deferred private memory backup.
+
+`--off` stops the reminders for good, `--on` brings them back. Without a way to
+decline, a nudge about a feature the owner has deliberately skipped repeats every
+week forever, and an alert nobody can silence stops being read at all.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import tempfile
+import time
+from urllib import parse, request
+
+HOME = Path.home()
+STATE = HOME / ".claude/onboarding-state.json"
+ACCESS = HOME / ".claude/channels/telegram/access.json"
+ENV_FILE = HOME / ".claude/channels/telegram/.env"
+PROFILE = HOME / ".agent-profile.env"
+INTERVAL = 7 * 24 * 60 * 60
+FIRST_INTERVAL = 24 * 60 * 60
+BACKUP_STATUS_TIMEOUT = 20
+BACKUP_REMINDER_TEXT = "🔐 Нагадування: автоматичне резервне копіювання ще не підключено. Якщо із сервером щось станеться, памʼять, навички й налаштування агента не відновляться автоматично. Напиши «Налаштувати резервну копію» — я допоможу створити приватний GitHub-репозиторій і підключити його. Більше не нагадувати — напиши: не нагадуй про налаштування."
+
+
+def profile_value(name: str) -> str:
+    if not PROFILE.exists():
+        return ""
+    prefix = name + "="
+    for line in PROFILE.read_text(encoding="utf-8").splitlines():
+        if line.startswith(prefix):
+            return line[len(prefix):].strip().strip("'\"")
+    return ""
+
+
+def backup_status() -> str:
+    helper = HOME / "bin/agent-github-backup"
+    if not helper.is_file() or helper.is_symlink():
+        return "unavailable"
+    try:
+        result = subprocess.run(
+            [str(helper), "status", "--json"],
+            cwd=HOME,
+            check=False,
+            text=True,
+            capture_output=True,
+            timeout=BACKUP_STATUS_TIMEOUT,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return "unavailable"
+    if result.returncode != 0 or len(result.stdout.encode("utf-8")) > 4096:
+        return "unavailable"
+    try:
+        payload = json.loads(result.stdout)
+    except (json.JSONDecodeError, RecursionError):
+        return "unavailable"
+    if (
+        isinstance(payload, dict)
+        and set(payload) == {"status", "revision", "containsSecrets"}
+        and payload.get("status") == "configured"
+        and isinstance(payload.get("revision"), str)
+        and re.fullmatch(r"[0-9a-f]{40}", payload["revision"]) is not None
+        and payload.get("containsSecrets") is False
+    ):
+        return "configured"
+    return "unavailable"
+
+
+def save_state(state: dict) -> None:
+    STATE.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix="onboarding-state-",
+        dir=STATE.parent,
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(state, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary_name, 0o600)
+        os.replace(temporary_name, STATE)
+    finally:
+        if os.path.exists(temporary_name):
+            os.unlink(temporary_name)
+
+
+def set_enabled(enabled: bool) -> None:
+    state = json.loads(STATE.read_text(encoding="utf-8")) if STATE.exists() else {}
+    state["optionalRemindersDisabled"] = not enabled
+    save_state(state)
+    print("нагадування про необов’язкові налаштування " + ("увімкнено" if enabled else "вимкнено"))
+
+
+if "--off" in sys.argv or "--on" in sys.argv:
+    set_enabled("--on" in sys.argv)
+    raise SystemExit(0)
+
+
+def env_value(name: str) -> str:
+    if not ENV_FILE.exists():
+        return ""
+    prefix = name + "="
+    for line in ENV_FILE.read_text(encoding="utf-8").splitlines():
+        if line.startswith(prefix):
+            return line[len(prefix):].strip().strip("'\"")
+    return ""
+
+
+if not (STATE.exists() and ACCESS.exists()):
+    raise SystemExit(0)
+
+state = json.loads(STATE.read_text(encoding="utf-8"))
+if state.get("optionalRemindersDisabled"):
+    raise SystemExit(0)
+access = json.loads(ACCESS.read_text(encoding="utf-8"))
+# The owner alone, not every admin: the private backup is their decision.
+owner = profile_value("OWNER_CHAT_ID")
+admins = [owner] if owner else [str(value) for value in access.get("admins", [])][:1]
+token = env_value("TELEGRAM_BOT_TOKEN")
+if not admins or not admins[0] or not token:
+    raise SystemExit(0)
+
+now = int(time.time())
+features = state.get("optionalFeatures", {})
+memory_backup = features.get("memory_backup")
+if (
+    isinstance(memory_backup, dict)
+    and memory_backup.get("status") == "deferred"
+    and backup_status() == "configured"
+):
+    memory_backup["status"] = "configured"
+    save_state(state)
+installed_at = int(state.get("installedAt") or 0)
+due = []
+for name, feature in features.items():
+    # Skipped connectors are not a recurring sales pitch. Only the separate
+    # private-backup safety reminder remains proactive.
+    if name != "memory_backup" or feature.get("status") != "deferred":
+        continue
+    last = int(feature.get("lastReminderAt") or 0)
+    # First nudge a day after install (never on install day), then weekly.
+    if last:
+        wait = INTERVAL
+    else:
+        last, wait = installed_at, FIRST_INTERVAL
+    if now - last >= wait:
+        due.append(name)
+
+if not due:
+    raise SystemExit(0)
+
+messages = [(BACKUP_REMINDER_TEXT, ["memory_backup"])]
+
+state_changed = False
+for text, names in messages:
+    sent = False
+    for chat_id in admins:
+        body = parse.urlencode({"chat_id": chat_id, "text": text}).encode()
+        req = request.Request(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            data=body,
+            method="POST",
+        )
+        try:
+            with request.urlopen(req, timeout=10) as response:
+                sent = sent or response.status == 200
+        except Exception:
+            continue
+    if sent:
+        for name in names:
+            features[name]["lastReminderAt"] = now
+        state_changed = True
+
+if state_changed:
+    save_state(state)

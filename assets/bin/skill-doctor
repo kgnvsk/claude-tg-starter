@@ -1,0 +1,181 @@
+#!/usr/bin/env python3
+"""Validate the bundled skill catalog, metadata, and unsafe launch patterns."""
+
+from pathlib import Path
+import argparse
+import json
+import re
+import sys
+
+
+# The skill listing the model chooses from is truncated; every character a
+# description spends is one another skill loses, and a skill past the cut is
+# shown as a bare name the model cannot route on.
+DESCRIPTION_LIMIT = 200
+
+FORBIDDEN = {
+    "nested Claude CLI": re.compile(r"\bclaude\s+(?:-p|--print|mcp\b)"),
+    "remote shell pipe": re.compile(r"curl\b[^\n|]*\|\s*(?:ba)?sh\b"),
+}
+FRONTMATTER_FIELD = re.compile(r"^([A-Za-z_][A-Za-z0-9_-]*):(?:[ \t]*(.*))?$")
+SKILL_NAME = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+
+
+def frontmatter(text: str) -> dict[str, str]:
+    if not text.startswith("---\n"):
+        return {}
+    end = text.find("\n---", 4)
+    if end == -1:
+        return {}
+    result: dict[str, str] = {}
+    lines = text[4:end].splitlines()
+    index = 0
+    while index < len(lines):
+        match = FRONTMATTER_FIELD.match(lines[index])
+        if match is None:
+            index += 1
+            continue
+        key, value = match.groups()
+        following = index + 1
+        while (
+            following < len(lines)
+            and FRONTMATTER_FIELD.match(lines[following]) is None
+        ):
+            following += 1
+        value = (value or "").strip()
+        if value in {"|", ">", "|-", ">-", "|+", ">+"}:
+            separator = " " if value.startswith(">") else "\n"
+            value = separator.join(
+                line.strip() for line in lines[index + 1 : following] if line.strip()
+            )
+        result[key] = value.strip().strip("\"'")
+        index = following
+    return result
+
+
+def inspect(root: Path) -> dict:
+    manifest_path = root / "manifest.json"
+    if not manifest_path.is_file():
+        raise ValueError(f"manifest.json is missing: {manifest_path}")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    declared = set(manifest.get("skills", {}))
+    required = declared
+    managed_policy = Path.home() / ".claude/product/managed-skills.json"
+    if root.resolve() == (Path.home() / ".claude/skills").resolve():
+        if not managed_policy.is_file():
+            raise ValueError(f"managed skill policy is missing: {managed_policy}")
+        policy = json.loads(managed_policy.read_text(encoding="utf-8"))
+        if not isinstance(policy, dict):
+            raise ValueError("managed skill policy must be an object")
+        if (
+            isinstance(policy.get("schemaVersion"), bool)
+            or policy.get("schemaVersion") != 1
+        ):
+            raise ValueError("managed skill policy schemaVersion must equal 1")
+        selected = policy.get("selected")
+        if (
+            not isinstance(selected, list)
+            or any(
+                not isinstance(value, str) or not SKILL_NAME.fullmatch(value)
+                for value in selected
+            )
+            or len(selected) != len(set(selected))
+        ):
+            raise ValueError(
+                "managed skill policy selected must contain unique skill names"
+            )
+        required = set(selected)
+    external_exceptions = manifest.get("externalSkillExceptions", {})
+    pack_members = {
+        skill
+        for pack in manifest.get("packs", {}).values()
+        for skill in pack.get("skills", [])
+    }
+    errors = []
+    warnings = []
+    if declared != pack_members:
+        missing_from_packs = declared - pack_members
+        missing_metadata = pack_members - declared
+        if missing_from_packs:
+            errors.append(
+                "skills missing from packs: " + ", ".join(sorted(missing_from_packs))
+            )
+        if missing_metadata:
+            errors.append(
+                "pack skills missing metadata: " + ", ".join(sorted(missing_metadata))
+            )
+
+    installed = {
+        path.parent.name
+        for path in root.glob("*/SKILL.md")
+        if path.parent.is_dir()
+    }
+    if installed != required:
+        undeclared = installed - required
+        missing = required - installed
+        if undeclared:
+            warnings.append(
+                "owner-managed skill directories: " + ", ".join(sorted(undeclared))
+            )
+        if missing:
+            errors.append("missing skill directories: " + ", ".join(sorted(missing)))
+
+    names = {}
+    for skill in sorted(installed):
+        path = root / skill / "SKILL.md"
+        text = path.read_text(encoding="utf-8", errors="replace")
+        metadata = frontmatter(text)
+        name = metadata.get("name", "")
+        description = metadata.get("description", "")
+        if name != skill:
+            errors.append(f"{skill}: frontmatter name must equal directory name")
+        if not description:
+            errors.append(f"{skill}: description is required")
+        elif skill in declared and len(description) > DESCRIPTION_LIMIT:
+            errors.append(
+                f"{skill}: description is {len(description)} chars, limit is "
+                f"{DESCRIPTION_LIMIT} — long descriptions push other skills out of "
+                "the truncated skill listing the model picks from"
+            )
+        if name in names:
+            errors.append(f"duplicate skill name: {name}")
+        names[name] = str(path)
+        for label, pattern in FORBIDDEN.items():
+            if pattern.search(text):
+                if label in external_exceptions.get(skill, []):
+                    warnings.append(f"{skill}: reviewed external exception: {label}")
+                else:
+                    errors.append(f"{skill}: forbidden {label}")
+        if len(text) > 60_000:
+            warnings.append(f"{skill}: SKILL.md exceeds 60000 characters")
+
+    return {
+        "status": "ok" if not errors else "failed",
+        "root": str(root),
+        "skills": len(installed),
+        "packs": sorted(manifest.get("packs", {})),
+        "errors": errors,
+        "warnings": warnings,
+    }
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--root",
+        type=Path,
+        default=Path.home() / ".claude/skills",
+    )
+    args = parser.parse_args()
+    report = inspect(args.root)
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+    if report["errors"]:
+        raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        print(f"skill-doctor: {error}", file=sys.stderr)
+        raise SystemExit(2)

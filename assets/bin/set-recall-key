@@ -1,0 +1,79 @@
+#!/usr/bin/env python3
+"""Configure the meeting notetaker without exposing the key in process args.
+
+The weekly reminder asks the owner to finish setting up the Recall.ai notetaker,
+but until now the only way to store the key was over SSH or by re-running the
+installer — neither of which an owner who talks to the bot in Telegram can do.
+"""
+
+from __future__ import annotations
+
+import getpass
+import json
+import os
+from pathlib import Path
+import shlex
+import sys
+import tempfile
+
+HOME = Path.home()
+ENV = HOME / ".claude/channels/telegram/.env"
+STATE = HOME / ".claude/onboarding-state.json"
+REGIONS = ("eu-central-1", "us-west-2", "us-east-1", "ap-northeast-1")
+
+args = [a for a in sys.argv[1:] if a != "--stdin"]
+region = "eu-central-1"
+if args:
+    region = args.pop(0)
+if args or region not in REGIONS:
+    print(f"usage: set-recall-key [{'|'.join(REGIONS)}] [--stdin]", file=sys.stderr)
+    raise SystemExit(2)
+
+if "--stdin" in sys.argv[1:]:
+    key = sys.stdin.readline().strip()
+else:
+    key = getpass.getpass("Recall.ai API key (hidden): ").strip()
+
+if len(key) < 20 or any(character.isspace() for character in key):
+    print("invalid Recall.ai API key format", file=sys.stderr)
+    raise SystemExit(2)
+
+ENV.parent.mkdir(parents=True, exist_ok=True)
+lines = ENV.read_text(encoding="utf-8").splitlines() if ENV.exists() else []
+wanted = {
+    "RECALL_API_KEY": "RECALL_API_KEY=" + shlex.quote(key),
+    "RECALL_REGION": "RECALL_REGION=" + shlex.quote(region),
+}
+updated = []
+seen = set()
+for line in lines:
+    name = line.split("=", 1)[0]
+    if name in wanted:
+        updated.append(wanted[name])
+        seen.add(name)
+    else:
+        updated.append(line)
+updated.extend(value for name, value in wanted.items() if name not in seen)
+
+fd, temporary = tempfile.mkstemp(prefix="telegram-env-", dir=ENV.parent)
+with os.fdopen(fd, "w", encoding="utf-8") as handle:
+    handle.write("\n".join(updated) + "\n")
+os.chmod(temporary, 0o600)
+os.replace(temporary, ENV)
+
+if STATE.exists():
+    state = json.loads(STATE.read_text(encoding="utf-8"))
+    meeting = state.setdefault("optionalFeatures", {}).setdefault("meeting_secretary", {})
+    meeting.update({"status": "configured", "region": region, "remindAfterDays": 7})
+    meeting["lastReminderAt"] = None
+    state_tmp = STATE.with_suffix(".json.tmp")
+    state_tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    state_tmp.chmod(0o600)
+    state_tmp.replace(STATE)
+
+print(
+    f"Meeting notetaker configured for region {region}. Restart "
+    + os.environ.get("CLAUDE_TELEGRAM_SERVICE", "claude-telegram.service")
+    + " to apply it. A 401 from Recall means the key belongs to another region —"
+    " re-run with the right one."
+)

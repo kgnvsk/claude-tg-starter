@@ -1,0 +1,65 @@
+#!/usr/bin/env python3
+"""Перевіряє токен Telegram-бота зі stdin, не показуючи його в argv."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote
+from urllib.request import Request, urlopen
+
+try:
+    from ukargparse import ArgumentParser
+except ModuleNotFoundError:
+    from assets.bin.ukargparse import ArgumentParser
+
+
+def fail(message: str, code: int = 1) -> None:
+    print(f"Не вдалося перевірити Telegram: {message}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+parser = ArgumentParser()
+parser.add_argument(
+    "--username",
+    required=True,
+    help="Очікуване ім’я користувача бота, з @ або без нього",
+)
+args = parser.parse_args()
+
+token = sys.stdin.readline().strip()
+if not token:
+    fail("вхідний токен порожній", 2)
+
+base = os.environ.get("VERIFY_TELEGRAM_API_BASE", "https://api.telegram.org").rstrip("/")
+url = f"{base}/bot{quote(token, safe=':_-')}/getMe"
+request = Request(url, method="GET", headers={"Accept": "application/json"})
+
+try:
+    with urlopen(request, timeout=15) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+except HTTPError as error:
+    if error.code == 401:
+        fail("Telegram відхилив токен; запросіть новий токен у @BotFather", 3)
+    fail(f"Telegram API повернув HTTP {error.code}; повторіть перед установленням", 4)
+except (URLError, TimeoutError, OSError, json.JSONDecodeError):
+    fail(
+        "Telegram API недоступний або повернув некоректну відповідь; "
+        "повторіть перед установленням",
+        4,
+    )
+
+if not payload.get("ok") or not isinstance(payload.get("result"), dict):
+    fail("Telegram не прийняв цей токен", 3)
+
+actual = str(payload["result"].get("username", "")).lstrip("@")
+expected = args.username.lstrip("@")
+if not actual:
+    fail("Telegram не повернув ім’я користувача бота", 3)
+if actual.casefold() != expected.casefold():
+    fail(f"токен належить @{actual}, а онбординг очікує @{expected}", 3)
+
+print(f"Telegram-бота перевірено: @{actual}")

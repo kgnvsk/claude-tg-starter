@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# Redacted browser health report. Safe to run as root or claude.
+set -uo pipefail
+
+failures=0
+pass() { printf 'PASS  %s\n' "$*"; }
+fail() { printf 'FAIL  %s\n' "$*"; failures=$((failures + 1)); }
+
+if systemctl is-active --quiet claude-browser.service; then
+  pass "claude-browser.service active"
+else
+  fail "claude-browser.service inactive"
+fi
+
+if ss -ltn | awk '$4 ~ /127\.0\.0\.1:8931$/ { found=1 } END { exit !found }'; then
+  pass "MCP listens only on 127.0.0.1:8931"
+else
+  fail "MCP is not listening on 127.0.0.1:8931"
+fi
+if ss -ltn | grep -Eq '(^|[[:space:]])(0\.0\.0\.0|\[::\]):8931([[:space:]]|$)'; then
+  fail "MCP port 8931 is publicly bound"
+fi
+
+http_code="$(curl --max-time 3 -sS -o /dev/null -w '%{http_code}' http://localhost:8931/mcp 2>/dev/null || true)"
+case "$http_code" in
+  200|400|405) pass "MCP HTTP endpoint reachable (HTTP $http_code)" ;;
+  *) fail "MCP HTTP endpoint unreachable (HTTP ${http_code:-none})" ;;
+esac
+
+if [ -r /srv/claude-browser-share/browser-smoke.png ] && [ -s /srv/claude-browser-share/browser-smoke.png ]; then
+  pass "DOM and screenshot smoke artifact exists"
+else
+  fail "browser smoke screenshot missing"
+fi
+
+if [ -r /srv/claude-browser-share/mcp-tool-smoke.png ] && [ -s /srv/claude-browser-share/mcp-tool-smoke.png ]; then
+  pass "MCP navigation and screenshot smoke artifact exists"
+else
+  fail "MCP tool smoke screenshot missing"
+fi
+
+if [ "$(id -u)" -eq 0 ]; then
+  claude_state="${CLAUDE_AGENT_HOME:-/home/claude}/.claude.json"
+else
+  claude_state="${CLAUDE_CONFIG_DIR:-$HOME}/.claude.json"
+fi
+if python3 - "$claude_state" <<'PY' >/dev/null 2>&1
+import json
+import sys
+from pathlib import Path
+
+data = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+playwright = data.get("mcpServers", {}).get("playwright", {})
+if playwright.get("type") != "http" or playwright.get("url") != "http://localhost:8931/mcp":
+    raise SystemExit(1)
+PY
+then
+  pass "Claude user has Playwright MCP registered"
+else
+  fail "Playwright MCP is not registered for this Claude user"
+fi
+
+exit "$failures"

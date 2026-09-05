@@ -1,0 +1,150 @@
+#!/usr/bin/env python3
+"""tg-send [--no-watchdog-credit] <chat_id> "text" — deliver a plain message straight through the
+Telegram Bot API, bypassing the MCP reply-tool.
+
+The FALLBACK path: when the telegram plugin's MCP reply-tool is momentarily gone
+(bun server.ts died — a known upstream flake), the agent still has to answer.
+Instead of narrating a "technical glitch" to the owner, it just calls this and
+the user gets the actual content, silently. The healthcheck restores the native
+tool within ~60s; the owner never needs to know it blipped.
+
+Portable token resolution (env or TELEGRAM_STATE_DIR); prints ok:true/false.
+"""
+import sys, os, re, json, sqlite3, subprocess, time, urllib.parse, urllib.request
+
+
+def token():
+    tok = os.environ.get("TELEGRAM_BOT_TOKEN")
+    if tok:
+        return tok.strip()
+    state = os.environ.get("TELEGRAM_STATE_DIR") or os.path.expanduser(
+        "~/.claude/channels/telegram")
+    try:
+        for line in open(os.path.join(state, ".env"), encoding="utf-8"):
+            if line.startswith("TELEGRAM_BOT_TOKEN="):
+                return line.split("=", 1)[1].strip()
+    except Exception:
+        pass
+    sys.exit("tg-send: TELEGRAM_BOT_TOKEN not found")
+
+
+def record_outbound(chat_id, text, receipt, task_id="", occurrence=""):
+    """Record only a matching Telegram acknowledgement; never resend on failure."""
+    if not isinstance(receipt, dict) or receipt.get("ok") is not True:
+        return False
+    result = receipt.get("result")
+    if not isinstance(result, dict):
+        return False
+    message_id = result.get("message_id")
+    chat = result.get("chat")
+    if (type(message_id) is not int or message_id <= 0
+            or not isinstance(chat, dict) or type(chat.get("id")) is not int
+            or str(chat["id"]) != str(chat_id) or chat["id"] == 0):
+        return False
+    chat_id = str(chat["id"])
+    thread_id = None
+    conversation_key = ("group:" if chat_id.startswith("-") else "user:") + chat_id
+    if result.get("is_topic_message") is True:
+        thread_id = result.get("message_thread_id")
+        if not chat_id.startswith("-") or type(thread_id) is not int or thread_id <= 0:
+            return False
+        conversation_key = f"topic:{chat_id}:{thread_id}"
+    if task_id:
+        safe_task = task_id if re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", task_id) else "scheduled"
+        safe_occurrence = occurrence if re.fullmatch(r"[0-9]{1,20}", occurrence) else "unknown"
+        text = f"[scheduled-task result; task={safe_task}; occurrence={safe_occurrence}]\n{text}"
+    try:
+        state = os.environ.get("TELEGRAM_STATE_DIR") or os.path.expanduser(
+            "~/.claude/channels/telegram")
+        database = os.path.join(state, "messages.db")
+        if not os.path.isfile(database):
+            return False
+        connection = sqlite3.connect(database, timeout=0.5)
+        try:
+            # Older non-corporate installations do not yet have the scope columns.
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(messages)")}
+            values = {
+                "chat_id": chat_id, "user_id": None, "username": "bot",
+                "direction": "out", "text": text, "ts": int(time.time() * 1000),
+                "message_id": message_id,
+            }
+            for name, value in (("conversation_key", conversation_key), ("thread_id", thread_id)):
+                if name in columns:
+                    values[name] = value
+            names = ", ".join(values)
+            placeholders = ", ".join("?" for _ in values)
+            connection.execute(
+                f"INSERT OR IGNORE INTO messages ({names}) SELECT {placeholders} "
+                "WHERE NOT EXISTS (SELECT 1 FROM messages WHERE chat_id=? AND message_id=?)",
+                (*values.values(), chat_id, message_id),
+            )
+            connection.commit()
+            return True
+        finally:
+            connection.close()
+    except Exception:
+        return False
+
+
+def main(argv):
+    # ATARAX_SUPPRESS_TELEGRAM=1 marks a claude session that must not touch Telegram
+    # (nested claude -p workers, cron sessions). The persona's silent-fallback rule
+    # fires in those sessions too — swallow the send here, at the one choke point.
+    #
+    # The wording does two jobs. Exit 0 with no error framing, so the caller does not
+    # escalate to another delivery channel — that escalation is what leaked rewrite
+    # drafts to the owner in July. And no "ok", because an agent reading "ok: True"
+    # reports the owner as answered when nothing was sent.
+    if os.environ.get("ATARAX_SUPPRESS_TELEGRAM") == "1":
+        print(
+            "not delivered: this session does not send to Telegram. "
+            "Nothing was sent, and no other channel should be tried — "
+            "return the text to whoever started the run."
+        )
+        sys.exit(0)
+    arguments = argv[1:]
+    if arguments[:1] == ["--record-confirmed-outbound"]:
+        if len(arguments) != 4:
+            sys.exit(2)
+        try:
+            raw_receipt, text = sys.stdin.buffer.read().decode("utf-8").split("\0", 1)
+            recorded = record_outbound(arguments[1], text, json.loads(raw_receipt),
+                                       arguments[2], arguments[3])
+        except (ValueError, UnicodeError):
+            recorded = False
+        sys.exit(0 if recorded else 1)
+    watchdog_credit = True
+    if arguments[:1] == ["--no-watchdog-credit"]:
+        watchdog_credit = False
+        arguments = arguments[1:]
+    if len(arguments) != 2:
+        sys.exit('usage: tg-send [--no-watchdog-credit] <chat_id> "text"')
+    chat_id, text = arguments
+    for chunk_start in range(0, len(text), 4000) or [0]:
+        chunk = text[chunk_start:chunk_start + 4000]
+        body = urllib.parse.urlencode({"chat_id": chat_id, "text": chunk}).encode()
+        req = urllib.request.Request(
+            f"https://api.telegram.org/bot{token()}/sendMessage", data=body)
+        try:
+            out = urllib.request.urlopen(req, timeout=15).read().decode()
+            payload = json.loads(out)
+            ok = payload.get("ok") is True
+            if ok and watchdog_credit:
+                if not record_outbound(chat_id, chunk, payload):
+                    print("tg-send: history_write_failed; message will not be resent", file=sys.stderr)
+        except Exception as e:
+            print("tg-send error:", type(e).__name__)
+            sys.exit(1)
+    if watchdog_credit:
+        subprocess.run(
+            [os.path.expanduser("~/bin/tg-fallback-outbound"), chat_id],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    print("ok:", ok)
+    sys.exit(0 if ok else 1)
+
+
+if __name__ == "__main__":
+    main(sys.argv)

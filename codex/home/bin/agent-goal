@@ -1,0 +1,242 @@
+#!/usr/bin/env python3
+"""Durable goals with explicit completion criteria and evidence."""
+
+from pathlib import Path
+import argparse
+import fcntl
+import json
+import os
+import re
+import sys
+import tempfile
+import uuid
+from contextlib import contextmanager
+from datetime import datetime, timezone
+
+
+GOALS_DIR = Path.home() / ".codex/goals"
+LOCK_FILE = GOALS_DIR / ".lock"
+SECRET_PATTERNS = (
+    re.compile(r"sk-(?:proj-)?[A-Za-z0-9_-]{20,}"),
+    re.compile(r"\b\d{8,12}:AA[A-Za-z0-9_-]{20,}\b"),
+    re.compile(r"-----BEGIN (?:OPENSSH|RSA|EC|PRIVATE)"),
+)
+
+
+def now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def reject_secrets(*values: str) -> None:
+    text = "\n".join(values)
+    if any(pattern.search(text) for pattern in SECRET_PATTERNS):
+        raise ValueError("secret-like content is not allowed in durable goal state")
+
+
+@contextmanager
+def locked():
+    GOALS_DIR.mkdir(parents=True, exist_ok=True)
+    os.chmod(GOALS_DIR, 0o700)
+    with LOCK_FILE.open("a+", encoding="utf-8") as handle:
+        os.chmod(LOCK_FILE, 0o600)
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        yield
+
+
+def goal_path(goal_id: str) -> Path:
+    if not re.fullmatch(r"[a-f0-9]{12}", goal_id):
+        raise ValueError("invalid goal id")
+    return GOALS_DIR / f"{goal_id}.json"
+
+
+def load_goal(goal_id: str) -> dict:
+    path = goal_path(goal_id)
+    if not path.is_file():
+        raise ValueError(f"goal not found: {goal_id}")
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def save_goal(goal: dict) -> None:
+    path = goal_path(goal["id"])
+    goal["updatedAt"] = now()
+    rendered = json.dumps(goal, ensure_ascii=False, indent=2) + "\n"
+    fd, temporary = tempfile.mkstemp(prefix=path.name + ".", dir=GOALS_DIR)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(rendered)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def summary(goal: dict) -> dict:
+    return {
+        "id": goal["id"],
+        "objective": goal["objective"],
+        "status": goal["status"],
+        "criteria": {
+            "done": sum(1 for item in goal["criteria"] if item["done"]),
+            "total": len(goal["criteria"]),
+        },
+        "updatedAt": goal["updatedAt"],
+    }
+
+
+def create(args: argparse.Namespace) -> dict:
+    criteria = [item.strip() for item in args.criterion if item.strip()]
+    objective = args.objective.strip()
+    if not objective:
+        raise ValueError("objective cannot be empty")
+    if not criteria:
+        raise ValueError("at least one completion criterion is required")
+    reject_secrets(objective, *criteria, *(args.constraint or []))
+    goal_id = uuid.uuid4().hex[:12]
+    timestamp = now()
+    goal = {
+        "schemaVersion": 1,
+        "id": goal_id,
+        "objective": objective,
+        "status": "active",
+        "criteria": [
+            {
+                "text": text,
+                "done": False,
+                "evidence": None,
+                "checkedAt": None,
+            }
+            for text in criteria
+        ],
+        "constraints": [item.strip() for item in (args.constraint or []) if item.strip()],
+        "events": [{"type": "created", "at": timestamp}],
+        "createdAt": timestamp,
+        "updatedAt": timestamp,
+    }
+    save_goal(goal)
+    return summary(goal)
+
+
+def check(args: argparse.Namespace) -> dict:
+    goal = load_goal(args.goal_id)
+    if goal["status"] != "active":
+        raise ValueError("only an active goal can be updated")
+    index = args.criterion - 1
+    if index < 0 or index >= len(goal["criteria"]):
+        raise ValueError("criterion index is out of range")
+    evidence = args.evidence.strip()
+    if not evidence:
+        raise ValueError("evidence is required")
+    reject_secrets(evidence)
+    item = goal["criteria"][index]
+    item.update({"done": True, "evidence": evidence, "checkedAt": now()})
+    goal["events"].append(
+        {
+            "type": "criterion_checked",
+            "criterion": args.criterion,
+            "evidence": evidence,
+            "at": now(),
+        }
+    )
+    save_goal(goal)
+    return summary(goal)
+
+
+def complete(args: argparse.Namespace) -> dict:
+    goal = load_goal(args.goal_id)
+    incomplete = [
+        index + 1
+        for index, item in enumerate(goal["criteria"])
+        if not item["done"] or not item.get("evidence")
+    ]
+    if incomplete:
+        raise ValueError(
+            "cannot complete goal; criteria without evidence: "
+            + ", ".join(map(str, incomplete))
+        )
+    goal["status"] = "complete"
+    goal["events"].append({"type": "completed", "at": now()})
+    save_goal(goal)
+    return summary(goal)
+
+
+def block(args: argparse.Namespace) -> dict:
+    goal = load_goal(args.goal_id)
+    reason = args.reason.strip()
+    if not reason:
+        raise ValueError("block reason is required")
+    reject_secrets(reason)
+    goal["status"] = "blocked"
+    goal["events"].append({"type": "blocked", "reason": reason, "at": now()})
+    save_goal(goal)
+    return summary(goal)
+
+
+def list_goals(args: argparse.Namespace) -> list[dict]:
+    goals = []
+    for path in sorted(GOALS_DIR.glob("*.json")):
+        try:
+            goal = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if args.status and goal.get("status") != args.status:
+            continue
+        goals.append(summary(goal))
+    return goals
+
+
+def build_parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(description=__doc__)
+    sub = result.add_subparsers(dest="command", required=True)
+
+    create_parser = sub.add_parser("create")
+    create_parser.add_argument("--objective", required=True)
+    create_parser.add_argument("--criterion", action="append", required=True)
+    create_parser.add_argument("--constraint", action="append")
+
+    show_parser = sub.add_parser("show")
+    show_parser.add_argument("goal_id")
+
+    list_parser = sub.add_parser("list")
+    list_parser.add_argument("--status", choices=("active", "blocked", "complete"))
+
+    check_parser = sub.add_parser("check")
+    check_parser.add_argument("goal_id")
+    check_parser.add_argument("--criterion", type=int, required=True)
+    check_parser.add_argument("--evidence", required=True)
+
+    complete_parser = sub.add_parser("complete")
+    complete_parser.add_argument("goal_id")
+
+    block_parser = sub.add_parser("block")
+    block_parser.add_argument("goal_id")
+    block_parser.add_argument("--reason", required=True)
+    return result
+
+
+def main() -> None:
+    args = build_parser().parse_args()
+    with locked():
+        if args.command == "create":
+            output = create(args)
+        elif args.command == "show":
+            output = load_goal(args.goal_id)
+        elif args.command == "list":
+            output = list_goals(args)
+        elif args.command == "check":
+            output = check(args)
+        elif args.command == "complete":
+            output = complete(args)
+        else:
+            output = block(args)
+    print(json.dumps(output, ensure_ascii=False, indent=2))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (ValueError, OSError, json.JSONDecodeError) as error:
+        print(f"agent-goal: {error}", file=sys.stderr)
+        raise SystemExit(2)

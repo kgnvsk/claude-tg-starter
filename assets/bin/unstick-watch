@@ -1,0 +1,476 @@
+#!/usr/bin/env python3
+"""Owner-triggered recovery for a bot that cannot recover itself.
+
+The Telegram session is the one thing that stops working when the agent is
+wedged, so a command handled by the agent is useless exactly when it is needed —
+that is why /relogin lives in cron, and why this does too. Reads the owner's
+message straight from the transport's message log and acts outside Claude.
+
+Two things happen on /unstick, in this order:
+  1. automatic restarts are parked for a while — when the watchdog is itself the
+     thing killing the bot, restarting without parking it just feeds the loop;
+  2. the service is restarted once.
+
+Never logs message text. Only the owner can trigger it.
+"""
+import fcntl
+import json
+import os
+import re
+import sqlite3
+import stat
+import subprocess
+import tempfile
+import time
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+HOME = Path(os.environ.get("HOME", "/home/claude"))
+AGENT_ROOT = Path(os.environ.get("AGENT_ROOT", str(HOME)))
+STATE_DIR = Path(os.environ.get("TELEGRAM_STATE_DIR")
+                 or (AGENT_ROOT / ".claude/channels/telegram"))
+ENV_FILE = STATE_DIR / ".env"
+ACCESS_FILE = STATE_DIR / "access.json"
+MESSAGES_DB = STATE_DIR / "messages.db"
+STATE_FILE = AGENT_ROOT / "logs/unstick-watch.state"
+RESTART_HOLD = AGENT_ROOT / "logs/restart-hold.until"
+LIFECYCLE_LOCK = AGENT_ROOT / "logs/transport-lifecycle.lock"
+LOG = AGENT_ROOT / "logs/healthcheck.log"
+SERVICE = os.environ.get("CLAUDE_TELEGRAM_SERVICE", "claude-telegram.service")
+HOLD_SECONDS = 15 * 60
+# The whole message has to be the command. "fix" and "оживи" are words the owner
+# uses in ordinary requests — matching them at the start of a sentence would
+# restart the agent in the middle of the very task he just asked for.
+TRIGGER = re.compile(
+    r"^\s*/?(unstick|fix|фикс|отвисни|оживи|перезапустись|розблокуйся|відвисни|перезапустися)\s*[.!]*\s*$",
+    re.IGNORECASE,
+)
+
+
+def env_val(key: str) -> str:
+    try:
+        for line in ENV_FILE.read_text(encoding="utf-8").splitlines():
+            if line.startswith(key + "="):
+                return line.split("=", 1)[1].strip()
+    except Exception:
+        pass
+    return ""
+
+
+def owner() -> str:
+    data = json.loads(ACCESS_FILE.read_text(encoding="utf-8"))
+    ids = data.get("admins") or data.get("allowFrom") or []
+    return str(ids[0]) if ids else ""
+
+
+def send(chat: str, text: str) -> bool:
+    token = env_val("TELEGRAM_BOT_TOKEN")
+    if not token or not chat:
+        return False
+    body = urllib.parse.urlencode({"chat_id": chat, "text": text}).encode()
+    try:
+        with urllib.request.urlopen(urllib.request.Request(
+                f"https://api.telegram.org/bot{token}/sendMessage", data=body),
+                timeout=15) as response:
+            delivered = json.loads(response.read().decode("utf-8")).get("ok") is True
+        if delivered:
+            try:
+                subprocess.run(
+                    [str(HOME / "bin/tg-fallback-outbound"), chat],
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            except OSError:
+                pass
+        return delivered
+    except Exception:
+        return False
+
+
+def fallback_outbound(chat: str) -> int:
+    """Return a recent verified direct-send timestamp for this exact chat."""
+    if re.fullmatch(r"-?\d+", chat) is None:
+        return 0
+    try:
+        raw = (STATE_DIR / "fallback-outbound" / f"{chat}.ts").read_text(
+            encoding="ascii"
+        ).strip()
+    except (OSError, UnicodeError):
+        return 0
+    if not raw.isascii() or not raw.isdigit() or len(raw) > 16:
+        return 0
+    timestamp = int(raw)
+    now_ms = time.time_ns() // 1_000_000
+    return timestamp if 0 < timestamp <= now_ms + 60_000 else 0
+
+
+def note(line: str) -> None:
+    try:
+        with LOG.open("a", encoding="utf-8") as handle:
+            handle.write(f"[{time.strftime('%FT%TZ', time.gmtime())}] {line}\n")
+    except Exception:
+        pass
+
+
+def recent_restarts() -> int:
+    """Restarts in the last ten minutes — the tell that the watchdog is the problem."""
+    try:
+        out = subprocess.run(
+            ["journalctl", "-u", SERVICE, "--since", "10 min ago", "--no-pager"],
+            capture_output=True, text=True, timeout=20).stdout
+        return out.count("Started Claude Code")
+    except Exception:
+        return -1
+
+
+def open_lifecycle_lock(path: Path) -> int | None:
+    """Take the transport-wide nonblocking restart lock without following links."""
+    descriptor = -1
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        flags = os.O_RDWR | os.O_CREAT
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(path, flags, 0o600)
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            return None
+        os.fchmod(descriptor, 0o600)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return None
+        acquired = descriptor
+        descriptor = -1
+        return acquired
+    except OSError:
+        return None
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def atomic_write_private(path: Path, payload: bytes) -> None:
+    """Replace a file with one private, complete value in the same directory."""
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=path.parent,
+    )
+    temporary = Path(temporary_name)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "wb") as handle:
+            descriptor = -1
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        directory_flags = os.O_RDONLY
+        if hasattr(os, "O_DIRECTORY"):
+            directory_flags |= os.O_DIRECTORY
+        directory_descriptor = os.open(path.parent, directory_flags)
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def atomic_write_restart_hold(until: int) -> None:
+    atomic_write_private(RESTART_HOLD, str(until).encode("ascii"))
+
+
+def restart_hold_active() -> bool:
+    """Is somebody else holding restarts right now?
+
+    This file is how an update stops the watchdog from restarting the agent
+    mid-upgrade. cash-healthcheck has always honoured it; /unstick wrote one and
+    then restarted regardless, so the one command the owner reaches for when the
+    bot feels stuck could interrupt the very update in progress.
+
+    Narrower than service_mutation_allowed() on purpose: only a well-formed hold
+    in the future blocks. That check also refuses on a corrupted or symlinked
+    file, which is right for an automatic restart — but this path runs because a
+    person asked for help, and junk on disk is not evidence of an update.
+    """
+    if not RESTART_HOLD.exists() and not RESTART_HOLD.is_symlink():
+        return False
+    try:
+        raw = RESTART_HOLD.read_text(encoding="ascii").strip()
+    except OSError:
+        raw = ""
+    # Only a well-formed hold in the future counts. cash-healthcheck also blocks
+    # on a malformed one, and for an automatic restart that is right — but this
+    # is the owner typing /unstick because the bot feels dead. A corrupted file
+    # or a planted symlink is not evidence of an update, and refusing on it
+    # would strand him with no way back. Junk is replaced by the write below.
+    if raw.isdigit() and len(raw) <= 10 and int(time.time()) < int(raw):
+        note(f"/unstick: restart hold active until {raw} — refusing to restart")
+        return True
+    return False
+
+
+def atomic_write_checkpoint(timestamp: int) -> None:
+    payload = json.dumps({"ts": timestamp}, separators=(",", ":")).encode("utf-8")
+    atomic_write_private(STATE_FILE, payload)
+
+
+def started_fifo_head() -> tuple[str, str] | None:
+    """Return the exact reserved FIFO head and observed state, payload-free."""
+    connection = None
+    try:
+        connection = sqlite3.connect(
+            f"file:{MESSAGES_DB}?mode=ro", uri=True, timeout=2
+        )
+        row = connection.execute(
+            "SELECT delivery_id,state FROM pending_inbound_deliveries "
+            "ORDER BY created_at ASC, rowid ASC LIMIT 1"
+        ).fetchone()
+        if (
+            row is not None
+            and row[1] in {"started", "recovering"}
+            and isinstance(row[0], str)
+        ):
+            return row[0], row[1]
+    except sqlite3.Error:
+        pass
+    finally:
+        if connection is not None:
+            connection.close()
+    return None
+
+
+def delivery_origin_chat(delivery_id: str) -> str | None:
+    """Extract the exact numeric origin chat from a canonical delivery id."""
+    identity = re.fullmatch(r"(-?[0-9]+):[0-9]+", delivery_id)
+    return identity.group(1) if identity is not None else None
+
+
+def abort_started_fifo_head(delivery_id: str, observed_state: str) -> bool:
+    """CAS-delete only the exact reserved delivery whose origin was notified."""
+    if observed_state not in {"started", "recovering"}:
+        return False
+    connection = None
+    try:
+        connection = sqlite3.connect(
+            f"file:{MESSAGES_DB}?mode=rw", uri=True, timeout=2
+        )
+        deleted = connection.execute(
+            "DELETE FROM pending_inbound_deliveries "
+            "WHERE delivery_id=? AND state=? "
+            "AND rowid=(SELECT rowid FROM pending_inbound_deliveries "
+            "ORDER BY created_at ASC, rowid ASC LIMIT 1)",
+            (delivery_id, observed_state),
+        )
+        connection.commit()
+        return deleted.rowcount == 1
+    except sqlite3.Error:
+        return False
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def remove_matching_cleanup_proof(delivery_id: str) -> bool:
+    """Remove only a private proof for this exact delivery."""
+    try:
+        chat_id, message_id = delivery_id.rsplit(":", 1)
+    except ValueError:
+        return False
+    if (
+        re.fullmatch(r"-?\d+", chat_id) is None
+        or re.fullmatch(r"\d+", message_id) is None
+    ):
+        return False
+    proof_path = STATE_DIR / "fallback-cleanup-proof.json"
+    lock = open_lifecycle_lock(STATE_DIR / "fallback-cleanup-proof.lock")
+    if lock is None:
+        return False
+    descriptor = -1
+    try:
+        if not os.path.lexists(proof_path):
+            return True
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(proof_path, flags)
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_uid != os.geteuid()
+            or opened.st_mode & 0o077
+            or opened.st_size <= 0
+            or opened.st_size > 512
+        ):
+            return False
+        with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
+            descriptor = -1
+            proof = json.load(handle)
+        status_value = proof.get("status") if isinstance(proof, dict) else None
+        if status_value not in {"prepared", "delivered"}:
+            return False
+        if proof != {
+            "delivery_id": delivery_id,
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "status": status_value,
+        }:
+            return True
+        proof_path.unlink()
+        directory_flags = os.O_RDONLY
+        if hasattr(os, "O_DIRECTORY"):
+            directory_flags |= os.O_DIRECTORY
+        directory_descriptor = os.open(proof_path.parent, directory_flags)
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
+        return True
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return False
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+        finally:
+            os.close(lock)
+
+
+def main() -> int:
+    if not MESSAGES_DB.exists():
+        return 0
+    chat = owner()
+    if not chat:
+        return 0
+    descriptor = open_lifecycle_lock(LIFECYCLE_LOCK)
+    if descriptor is None:
+        # Do not scan or checkpoint while another recovery owns the lifecycle:
+        # the next cron tick retries from the same durable boundary.
+        return 0
+    try:
+        try:
+            checkpoint = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            if os.path.lexists(STATE_FILE):
+                return 0
+            last = int((time.time() - 120) * 1000)  # first run: only look 2 min back
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return 0
+        else:
+            if not isinstance(checkpoint, dict):
+                return 0
+            last = checkpoint.get("ts")
+            if isinstance(last, bool) or not isinstance(last, int) or last < 0:
+                return 0
+
+        try:
+            conn = sqlite3.connect(f"file:{MESSAGES_DB}?mode=ro", uri=True, timeout=2)
+            rows = conn.execute(
+                "SELECT ts,text FROM messages WHERE chat_id=? AND direction='in' "
+                "AND ts>? ORDER BY ts", (chat, last)).fetchall()
+            latest_out = conn.execute(
+                "SELECT COALESCE(MAX(ts), 0) FROM messages "
+                "WHERE chat_id=? AND direction='out'", (chat,)
+            ).fetchone()[0]
+            conn.close()
+        except Exception:
+            return 0
+
+        latest_out = max(latest_out, fallback_outbound(chat))
+
+        fired = False
+        latest_trigger = 0
+        newest = last
+        for ts, text in rows:
+            newest = max(newest, ts)
+            if text and TRIGGER.match(text.strip()):
+                fired = True
+                latest_trigger = max(latest_trigger, ts)
+
+        # Preserve the existing at-most-once command semantics by checkpointing
+        # before the first side effect. Non-trigger advancement uses the same lock
+        # so an older scan can never roll a completed /unstick checkpoint back.
+        atomic_write_checkpoint(newest)
+        if not fired:
+            return 0
+        if latest_out > latest_trigger:
+            note("/unstick already received a confirmed reply — restart skipped")
+            return 0
+
+        if restart_hold_active():
+            send(chat, "🛠 Зараз триває оновлення — перезапускати мене саме "
+                       "зараз небезпечно, це перерве його на півдорозі. "
+                       "Напиши ще раз за кілька хвилин.")
+            return 0
+
+        loops = recent_restarts()
+        atomic_write_restart_hold(int(time.time()) + HOLD_SECONDS)
+        note(f"/unstick from owner: holding automatic restarts {HOLD_SECONDS // 60}m, "
+             f"restarts in last 10m={loops}")
+
+        verdict = (f"Автоперезапуски вимкнено на {HOLD_SECONDS // 60} хв — "
+                   f"сторож перезапускав мене {loops} разів за 10 хвилин, саме це й заважало."
+                   if loops >= 2 else
+                   f"Автоперезапуски вимкнено на {HOLD_SECONDS // 60} хв, щоб нічого не заважало.")
+        started_head = started_fifo_head()
+        delivery_id = started_head[0] if started_head is not None else None
+        origin_chat = (
+            delivery_origin_chat(delivery_id) if delivery_id is not None else None
+        )
+        send(chat, f"🛠 Прийнято. {verdict} Перезапускаюся один раз — "
+                   "напиши мені за хвилину.")
+
+        try:
+            restarted = subprocess.run(
+                ["sudo", "systemctl", "restart", SERVICE],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=30,
+            )
+        except subprocess.TimeoutExpired:
+            note("/unstick: restart timed out")
+            return 0
+        if restarted.returncode != 0:
+            note("/unstick: restart failed")
+            return 0
+
+        head_unchanged = (
+            started_head is not None and started_fifo_head() == started_head
+        )
+        if head_unchanged and origin_chat is not None and send(
+                origin_chat,
+                "Незавершений попередній запит не повторюю автоматично, щоб "
+                "випадково не виконати його двічі. Після відновлення надішли його ще раз.",
+        ):
+            if abort_started_fifo_head(delivery_id, started_head[1]):
+                if not remove_matching_cleanup_proof(delivery_id):
+                    note("/unstick: exact cleanup proof retained for Stop retry")
+                note("/unstick: aborted unfinished started delivery")
+            else:
+                note("/unstick: started delivery changed before cleanup")
+        elif head_unchanged and origin_chat is None:
+            note("/unstick: invalid started delivery identity retained")
+        elif delivery_id is not None:
+            note("/unstick: started delivery changed before resend notice")
+        note("/unstick: single restart issued")
+        return 0
+    finally:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "forbidden": {
+    "skills": [],
+    "plugins": [
+      "frontend-design@claude-plugins-official",
+      "impeccable@impeccable",
+      "marketing-skills@marketingskills"
+    ],
+    "terms": []
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "enabled": [
+    "telegram@claude-plugins-official"
+  ],
+  "managed": [
+    "document-skills@anthropic-agent-skills",
+    "example-skills@anthropic-agent-skills",
+    "frontend-design@claude-plugins-official",
+    "impeccable@impeccable",
+    "marketing-skills@marketingskills",
+    "superpowers@superpowers-marketplace",
+    "telegram@claude-plugins-official"
+  ],
+  "required": [
+    "telegram@claude-plugins-official"
+  ]
+}

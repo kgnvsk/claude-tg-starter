@@ -1,0 +1,91 @@
+#!/usr/bin/env python3
+"""Delete old Telegram inbox files without breaking durable pending delivery."""
+
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+import sqlite3
+import stat
+import sys
+import time
+
+
+RETENTION_SECONDS = 2 * 24 * 60 * 60
+
+
+def fail() -> int:
+    print("telegram-inbox-prune: queue state unavailable; cleanup skipped", file=sys.stderr)
+    return 1
+
+
+def main() -> int:
+    state = Path(
+        os.environ.get("TELEGRAM_STATE_DIR")
+        or Path.home() / ".claude/channels/telegram"
+    )
+    inbox = state / "inbox"
+    try:
+        inbox_metadata = inbox.lstat()
+    except FileNotFoundError:
+        return 0
+    except OSError:
+        return fail()
+    if stat.S_ISLNK(inbox_metadata.st_mode) or not stat.S_ISDIR(inbox_metadata.st_mode):
+        return fail()
+
+    candidates: list[tuple[Path, os.stat_result]] = []
+    try:
+        for entry in inbox.iterdir():
+            metadata = entry.lstat()
+            if stat.S_ISREG(metadata.st_mode):
+                candidates.append((entry, metadata))
+    except OSError:
+        return fail()
+    if not candidates:
+        return 0
+
+    database = state / "messages.db"
+    try:
+        database_metadata = database.lstat()
+        if stat.S_ISLNK(database_metadata.st_mode) or not stat.S_ISREG(
+            database_metadata.st_mode
+        ):
+            return fail()
+        with sqlite3.connect(f"file:{database}?mode=ro", uri=True) as connection:
+            rows = connection.execute(
+                "SELECT payload FROM pending_inbound_deliveries"
+            ).fetchall()
+    except (OSError, sqlite3.Error):
+        return fail()
+
+    referenced: set[str] = set()
+    try:
+        for (raw_payload,) in rows:
+            payload = json.loads(raw_payload)
+            image_path = payload.get("params", {}).get("meta", {}).get("image_path")
+            if isinstance(image_path, str):
+                referenced.add(os.path.abspath(image_path))
+    except (AttributeError, TypeError, json.JSONDecodeError):
+        return fail()
+
+    cutoff = time.time() - RETENTION_SECONDS
+    for entry, metadata in candidates:
+        if os.path.abspath(entry) in referenced:
+            try:
+                os.utime(entry, None, follow_symlinks=False)
+            except OSError:
+                return fail()
+        elif metadata.st_mtime < cutoff:
+            try:
+                entry.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                return fail()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

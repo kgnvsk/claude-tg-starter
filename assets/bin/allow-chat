@@ -1,24 +1,53 @@
 #!/usr/bin/env python3
-"""allow-chat <chat_id> [name] — add a Telegram chat to the bot's DM allowlist (access.json).
+"""allow-chat <requester_id> <message_id> <chat_id> [name] — add a Telegram chat to the DM allowlist.
+allow-chat --revoke <requester_id> <message_id> <chat_id> — remove it again.
 
-OWNER-GATED by the persona: the bot runs this ONLY when the command came from the
-owner's chat. Anyone else asking for access is never auto-added.
+requester_id and message_id are the sender and message id of the request exactly
+as the transport delivered them. The helper checks the requester against the
+live admins list AND confirms that carrier message in the transport's own log
+before changing access, so a number the model was talked into does not pass on
+its own. Every decision, granted or denied, lands in ~/logs/access-grants.log.
+Takes effect immediately (the plugin re-reads access.json), no restart needed.
+
+Portable: resolves access.json from $TELEGRAM_STATE_DIR (exported by the wrapper),
+falling back to ~/.claude/channels/telegram — so on custom layouts (root user,
+per-bot dirs) it writes the RIGHT file, not a hardcoded /home/claude path.
 """
-import json, sys
+import os
+from pathlib import Path
+import subprocess
+import sys
 
-P = "/home/claude/.claude/channels/telegram/access.json"
+state = os.environ.get("TELEGRAM_STATE_DIR") or os.path.expanduser(
+    "~/.claude/channels/telegram")
+P = os.path.join(state, "access.json")
 
-if len(sys.argv) < 2 or not sys.argv[1].lstrip("-").isdigit():
-    print("usage: allow-chat <chat_id> [name]")
+args = sys.argv[1:]
+revoke = bool(args) and args[0] == "--revoke"
+if revoke:
+    args = args[1:]
+
+if (
+    len(args) < 3
+    or not all(value.lstrip("-").isdigit() for value in args[:3])
+    or (revoke and len(args) != 3)
+):
+    print("Використання: allow-chat [--revoke] <requester_id> <message_id> <chat_id> [name]")
     sys.exit(1)
 
-cid = str(sys.argv[1]).strip()
-d = json.load(open(P))
-af = d.setdefault("allowFrom", [])
-if cid in [str(x) for x in af]:
-    print(f"{cid} already in allowlist ({len(af)} total)")
-    sys.exit(0)
-af.append(cid)
-json.dump(d, open(P, "w"), ensure_ascii=False, indent=2)
-who = (" " + " ".join(sys.argv[2:])) if len(sys.argv) > 2 else ""
-print(f"added {cid}{who} to allowlist ({len(af)} total)")
+requester, message_id, cid = (str(value).strip() for value in args[:3])
+helper = Path(__file__).with_name("access-update")
+result = subprocess.run(
+    [
+        sys.executable,
+        str(helper),
+        "revoke" if revoke else "allow",
+        P,
+        requester,
+        message_id,
+        cid,
+        *args[3:],
+    ],
+    check=False,
+)
+raise SystemExit(result.returncode)

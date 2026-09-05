@@ -1,0 +1,215 @@
+#!/usr/bin/env python3
+"""Що з файлів комплекту власник змінив своїми руками.
+
+Оновлення повертає свої файли — це його робота. Але якщо власник допиляв
+`transcribe` під локальну модель або переписав helper під свій процес, мовчазне
+повернення нашої версії виглядає як поломка: вчора працювало, сьогодні ні.
+
+Порівнюємо живі файли з тими, що лежать у чекауті комплекту цієї ж інсталяції.
+Різниця означає рівно одне: тут людина щось міняла, і про це треба спитати,
+а не переписувати наосліп.
+"""
+from __future__ import annotations
+
+import hashlib
+import argparse
+import importlib.util
+import json
+import os
+import pathlib
+import pwd
+import sys
+
+HOME = pathlib.Path(os.environ.get("HOME", "/home/claude"))
+KIT = pathlib.Path(os.environ.get("KIT_DIR", "/opt/claude-tg-starter"))
+
+
+def load_update_module():
+    source_candidate = pathlib.Path(__file__).resolve().parents[1] / "lib/managed_runtime_update.py"
+    installed_candidate = KIT / "assets/lib/managed_runtime_update.py"
+    module_path = source_candidate if source_candidate.is_file() else installed_candidate
+    if not module_path.is_file():
+        raise RuntimeError("модуль безпечного оновлення не знайдено")
+    spec = importlib.util.spec_from_file_location("managed_runtime_update", module_path)
+    module = importlib.util.module_from_spec(spec)
+    if spec.loader is None:
+        raise RuntimeError("модуль безпечного оновлення не завантажено")
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def digest(path: pathlib.Path) -> str | None:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def legacy_main() -> int:
+    as_json = "--json" in sys.argv
+    reference = KIT / "assets/bin"
+    if not reference.is_dir():
+        print(f"чекаут комплекту не знайдено: {reference}", file=sys.stderr)
+        return 2
+
+    changed, missing = [], []
+    for source in sorted(reference.iterdir()):
+        if not source.is_file():
+            continue
+        live = HOME / "bin" / source.name
+        if not live.exists():
+            missing.append(source.name)
+            continue
+        if digest(live) != digest(source):
+            changed.append(source.name)
+
+    if as_json:
+        print(json.dumps({"changedByOwner": changed, "absent": missing},
+                         ensure_ascii=False))
+        return 0
+
+    if not changed:
+        print("Файли комплекту не змінювались — оновлення нічого не перезапише.")
+        return 0
+
+    print(f"Власник змінив {len(changed)} файл(ів) комплекту. Оновлення поверне наші версії:")
+    for name in changed:
+        print(f"  ~/bin/{name}")
+    print("\nПерш ніж оновлюватись, спитай власника про кожен і збережи копію:")
+    print("  cp -a ~/bin/<файл> ~/bin/<файл>.my")
+    return 0
+
+
+def command_main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("command", choices=("plan", "seed", "apply", "accept"))
+    parser.add_argument("--home", type=pathlib.Path, required=True)
+    parser.add_argument("--kit", type=pathlib.Path, required=True)
+    parser.add_argument("--policy", type=pathlib.Path, required=True)
+    parser.add_argument("--baseline", type=pathlib.Path, required=True)
+    parser.add_argument("--owner", default=pwd.getpwuid(os.getuid()).pw_name)
+    parser.add_argument("--json", action="store_true")
+    parser.add_argument("--defer-baseline", action="store_true")
+    args = parser.parse_args(argv)
+    if args.defer_baseline and args.command != "apply":
+        raise ValueError("--defer-baseline дозволено лише для apply")
+    try:
+        account = pwd.getpwnam(args.owner)
+    except KeyError as error:
+        raise ValueError("невідомий Unix-користувач агента") from error
+    module = load_update_module()
+    if args.command == "seed":
+        baseline = module.seed_baseline(
+            args.home,
+            args.kit,
+            args.policy,
+            args.baseline,
+            account.pw_uid,
+            account.pw_gid,
+        )
+        output = {
+            "status": "seeded",
+            "files": len(baseline["files"]),
+            "containsSecrets": False,
+        }
+    else:
+        plan = module.build_plan(args.home, args.kit, args.policy, args.baseline)
+        blocked_actions = {"conflict", "unclassified"}
+        if args.command == "accept":
+            blocked_actions |= {"install", "remove"}
+        blocked = any(
+            decision.action in blocked_actions
+            for decision in plan.decisions
+        )
+        if args.command == "apply" and not blocked:
+            module.apply_plan(
+                args.home,
+                args.kit,
+                args.baseline,
+                plan,
+                account.pw_uid,
+                account.pw_gid,
+                args.defer_baseline,
+            )
+        elif args.command == "accept" and not blocked:
+            module.accept_plan(
+                args.home,
+                args.baseline,
+                plan,
+                account.pw_uid,
+                account.pw_gid,
+            )
+        statuses = {"plan": "ready", "apply": "applied", "accept": "accepted"}
+        output = {
+            "status": "blocked" if blocked else statuses[args.command],
+            "actions": [
+                {
+                    "path": decision.path,
+                    "action": decision.action,
+                    "reason": decision.reason,
+                }
+                for decision in plan.decisions
+            ],
+        }
+    if args.json:
+        print(json.dumps(output, ensure_ascii=False, sort_keys=True))
+    else:
+        if args.command == "seed":
+            print(f"Контрольну базу створено: {output['files']} файл(ів).")
+        elif output["status"] == "blocked":
+            print("Оновлення зупинено: керовані файли потребують рішення власника.")
+        elif args.command == "accept":
+            print("Контрольну базу прийнято після фінальних перевірок.")
+        else:
+            print("Керовані файли перевірено без конфліктів.")
+    return 3 if output["status"] == "blocked" else 0
+
+
+def profile_value_main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--home", type=pathlib.Path, required=True)
+    parser.add_argument("name", choices=("AGENT_NAME",))
+    args = parser.parse_args(argv)
+    module = load_update_module()
+    values = module.render_context(args.home, include_environment=False)
+    sys.stdout.write(values.get(args.name, ""))
+    return 0
+
+
+def profile_export_main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--home", type=pathlib.Path, required=True)
+    args = parser.parse_args(argv)
+    module = load_update_module()
+    values = module.render_context(args.home, include_environment=False)
+    for name in module.PROFILE_KEYS:
+        if name in values:
+            os.write(1, name.encode() + b"\0" + values[name].encode() + b"\0")
+    return 0
+
+
+def main() -> int:
+    if len(sys.argv) > 1 and sys.argv[1] == "profile-export":
+        try:
+            return profile_export_main(sys.argv[2:])
+        except (OSError, ValueError, RuntimeError) as error:
+            print(f"update-safety-check: {error}", file=sys.stderr)
+            return 2
+    if len(sys.argv) > 1 and sys.argv[1] == "profile-value":
+        try:
+            return profile_value_main(sys.argv[2:])
+        except (OSError, ValueError, RuntimeError) as error:
+            print(f"update-safety-check: {error}", file=sys.stderr)
+            return 2
+    if len(sys.argv) > 1 and sys.argv[1] in {"plan", "seed", "apply", "accept"}:
+        try:
+            return command_main(sys.argv[1:])
+        except (OSError, ValueError, RuntimeError) as error:
+            print(f"update-safety-check: {error}", file=sys.stderr)
+            return 2
+    return legacy_main()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

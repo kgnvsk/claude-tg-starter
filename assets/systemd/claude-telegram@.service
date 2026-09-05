@@ -1,0 +1,37 @@
+[Unit]
+Description=Claude Code Telegram Bot (instance %i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=%i
+Group=%i
+UMask=0077
+WorkingDirectory=/home/%i
+Environment=HOME=/home/%i
+Environment=USER=%i
+Environment=TERM=xterm-256color
+Environment=BUN_INSTALL=/home/%i/.bun
+Environment=PATH=/home/%i/.local/bin:/home/%i/.bun/bin:/home/%i/bin:/usr/local/bin:/usr/bin:/bin
+Environment=CLAUDE_TELEGRAM_SERVICE=claude-telegram@%i.service
+
+# screen -Dm: detach+stay foreground, -S name (screen sockets are per-user, no clash)
+ExecStart=/usr/bin/screen -L -Logfile /home/%i/logs/claude-screen.log -Dm -S claude-bot /home/%i/bin/claude-telegram-bot
+ExecStop=-/usr/bin/screen -S claude-bot -X quit
+# GNU screen exits with 1 after a requested quit; for this unit that is a clean stop.
+SuccessExitStatus=0 1
+
+StandardInput=null
+StandardOutput=journal
+StandardError=journal
+
+Restart=always
+RestartSec=10
+StartLimitInterval=120
+StartLimitBurst=5
+LimitNOFILE=65536
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

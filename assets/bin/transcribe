@@ -9,14 +9,19 @@ set -e
 [ ! -f "$1" ] && { echo "Not found: $1" >&2; exit 1; }
 
 # Load env
-[ -f ~/.claude/channels/telegram/.env ] && export $(grep -v '^#' ~/.claude/channels/telegram/.env | xargs)
+if [ -f "$HOME/.claude/channels/telegram/.env" ]; then
+  set -a
+  . "$HOME/.claude/channels/telegram/.env"
+  set +a
+fi
 [ -z "$OPENAI_API_KEY" ] && { echo "No OPENAI_API_KEY" >&2; exit 1; }
 
 SRC="$1"
 EXT="${SRC##*.}"
 # OpenAI doesn't accept .oga — rename (it's valid ogg container)
 if [ "$EXT" = "oga" ]; then
-  TMP="/tmp/transcribe-$$.ogg"
+  TMP="$(mktemp "${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/transcribe.XXXXXX.ogg")"
+  chmod 600 "$TMP"
   cp "$SRC" "$TMP"
   SRC="$TMP"
   trap 'rm -f "$TMP"' EXIT
@@ -24,6 +29,8 @@ fi
 
 try_key() {
   curl -sS -X POST "https://api.openai.com/v1/audio/transcriptions" \
+    --connect-timeout "${TRANSCRIBE_CONNECT_TIMEOUT_SECONDS:-10}" \
+    --max-time "${TRANSCRIBE_MAX_TIME_SECONDS:-120}" \
     -H "Authorization: Bearer $1" \
     -F "file=@$SRC" \
     -F "model=gpt-4o-mini-transcribe" \

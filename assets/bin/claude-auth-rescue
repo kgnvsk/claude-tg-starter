@@ -1,0 +1,536 @@
+#!/usr/bin/env python3
+"""Self-service Claude re-login via Telegram — no SSH needed.
+
+When the Claude OAuth refresh token dies, the agent's model calls fail but the
+Telegram plugin poller keeps running (bot token is independent). This script,
+launched by the healthcheck, closes the loop without an operator:
+
+  1. spawn `claude auth login --claudeai` under a pty, capture the OAuth URL
+     ("If the browser didn't open, visit: https://claude.com/cai/oauth/...");
+  2. send that URL to the owner via raw Bot API with instructions;
+  3. the owner signs in, gets a code, and sends it back TO THE BOT as a plain
+     message; we read it from the plugin's messages.db (chat-scoped) and paste
+     it into the waiting CLI prompt ("Paste code here if prompted >");
+  4. verify `claude auth status`, restart the service, prove the canonical
+     Telegram poller is alive, then confirm in Telegram.
+
+Hardening (2026-07-11, Mani incident): codes from stale links (wrong #state
+suffix) are ignored while waiting; if the CLI ignores stdin (~2.1.113-era
+loopback-only login), the code is delivered to its local OAuth callback
+instead; after success the owner is warned about stale
+CLAUDE_CODE_OAUTH_TOKEN / ANTHROPIC_API_KEY left in .env (they override fresh
+credentials and 401 the bot).
+
+The human tap is unavoidable by OAuth design (and desirable: no password is
+ever stored). Everything else is automatic. Debounced via a state file so the
+2-minute healthcheck can call this unconditionally. Never logs tokens/codes.
+"""
+
+import json
+import fcntl
+import os
+import pty
+import re
+import select
+import signal
+import sqlite3
+import stat
+import subprocess
+import sys
+import time
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+HOME = Path(os.environ.get("HOME", "/home/claude"))
+AGENT_ROOT = Path(os.environ.get("AGENT_ROOT", str(HOME)))
+CLAUDE_CONFIG_DIR = Path(
+    os.environ.get("CLAUDE_CONFIG_DIR", str(HOME / ".claude"))
+)
+STATE_DIR = Path(
+    os.environ.get("TELEGRAM_STATE_DIR")
+    or str(AGENT_ROOT / ".claude/channels/telegram")
+)
+
+
+def _find_claude() -> Path:
+    """The kit installs claude to ~/.local/bin, but custom boxes differ."""
+    for candidate in (HOME / ".local/bin/claude",
+                      Path("/usr/local/bin/claude"), Path("/usr/bin/claude")):
+        if candidate.is_file():
+            return candidate
+    return HOME / ".local/bin/claude"
+
+
+CLAUDE_BIN = _find_claude()
+ENV_FILE = STATE_DIR / ".env"
+ACCESS_FILE = STATE_DIR / "access.json"
+MESSAGES_DB = STATE_DIR / "messages.db"
+BOT_PID_FILE = STATE_DIR / "bot.pid"
+STATE_FILE = AGENT_ROOT / "logs/auth-rescue.state"
+LOG_FILE = AGENT_ROOT / "logs/auth-rescue.log"
+LOCK_FILE = AGENT_ROOT / "logs/auth-rescue.lock"
+AUTH_ESTABLISHED = AGENT_ROOT / ".claude/auth-established"
+SERVICE = os.environ.get("CLAUDE_TELEGRAM_SERVICE", "claude-telegram.service")
+PROC_ROOT = Path("/proc")
+
+URL_TIMEOUT_S = 75        # waiting for the OAuth URL to appear in CLI output
+CODE_TIMEOUT_S = 600      # waiting for the owner to send the code back
+DEBOUNCE_S = 1200         # min gap between rescue attempts
+# Авто-спроби обмежені: кожна нова вбиває попередню login-сесію і робить
+# код, який власник уже відкрив, недійсним (Бухтич, 29.08.2026). Після
+# двох авто-спроб зупиняємось і чекаємо ручного /relogin (він іде з --force).
+AUTO_ATTEMPTS_CAP = 2
+ATTEMPTS_FILE = AGENT_ROOT / ".claude/auth-rescue-auto-attempts"
+POLLER_START_TIMEOUT_S = 60
+POLLER_POLL_INTERVAL_S = 1
+TRANSPORT_RESTART_ATTEMPTS = 2
+
+
+def log(message: str) -> None:
+    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with LOG_FILE.open("a", encoding="utf-8") as handle:
+        handle.write(f"{time.strftime('%F %T')} {message}\n")
+
+
+def mark_auth_established() -> None:
+    AUTH_ESTABLISHED.parent.mkdir(parents=True, exist_ok=True)
+    AUTH_ESTABLISHED.touch(mode=0o600, exist_ok=True)
+    AUTH_ESTABLISHED.chmod(0o600)
+
+
+def extract_url(text: str) -> str:
+    """OAuth URL from real CLI output. Newer CLIs (2.1.2xx) print it as an OSC-8
+    terminal hyperlink (\\e]8;;URL\\e\\ visible-URL \\e]8;;\\e\\) — the URL appears
+    twice back-to-back with no whitespace, so a greedy \\S* grabbed BOTH copies +
+    the escape bytes (that's the 'two links + ]8;; tail' bug). Strip OSC and CSI
+    sequences first, then match URL chars only, stopping at ws / esc / ] / \\."""
+    clean = re.sub(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)", "", text)  # OSC (incl. 8)
+    clean = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", clean)           # CSI
+    clean = clean.replace("\x1b\\", "").replace("\x1b", "")        # stray ST/ESC
+    match = re.search(r"https://[^\s\x1b\]\\]+oauth[^\s\x1b\]\\]*", clean)
+    return match.group(0).rstrip(".,)") if match else ""
+
+
+def looks_like_code(text: str) -> bool:
+    """The pasted-back authorization code: one long token, no spaces."""
+    text = text.strip()
+    return bool(re.fullmatch(r"[A-Za-z0-9_#\-\.]{15,}", text))
+
+
+def logged_in() -> bool:
+    try:
+        probe = subprocess.run(
+            [str(CLAUDE_BIN), "auth", "status"],
+            capture_output=True, text=True, timeout=25,
+            env={
+                **os.environ,
+                "HOME": str(HOME),
+                "CLAUDE_CONFIG_DIR": str(CLAUDE_CONFIG_DIR),
+                "ATARAX_SUPPRESS_TELEGRAM": "1",
+            },
+        )
+        out = (probe.stdout or "") + (probe.stderr or "")
+        # Хук no-nested-claude-guard блокує виклик і повертає свій текст замість
+        # статусу. Порожній статус — це «не знаю», а не «логін помер»: інакше
+        # сторож бачить блокування як прострочений токен і щоп'ять хвилин
+        # шле власнику посилання на новий вхід.
+        if "SELF-KILL GUARD" in out or '"decision": "block"' in out or "PermissionDenied" in out:
+            log("auth probe blocked by hook — не вважаю це втратою логіну")
+            return True
+        return '"loggedIn": true' in out
+    except Exception:
+        return False
+
+
+def listener_port(pid: int) -> str:
+    """Old CLIs (~2.1.113) take the code ONLY via a loopback HTTP callback."""
+    try:
+        out = subprocess.run(["ss", "-tlnp"], capture_output=True, text=True,
+                             timeout=10).stdout
+    except Exception:
+        return ""
+    for line in out.splitlines():
+        if f"pid={pid}," in line:
+            match = re.search(r":(\d+)\s", line)
+            if match:
+                return match.group(1)
+    return ""
+
+
+def env_token_zombies() -> str:
+    """Stale auth env vars in .env override fresh credentials → the bot 401s."""
+    try:
+        names = [line.split("=", 1)[0]
+                 for line in ENV_FILE.read_text(encoding="utf-8").splitlines()
+                 if line.startswith(("CLAUDE_CODE_OAUTH_TOKEN=",
+                                     "ANTHROPIC_API_KEY="))]
+        return ", ".join(names)
+    except Exception:
+        return ""
+
+
+def bot_token() -> str:
+    for line in ENV_FILE.read_text(encoding="utf-8").splitlines():
+        if line.startswith("TELEGRAM_BOT_TOKEN="):
+            return line.split("=", 1)[1].strip()
+    return ""
+
+
+def owner_chat() -> str:
+    data = json.loads(ACCESS_FILE.read_text(encoding="utf-8"))
+    admins = data.get("admins") or []
+    if admins:
+        return str(admins[0])
+    allow = data.get("allowFrom") or []
+    return str(allow[0]) if allow else ""
+
+
+def send(token: str, chat: str, text: str) -> None:
+    body = urllib.parse.urlencode({"chat_id": chat, "text": text}).encode()
+    req = urllib.request.Request(
+        f"https://api.telegram.org/bot{token}/sendMessage", data=body
+    )
+    try:
+        urllib.request.urlopen(req, timeout=15).read()
+    except Exception as error:
+        log(f"send failed: {type(error).__name__}")
+
+
+def canonical_poller_alive() -> bool:
+    """Prove bot.pid names this user's live Bun server.ts process.
+
+    A bare PID existence check is unsafe because stale PIDs can be reused. The
+    Telegram server owns bot.pid and removes it on clean shutdown, while /proc
+    lets us bind the proof to the expected user, executable, and entrypoint.
+    """
+    try:
+        metadata = BOT_PID_FILE.lstat()
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid():
+            return False
+        raw = BOT_PID_FILE.read_text(encoding="ascii").strip()
+        if not raw.isdigit():
+            return False
+        pid = int(raw)
+        if pid <= 1:
+            return False
+        os.kill(pid, 0)
+
+        process = PROC_ROOT / str(pid)
+        status = (process / "status").read_text(encoding="utf-8")
+        uid_line = next(
+            line for line in status.splitlines() if line.startswith("Uid:")
+        )
+        if int(uid_line.split()[1]) != os.getuid():
+            return False
+
+        executable = Path(os.readlink(process / "exe")).name
+        if executable not in {"bun", "bun.exe"}:
+            return False
+        arguments = [
+            value.decode("utf-8", errors="replace")
+            for value in (process / "cmdline").read_bytes().split(b"\0")
+            if value
+        ]
+        return any(Path(argument).name == "server.ts" for argument in arguments)
+    except (OSError, UnicodeDecodeError, ValueError, StopIteration):
+        return False
+
+
+def wait_for_canonical_poller() -> bool:
+    """Wait a bounded interval for the post-restart Telegram process."""
+    deadline = time.monotonic() + POLLER_START_TIMEOUT_S
+    while True:
+        if canonical_poller_alive():
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(POLLER_POLL_INTERVAL_S, remaining))
+
+
+def restart_and_verify_transport() -> bool:
+    """Restart at most twice and return only after a proven poller."""
+    for attempt in range(1, TRANSPORT_RESTART_ATTEMPTS + 1):
+        try:
+            result = subprocess.run(
+                ["sudo", "systemctl", "restart", SERVICE],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=60,
+            )
+            restart_ok = result.returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            restart_ok = False
+        if not restart_ok:
+            log(f"service restart attempt {attempt} failed")
+        if wait_for_canonical_poller():
+            return True
+        log(f"Telegram poller absent after service restart attempt {attempt}")
+    return False
+
+
+def finish_recovery(
+    token: str,
+    chat: str,
+    *,
+    success_message: str,
+    success_log: str,
+) -> int:
+    """Complete OAuth recovery only when Telegram transport is live."""
+    mark_auth_established()
+    recovered = restart_and_verify_transport()
+    try:
+        STATE_FILE.unlink()
+    except OSError:
+        pass
+    if recovered:
+        send(token, chat, success_message)
+        log(success_log)
+        return 0
+    send(
+        token,
+        chat,
+        "⚠️ Авторизацію Claude відновлено, але Telegram-канал не запустився "
+        "після двох безпечних перезапусків. Відновлення не позначено завершеним — "
+        "потрібна перевірка каналу.",
+    )
+    log("auth restored but Telegram poller failed after two restarts")
+    return 1
+
+
+def debounced() -> bool:
+    try:
+        state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    pid = state.get("pid")
+    if pid:
+        try:
+            os.kill(int(pid), 0)
+            return True  # another rescue flow is live
+        except OSError:
+            pass
+    return time.time() - state.get("ts", 0) < DEBOUNCE_S
+
+
+def save_state() -> None:
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    STATE_FILE.write_text(json.dumps({"ts": time.time(), "pid": os.getpid()}))
+
+
+def acquire_lock() -> int | None:
+    """Allow only one interactive OAuth flow per agent."""
+    LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(LOCK_FILE, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(descriptor)
+        return None
+    return descriptor
+
+
+def wait_code_from_owner(chat: str, since_ms: int, state: str = "") -> str | None:
+    deadline = time.time() + CODE_TIMEOUT_S
+    while time.time() < deadline:
+        # A desktop operator may complete a separate login while this rescue is
+        # waiting on its own OAuth code. Stop immediately instead of sending a
+        # false "still logged out / link expired" alert ten minutes later.
+        if logged_in():
+            return None
+        try:
+            conn = sqlite3.connect(f"file:{MESSAGES_DB}?mode=ro", uri=True, timeout=2)
+            rows = conn.execute(
+                "SELECT text FROM messages WHERE chat_id=? AND direction='in' "
+                "AND ts>? ORDER BY ts",
+                (chat, since_ms),
+            ).fetchall()
+            conn.close()
+            for (text,) in rows:
+                if not text or not looks_like_code(text):
+                    continue
+                text = text.strip()
+                # a code from an OLD login link (stale #state suffix) can never
+                # succeed — ignore it and keep waiting for the right one
+                if state and not text.endswith(f"#{state}"):
+                    continue
+                return text
+        except Exception:
+            pass
+        time.sleep(5)
+    return ""
+
+
+def main(force: bool = False) -> int:
+    lock_descriptor = acquire_lock()
+    if lock_descriptor is None:
+        log("another rescue flow is active")
+        return 0
+    # force = owner typed /relogin: send a fresh link now, even if the current
+    # login still looks alive and regardless of the auto-debounce.
+    if not force and logged_in():
+        mark_auth_established()
+        try:
+            os.unlink(ATTEMPTS_FILE)
+        except FileNotFoundError:
+            pass
+        return 0
+    if not force and not AUTH_ESTABLISHED.exists():
+        log("initial Claude auth pending; auto-rescue disabled")
+        return 0
+    if not force and debounced():
+        log("debounced")
+        return 0
+    # cap: дві авто-спроби на один збій — кожна нова вбиває попередню
+    # login-сесію і робить відкритий власником код недійсним. Далі чекаємо
+    # ручного /relogin (він іде з force і скидає лічильник).
+    if force:
+        try:
+            os.unlink(ATTEMPTS_FILE)
+        except FileNotFoundError:
+            pass
+    else:
+        try:
+            _n = int(ATTEMPTS_FILE.read_text(encoding="ascii").strip() or "0")
+        except Exception:
+            _n = 0
+        if _n >= AUTO_ATTEMPTS_CAP:
+            log(f"auto-rescue capped after {_n} attempts; waiting for /relogin")
+            return 0
+        ATTEMPTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        ATTEMPTS_FILE.write_text(str(_n + 1), encoding="ascii")
+    save_state()
+
+    token = bot_token()
+    chat = owner_chat()
+    if not token or not chat:
+        log("no bot token or owner chat — cannot assist")
+        return 1
+
+    log("auth dead — starting rescue flow")
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.environ["HOME"] = str(HOME)
+        os.environ["CLAUDE_CONFIG_DIR"] = str(CLAUDE_CONFIG_DIR)
+        os.environ["ATARAX_SUPPRESS_TELEGRAM"] = "1"
+        os.execv(str(CLAUDE_BIN), [str(CLAUDE_BIN), "auth", "login", "--claudeai"])
+
+    output = b""
+    url = ""
+    end = time.time() + URL_TIMEOUT_S
+    while time.time() < end and not url:
+        ready, _, _ = select.select([fd], [], [], 1)
+        if ready:
+            try:
+                chunk = os.read(fd, 4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            output += chunk
+            url = extract_url(output.decode(errors="replace"))
+
+    if not url:
+        os.kill(pid, signal.SIGKILL)
+        log("no oauth url captured — will retry on next tick (no user spam)")
+        try:
+            STATE_FILE.unlink()  # снять debounce → следующий cron-тик (5 мин) повторит
+        except OSError:
+            pass
+        return 1
+
+    state_match = re.search(r"[?&]state=([A-Za-z0-9_\-]+)", url)
+    state = state_match.group(1) if state_match else ""
+
+    since_ms = int(time.time() * 1000)
+    send(token, chat,
+         "🔐 Термін дії моєї авторизації Claude завершився. Віднови її за хвилину, без SSH:\n"
+         "1) Відкрий посилання нижче та увійди до свого облікового запису Claude.\n"
+         "2) Скопіюй код зі сторінки.\n"
+         "3) Надішли мені сюди код ОДНИМ повідомленням (лише код, без слів).\n\n"
+         f"{url}\n\n"
+         "⏳ Чекаю код 10 хвилин. Якщо не встигнеш або посилання втратить чинність — просто напиши мені "
+         "/relogin, і я відразу надішлю свіже (скільки завгодно разів).")
+    log("oauth url sent to owner; waiting for code")
+
+    code = wait_code_from_owner(chat, since_ms, state)
+    if code is None:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        return finish_recovery(
+            token,
+            chat,
+            success_message=(
+                "✅ Авторизацію вже відновлено іншим способом, Telegram-канал "
+                "працює — я знову в строю."
+            ),
+            success_log="rescue completed by another login flow; transport verified",
+        )
+    if not code:
+        os.kill(pid, signal.SIGKILL)
+        send(token, chat,
+             "⌛ Код не надійшов за 10 хвилин — посилання втратило чинність. "
+             "Приблизно за 20 хвилин надішлю нове, або напиши адміністратору.")
+        log("code wait timeout")
+        return 1
+
+    os.write(fd, code.encode() + b"\n")
+    log("code pasted into cli")
+
+    end = time.time() + 45
+    while time.time() < end:
+        if os.waitpid(pid, os.WNOHANG)[0] == pid:
+            break
+        ready, _, _ = select.select([fd], [], [], 1)
+        if ready:
+            try:
+                if not os.read(fd, 4096):
+                    break
+            except OSError:
+                break
+
+    if not logged_in():
+        # old CLIs ignore the stdin paste — their login waits on a loopback port
+        port = listener_port(pid)
+        if port and state:
+            try:
+                query = urllib.parse.urlencode(
+                    {"code": code.split("#", 1)[0], "state": state})
+                urllib.request.urlopen(
+                    f"http://127.0.0.1:{port}/callback?{query}", timeout=20)
+                log("stdin didn't land — delivered via loopback callback")
+            except Exception as error:
+                log(f"loopback delivery failed: {type(error).__name__}")
+            end = time.time() + 40
+            while time.time() < end:
+                if logged_in():
+                    break
+                time.sleep(5)
+
+    if logged_in():
+        zombies = env_token_zombies()
+        warn = (f"\n⚠️ У {ENV_FILE} залишився {zombies} — старий токен перекриває "
+                "нову авторизацію (бот отримає 401). Видали цей рядок і перезапусти мене."
+                if zombies else "")
+        return finish_recovery(
+            token,
+            chat,
+            success_message=(
+                "✅ Авторизацію відновлено, Telegram-канал працює — "
+                "я знову в строю." + warn
+            ),
+            success_log="rescue OK, transport verified",
+        )
+
+    send(token, chat,
+         "❌ Код не підійшов (або надісланий із зайвим текстом). "
+         "Напиши /relogin — надішлю свіже посилання, спробуємо ще раз.")
+    log("code rejected — still logged out")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main("--force" in sys.argv))

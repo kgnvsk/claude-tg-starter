@@ -5,29 +5,32 @@
 # need the owner (cash-doctor flags them). Most failures self-heal via healthcheck (cron);
 # this is the on-demand "force heal".
 set -u
-H=/home/claude
-echo "🔧 {{AGENT_NAME}} fix"
+H="${HOME:-/home/claude}"
+SVC="${CLAUDE_TELEGRAM_SERVICE:-claude-telegram.service}"
+echo "🔧 {{AGENT_NAME}} — виправлення"
 echo
 
-# 1. golden-restore — re-apply the patched plugin if it drifted (upstream sync revert)
-if [ -f "$H/telegram-server-fixed.ts" ]; then
-  n=0
-  for SRV in "$H"/.claude/plugins/cache/claude-plugins-official/telegram/*/server.ts \
-             "$H"/.claude/plugins/marketplaces/claude-plugins-official/external_plugins/telegram/server.ts; do
-    if [ -f "$SRV" ] && ! cmp -s "$H/telegram-server-fixed.ts" "$SRV"; then cp "$H/telegram-server-fixed.ts" "$SRV"; n=$((n+1)); fi
-  done
-  [ "$n" -gt 0 ] && echo "  ✅ golden восстановлен (${n} шт. дрейфнули)" || echo "  ✅ golden уже на месте"
+# 1. golden restore — only the exact official 0.0.7 provenance may transition
+# to the reviewed golden. A future or locally modified plugin is a manual review,
+# never a wildcard overwrite followed by a restart.
+if [ ! -x "$H/bin/reconcile-telegram-plugin" ]; then
+  echo "  ❌ відсутній перевірений reconciler Telegram plugin; службу не перезапущено" >&2
+  exit 2
+fi
+if ! "$H/bin/reconcile-telegram-plugin" --apply; then
+  echo "  ❌ Telegram plugin несумісний із перевіреним patch 0.0.7; службу не перезапущено" >&2
+  exit 2
 fi
 
 # 2. clear failed state + restart — re-reads creds, respawns poller, clears crash-loop stop
-sudo systemctl reset-failed claude-telegram.service 2>/dev/null
-if sudo systemctl restart claude-telegram.service 2>/dev/null; then
-  echo "  ✅ сервис перезапущен"
+sudo systemctl reset-failed "$SVC" 2>/dev/null
+if sudo systemctl restart "$SVC" 2>/dev/null; then
+  echo "  ✅ службу перезапущено"
 else
-  echo "  ❌ рестарт не удался — нужен ты (ssh)"
+  echo "  ❌ перезапуск не вдався — потрібен ти (SSH)"
 fi
 
 sleep 5
 echo
-echo "── состояние после фикса ──"
+echo "── стан після виправлення ──"
 "$H/bin/cash-doctor"

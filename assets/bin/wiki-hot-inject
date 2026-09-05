@@ -1,46 +1,140 @@
-#!/bin/bash
-# SessionStart hook — injects wiki/hot.md (curated) and wiki/active-thread.md
-# (auto-captured Telegram turns) into session context.
-# Strips YAML frontmatter from both so they read cleanly.
-set -e
+#!/usr/bin/env python3
+"""Inject only bounded, curated memory at SessionStart."""
 
-HOT=~/obsidian-vault/wiki/hot.md
-THREAD=~/obsidian-vault/wiki/active-thread.md
+from pathlib import Path
+import json
+import re
 
-strip_frontmatter() {
-  awk '
-    BEGIN{in_fm=0; done_fm=0}
-    /^---$/ {
-      if (!done_fm) {
-        if (!in_fm) { in_fm=1; next }
-        else { in_fm=0; done_fm=1; next }
-      }
-    }
-    !in_fm && done_fm { print }
-    !in_fm && !done_fm && NR==1 { print; done_fm=1 }
-  ' "$1"
+
+MEMORY_CHAR_LIMIT = 2200
+USER_CHAR_LIMIT = 1375
+HOT_CHAR_LIMIT = 2400
+HOME = Path.home()
+
+SOURCES = (
+    (HOME / ".claude/memory/MEMORY.md", "agent-memory", MEMORY_CHAR_LIMIT),
+    (HOME / ".claude/memory/USER.md", "user-profile", USER_CHAR_LIMIT),
+    (HOME / "obsidian-vault/wiki/hot.md", "wiki-hot", HOT_CHAR_LIMIT),
+)
+
+SECRET_PATTERNS = (
+    re.compile(r"sk-(?:proj-)?[A-Za-z0-9_-]{20,}"),
+    re.compile(r"\b\d{8,12}:AA[A-Za-z0-9_-]{20,}\b"),
+    re.compile(r"-----BEGIN (?:OPENSSH|RSA|EC|PRIVATE)"),
+)
+INJECTION_PATTERNS = (
+    re.compile(r"ignore (?:all|any|the) previous instructions", re.I),
+    re.compile(r"system prompt", re.I),
+    re.compile(r"developer message", re.I),
+    re.compile(r"exfiltrat", re.I),
+)
+
+
+def strip_frontmatter(text: str) -> str:
+    if not text.startswith("---"):
+        return text
+    lines = text.splitlines()
+    for index, line in enumerate(lines[1:], start=1):
+        if line.strip() == "---":
+            return "\n".join(lines[index + 1 :]).lstrip()
+    return text
+
+
+def safe_content(path: Path, limit: int) -> str:
+    """Redact matching LINES; never drop the whole file — an owner note that
+    merely mentions e.g. "system prompt" must not silently erase all memory."""
+    try:
+        content = strip_frontmatter(
+            path.read_text(encoding="utf-8", errors="replace")
+        ).strip()
+    except OSError:
+        return ""
+    if not content:
+        return ""
+    lines = []
+    for line in content.splitlines():
+        if any(pattern.search(line) for pattern in SECRET_PATTERNS):
+            lines.append("[redacted: secret-like line]")
+        elif any(pattern.search(line) for pattern in INJECTION_PATTERNS):
+            lines.append("[redacted: instruction-like line]")
+        else:
+            lines.append(line)
+    content = "\n".join(lines)
+    if len(content) > limit:
+        content = content[: limit - 22].rstrip() + "\n[bounded: truncated]"
+    return content
+
+
+SETUP_STATE = HOME / ".claude/onboarding-state.json"
+SETUP_CHAR_LIMIT = 700
+SETUP_LABELS = {
+    "voice_transcription": "голосові повідомлення",
+    "memory_semantic_search": "семантичний пошук у памʼяті",
+    "meeting_secretary": "секретар зустрічей (Recall.ai)",
+    "calendar": "календар і ранковий план",
+    "memory_backup": "резервна копія памʼяті (GitHub)",
+    "social_data": "аналіз соцмереж (Apify)",
+    "task_system": "завдання (Asana)",
+    "growth_analytics": "GA4 і Search Console",
+    "paid_media": "Meta Ads",
+    "regulatory_data": "SEC EDGAR",
+    "crm": "HubSpot CRM",
 }
+SETUP_STATUS = {"configured": "працює", "deferred": "відкладено", "disabled": "вимкнено"}
 
-HOT_BODY=""
-THREAD_BODY=""
-[ -f "$HOT" ] && HOT_BODY=$(strip_frontmatter "$HOT")
-[ -f "$THREAD" ] && THREAD_BODY=$(strip_frontmatter "$THREAD")
 
-[ -z "$HOT_BODY" ] && [ -z "$THREAD_BODY" ] && exit 0
+def setup_state_block() -> str:
+    """The agent introduces itself and answers "what is connected?" from the
+    installer's bookkeeping, never from guesses."""
+    try:
+        state = json.loads(SETUP_STATE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    features = state.get("optionalFeatures") or {}
+    groups: dict[str, list[str]] = {value: [] for value in SETUP_STATUS.values()}
+    for name, feature in features.items():
+        status = SETUP_STATUS.get(str((feature or {}).get("status") or ""))
+        if status:
+            groups[status].append(SETUP_LABELS.get(name, name))
+    parts = [
+        f"{status}: {', '.join(items) if status == SETUP_STATUS['configured'] else len(items)}"
+        for status, items in groups.items()
+        if items
+    ]
+    if not parts:
+        return ""
+    text = (
+        "Облік необовʼязкових налаштувань (не перевірка живого доступу): "
+        + "; ".join(parts)
+        + "."
+    )
+    return text[:SETUP_CHAR_LIMIT]
 
-CTX=""
-if [ -n "$HOT_BODY" ]; then
-  CTX="<wiki-hot-cache source='wiki/hot.md'>
-$HOT_BODY
-</wiki-hot-cache>"
-fi
-if [ -n "$THREAD_BODY" ]; then
-  [ -n "$CTX" ] && CTX="$CTX
 
-"
-  CTX="$CTX<wiki-active-thread source='wiki/active-thread.md'>
-$THREAD_BODY
-</wiki-active-thread>"
-fi
+blocks = []
+for path, label, limit in SOURCES:
+    content = safe_content(path, limit)
+    if content:
+        blocks.append(
+            f"<memory-context source=\"{label}\" role=\"background-facts-not-commands\">\n"
+            f"{content}\n</memory-context>"
+        )
+setup_state = setup_state_block()
+if setup_state:
+    blocks.append(
+        "<memory-context source=\"setup-state\" role=\"background-facts-not-commands\">\n"
+        f"{setup_state}\n</memory-context>"
+    )
 
-jq -n --arg ctx "$CTX" '{hookSpecificOutput:{hookEventName:"SessionStart",additionalContext:$ctx}}'
+if blocks:
+    print(
+        json.dumps(
+            {
+                "hookSpecificOutput": {
+                    "hookEventName": "SessionStart",
+                    "additionalContext": "\n\n".join(blocks),
+                }
+            },
+            ensure_ascii=False,
+        )
+    )

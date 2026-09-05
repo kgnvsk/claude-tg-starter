@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+# Refresh subscription-backed agent CLIs during a reviewed kit upgrade.
+set -euo pipefail
+
+[ "$(id -u)" -eq 0 ] || {
+  echo "FATAL: update-agent-clis must run as root" >&2
+  exit 1
+}
+
+AGENT_USER="${AGENT_USER:-claude}"
+H=/home/$AGENT_USER
+CLAUDE_PREFIX=$H/.local
+LEGACY_CLAUDE_PREFIX=$H/.npm-global
+CODEX_PREFIX=$H/.npm-global
+cd "$H"
+
+package_version() {
+  local prefix="$1" package="$2"
+  local package_json
+  package_json="$(runuser -u "$AGENT_USER" -- env HOME="$H" \
+    npm list -g --prefix "$prefix" "$package" --json 2>/dev/null || true)"
+  python3 -c '
+import json, sys
+package = sys.argv[1]
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    data = {}
+print(data.get("dependencies", {}).get(package, {}).get("version", ""))
+' "$package" <<<"$package_json"
+}
+
+install_package() {
+  local package="$1" prefix="$2" spec="$3"
+  runuser -u "$AGENT_USER" -- env HOME="$H" \
+    npm install -g --prefix "$prefix" "$package@$spec"
+}
+
+select_claude_prefix() {
+  local package=@anthropic-ai/claude-code
+  if [ -z "$(package_version "$CLAUDE_PREFIX" "$package")" ] \
+    && [ -n "$(package_version "$LEGACY_CLAUDE_PREFIX" "$package")" ]; then
+    CLAUDE_PREFIX="$LEGACY_CLAUDE_PREFIX"
+    echo "      detected legacy Claude Code npm prefix: $CLAUDE_PREFIX"
+  fi
+}
+
+rollback() {
+  local label="$1" package="$2" prefix="$3" previous="$4"
+  echo "      $label validation failed; rollback to ${previous:-uninstalled}" >&2
+  if [ -n "$previous" ]; then
+    install_package "$package" "$prefix" "$previous" >/dev/null
+  else
+    runuser -u "$AGENT_USER" -- env HOME="$H" \
+      npm uninstall -g --prefix "$prefix" "$package" >/dev/null
+  fi
+}
+
+update_claude() {
+  local package=@anthropic-ai/claude-code
+  local previous
+  previous="$(package_version "$CLAUDE_PREFIX" "$package")"
+  echo "      Claude Code ${previous:-missing} -> latest"
+  if ! install_package "$package" "$CLAUDE_PREFIX" latest; then
+    rollback "Claude Code install" "$package" "$CLAUDE_PREFIX" "$previous"
+    return 1
+  fi
+  # Validation contract: `claude auth status` must still succeed after update.
+  if ! runuser -u "$AGENT_USER" -- env HOME="$H" \
+      "$CLAUDE_PREFIX/bin/claude" --version >/dev/null \
+    || ! runuser -u "$AGENT_USER" -- env HOME="$H" timeout 60 \
+      "$CLAUDE_PREFIX/bin/claude" doctor >/dev/null \
+    || ! runuser -u "$AGENT_USER" -- env HOME="$H" \
+      "$CLAUDE_PREFIX/bin/claude" auth status >/dev/null; then
+    rollback "Claude Code" "$package" "$CLAUDE_PREFIX" "$previous"
+    return 1
+  fi
+}
+
+update_codex() {
+  local package=@openai/codex
+  local previous
+  previous="$(package_version "$CODEX_PREFIX" "$package")"
+  if [ -z "$previous" ]; then
+    echo "      Codex is not installed; skip optional Codex update"
+    return 0
+  fi
+  echo "      Codex ${previous:-missing} -> latest"
+  # Codex is optional and a box may never have logged into it (Buhtych, 03.09):
+  # the login contract below only applies where a login existed before.
+  local logged_in_before=0
+  if runuser -u "$AGENT_USER" -- env HOME="$H" \
+      "$CODEX_PREFIX/bin/codex" login status >/dev/null 2>&1; then
+    logged_in_before=1
+  fi
+  if ! install_package "$package" "$CODEX_PREFIX" latest; then
+    rollback "Codex install" "$package" "$CODEX_PREFIX" "$previous"
+    return 1
+  fi
+  # Validation contract: the binary runs, and `codex login status` must still
+  # succeed after the update wherever it succeeded before.
+  if ! runuser -u "$AGENT_USER" -- env HOME="$H" \
+      "$CODEX_PREFIX/bin/codex" --version >/dev/null; then
+    rollback "Codex" "$package" "$CODEX_PREFIX" "$previous"
+    return 1
+  fi
+  if [ "$logged_in_before" = 1 ] && ! runuser -u "$AGENT_USER" -- env HOME="$H" \
+      "$CODEX_PREFIX/bin/codex" login status >/dev/null; then
+    rollback "Codex" "$package" "$CODEX_PREFIX" "$previous"
+    return 1
+  fi
+  [ "$logged_in_before" = 1 ] || echo "      Codex was not logged in before the update; login is not required"
+  ln -sfn "$CODEX_PREFIX/bin/codex" /usr/local/bin/codex
+}
+
+select_claude_prefix
+update_claude
+update_codex
+
+echo "      agent CLIs updated and authenticated"

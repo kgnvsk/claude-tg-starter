@@ -1,0 +1,515 @@
+#!/usr/bin/env python3
+"""Manage durable reminder tasks under the reminder worker's lock."""
+
+import argparse
+import fcntl
+import os
+import re
+import shutil
+import sys
+import tempfile
+from contextlib import contextmanager
+from dataclasses import dataclass
+from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+
+HEADER_RE = re.compile(r"^([A-Z][A-Z0-9_]*)=(.*)$")
+TASK_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+CHAT_RE = re.compile(r"^-?[0-9]{1,20}$")
+UINT_RE = re.compile(r"^[0-9]{1,18}$")
+QUIET_RE = re.compile(r"^(?:[01][0-9]|2[0-3]):[0-5][0-9]$")
+PARSE_VALUES = {"text", "markdown", "markdownv2", "html"}
+
+
+class TaskError(Exception):
+    pass
+
+
+@dataclass
+class Record:
+    path: Path
+    headers: dict
+    body: str
+
+
+def uint(value, name, *, positive=False):
+    text = str(value)
+    if not UINT_RE.fullmatch(text):
+        raise TaskError(f"invalid {name}: {text}")
+    number = int(text)
+    if positive and number == 0:
+        raise TaskError(f"invalid {name}: {text}")
+    return number
+
+
+def task_id(value):
+    if not TASK_RE.fullmatch(value):
+        raise TaskError(f"invalid TASK: {value}")
+    return value
+
+
+def chat_id(value):
+    if not CHAT_RE.fullmatch(value) or int(value) == 0:
+        raise TaskError(f"invalid CHAT: {value}")
+    return value
+
+
+def body_text(value):
+    if not value or not value.strip():
+        raise TaskError("message body must be nonempty")
+    return value.strip()
+
+
+def timezone_name(value):
+    if value is None:
+        return None
+    try:
+        ZoneInfo(value)
+    except (ZoneInfoNotFoundError, ValueError):
+        raise TaskError(f"invalid TIMEZONE: {value}") from None
+    return value
+
+
+def quiet_pair(start, end, timezone):
+    if (start is None) != (end is None):
+        raise TaskError("QUIET_START and QUIET_END must be provided together")
+    if start is None:
+        return None, None
+    if timezone is None:
+        raise TaskError("TIMEZONE is required with quiet hours")
+    if not QUIET_RE.fullmatch(start) or not QUIET_RE.fullmatch(end) or start == end:
+        raise TaskError("invalid quiet hours")
+    return start, end
+
+
+def split_file(path):
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError) as exc:
+        raise TaskError(f"cannot read queue file {path}: {exc}") from exc
+    headers = {}
+    body_lines = []
+    for index, line in enumerate(lines):
+        match = HEADER_RE.fullmatch(line)
+        if match:
+            key, value = match.groups()
+            if key in headers:
+                raise TaskError(f"duplicate {key} in {path}")
+            headers[key] = value
+            continue
+        body_lines = lines[index + 1 :] if not line.strip() else lines[index:]
+        break
+    return Record(path, headers, "\n".join(body_lines))
+
+
+def peek_task(path):
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError) as exc:
+        raise TaskError(f"cannot read queue file {path}: {exc}") from exc
+    found = None
+    for line in lines:
+        match = HEADER_RE.fullmatch(line)
+        if not match:
+            break
+        if match.group(1) == "TASK" and found is None:
+            found = match.group(2)
+    return found
+
+
+def validate_record(record, expected_task):
+    headers = record.headers
+    if headers.get("TASK") != expected_task:
+        raise TaskError(f"TASK mismatch in {record.path}")
+    task_id(headers["TASK"])
+    epoch = uint(headers.get("EPOCH", ""), "EPOCH", positive=True)
+    chat_id(headers.get("CHAT", ""))
+    parse = headers.get("PARSE", "text")
+    if parse not in PARSE_VALUES:
+        raise TaskError(f"invalid PARSE in {record.path}")
+    body_text(record.body)
+
+    repeat = headers.get("REPEAT_SECONDS")
+    if repeat is not None:
+        uint(repeat, "REPEAT_SECONDS", positive=True)
+        uint(headers.get("COUNT", "0"), "COUNT")
+        timezone = timezone_name(headers.get("TIMEZONE"))
+        quiet_pair(headers.get("QUIET_START"), headers.get("QUIET_END"), timezone)
+        if "UNTIL_EPOCH" in headers:
+            until = uint(headers["UNTIL_EPOCH"], "UNTIL_EPOCH", positive=True)
+            if until < epoch:
+                raise TaskError(f"UNTIL_EPOCH precedes EPOCH in {record.path}")
+    else:
+        forbidden = {"COUNT", "TIMEZONE", "QUIET_START", "QUIET_END", "UNTIL_EPOCH"}
+        if forbidden.intersection(headers):
+            raise TaskError(f"repeat-only header without REPEAT_SECONDS in {record.path}")
+
+    sequence_count = headers.get("SEQUENCE_COUNT")
+    sequence_index = headers.get("SEQUENCE_INDEX")
+    if (sequence_count is None) != (sequence_index is None):
+        raise TaskError(f"incomplete sequence headers in {record.path}")
+    if sequence_count is not None:
+        uint(sequence_count, "SEQUENCE_COUNT", positive=True)
+        uint(sequence_index, "SEQUENCE_INDEX", positive=True)
+    return epoch
+
+
+def infer_mode(records, task):
+    if not records:
+        raise TaskError(f"task not queued: {task}")
+    epochs = [validate_record(record, task) for record in records]
+    repeats = [record for record in records if "REPEAT_SECONDS" in record.headers]
+    sequence_marked = [record for record in records if "SEQUENCE_COUNT" in record.headers]
+    if repeats:
+        if len(records) != 1 or len(repeats) != 1:
+            raise TaskError(f"partial repeat state for {task}")
+        return "repeat", epochs
+    if sequence_marked:
+        if len(sequence_marked) != len(records):
+            raise TaskError(f"partial sequence state for {task}")
+        totals = {int(record.headers["SEQUENCE_COUNT"]) for record in records}
+        indexes = [int(record.headers["SEQUENCE_INDEX"]) for record in records]
+        if len(totals) != 1:
+            raise TaskError(f"partial sequence state for {task}")
+        total = totals.pop()
+        if (
+            len(set(indexes)) != len(indexes)
+            or max(indexes) != total
+            or sorted(indexes) != list(range(min(indexes), total + 1))
+        ):
+            raise TaskError(f"partial sequence state for {task}")
+        return "sequence", epochs
+    if len(records) == 1:
+        return "one", epochs
+    return "sequence", epochs
+
+
+def task_records(rem_dir, task):
+    records = []
+    for path in sorted(rem_dir.glob("*.rem")):
+        if path.is_file() and peek_task(path) == task:
+            records.append(split_file(path))
+    return records
+
+
+def require_equivalent(records, args, requested_mode):
+    actual_mode, _ = infer_mode(records, args.task)
+    if actual_mode != requested_mode:
+        raise TaskError(
+            f"existing task mode mismatch: requested {requested_mode}, found {actual_mode}"
+        )
+
+    if requested_mode == "one":
+        record = records[0]
+        expected = {
+            "EPOCH": str(args.at),
+            "CHAT": args.chat,
+            "PARSE": "text",
+            "RUN": "1" if getattr(args, "run", False) else None,
+        }
+        if any(record.headers.get(key) != value for key, value in expected.items()):
+            raise TaskError(f"existing task arguments differ: {args.task}")
+        if record.body != args.text:
+            raise TaskError(f"existing task body differs: {args.task}")
+        return
+
+    if requested_mode == "repeat":
+        record = records[0]
+        expected = {
+            "CHAT": args.chat,
+            "PARSE": "text",
+            "RUN": "1" if getattr(args, "run", False) else None,
+            "REPEAT_SECONDS": str(args.every),
+            "TIMEZONE": args.timezone,
+            "QUIET_START": args.quiet_start,
+            "QUIET_END": args.quiet_end,
+        }
+        until = record.headers.get("UNTIL_EPOCH")
+        if any(record.headers.get(key) != value for key, value in expected.items()):
+            raise TaskError(f"existing task arguments differ: {args.task}")
+        if until != (str(args.until) if args.until is not None else None):
+            raise TaskError(f"existing task UNTIL_EPOCH differs: {args.task}")
+        if record.body != args.text:
+            raise TaskError(f"existing task body differs: {args.task}")
+        return
+
+    total = len(args.checkpoints)
+    for record in records:
+        if "SEQUENCE_INDEX" not in record.headers:
+            raise TaskError(f"existing sequence lacks lifecycle metadata: {args.task}")
+        index = int(record.headers["SEQUENCE_INDEX"])
+        if int(record.headers["SEQUENCE_COUNT"]) != total or index > total:
+            raise TaskError(f"existing sequence shape differs: {args.task}")
+        epoch, text = args.checkpoints[index - 1]
+        if (
+            record.headers["EPOCH"] != str(epoch)
+            or record.headers["CHAT"] != args.chat
+            or record.headers.get("PARSE", "text") != "text"
+            or record.body != text
+        ):
+            raise TaskError(f"existing sequence checkpoint {index} differs: {args.task}")
+
+
+def verified_status(rem_dir, task):
+    records = task_records(rem_dir, task)
+    mode, epochs = infer_mode(records, task)
+    records.sort(key=lambda record: (int(record.headers["EPOCH"]), record.path.name))
+    fields = [f"task={task}", f"mode={mode}", f"files={len(records)}"]
+    if mode == "sequence":
+        fields.append("schedule=" + ",".join(str(epoch) for epoch in sorted(epochs)))
+    else:
+        record = records[0]
+        fields.extend([f"at={record.headers['EPOCH']}", f"chat={record.headers['CHAT']}"])
+        if mode == "repeat":
+            headers = record.headers
+            fields.extend(
+                [
+                    f"every={headers['REPEAT_SECONDS']}",
+                    f"count={headers.get('COUNT', '0')}",
+                    f"timezone={headers.get('TIMEZONE', 'none')}",
+                ]
+            )
+            if "QUIET_START" in headers:
+                fields.append(f"quiet={headers['QUIET_START']}-{headers['QUIET_END']}")
+            if "UNTIL_EPOCH" in headers:
+                fields.append(f"until={headers['UNTIL_EPOCH']}")
+    return "VERIFIED " + " ".join(fields)
+
+
+def render(headers, body):
+    return "".join(f"{key}={value}\n" for key, value in headers) + "\n" + body + "\n"
+
+
+def atomic_write(rem_dir, destination, content):
+    fd, temporary = tempfile.mkstemp(prefix=".reminder-task.", suffix=".tmp", dir=rem_dir)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if destination.exists():
+            raise TaskError(f"queue path already exists: {destination}")
+        os.replace(temporary, destination)
+    except Exception:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def create_single(rem_dir, args, repeat=False):
+    existing = task_records(rem_dir, args.task)
+    if existing:
+        require_equivalent(existing, args, "repeat" if repeat else "one")
+        return verified_status(rem_dir, args.task)
+    headers = [
+        ("EPOCH", str(args.at)),
+        ("CHAT", args.chat),
+        ("PARSE", "text"),
+        ("TASK", args.task),
+    ]
+    if getattr(args, "run", False):
+        headers.append(("RUN", "1"))
+    if repeat:
+        headers.extend(
+            [
+                ("REPEAT_SECONDS", str(args.every)),
+                ("TIMEZONE", args.timezone),
+                ("QUIET_START", args.quiet_start),
+                ("QUIET_END", args.quiet_end),
+            ]
+        )
+        if args.until is not None:
+            headers.append(("UNTIL_EPOCH", str(args.until)))
+        headers.append(("COUNT", "0"))
+    content = render(headers, args.text)
+    destination = rem_dir / f"{args.at}-{args.task}.rem"
+    atomic_write(rem_dir, destination, content)
+    try:
+        return verified_status(rem_dir, args.task)
+    except Exception:
+        destination.unlink(missing_ok=True)
+        raise
+
+
+def create_sequence(rem_dir, args):
+    existing = task_records(rem_dir, args.task)
+    if existing:
+        require_equivalent(existing, args, "sequence")
+        return verified_status(rem_dir, args.task)
+    stage = Path(tempfile.mkdtemp(prefix=f".{args.task}.stage.", dir=rem_dir))
+    published = []
+    staged = []
+    try:
+        total = len(args.checkpoints)
+        for index, (epoch, text) in enumerate(args.checkpoints, start=1):
+            headers = [
+                ("EPOCH", str(epoch)),
+                ("CHAT", args.chat),
+                ("PARSE", "text"),
+                ("TASK", args.task),
+                ("SEQUENCE_COUNT", str(total)),
+                ("SEQUENCE_INDEX", str(index)),
+            ]
+            staged_path = stage / f"{epoch}-{args.task}-{index}.pending"
+            with staged_path.open("x", encoding="utf-8") as handle:
+                handle.write(render(headers, text))
+                handle.flush()
+                os.fsync(handle.fileno())
+            staged.append(staged_path)
+
+        staged_records = [split_file(path) for path in staged]
+        mode, _ = infer_mode(staged_records, args.task)
+        if mode != "sequence" or len(staged_records) != total:
+            raise TaskError("invalid staged sequence")
+
+        destinations = [
+            rem_dir / f"{epoch}-{args.task}-{index}.rem"
+            for index, (epoch, _) in enumerate(args.checkpoints, start=1)
+        ]
+        if any(path.exists() for path in destinations):
+            raise TaskError("sequence destination already exists")
+        for source, destination in zip(staged, destinations):
+            os.replace(source, destination)
+            published.append(destination)
+        stage.rmdir()
+        result = verified_status(rem_dir, args.task)
+        if "mode=sequence" not in result or f"files={total}" not in result:
+            raise TaskError("published sequence did not verify")
+        return result
+    except Exception:
+        for path in published:
+            path.unlink(missing_ok=True)
+        shutil.rmtree(stage, ignore_errors=True)
+        raise
+
+
+def cancel_task(rem_dir, task):
+    for path in list(rem_dir.glob("*.rem")):
+        if path.is_file() and peek_task(path) == task:
+            path.unlink()
+    if task_records(rem_dir, task):
+        raise TaskError(f"task remains queued: {task}")
+    return f"VERIFIED task={task} mode=cancelled files=0"
+
+
+@contextmanager
+def queue_lock(rem_dir, lock_file):
+    rem_dir.mkdir(parents=True, exist_ok=True)
+    lock_file.parent.mkdir(parents=True, exist_ok=True)
+    with lock_file.open("a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        yield
+
+
+def checkpoint(value):
+    try:
+        epoch_text, text = value.split("|", 1)
+    except ValueError:
+        raise argparse.ArgumentTypeError("checkpoint must be EPOCH|TEXT") from None
+    try:
+        epoch = uint(epoch_text, "checkpoint EPOCH", positive=True)
+        text = body_text(text)
+    except TaskError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
+    return epoch, text
+
+
+def parser():
+    root = argparse.ArgumentParser(prog="reminder-task")
+    commands = root.add_subparsers(dest="command", required=True)
+
+    def identity(command):
+        command.add_argument("--task", required=True)
+
+    def message(command):
+        identity(command)
+        command.add_argument("--chat", required=True)
+        command.add_argument("--at", required=True)
+        command.add_argument("--text", required=True)
+        # The body stops being a note to the owner and becomes work the agent
+        # performs headless; what arrives in the chat is the result.
+        command.add_argument("--run", action="store_true")
+
+    one = commands.add_parser("one", help="create one durable reminder")
+    message(one)
+
+    repeat = commands.add_parser("repeat", help="create a repeating reminder")
+    message(repeat)
+    repeat.add_argument("--every", required=True)
+    repeat.add_argument("--timezone", required=True)
+    repeat.add_argument("--quiet-start", required=True)
+    repeat.add_argument("--quiet-end", required=True)
+    repeat.add_argument("--until")
+
+    sequence = commands.add_parser("sequence", help="create durable checkpoints")
+    identity(sequence)
+    sequence.add_argument("--chat", required=True)
+    sequence.add_argument("--checkpoint", action="append", required=True, type=checkpoint)
+
+    status = commands.add_parser("status", help="verify queued task state")
+    identity(status)
+    cancel = commands.add_parser("cancel", help="remove every queued file for a task")
+    identity(cancel)
+    return root
+
+
+def normalize(args):
+    args.task = task_id(args.task)
+    if args.command in {"one", "repeat", "sequence"}:
+        args.chat = chat_id(args.chat)
+    if args.command in {"one", "repeat"}:
+        args.at = uint(args.at, "EPOCH", positive=True)
+        args.text = body_text(args.text)
+    if args.command == "repeat":
+        args.every = uint(args.every, "REPEAT_SECONDS", positive=True)
+        args.timezone = timezone_name(args.timezone)
+        args.quiet_start, args.quiet_end = quiet_pair(
+            args.quiet_start, args.quiet_end, args.timezone
+        )
+        if args.until is not None:
+            args.until = uint(args.until, "UNTIL_EPOCH", positive=True)
+            if args.until < args.at:
+                raise TaskError("UNTIL_EPOCH precedes EPOCH")
+    if args.command == "sequence" and len(args.checkpoint) < 2:
+        raise TaskError("sequence requires at least two checkpoints")
+    if args.command == "sequence":
+        args.checkpoints = args.checkpoint
+        epochs = [epoch for epoch, _ in args.checkpoints]
+        if any(current <= previous for previous, current in zip(epochs, epochs[1:])):
+            raise TaskError("sequence checkpoint EPOCHs must be strictly increasing")
+    return args
+
+
+def main():
+    try:
+        args = normalize(parser().parse_args())
+        rem_dir_value = os.environ.get(
+            "REM_DIR", str(Path.home() / ".atarax/reminders")
+        )
+        rem_dir = Path(rem_dir_value)
+        lock_file = Path(
+            os.environ.get("LOCK_FILE", f"{rem_dir_value}.worker.lock")
+        )
+        with queue_lock(rem_dir, lock_file):
+            if args.command == "one":
+                result = create_single(rem_dir, args)
+            elif args.command == "repeat":
+                result = create_single(rem_dir, args, repeat=True)
+            elif args.command == "sequence":
+                result = create_sequence(rem_dir, args)
+            elif args.command == "status":
+                result = verified_status(rem_dir, args.task)
+            else:
+                result = cancel_task(rem_dir, args.task)
+        print(result)
+        return 0
+    except (TaskError, OSError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,31 @@
+{
+  "schemaVersion": 1,
+  "policy": {
+    "progressiveDisclosure": true,
+    "loadFullSkillOnlyWhenMatched": true,
+    "forbidNestedClaudeCli": true,
+    "reviewExternalInstructions": true
+  },
+  "externalSkillExceptions": {
+    "media-use": [
+      "remote shell pipe"
+    ]
+  },
+  "packs": {
+    "core": {
+      "description": "General research and owner workflows",
+      "enabledByDefault": true,
+      "skills": [
+        "research"
+      ]
+    }
+  },
+  "skills": {
+    "research": {
+      "risk": "network",
+      "requires": [
+        "native-subagents"
+      ]
+    }
+  }
+}

@@ -1,0 +1,97 @@
+#!/usr/bin/env python3
+"""Parse persisted shell-style settings as data and emit NUL pairs."""
+
+import os
+import shlex
+import sys
+from pathlib import Path
+
+
+EXPORTABLE = {
+    "ACTIVE_ROLES", "AGENT_ROLE",
+    "ADDITIONAL_ADMIN_CHAT_IDS", "AGENT_NAME", "ALERT_COPY_CHAT_IDS",
+    "BOT_USERNAME", "BUN_EXECUTABLE", "CALENDAR_EMAIL", "CHANNEL_ID",
+    "CLAUDE_EXECUTABLE",
+    "GOG_KEYRING_BACKEND", "GOG_KEYRING_PASSWORD",
+    "MAX_ATTEMPTS", "MODULE_CHANNEL_PUBLISH",
+    "MODULE_DESIGN_PACK", "MODULE_INSTAGRAM_DM",
+    "MODULE_SOCIAL_BROWSER", "MODULE_TRANSPORT_DAEMON",
+    "MEMORY_EMBEDDINGS_OPENAI", "MODULE_VAULT_WEB", "MODULE_YOUTUBE_COMMENTS",
+    "OPENAI_API_KEY",
+    "OWNER_CHAT_ID", "OWNER_EMAIL", "OWNER_NAME",
+    "OWNER_TG_USERNAME", "RECALL_API_KEY", "RECALL_REGION",
+    "RETRY_INITIAL_MS", "RETRY_MAX_MS",
+    "SITE_PASSWORD", "TELEGRAM_BOT_TOKEN", "TG_CORPORATE_SESSIONS",
+    "TG_DROP_PENDING_ON_BOOT",
+    "TIMEZONE", "VAULT_LOCALE", "VOICE_SETUP_STATUS",
+    "WORKER_TIMEOUT_MS",
+}
+
+# Accepted only so an environment written by the former experimental runtime
+# can upgrade to stable main. These values must not re-enter the process env.
+RETIRED = {
+    "MODULE_GRAPHIFY",
+    "MODULE_MULTI_USER", "ADMIN_CHAT_IDS", "CREATIVE_OPERATOR_IDS",
+    "INSTAGRAM_OPERATOR_IDS", "GUEST_ACCESS_MODE", "MAX_WORKERS",
+    "WORKER_TIMEOUT_FULL_MS", "WORKER_TIMEOUT_CREATIVE_MS",
+    "WORKER_TIMEOUT_INSTAGRAM_MS", "WORKER_TIMEOUT_GUEST_MS",
+    "GUEST_RETENTION_DAYS", "RETENTION_CLEANUP_INTERVAL_MS",
+    "CODEX_EXECUTABLE", "OPENAI_API_KEY_FILE",
+    "INSTAGRAM_DM_REPORT_EXECUTABLE", "INSTAGRAM_COMMENT_REPORT_EXECUTABLE",
+    "INSTAGRAM_TOP_REPORT_EXECUTABLE", "INSTAGRAM_WEB_REPORT_EXECUTABLE",
+}
+ALLOWED = EXPORTABLE | RETIRED
+
+
+def parse(path: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        name, separator, raw = line.partition("=")
+        if not separator or name not in ALLOWED or name in values:
+            raise ValueError(f"invalid saved setting on line {number}")
+        if raw.startswith("$'"):
+            raise ValueError(f"unsupported ANSI-C quoting for {name}; re-run onboarding")
+        if raw == "":
+            value = ""
+        else:
+            lexer = shlex.shlex(raw, posix=True)
+            lexer.whitespace_split = True
+            lexer.commenters = ""
+            tokens = list(lexer)
+            if len(tokens) != 1:
+                raise ValueError(f"invalid saved value for {name} on line {number}")
+            value = tokens[0]
+        values[name] = value
+    return values
+
+
+def main() -> None:
+    value_mode = len(sys.argv) == 4 and sys.argv[1] == "--value"
+    if value_mode:
+        path = sys.argv[2]
+        requested = [sys.argv[3]]
+    else:
+        if len(sys.argv) < 2:
+            raise SystemExit("usage: saved-env-export PATH [NAME ...]")
+        path = sys.argv[1]
+        requested = sys.argv[2:]
+    if any(name not in EXPORTABLE for name in requested):
+        raise SystemExit("requested setting is not allowlisted")
+    try:
+        values = parse(Path(path))
+    except (OSError, UnicodeError, ValueError) as error:
+        raise SystemExit(str(error)) from error
+    if value_mode:
+        sys.stdout.write(values.get(requested[0], ""))
+        return
+    names = requested or [name for name in values if name in EXPORTABLE]
+    for name in names:
+        if name in values:
+            os.write(1, name.encode() + b"\0" + values[name].encode() + b"\0")
+
+
+if __name__ == "__main__":
+    main()

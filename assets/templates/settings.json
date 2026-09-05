@@ -1,11 +1,11 @@
 {
   "permissions": {
     "allow": [
-      "Bash(/home/claude/bin/html-to-pdf:*)",
-      "Bash(/home/claude/bin/transcribe:*)",
-      "Bash(/home/claude/bin/vc:*)",
+      "Bash({{AGENT_HOME}}/bin/html-to-pdf:*)",
+      "Bash({{AGENT_HOME}}/bin/transcribe:*)",
+      "Bash({{AGENT_HOME}}/bin/transcribe-telegram:*)",
+      "Bash({{AGENT_HOME}}/bin/vc:*)",
       "Bash(cp:*)",
-      "Bash(google-chrome:*)",
       "Bash(mv:*)",
       "Bash(rm /tmp/*)",
       "Bash(rm /tmp/*.html)",
@@ -14,17 +14,26 @@
       "Bash(~/.npm-global/bin/vercel:*)",
       "Bash(~/bin/html-to-pdf:*)",
       "Bash(~/bin/transcribe:*)",
+      "Bash(~/bin/transcribe-telegram:*)",
       "Bash(~/bin/vc:*)",
       "mcp__playwright__*",
-      "Bash(/home/claude/bin/allow-chat:*)",
+      "Bash({{AGENT_HOME}}/bin/allow-chat:*)",
       "Bash(~/bin/allow-chat:*)"
     ],
     "defaultMode": "bypassPermissions",
     "deny": [
-      "AskUserQuestion"
+      "AskUserQuestion",
+      "Read({{AGENT_HOME}}/.claude/channels/telegram/.env)",
+      "Read({{AGENT_HOME}}/.claude/.credentials.json)",
+      "Read(/etc/claude-tg-starter/**)",
+      "Edit({{AGENT_HOME}}/.claude/channels/telegram/.env)",
+      "Edit({{AGENT_HOME}}/.claude/.credentials.json)",
+      "Edit(/etc/claude-tg-starter/**)"
     ]
   },
-  "model": "claude-opus-4-8",
+  "model": "claude-opus-5",
+  "skillListingBudgetFraction": 0.08,
+  "skillListingMaxDescChars": 240,
   "hooks": {
     "PreToolUse": [
       {
@@ -32,7 +41,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/home/claude/bin/no-nested-claude-guard",
+            "command": "{{AGENT_HOME}}/bin/no-nested-claude-guard",
             "timeout": 5
           }
         ]
@@ -42,19 +51,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/home/claude/bin/tg-format-enforcer",
+            "command": "{{AGENT_HOME}}/bin/tg-format-enforcer",
             "timeout": 5
-          }
-        ]
-      }
-    ],
-    "SessionStart": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "/home/claude/bin/wiki-hot-inject",
-            "timeout": 10
           }
         ]
       },
@@ -62,8 +60,40 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/home/claude/bin/vault-index",
+            "command": "{{AGENT_HOME}}/bin/no-secrets-guard",
+            "timeout": 5
+          }
+        ],
+        "matcher": "Bash|Read|Edit|Write|MultiEdit"
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "{{AGENT_HOME}}/bin/memory-budget-guard",
+            "timeout": 5
+          }
+        ],
+        "matcher": "Bash|Edit|Write|MultiEdit"
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "{{AGENT_HOME}}/bin/wiki-hot-inject",
             "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "{{AGENT_HOME}}/bin/tg-context-inject",
+            "timeout": 5
           }
         ]
       }
@@ -74,17 +104,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "jq -r '.tool_input.file_path // .tool_response.filePath // \"\"' | grep -q \"^/home/claude/obsidian-vault/\" && /home/claude/bin/vault-sync &",
-            "timeout": 10
-          }
-        ]
-      },
-      {
-        "matcher": "mcp__plugin_telegram_telegram__(reply|edit_message)",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "/home/claude/bin/tg-thread-snapshot",
+            "command": "jq -r '.tool_input.file_path // .tool_response.filePath // \"\"' | grep -q \"^{{AGENT_HOME}}/obsidian-vault/\" && {{AGENT_HOME}}/bin/vault-sync &",
             "timeout": 10
           }
         ]
@@ -95,57 +115,37 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/home/claude/bin/cash-thread-capture",
+            "command": "{{AGENT_HOME}}/bin/tg-context-inject",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "{{AGENT_HOME}}/bin/subagent-result-nudge",
             "timeout": 5
           }
         ]
-      },
+      }
+    ],
+    "Stop": [
       {
         "hooks": [
           {
             "type": "command",
-            "command": "/home/claude/bin/tg-context-inject",
-            "timeout": 5
+            "command": "{{AGENT_HOME}}/bin/tg-reply-stop-guard",
+            "timeout": 35
           }
         ]
       }
     ]
   },
   "enabledPlugins": {
-    "telegram@claude-plugins-official": true,
-    "document-skills@anthropic-agent-skills": true,
-    "example-skills@anthropic-agent-skills": true,
-    "lazyweb@lazyweb": true,
-    "superpowers@superpowers-marketplace": true,
-    "frontend-design@claude-plugins-official": true,
-    "impeccable@impeccable": true
+    "telegram@claude-plugins-official": true
   },
-  "extraKnownMarketplaces": {
-    "anthropic-agent-skills": {
-      "source": {
-        "source": "github",
-        "repo": "anthropics/skills"
-      }
-    },
-    "lazyweb": {
-      "source": {
-        "source": "git",
-        "url": "https://github.com/aboul3ata/lazyweb-skill.git"
-      }
-    },
-    "superpowers-marketplace": {
-      "source": {
-        "source": "github",
-        "repo": "obra/superpowers-marketplace"
-      }
-    },
-    "impeccable": {
-      "source": {
-        "source": "github",
-        "repo": "pbakaus/impeccable"
-      }
-    }
-  },
+  "extraKnownMarketplaces": {},
   "alwaysThinkingEnabled": false,
-  "skipDangerousModePermissionPrompt": true
+  "skipDangerousModePermissionPrompt": true,
+  "env": {
+    "MCP_TOOL_TIMEOUT": "180000",
+    "CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT": "120000"
+  }
 }

@@ -1,0 +1,85 @@
+#!/usr/bin/env python3
+"""Субагент може написати «Зроблено», не запустивши жодного інструмента.
+
+Перевірено на живому: субагент повернув час доби з описом команди, якої не
+виконував — у його транскрипті нуль tool_use. Текст звіту сам себе підтвердити
+не може, тому хук рахує реальні виклики інструментів у транскрипті субагента.
+
+Точка перевірки — UserPromptSubmit, а не PostToolUse: субагенти асинхронні,
+PostToolUse спрацьовує на «агента запущено», коли результату ще немає. Результат
+приходить окремою подією <task-notification> з task-id, і цей id — імʼя файлу
+транскрипта субагента.
+"""
+from __future__ import annotations
+
+import json
+import pathlib
+import re
+import sys
+
+MARKER = re.compile(r"\[worker v\d+\]")
+TASK = re.compile(r"<task-id>([a-zA-Z0-9_-]+)</task-id>")
+
+
+def transcript_for(task_id: str) -> pathlib.Path | None:
+    root = pathlib.Path.home() / ".claude/projects"
+    hits = sorted(root.glob(f"**/subagents/agent-{task_id}.jsonl"),
+                  key=lambda p: p.stat().st_mtime, reverse=True)
+    return hits[0] if hits else None
+
+
+def inspect(path: pathlib.Path) -> tuple[int, bool]:
+    """Скільки інструментів справді викликано і чи є маркер у відповіді."""
+    tools, marked = 0, False
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        content = (row.get("message") or {}).get("content")
+        if isinstance(content, list):
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") == "tool_use":
+                    tools += 1
+                elif block.get("type") == "text" and MARKER.search(block.get("text", "")):
+                    marked = True
+        elif isinstance(content, str) and MARKER.search(content):
+            marked = True
+    return tools, marked
+
+
+def main() -> int:
+    raw = sys.stdin.read()
+    match = TASK.search(raw)
+    if not match:
+        return 0
+    path = transcript_for(match.group(1))
+    if path is None:
+        return 0
+    try:
+        tools, marked = inspect(path)
+    except OSError:
+        return 0
+
+    if tools == 0:
+        note = ("Субагент не викликав жодного інструмента — його «зроблено» "
+                "нічим не підтверджене. Перевір результат сам, перш ніж "
+                "переказувати власнику або писати у памʼять.")
+    elif not marked:
+        note = ("У відповіді субагента немає маркера базових правил — вони могли "
+                "не дійти. Звір ключове число або факт самостійно.")
+    else:
+        return 0
+    print(json.dumps({"hookSpecificOutput": {
+        "hookEventName": "UserPromptSubmit",
+        "additionalContext": f"[перевірка субагента] {note}",
+    }}, ensure_ascii=False))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

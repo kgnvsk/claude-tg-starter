@@ -1,35 +1,38 @@
 #!/bin/bash
-# cash-update — обновить ЭТОГО агента из репозитория кита (github.com/kgnvsk/claude-tg-starter).
-# Запускай прямо в сессии агента (или из шелла): подтянет свежий кит, покажет
-# git diff --stat (что меняется), и накатит update.sh (через sudo — на это есть право).
+# cash-update — безпечно перевірити наявність оновлення комплекту.
 #
-# Требует: кит развёрнут как git-КЛОН в /opt/claude-tg-starter, владелец claude, и
-# sudoers-правило на update.sh (см. DEPLOY.md «Самообновление»).
-set -u
+# Комплект і update.sh належать root. Claude може перевірити версію, але не може змінювати
+# root-owned код або запускати його через sudo. Застосування оновлення — окрема дія
+# адміністратора після перегляду diff.
+set -euo pipefail
+
 KIT=/opt/claude-tg-starter
+REMOTE=https://github.com/kgnvsk/claude-tg-starter.git
 
 if [ ! -d "$KIT/.git" ]; then
-  echo "✗ Кит в $KIT — не git-клон, сам обновиться не могу."
-  echo "  Владельцу (root) разово:"
-  echo "    rm -rf $KIT && git clone https://github.com/kgnvsk/claude-tg-starter $KIT && chown -R claude:claude $KIT"
+  echo "Комплект у $KIT не є git-клоном."
+  echo "Адміністратору root: розгорніть продуктовий репозиторій за інструкцією DEPLOY.md."
   exit 1
 fi
 
-OLD=$(git -C "$KIT" rev-parse --short HEAD 2>/dev/null || echo '?')
-echo "==> git pull (сейчас: $OLD)"
-if ! git -C "$KIT" pull --ff-only; then
-  echo "✗ git pull не прошёл (конфликт локальных правок или нет сети). Не трогаю ничего."
+current=$(git -C "$KIT" rev-parse HEAD)
+remote=$(git ls-remote "$REMOTE" refs/heads/main 2>/dev/null | awk 'NR == 1 { print $1 }' || true)
+
+if [ -z "$remote" ]; then
+  echo "Не вдалося перевірити приватний GitHub. Локальна версія: ${current:0:12}."
+  echo "Адміністратору root: перевірте доступ і виконайте git fetch origin main."
   exit 1
 fi
-NEW=$(git -C "$KIT" rev-parse --short HEAD)
-if [ "$OLD" = "$NEW" ]; then
-  echo "✅ Уже последняя версия ($NEW) — обновлять нечего."
+
+if [ "$current" = "$remote" ]; then
+  echo "Комплект уже оновлено: ${current:0:12}."
   exit 0
 fi
 
-echo "==> Что меняется ($OLD → $NEW):"
-git -C "$KIT" diff --stat "$OLD..$NEW" | tail -40
-
-echo "==> Применяю update.sh (sudo) — re-render + golden-патч + рестарт…"
-sudo "$KIT/update.sh"
-echo "✅ Обновление накатано: $OLD → $NEW"
+echo "Доступне оновлення: ${current:0:12} → ${remote:0:12}."
+echo "Застосувати його може лише адміністратор root після перевірки змін:"
+echo "  cd $KIT"
+echo "  git fetch origin main"
+echo "  git diff --stat HEAD..origin/main"
+echo "  git pull --ff-only"
+echo "  далі виконайте зупинену maintenance-транзакцію з UPGRADING.md"

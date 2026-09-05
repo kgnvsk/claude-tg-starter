@@ -1,0 +1,377 @@
+#!/usr/bin/env python3
+"""Atomically update Telegram access.json under a cross-process lock."""
+
+from __future__ import annotations
+
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import sqlite3
+import sys
+import tempfile
+import time
+from typing import Callable
+
+
+CARRIER_MAX_AGE_S = 15 * 60
+LOCK_WAIT_SECONDS = 5.0
+
+
+def acquire_access_lock(lock_fd: int) -> None:
+    # A membership handler awaits this process in the sequential Telegram poller.
+    # Never let a wedged writer hold up every later private message indefinitely.
+    deadline = time.monotonic() + LOCK_WAIT_SECONDS
+    while True:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise SystemExit("access-update: lock wait timed out; retry the access change") from None
+            time.sleep(min(0.05, remaining))
+
+
+def unique(values: list[object]) -> list[str]:
+    result: list[str] = []
+    for value in values:
+        normalized = str(value).strip()
+        if normalized and normalized not in result:
+            result.append(normalized)
+    return result
+
+
+def locked_update(path: Path, update: Callable[[dict], str]) -> str:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_name(path.name + ".lock")
+    lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        acquire_access_lock(lock_fd)
+        if path.is_symlink():
+            raise SystemExit(f"Символічне посилання на файл доступу відхилено: {path}")
+        data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+        if not isinstance(data, dict):
+            raise SystemExit(f"Файл доступу має містити JSON-об’єкт: {path}")
+        message = update(data)
+        fd, temporary = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(data, handle, ensure_ascii=False, indent=2)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(temporary, 0o600)
+            os.replace(temporary, path)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+        return message
+    finally:
+        os.close(lock_fd)
+
+
+def locked_inspect(path: Path, inspect: Callable[[dict], str]) -> str:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_name(path.name + ".lock")
+    lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        acquire_access_lock(lock_fd)
+        if path.is_symlink() or not path.is_file():
+            raise SystemExit(f"Файл доступу відсутній або небезпечний: {path}")
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise SystemExit(f"Файл доступу має містити JSON-об’єкт: {path}")
+        return inspect(data)
+    finally:
+        os.close(lock_fd)
+
+
+def reconcile_admins(data: dict, owner: str, additional_csv: str) -> str:
+    desired = unique([owner, *additional_csv.split(",")])
+    previous_admins = set(unique(data.get("admins", [])))
+    guests = [
+        chat_id
+        for chat_id in unique(data.get("allowFrom", []))
+        if chat_id not in previous_admins and chat_id not in desired
+    ]
+    data["admins"] = desired
+    data["allowFrom"] = [*guests, *desired]
+    return f"Узгоджено адміністраторів: {len(desired)}; збережено гостей: {len(guests)}"
+
+
+def preserve_admins(data: dict, owner: str, additional_csv: str) -> str:
+    del additional_csv  # Saved profile is not authority during an update.
+    raw_admins = data.get("admins")
+    raw_allowed = data.get("allowFrom")
+    if not isinstance(raw_admins, list) or not isinstance(raw_allowed, list):
+        raise SystemExit("Поля admins і allowFrom мають бути списками")
+    if any(not isinstance(value, str) or not value.isdigit() for value in [*raw_admins, *raw_allowed]):
+        raise SystemExit("Telegram ID у файлі доступу мають бути числовими рядками")
+    if len(set(raw_admins)) != len(raw_admins) or len(set(raw_allowed)) != len(raw_allowed):
+        raise SystemExit("Файл доступу містить дублікати Telegram ID")
+    if owner not in raw_admins or owner not in raw_allowed:
+        raise SystemExit("Основний власник відсутній у поточному файлі доступу")
+    if not set(raw_admins).issubset(raw_allowed):
+        raise SystemExit("Адміністратор поза allowFrom: оновлення не розширює доступ автоматично")
+    return f"Збережено чинний склад доступу: адміністраторів {len(raw_admins)}"
+
+
+def registered_groups(path: Path) -> set[str]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return set()
+    groups = data.get("groups") if isinstance(data, dict) else None
+    return set(map(str, groups)) if isinstance(groups, dict) else set()
+
+
+def corroborate_requester(path: Path, requester: str, message_id: str, target: str) -> None:
+    """The requester id arrives from the model, which read it out of message
+    metadata, so a prompt injection could hand over any number. The transport's
+    own message log is the second witness: the carrier message must exist, come
+    from that user, and be fresh. In a private chat that is enough — nobody
+    else sees those message ids. In a registered group every member sees them,
+    so the carrier must additionally name the target id itself: an injected
+    request can then only repeat what the admin literally asked for."""
+    db_path = path.with_name("messages.db")
+    if db_path.is_symlink() or not db_path.is_file():
+        raise SystemExit("Дію відхилено: журнал транспорту недоступний, відправника не підтверджено")
+    try:
+        connection = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            rows = connection.execute(
+                "SELECT chat_id, ts, COALESCE(text, '') FROM messages WHERE direction='in' "
+                "AND user_id=? AND message_id=? ORDER BY ts DESC",
+                (requester, int(message_id)),
+            ).fetchall()
+        finally:
+            connection.close()
+    except (sqlite3.Error, ValueError):
+        raise SystemExit("Дію відхилено: журнал транспорту не читається, відправника не підтверджено") from None
+    if not rows:
+        raise SystemExit("Дію відхилено: повідомлення-носій не знайдено в журналі транспорту для цього відправника")
+    groups = registered_groups(path)
+    names_target = re.compile(rf"(?<!\d){re.escape(target)}(?!\d)")
+    stale = False
+    for chat_id, ts, text in rows:
+        if time.time() - int(ts) / 1000 > CARRIER_MAX_AGE_S:
+            stale = True
+            continue
+        if str(chat_id) == requester:
+            return
+        if str(chat_id) in groups and names_target.search(text):
+            return
+    if stale:
+        raise SystemExit("Дію відхилено: повідомлення-носій старіше за 15 хвилин — попроси адміністратора повторити запит")
+    raise SystemExit(
+        "Дію відхилено: носій має бути з приватного чату адміністратора або із зареєстрованої групи, "
+        f"де в тому самому повідомленні названо id {target}"
+    )
+
+
+def record_access_event(event: dict) -> None:
+    """Append-only trail: who changed the allowlist, for whom, when, and with
+    which carrier message. Without it a grant is unexplainable after the fact."""
+    log_dir = Path(os.environ.get("HOME") or Path.home()) / "logs"
+    try:
+        log_dir.mkdir(mode=0o700, exist_ok=True)
+        fd = os.open(log_dir / "access-grants.log", os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        with os.fdopen(fd, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps({"ts": int(time.time()), **event}, ensure_ascii=False) + "\n")
+    except OSError as error:
+        print(f"Увага: журнал видач не записано ({error})", file=sys.stderr)
+
+
+def allow_chat(data: dict, requester: str, chat_id: str, name: str) -> str:
+    if requester not in unique(data.get("admins", [])):
+        raise SystemExit("Дію відхилено: користувач не є адміністратором")
+    allowed = unique(data.get("allowFrom", []))
+    if chat_id in allowed:
+        return f"Чат {chat_id} уже в списку дозволених (усього: {len(allowed)})"
+    allowed.append(chat_id)
+    data["allowFrom"] = allowed
+    suffix = f" {name}" if name else ""
+    return f"Чат {chat_id}{suffix} додано до списку дозволених (усього: {len(allowed)})"
+
+
+def revoke_chat(data: dict, requester: str, chat_id: str) -> str:
+    admins = unique(data.get("admins", []))
+    if requester not in admins:
+        raise SystemExit("Дію відхилено: користувач не є адміністратором")
+    # admins ⊆ allowFrom is an invariant preserve-admins checks on every update;
+    # stripping an admin from the allowlist is a separate owner decision.
+    if chat_id in admins:
+        raise SystemExit("Дію відхилено: це адміністратор — зняти адміністратора може лише власник окремим рішенням")
+    allowed = unique(data.get("allowFrom", []))
+    if chat_id not in allowed:
+        return f"Чату {chat_id} немає у списку дозволених — нічого змінювати (усього: {len(allowed)})"
+    allowed.remove(chat_id)
+    data["allowFrom"] = allowed
+    return f"Чат {chat_id} прибрано зі списку дозволених (усього: {len(allowed)})"
+
+
+def register_group(data: dict, actor: str, group_id: str, name: str) -> str:
+    if actor not in unique(data.get("admins", [])):
+        raise SystemExit("Дію відхилено: користувач не є адміністратором")
+
+    groups = data.setdefault("groups", {})
+    if not isinstance(groups, dict):
+        raise SystemExit("Поле groups має бути JSON-об’єктом")
+    current = groups.get(group_id, {})
+    if not isinstance(current, dict):
+        raise SystemExit(f"Некоректна політика групи: {group_id}")
+    current["requireMention"] = current.get("requireMention", True)
+    current["allowFrom"] = unique(current.get("allowFrom", []))
+    current["observeEnabled"] = True
+    if name:
+        current["name"] = name
+    groups[group_id] = current
+    return f"Групу {name or group_id} зареєстровано ({group_id})"
+
+
+def deactivate_group(data: dict, group_id: str, name: str) -> str:
+    groups = data.get("groups", {})
+    if not isinstance(groups, dict):
+        raise SystemExit("Поле groups має бути JSON-об’єктом")
+    current = groups.get(group_id)
+    if not isinstance(current, dict):
+        return f"Групу {group_id} не було зареєстровано"
+    current["observeEnabled"] = False
+    if name:
+        current["name"] = name
+    return f"Групу {current.get('name') or group_id} деактивовано ({group_id})"
+
+
+def resolve_group(data: dict, target: str) -> tuple[str, dict]:
+    groups = data.get("groups", {})
+    if not isinstance(groups, dict):
+        raise SystemExit("Поле groups має бути JSON-об’єктом")
+    target = str(target).strip()
+    if target in groups:
+        return target, groups[target]
+
+    folded = target.casefold()
+    exact = [
+        (group_id, policy)
+        for group_id, policy in groups.items()
+        if str(policy.get("name", "")).strip().casefold() == folded
+    ]
+    if len(exact) == 1:
+        return exact[0]
+
+    partial = [
+        (group_id, policy)
+        for group_id, policy in groups.items()
+        if folded and folded in str(policy.get("name", "")).strip().casefold()
+    ]
+    if len(partial) == 1:
+        return partial[0]
+    if len(exact) > 1 or len(partial) > 1:
+        raise SystemExit(f"Неоднозначна назва групи: {target}")
+    raise SystemExit(f"Групу не знайдено: {target}")
+
+
+def set_group_observation(
+    data: dict, requester: str, desired: str, target: str
+) -> str:
+    admins = unique(data.get("admins", []))
+    if requester not in admins:
+        raise SystemExit("Дію відхилено: користувач не є адміністратором")
+
+    group_id, policy = resolve_group(data, target)
+    if not isinstance(policy, dict):
+        raise SystemExit(f"Некоректна політика групи: {group_id}")
+    name = str(policy.get("name") or group_id)
+
+    if desired == "status":
+        enabled = policy.get("observeEnabled", True) is not False
+    elif desired in {"on", "off"}:
+        enabled = desired == "on"
+        policy["observeEnabled"] = enabled
+    else:
+        raise SystemExit("Стан має бути on, off або status")
+
+    state_label = "увімкнено" if enabled else "вимкнено"
+    return f"{name} ({group_id}): спостереження {state_label}"
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) < 3:
+        command_name = Path(argv[0]).name
+        observation_command = "group-observation"
+        print(
+            f"Використання: {command_name} reconcile-admins <path> <chat_id_власника> [additional_csv]\n"
+            f"       {command_name} preserve-admins <path> <chat_id_власника> [additional_csv]\n"
+            f"       {command_name} allow <path> <requester> <message_id> <chat_id> [name]\n"
+            f"       {command_name} revoke <path> <requester> <message_id> <chat_id>\n"
+            f"       {command_name} {observation_command} <path> <requester> <on|off|status> <group>\n"
+            f"       {command_name} group-register <path> <actor> <group_id> [name]\n"
+            f"       {command_name} group-deactivate <path> <group_id> [name]",
+            file=sys.stderr,
+        )
+        return 2
+    command, path = argv[1], Path(argv[2])
+    if command == "reconcile-admins" and len(argv) in (4, 5):
+        message = locked_update(
+            path, lambda data: reconcile_admins(data, argv[3], argv[4] if len(argv) == 5 else "")
+        )
+    elif command == "preserve-admins" and len(argv) in (4, 5):
+        message = locked_inspect(
+            path, lambda data: preserve_admins(data, argv[3], argv[4] if len(argv) == 5 else "")
+        )
+    elif (
+        command in {"allow", "revoke"}
+        and (len(argv) >= 6 if command == "allow" else len(argv) == 6)
+        and all(argv[index].lstrip("-").isdigit() for index in (3, 4, 5))
+    ):
+        requester, message_id, chat_id = argv[3], argv[4], argv[5]
+        name = " ".join(argv[6:])
+        event = {
+            "action": command,
+            "requester_id": requester,
+            "message_id": message_id,
+            "chat_id": chat_id,
+            "name": name,
+        }
+        try:
+            corroborate_requester(path, requester, message_id, chat_id)
+            if command == "allow":
+                message = locked_update(
+                    path, lambda data: allow_chat(data, requester, chat_id, name)
+                )
+            else:
+                message = locked_update(
+                    path, lambda data: revoke_chat(data, requester, chat_id)
+                )
+        except SystemExit as error:
+            record_access_event({**event, "result": "denied", "reason": str(error)})
+            raise
+        record_access_event({**event, "result": "ok", "detail": message})
+    elif command == "group-observation" and len(argv) >= 6:
+        message = locked_update(
+            path,
+            lambda data: set_group_observation(
+                data, argv[3], argv[4].lower(), " ".join(argv[5:])
+            ),
+        )
+    elif command == "group-register" and len(argv) >= 5:
+        message = locked_update(
+            path,
+            lambda data: register_group(data, argv[3], argv[4], " ".join(argv[5:])),
+        )
+    elif command == "group-deactivate" and len(argv) >= 4:
+        message = locked_update(
+            path,
+            lambda data: deactivate_group(data, argv[3], " ".join(argv[4:])),
+        )
+    else:
+        print("Некоректні аргументи команди", file=sys.stderr)
+        return 2
+    print(message)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))

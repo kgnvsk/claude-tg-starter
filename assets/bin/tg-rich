@@ -1,0 +1,101 @@
+#!/usr/bin/env python3
+"""tg-rich — send a Telegram Rich Message (Bot API 10.1 sendRichMessage).
+
+Rich messages give REAL tables, headings, ordered/unordered lists, blockquotes,
+static checkbox lists, code blocks — not symbol-costyli. No Telegram Business
+connection needed (business_connection_id is optional for sendRichMessage; it is
+required ONLY for the interactive tappable sendChecklist — a different method).
+
+Usage:
+    tg-rich <chat_id> <html_file> [--reply-to <message_id>]
+    tg-rich <chat_id> --html '<h2>..</h2>' [--reply-to <message_id>]
+
+The HTML body may use only the tags Telegram supports for rich messages
+(https://core.telegram.org/bots/api#rich-html-style): b/i/u/s/code/mark, h1..h6,
+p, pre, ul/ol/li, <input type=checkbox>, blockquote/cite, table (bordered/striped,
+th/td, colspan/rowspan/align/valign), details/summary, hr, img/video/audio,
+tg-spoiler, tg-math, etc.
+
+Prints the JSON API response; exit 0 only if Telegram returns ok:true.
+Token resolution (portable across kit/custom layouts): $TELEGRAM_BOT_TOKEN if the
+wrapper already exported it, else the channel .env under $TELEGRAM_STATE_DIR (or
+~/.claude/channels/telegram).
+"""
+import sys, os, json, re, subprocess, tempfile
+
+
+def read_token():
+    tok = os.environ.get("TELEGRAM_BOT_TOKEN")
+    if tok:
+        return tok.strip()
+    state = os.environ.get("TELEGRAM_STATE_DIR") or os.path.expanduser(
+        "~/.claude/channels/telegram")
+    env_file = os.path.join(state, ".env")
+    try:
+        for line in open(env_file, encoding="utf-8"):
+            m = re.match(r"^TELEGRAM_BOT_TOKEN=(.*)$", line.strip())
+            if m:
+                return m.group(1).strip()
+    except Exception:
+        pass
+    sys.exit("tg-rich: TELEGRAM_BOT_TOKEN not found (env or %s)" % env_file)
+
+
+def main(argv):
+    if os.environ.get("ATARAX_SUPPRESS_TELEGRAM") == "1":
+        print("tg-rich: delivery suppressed", file=sys.stderr)
+        raise SystemExit(75)
+    if len(argv) < 3:
+        sys.exit(__doc__)
+    chat_id = argv[1]
+    if argv[2] == "--html":
+        if len(argv) < 4:
+            sys.exit("tg-rich: --html needs an argument")
+        html_body = argv[3]
+    else:
+        html_body = open(argv[2], encoding="utf-8").read()
+
+    reply_to = None
+    if "--reply-to" in argv:
+        reply_to = int(argv[argv.index("--reply-to") + 1])
+
+    payload = {"chat_id": int(chat_id), "rich_message": {"html": html_body}}
+    if reply_to is not None:
+        payload["reply_parameters"] = {"message_id": reply_to}
+
+    descriptor, body_path = tempfile.mkstemp(prefix="tg-rich-body-", suffix=".json")
+    os.chmod(body_path, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False)
+
+    token = read_token()
+    url = "https://api.telegram.org/bot%s/sendRichMessage" % token
+    try:
+        r = subprocess.run(
+            ["curl", "-sS", "--max-time", "15", "-X", "POST", url,
+             "-H", "Content-Type: application/json", "-d", "@" + body_path],
+            capture_output=True, text=True,
+        )
+    finally:
+        try:
+            os.unlink(body_path)
+        except OSError:
+            pass
+    out = r.stdout.strip()
+    print(out[:2000])
+    try:
+        ok = json.loads(out).get("ok") is True
+    except Exception:
+        ok = False
+    if ok:
+        subprocess.run(
+            [os.path.expanduser("~/bin/tg-fallback-outbound"), chat_id],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    sys.exit(0 if ok else 1)
+
+
+if __name__ == "__main__":
+    main(sys.argv)

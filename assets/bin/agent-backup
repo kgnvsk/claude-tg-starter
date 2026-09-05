@@ -1,0 +1,449 @@
+#!/usr/bin/env python3
+"""Create and verify portable agent-data backups without runtime secrets."""
+
+from pathlib import Path, PurePosixPath
+import argparse
+import hashlib
+import json
+import os
+import re
+import shutil
+import stat
+import sys
+import tempfile
+import zipfile
+from datetime import datetime, timezone
+
+
+HOME = Path.home()
+INCLUDED_FILES = (
+    Path("CLAUDE.md"),
+    Path(".claude/CLAUDE.premium.md"),
+    Path(".claude/settings.json"),
+    Path(".claude/onboarding-state.json"),
+    Path(".claude/channels/telegram/access.json"),
+    Path(".claude/product/managed-runtime-baseline.json"),
+    Path(".claude/plugins/installed_plugins.json"),
+)
+INCLUDED_DIRS = (
+    Path(".claude/memory"),
+    Path(".claude/goals"),
+    Path(".claude/agents"),
+    Path(".claude/skills"),
+    Path(".claude/hooks"),
+    Path(".local/state/asana-tasks/operations"),
+    Path(".local/state/meta-ads/operations"),
+    Path(".local/state/hubspot-crm/operations"),
+    Path("obsidian-vault"),
+)
+EXCLUDED_DIRS = {
+    ".agent-backup",
+    ".git",
+    "__pycache__",
+    "node_modules",
+    "quarantine",
+}
+EXCLUDED_NAMES = {
+    ".env",
+    "auth.json",
+    "credentials.json",
+    "index.lock",
+    "index.sqlite3",
+    "index.sqlite3-shm",
+    "index.sqlite3-wal",
+    "messages.db",
+    "messages.db-shm",
+    "messages.db-wal",
+}
+SECRET_SUFFIXES = (".key", ".pem", ".p12", ".pfx")
+MAX_FILE_BYTES = 100 * 1024 * 1024
+MANAGED_PATH = re.compile(r"^bin/[a-z0-9][a-z0-9.-]*$")
+SHA256 = re.compile(r"^[0-9a-f]{64}$")
+SECRET_PATTERNS = (
+    re.compile(rb"sk-(?:proj-|ant-)?[A-Za-z0-9_-]{20,}"),
+    re.compile(rb"\b\d{8,12}:AA[A-Za-z0-9_-]{20,}\b"),
+    re.compile(rb"(?:ghp_|github_pat_)[A-Za-z0-9_]{20,}"),
+    re.compile(rb"xox[baprs]-[A-Za-z0-9-]{20,}"),
+    re.compile(rb"-----BEGIN (?:OPENSSH |RSA |EC )?PRIVATE KEY-----"),
+)
+
+
+def sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def is_excluded(relative: Path) -> bool:
+    if relative.parts[:2] == ("obsidian-vault", "learning"):
+        return True
+    if any(part in EXCLUDED_DIRS for part in relative.parts):
+        return True
+    if relative.name in EXCLUDED_NAMES:
+        return True
+    if relative.name.endswith(".lock"):
+        return True
+    if relative.name.endswith(SECRET_SUFFIXES):
+        return True
+    return False
+
+
+def contains_secret(data: bytes) -> bool:
+    return any(pattern.search(data) for pattern in SECRET_PATTERNS)
+
+
+def safe_managed_customizations() -> list[tuple[Path, str]]:
+    baseline_path = HOME / ".claude/product/managed-runtime-baseline.json"
+    if not baseline_path.exists():
+        return []
+    baseline_metadata = baseline_path.lstat()
+    if (
+        not stat.S_ISREG(baseline_metadata.st_mode)
+        or baseline_metadata.st_nlink != 1
+        or baseline_metadata.st_size > MAX_FILE_BYTES
+    ):
+        raise ValueError("managed runtime baseline is unsafe")
+    try:
+        baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("managed runtime baseline is unreadable") from error
+    if (
+        not isinstance(baseline, dict)
+        or baseline.get("schemaVersion") != 1
+        or not isinstance(baseline.get("files"), dict)
+        or len(baseline["files"]) > 512
+    ):
+        raise ValueError("managed runtime baseline is invalid")
+    selected = []
+    for relative_name, metadata in sorted(baseline["files"].items()):
+        if (
+            not isinstance(relative_name, str)
+            or not MANAGED_PATH.fullmatch(relative_name)
+            or not isinstance(metadata, dict)
+            or not isinstance(metadata.get("sha256"), str)
+            or not SHA256.fullmatch(metadata["sha256"])
+            or isinstance(metadata.get("mode"), bool)
+            or not isinstance(metadata.get("mode"), int)
+        ):
+            raise ValueError("managed runtime baseline is invalid")
+        relative = Path(relative_name)
+        source = HOME / relative
+        if not source.exists():
+            continue
+        if source.is_symlink() or not source.is_file():
+            raise ValueError(f"managed customization is unsafe: {relative_name}")
+        metadata_now = source.stat()
+        if metadata_now.st_nlink != 1:
+            raise ValueError(f"managed customization is unsafe: {relative_name}")
+        if metadata_now.st_size > MAX_FILE_BYTES:
+            raise ValueError(f"file exceeds GitHub size limit: home/{relative_name}")
+        if (
+            sha256_bytes(source.read_bytes()) != metadata["sha256"]
+            or stat.S_IMODE(metadata_now.st_mode) != metadata["mode"]
+        ):
+            selected.append((source, "home/" + relative.as_posix()))
+    return selected
+
+
+def selected_files(*, include_vault: bool = True) -> list[tuple[Path, str]]:
+    selected: dict[str, Path] = {}
+    for relative in INCLUDED_FILES:
+        source = HOME / relative
+        if source.is_file() and not source.is_symlink() and not is_excluded(relative):
+            selected["home/" + relative.as_posix()] = source
+    for relative_root in INCLUDED_DIRS:
+        if relative_root == Path("obsidian-vault") and not include_vault:
+            continue
+        root = HOME / relative_root
+        if not root.is_dir():
+            continue
+        for source in root.rglob("*"):
+            if not source.is_file() or source.is_symlink():
+                continue
+            relative = source.relative_to(HOME)
+            if is_excluded(relative):
+                continue
+            selected["home/" + relative.as_posix()] = source
+    for source, name in safe_managed_customizations():
+        selected[name] = source
+    return [(source, name) for name, source in sorted(selected.items())]
+
+
+def read_safe_file(source: Path, archive_name: str) -> tuple[bytes, int]:
+    relative = Path(archive_name.removeprefix("home/"))
+    current = HOME
+    for part in relative.parts[:-1]:
+        current = current / part
+        if current.is_symlink():
+            raise ValueError(f"source parent is a symlink: {archive_name}")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(source, flags)
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise ValueError(f"source file is unsafe: {archive_name}")
+        if metadata.st_size > MAX_FILE_BYTES:
+            raise ValueError(f"file exceeds GitHub size limit: {archive_name}")
+        with os.fdopen(descriptor, "rb", closefd=False) as handle:
+            data = handle.read(MAX_FILE_BYTES + 1)
+        if len(data) != metadata.st_size or len(data) > MAX_FILE_BYTES:
+            raise ValueError(f"file changed or exceeds size limit: {archive_name}")
+        if contains_secret(data):
+            raise ValueError(f"secret-like content detected: {archive_name}")
+        return data, stat.S_IMODE(metadata.st_mode)
+    finally:
+        os.close(descriptor)
+
+
+def selected_payload(*, include_vault: bool) -> list[tuple[str, bytes, int]]:
+    return [
+        (archive_name, *read_safe_file(source, archive_name))
+        for source, archive_name in selected_files(include_vault=include_vault)
+    ]
+
+
+def backup_manifest(
+    entries: list[dict],
+    *,
+    created_at: str,
+) -> dict:
+    return {
+        "schemaVersion": 1,
+        "createdAt": created_at,
+        "containsSecrets": False,
+        "files": entries,
+        "excluded": {
+            "runtimeSecrets": True,
+            "telegramTranscripts": True,
+            "learningEvidence": True,
+            "generatedIndexes": True,
+        },
+    }
+
+
+def default_output() -> Path:
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return HOME / "backups" / f"agent-backup-{stamp}.zip"
+
+
+def create_archive(output: Path) -> dict:
+    output = output.expanduser().resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=output.name + ".",
+        suffix=".tmp",
+        dir=output.parent,
+    )
+    os.close(fd)
+    temporary = Path(temporary_name)
+    entries = []
+    try:
+        payload = selected_payload(include_vault=True)
+        with zipfile.ZipFile(
+            temporary, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6
+        ) as archive:
+            for archive_name, data, mode in payload:
+                info = zipfile.ZipInfo(
+                    archive_name,
+                    date_time=datetime.now().timetuple()[:6],
+                )
+                info.compress_type = zipfile.ZIP_DEFLATED
+                info.external_attr = mode << 16
+                archive.writestr(info, data)
+                entries.append(
+                    {
+                        "path": archive_name,
+                        "size": len(data),
+                        "sha256": sha256_bytes(data),
+                    }
+                )
+            manifest = backup_manifest(
+                entries,
+                created_at=datetime.now(timezone.utc).isoformat(),
+            )
+            info = zipfile.ZipInfo("manifest.json")
+            info.compress_type = zipfile.ZIP_DEFLATED
+            info.external_attr = 0o600 << 16
+            archive.writestr(
+                info,
+                (json.dumps(manifest, ensure_ascii=False, indent=2) + "\n").encode(),
+            )
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, output)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return {
+        "status": "created",
+        "archive": str(output),
+        "files": len(entries),
+        "sizeBytes": output.stat().st_size,
+        "containsSecrets": False,
+    }
+
+
+def projection_created_at(output: Path, entries: list[dict]) -> str:
+    manifest_path = output / "manifest.json"
+    if manifest_path.is_file() and not manifest_path.is_symlink():
+        try:
+            previous = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            previous = None
+        if isinstance(previous, dict):
+            comparison = dict(previous)
+            created_at = comparison.pop("createdAt", None)
+            candidate = backup_manifest(entries, created_at="")
+            candidate.pop("createdAt")
+            if comparison == candidate and isinstance(created_at, str):
+                return created_at
+    return datetime.now(timezone.utc).isoformat()
+
+
+def create_projection(output: Path) -> dict:
+    output = Path(os.path.abspath(output.expanduser()))
+    if output == output.parent or output.is_symlink():
+        raise ValueError("projection destination is unsafe")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    if output.exists() and not output.is_dir():
+        raise ValueError("projection destination is not a directory")
+    payload = selected_payload(include_vault=False)
+    entries = [
+        {
+            "path": archive_name,
+            "size": len(data),
+            "sha256": sha256_bytes(data),
+        }
+        for archive_name, data, _ in payload
+    ]
+    created_at = projection_created_at(output, entries)
+    temporary = Path(
+        tempfile.mkdtemp(prefix=f".{output.name}.", dir=output.parent)
+    )
+    previous = temporary.with_name(temporary.name + ".previous")
+    try:
+        for archive_name, data, source_mode in payload:
+            target = temporary / archive_name
+            target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            descriptor = os.open(
+                target,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o700 if source_mode & 0o111 else 0o600,
+            )
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+        manifest_path = temporary / "manifest.json"
+        manifest_path.write_text(
+            json.dumps(
+                backup_manifest(entries, created_at=created_at),
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        os.chmod(manifest_path, 0o600)
+        with manifest_path.open("rb") as handle:
+            os.fsync(handle.fileno())
+        directory_descriptor = os.open(temporary, os.O_RDONLY)
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
+        if output.exists():
+            os.replace(output, previous)
+        try:
+            os.replace(temporary, output)
+        except Exception:
+            if previous.exists():
+                os.replace(previous, output)
+            raise
+        if previous.exists():
+            shutil.rmtree(previous)
+        parent_descriptor = os.open(output.parent, os.O_RDONLY)
+        try:
+            os.fsync(parent_descriptor)
+        finally:
+            os.close(parent_descriptor)
+    finally:
+        if temporary.exists():
+            shutil.rmtree(temporary)
+        if previous.exists():
+            shutil.rmtree(previous)
+    return {
+        "status": "projected",
+        "files": len(entries),
+        "containsSecrets": False,
+    }
+
+def safe_archive_name(name: str) -> bool:
+    path = PurePosixPath(name)
+    return not path.is_absolute() and ".." not in path.parts and name != ""
+
+
+def verify_archive(path: Path) -> dict:
+    path = path.expanduser().resolve()
+    with zipfile.ZipFile(path) as archive:
+        names = archive.namelist()
+        if len(names) != len(set(names)):
+            raise ValueError("archive contains duplicate paths")
+        if not all(safe_archive_name(name) for name in names):
+            raise ValueError("archive contains an unsafe path")
+        if "manifest.json" not in names:
+            raise ValueError("manifest.json is missing")
+        manifest = json.loads(archive.read("manifest.json"))
+        if manifest.get("schemaVersion") != 1:
+            raise ValueError("unsupported backup schema")
+        if manifest.get("containsSecrets") is not False:
+            raise ValueError("backup is not marked secret-free")
+        declared = {item["path"]: item for item in manifest.get("files", [])}
+        actual = set(names) - {"manifest.json"}
+        if actual != set(declared):
+            raise ValueError("manifest file list does not match archive")
+        for name, item in declared.items():
+            if archive.getinfo(name).file_size > MAX_FILE_BYTES:
+                raise ValueError(f"file exceeds GitHub size limit: {name}")
+            data = archive.read(name)
+            if contains_secret(data):
+                raise ValueError(f"secret-like content detected: {name}")
+            if len(data) != item["size"] or sha256_bytes(data) != item["sha256"]:
+                raise ValueError(f"checksum mismatch: {name}")
+            relative = Path(name.removeprefix("home/"))
+            if is_excluded(relative):
+                raise ValueError(f"excluded file found in archive: {name}")
+    return {
+        "status": "ok",
+        "archive": str(path),
+        "files": len(declared),
+        "containsSecrets": False,
+    }
+
+
+def build_parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(description=__doc__)
+    sub = result.add_subparsers(dest="command", required=True)
+    create_parser = sub.add_parser("create")
+    create_parser.add_argument("output", nargs="?", type=Path)
+    verify_parser = sub.add_parser("verify")
+    verify_parser.add_argument("archive", type=Path)
+    project_parser = sub.add_parser("project")
+    project_parser.add_argument("output", type=Path)
+    return result
+
+
+def main() -> None:
+    args = build_parser().parse_args()
+    if args.command == "create":
+        output = create_archive(args.output or default_output())
+    elif args.command == "verify":
+        output = verify_archive(args.archive)
+    else:
+        output = create_projection(args.output)
+    print(json.dumps(output, ensure_ascii=False, indent=2))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, ValueError, zipfile.BadZipFile, json.JSONDecodeError) as error:
+        print(f"agent-backup: {error}", file=sys.stderr)
+        raise SystemExit(2)

@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "plugins": {
+    "telegram@claude-plugins-official": {
+      "source": {
+        "source": "github",
+        "repo": "anthropics/claude-plugins-official"
+      },
+      "requiredSkills": [
+        "access",
+        "configure"
+      ]
+    }
+  }
+}

@@ -1,0 +1,946 @@
+#!/usr/bin/env python3
+"""Block one Stop event when a Telegram turn was never delivered to Telegram."""
+
+from datetime import datetime, timezone
+import fcntl
+import json
+import subprocess
+import os
+from pathlib import Path
+import re
+import shlex
+import sqlite3
+import stat
+import sys
+import tempfile
+
+
+MALFORMED_WINDOW_SECONDS = 10 * 60
+MAX_ANCESTRY_EVENTS = 20_000
+OUTBOUND_SUFFIXES = (
+    "__reply",
+    "__send_message",
+    "__send_photo",
+    "__send_document",
+    "__send_video",
+    "__send_audio",
+    "__send_voice",
+)
+BASH_SENDER = re.compile(
+    r"(?:(?:~|/home/[^/\s]+)/bin/)?"
+    r"(?:tg-(?:rich|send|send-file|md|video)|tg_send)\Z"
+)
+UNSAFE_FALLBACK_TEXT = re.compile(
+    r"(?:\btg[_-]send\b|\bmessage_id\b|\bdelivery_id\b|\btoolu_[A-Za-z0-9]+\b|"
+    r"\bmcp__[A-Za-z0-9_]+\b|\bstop_hook\b|/home/|\.jsonl\b|<channel\b|\*\*|```)",
+    re.IGNORECASE,
+)
+TRANSCRIPT_TAIL_BYTES = 16 * 1024 * 1024
+CONTINUATION_ATTACHMENT_TYPES = frozenset(
+    {
+        "task_reminder",
+        "file",
+        "invoked_skills",
+        "deferred_tools_delta",
+        "agent_listing_delta",
+        "mcp_instructions_delta",
+        "hook_success",
+        "hook_additional_context",
+        "hook_system_message",
+        "hook_blocking_error",
+        "skill_listing",
+        "command_permissions",
+        "date_change",
+        "compact_file_reference",
+        # Службові позначки рантайму всередині ходу. total_tokens_reminder
+        # 19.08 зробив сторожа сліпим на Кеші: ланцюг обривався на ньому,
+        # хід ставав невидимим, і мовчазна відповідь пройшла без блокування.
+        "total_tokens_reminder",
+        "auto_mode",
+        "edited_text_file",
+        # 02.09: Remote Control приєднався до сесії посеред ходу — той самий
+        # клас, і знову мовчазний бот.
+        "remote_session_change",
+        # Native subagent progress does not sever the original Telegram turn.
+        # Delivery still requires the exact chat/receipt; status alone is not proof.
+        "task_status",
+    }
+)
+CHANNEL_ENVELOPE = re.compile(
+    r"\A\s*<channel\b(?P<attributes>[^>]*)>.*</channel>\s*\Z",
+    re.DOTALL,
+)
+CHANNEL_ATTRIBUTE = re.compile(
+    r"\s+([A-Za-z_][A-Za-z0-9_.:-]*)\s*=\s*(['\"])(.*?)\2",
+    re.DOTALL,
+)
+
+
+def read_recent_events(path: Path) -> list[dict] | None:
+    with path.open("rb") as handle:
+        size = handle.seek(0, 2)
+        start = max(0, size - TRANSCRIPT_TAIL_BYTES)
+        handle.seek(start)
+        payload = handle.read()
+    if start:
+        first_newline = payload.find(b"\n")
+        if first_newline < 0:
+            return []
+        payload = payload[first_newline + 1 :]
+    try:
+        decoded = payload.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    events = []
+    for line in decoded.splitlines():
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            return None
+        if (
+            not isinstance(event, dict)
+            or not isinstance(event.get("type"), str)
+            or not event.get("type")
+        ):
+            return None
+        events.append(event)
+    return events
+
+
+def channel_attributes(value: object) -> dict[str, str] | None:
+    """Parse one outer channel envelope with unambiguous quoted attributes."""
+    if not isinstance(value, str):
+        return None
+    envelope = CHANNEL_ENVELOPE.fullmatch(value)
+    if envelope is None:
+        return None
+
+    raw_attributes = envelope.group("attributes")
+    attributes: dict[str, str] = {}
+    position = 0
+    while position < len(raw_attributes):
+        match = CHANNEL_ATTRIBUTE.match(raw_attributes, position)
+        if match is None:
+            if raw_attributes[position:].strip():
+                return None
+            break
+        name, value = match.group(1), match.group(3)
+        if name in attributes:
+            return None
+        attributes[name] = value
+        position = match.end()
+    return attributes
+
+
+def telegram_chat_id(prompt: object, origin: object) -> str | None:
+    if not isinstance(origin, dict):
+        return None
+    if origin.get("kind") != "channel":
+        return None
+    if origin.get("server") != "plugin:telegram:telegram":
+        return None
+
+    attributes = channel_attributes(prompt)
+    if attributes is None:
+        return None
+    if attributes.get("source") != "plugin:telegram:telegram":
+        return None
+    chat_id = attributes.get("chat_id")
+    if chat_id is None or re.fullmatch(r"-?[0-9]+", chat_id) is None:
+        return None
+    return chat_id
+
+
+def telegram_delivery_id(prompt: object, origin: object) -> str | None:
+    """Return the exact queued delivery carried by a valid Telegram envelope."""
+    chat_id = telegram_chat_id(prompt, origin)
+    attributes = channel_attributes(prompt)
+    if chat_id is None or attributes is None:
+        return None
+    message_id = attributes.get("message_id")
+    delivery_id = attributes.get("delivery_id")
+    if message_id is None or re.fullmatch(r"[0-9]+", message_id) is None:
+        return None
+    expected = f"{chat_id}:{message_id}"
+    if delivery_id is None:
+        return expected
+    return delivery_id if delivery_id == expected else None
+
+
+def telegram_state_dir() -> Path:
+    config_root = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
+    return Path(
+        os.environ.get("TELEGRAM_STATE_DIR")
+        or config_root / "channels" / "telegram"
+    )
+
+
+def complete_started_delivery(
+    delivery_id: str | None, *, allow_offered: bool = False
+) -> bool:
+    """Remove the exact completed row; queued carriers may still be offered."""
+    if delivery_id is None:
+        return True
+    database = telegram_state_dir() / "messages.db"
+    if not database.exists():
+        return False
+    connection = None
+    try:
+        connection = sqlite3.connect(
+            f"file:{database}?mode=rw", uri=True, timeout=1.0
+        )
+        table = connection.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type='table' AND name='pending_inbound_deliveries'"
+        ).fetchone()
+        if table is None:
+            return False
+        if allow_offered:
+            deleted = connection.execute(
+                "DELETE FROM pending_inbound_deliveries "
+                "WHERE delivery_id=? AND state IN ('offered','started','recovering')",
+                (delivery_id,),
+            )
+        else:
+            deleted = connection.execute(
+                "DELETE FROM pending_inbound_deliveries "
+                "WHERE delivery_id=? AND state IN ('started','recovering')",
+                (delivery_id,),
+            )
+        connection.commit()
+        if deleted.rowcount == 1:
+            return True
+        remaining = connection.execute(
+            "SELECT state FROM pending_inbound_deliveries WHERE delivery_id=?",
+            (delivery_id,),
+        ).fetchone()
+        return remaining is None
+    except sqlite3.Error:
+        return False
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def cleanup_proof_path() -> Path:
+    return telegram_state_dir() / "fallback-cleanup-proof.json"
+
+
+def open_cleanup_proof_lock() -> int | None:
+    path = telegram_state_dir() / "fallback-cleanup-proof.lock"
+    descriptor = -1
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        flags = os.O_RDWR | os.O_CREAT
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(path, flags, 0o600)
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode) or opened.st_uid != os.geteuid():
+            return None
+        os.fchmod(descriptor, 0o600)
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        acquired = descriptor
+        descriptor = -1
+        return acquired
+    except OSError:
+        return None
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def close_cleanup_proof_lock(descriptor: int) -> None:
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+    finally:
+        os.close(descriptor)
+
+
+def fsync_cleanup_proof_directory() -> None:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    descriptor = os.open(cleanup_proof_path().parent, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def cleanup_identity(delivery_id: str | None, chat_id: str) -> dict[str, str] | None:
+    if delivery_id is None:
+        return None
+    prefix = f"{chat_id}:"
+    if not delivery_id.startswith(prefix):
+        return None
+    message_id = delivery_id[len(prefix) :]
+    if re.fullmatch(r"[0-9]+", message_id) is None:
+        return None
+    return {
+        "delivery_id": delivery_id,
+        "chat_id": chat_id,
+        "message_id": message_id,
+    }
+
+
+def write_cleanup_proof(
+    delivery_id: str | None, chat_id: str, status_value: str
+) -> bool:
+    identity = cleanup_identity(delivery_id, chat_id)
+    if identity is None:
+        return delivery_id is None
+    if status_value not in {"prepared", "delivered"}:
+        return False
+    proof = {**identity, "status": status_value}
+    destination = cleanup_proof_path()
+    lock = open_cleanup_proof_lock()
+    if lock is None:
+        return False
+    temporary_name = ""
+    try:
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=".fallback-cleanup-proof.", dir=destination.parent
+        )
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            os.fchmod(handle.fileno(), 0o600)
+            json.dump(proof, handle, ensure_ascii=True, separators=(",", ":"))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_name, destination)
+        temporary_name = ""
+        fsync_cleanup_proof_directory()
+        return True
+    except OSError:
+        return False
+    finally:
+        if temporary_name:
+            try:
+                os.unlink(temporary_name)
+            except OSError:
+                pass
+        close_cleanup_proof_lock(lock)
+
+
+def read_cleanup_proof_unlocked() -> dict[str, str] | None:
+    if not hasattr(os, "O_NOFOLLOW"):
+        return None
+    descriptor = -1
+    try:
+        descriptor = os.open(cleanup_proof_path(), os.O_RDONLY | os.O_NOFOLLOW)
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_uid != os.geteuid()
+            or opened.st_mode & 0o077
+            or opened.st_size <= 0
+            or opened.st_size > 512
+        ):
+            return None
+        with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
+            descriptor = -1
+            proof = json.load(handle)
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    if not isinstance(proof, dict):
+        return None
+    if set(proof) != {"delivery_id", "chat_id", "message_id", "status"}:
+        return None
+    if not all(isinstance(value, str) for value in proof.values()):
+        return None
+    status_value = proof.get("status")
+    if status_value not in {"prepared", "delivered"}:
+        return None
+    identity = cleanup_identity(proof["delivery_id"], proof["chat_id"])
+    return proof if identity == {
+        "delivery_id": proof["delivery_id"],
+        "chat_id": proof["chat_id"],
+        "message_id": proof["message_id"],
+    } else None
+
+
+def cleanup_proof_status(delivery_id: str | None, chat_id: str) -> str | None:
+    identity = cleanup_identity(delivery_id, chat_id)
+    if identity is None:
+        return None
+    lock = open_cleanup_proof_lock()
+    if lock is None:
+        return None
+    try:
+        proof = read_cleanup_proof_unlocked()
+        if proof is None:
+            return None
+        status_value = proof["status"]
+        return status_value if proof == {**identity, "status": status_value} else None
+    finally:
+        close_cleanup_proof_lock(lock)
+
+
+def remove_cleanup_proof(delivery_id: str | None, chat_id: str) -> bool:
+    identity = cleanup_identity(delivery_id, chat_id)
+    if identity is None:
+        return False
+    lock = open_cleanup_proof_lock()
+    if lock is None:
+        return False
+    try:
+        proof = read_cleanup_proof_unlocked()
+        if proof is None or proof != {**identity, "status": proof["status"]}:
+            return False
+        cleanup_proof_path().unlink()
+        fsync_cleanup_proof_directory()
+        return True
+    except OSError:
+        return False
+    finally:
+        close_cleanup_proof_lock(lock)
+
+
+def delivery_still_pending(delivery_id: str) -> bool | None:
+    database = telegram_state_dir() / "messages.db"
+    if not database.exists():
+        return None
+    connection = None
+    try:
+        connection = sqlite3.connect(
+            f"file:{database}?mode=ro", uri=True, timeout=1.0
+        )
+        table = connection.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type='table' AND name='pending_inbound_deliveries'"
+        ).fetchone()
+        if table is None:
+            return None
+        row = connection.execute(
+            "SELECT 1 FROM pending_inbound_deliveries WHERE delivery_id=?",
+            (delivery_id,),
+        ).fetchone()
+        return row is not None
+    except sqlite3.Error:
+        return None
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def remove_stale_cleanup_proof() -> bool:
+    """Remove a proof only after its exact queue row is durably absent."""
+    lock = open_cleanup_proof_lock()
+    if lock is None:
+        return False
+    try:
+        if not os.path.lexists(cleanup_proof_path()):
+            return True
+        proof = read_cleanup_proof_unlocked()
+        if proof is None:
+            return False
+        pending = delivery_still_pending(proof["delivery_id"])
+        if pending is not False:
+            return pending is True
+        cleanup_proof_path().unlink()
+        fsync_cleanup_proof_directory()
+        return True
+    except OSError:
+        return False
+    finally:
+        close_cleanup_proof_lock(lock)
+
+
+def block_cleanup() -> None:
+    reason = (
+        "The Telegram response was delivered, but its queue completion did not commit. "
+        "Do not send the response again. Retry Stop so cleanup can finish."
+    )
+    print(json.dumps({"decision": "block", "reason": reason, "systemMessage": reason}))
+
+
+def transcript_uuid_map(events: list[object]) -> dict[str, dict] | None:
+    by_uuid: dict[str, dict] = {}
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        event_uuid = event.get("uuid")
+        if not isinstance(event_uuid, str) or not event_uuid:
+            continue
+        if event_uuid in by_uuid:
+            return None
+        by_uuid[event_uuid] = event
+    return by_uuid
+
+
+def newest_active_assistant(events: list[object]) -> dict | None:
+    for event in reversed(events):
+        if not isinstance(event, dict) or event.get("type") != "assistant":
+            continue
+        if event.get("isSidechain") is True:
+            continue
+        return event
+    return None
+
+
+def event_disposition(event: dict) -> tuple[str, object, object]:
+    """Return continuation, carrier, or ambiguous for an ancestry event."""
+    event_type = event.get("type")
+    if event_type == "assistant":
+        return "continuation", None, None
+    if event_type == "system":
+        if event.get("subtype") in {"compact_boundary", "stop_hook_summary", "turn_duration"}:
+            return "continuation", None, None
+        return "ambiguous", None, None
+    if event_type == "attachment":
+        attachment = event.get("attachment")
+        if not isinstance(attachment, dict):
+            return "ambiguous", None, None
+        attachment_type = attachment.get("type")
+        if attachment_type == "queued_command":
+            # Claude Code ставить результат фонового Agent у ту саму чергу,
+            # але це продовження поточного ходу, не новий Telegram-запит.
+            if (
+                attachment.get("commandMode") == "task-notification"
+                and attachment.get("origin") is None
+            ):
+                return "continuation", None, None
+            return "carrier", attachment.get("prompt"), attachment.get("origin")
+        if attachment_type in CONTINUATION_ATTACHMENT_TYPES:
+            return "continuation", None, None
+        return "ambiguous", None, None
+    if event_type != "user":
+        return "ambiguous", None, None
+
+    if event.get("isCompactSummary") is True:
+        return "continuation", None, None
+
+    origin = event.get("origin")
+    if isinstance(origin, dict) and origin.get("kind") == "task-notification":
+        return "continuation", None, None
+
+    structured_channel_origin = (
+        isinstance(origin, dict) and origin.get("kind") == "channel"
+    )
+    if event.get("isMeta") is True and not structured_channel_origin:
+        return "continuation", None, None
+
+    message = event.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    if isinstance(content, list):
+        if content and all(
+            isinstance(block, dict) and block.get("type") == "tool_result"
+            for block in content
+        ):
+            return "continuation", None, None
+        return "ambiguous", None, None
+
+    if isinstance(content, str):
+        return "carrier", content, origin
+    return "ambiguous", None, None
+
+
+def ancestry_parent_uuid(event: dict) -> str | None:
+    parent_uuid = event.get("parentUuid")
+    if (
+        parent_uuid is None
+        and event.get("type") == "system"
+        and event.get("subtype") == "compact_boundary"
+    ):
+        parent_uuid = event.get("logicalParentUuid")
+    if not isinstance(parent_uuid, str) or not parent_uuid:
+        return None
+    return parent_uuid
+
+
+def active_turn(
+    events: list[object],
+) -> tuple[list[dict], object, object, bool] | None:
+    """Find the current prompt and its descendants without crossing branches."""
+    by_uuid = transcript_uuid_map(events)
+    leaf = newest_active_assistant(events)
+    if by_uuid is None or leaf is None:
+        return None
+
+    ancestry: list[dict] = []
+    visited: set[str] = set()
+    current = leaf
+    for _ in range(MAX_ANCESTRY_EVENTS):
+        current_uuid = current.get("uuid")
+        if not isinstance(current_uuid, str) or not current_uuid:
+            return None
+        if current_uuid in visited or by_uuid.get(current_uuid) is not current:
+            return None
+        is_sidechain = current.get("isSidechain")
+        if is_sidechain is not None and is_sidechain is not False:
+            return None
+        visited.add(current_uuid)
+        ancestry.append(current)
+
+        disposition, prompt, origin = event_disposition(current)
+        if disposition == "carrier":
+            carrier_parent = current.get("parentUuid")
+            if carrier_parent is not None and (
+                not isinstance(carrier_parent, str)
+                or not carrier_parent
+                or carrier_parent in visited
+                or carrier_parent not in by_uuid
+            ):
+                return None
+            attachment = current.get("attachment")
+            queued_carrier = (
+                current.get("type") == "attachment"
+                and isinstance(attachment, dict)
+                and attachment.get("type") == "queued_command"
+            )
+            return list(reversed(ancestry[:-1])), prompt, origin, queued_carrier
+        if disposition != "continuation":
+            return None
+
+        parent_uuid = ancestry_parent_uuid(current)
+        if parent_uuid is None:
+            return None
+        parent = by_uuid.get(parent_uuid)
+        if parent is None:
+            return None
+        current = parent
+    return None
+
+
+def event_timestamp(event: object) -> float | None:
+    if not isinstance(event, dict):
+        return None
+    value = event.get("timestamp")
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def malformed_tool_calls(events: list[object]) -> list[object]:
+    """Return recent textual tool calls since the last real tool call."""
+    after_real_tool = 0
+    for index, event in enumerate(events):
+        if not isinstance(event, dict) or event.get("type") != "assistant":
+            continue
+        if any(
+            isinstance(block, dict) and block.get("type") == "tool_use"
+            for block in content_blocks(event)
+        ):
+            after_real_tool = index + 1
+
+    cutoff = datetime.now(timezone.utc).timestamp() - MALFORMED_WINDOW_SECONDS
+    malformed = []
+    for event in events[after_real_tool:]:
+        if not isinstance(event, dict) or event.get("type") != "assistant":
+            continue
+        timestamp = event_timestamp(event)
+        if timestamp is None or timestamp < cutoff:
+            continue
+        for block in content_blocks(event):
+            if not isinstance(block, dict) or block.get("type") != "text":
+                continue
+            matches = re.findall(
+                r"<invoke\b[^>]*\bname\s*=",
+                str(block.get("text", "")),
+                re.I,
+            )
+            malformed.extend([event] * len(matches))
+    return malformed
+
+
+def request_clean_restart(events: list[object], chat_id: str) -> None:
+    malformed = malformed_tool_calls(events)
+    if len(malformed) < 2:
+        return
+    marker = Path.home() / "logs" / "malformed-tool-restart.json"
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    temporary = marker.with_suffix(".tmp")
+    payload = {
+        "created_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "chat_id": chat_id,
+        "reason": "malformed_tool_call_loop",
+        "count": len(malformed),
+    }
+    temporary.write_text(json.dumps(payload), encoding="utf-8")
+    temporary.chmod(0o600)
+    temporary.replace(marker)
+
+
+def delivery_attempt_chat_ids(block: object) -> set[str]:
+    if not isinstance(block, dict) or block.get("type") != "tool_use":
+        return set()
+    name = str(block.get("name", ""))
+    if "telegram" in name and name.endswith(OUTBOUND_SUFFIXES):
+        tool_input = block.get("input")
+        if not isinstance(tool_input, dict):
+            return set()
+        chat_id = str(tool_input.get("chat_id", ""))
+        return {chat_id} if re.fullmatch(r"-?[0-9]+", chat_id) else set()
+    if name != "Bash":
+        return set()
+    tool_input = block.get("input")
+    command = str(tool_input.get("command", "")) if isinstance(tool_input, dict) else ""
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|<>()\r\n")
+        # Новий рядок усередині лапок — текст; поза ними — інша shell-команда.
+        lexer.whitespace = " \t"
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        tokens = list(lexer)
+    except ValueError:
+        return set()
+    if not tokens or BASH_SENDER.fullmatch(tokens[0]) is None:
+        return set()
+    if any(re.fullmatch(r"[;&|<>()\r\n]+", token) for token in tokens[1:]):
+        return set()
+    chat_index = 2 if tokens[1:2] == ["--no-watchdog-credit"] else 1
+    if len(tokens) <= chat_index:
+        return set()
+    chat_id = tokens[chat_index]
+    if re.fullmatch(r"-?[0-9]+", chat_id) is None:
+        return set()
+    if any(BASH_SENDER.fullmatch(token) for token in tokens[chat_index + 1 :]):
+        return set()
+    return {chat_id}
+
+
+def content_blocks(event: object) -> list[object]:
+    if not isinstance(event, dict):
+        return []
+    message = event.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    return content if isinstance(content, list) else []
+
+
+def successful_delivery(
+    events: list[object],
+    chat_id: str,
+    result_events: list[object] | None = None,
+) -> bool:
+    """True when a delivery attempt in `events` came back without an error.
+
+    Attempts are collected from the current turn, but their tool_result blocks
+    are looked for in `result_events` — the whole transcript. A tool_result is
+    a CHILD of the assistant event that issued the call, so when a turn ends on
+    the delivery tool_use itself the result never joins the ancestry that built
+    that turn. Searching only the turn then reports a delivered message as
+    undelivered: the guard blocks the stop, the agent believes nothing arrived
+    and sends it again. That is the duplicate the owner sees.
+    """
+    delivery_ids: set[str] = set()
+    for event in events:
+        if not isinstance(event, dict) or event.get("type") != "assistant":
+            continue
+        for block in content_blocks(event):
+            if (
+                chat_id in delivery_attempt_chat_ids(block)
+                and isinstance(block, dict)
+            ):
+                tool_id = str(block.get("id", ""))
+                if tool_id:
+                    delivery_ids.add(tool_id)
+
+    if not delivery_ids:
+        return False
+    for event in result_events if result_events is not None else events:
+        for block in content_blocks(event):
+            if not isinstance(block, dict) or block.get("type") != "tool_result":
+                continue
+            if str(block.get("tool_use_id", "")) not in delivery_ids:
+                continue
+            if block.get("is_error") is not True:
+                return True
+    return False
+
+
+def delivery_is_newer_than_last_incoming(events: list[object], chat_id: str) -> bool:
+    """Чи є підтверджена доставка ПІСЛЯ останнього вхідного в цьому чаті.
+
+    Гонка запису: транскрипт дописується на диск не миттєво, і в момент Stop
+    останнього ходу в файлі може ще не бути. Тоді розбір ланцюга бачить
+    попередній хід — той, де доставка була, — і мовчазний хід проходить. Так
+    19.08 Кеш двічі написав відповідь власнику й не надіслав її.
+
+    Це порівняння не залежить від того, чи долетів останній запис: якщо після
+    останнього вхідного немає успішної доставки, хід завершувати рано.
+    """
+    last_in = 0.0
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        disposition, prompt, origin = event_disposition(event)
+        if disposition != "carrier":
+            continue
+        if telegram_chat_id(prompt, origin) != chat_id:
+            continue
+        stamp = event_timestamp(event)
+        if stamp is not None and stamp > last_in:
+            last_in = stamp
+    if not last_in:
+        return True
+
+    delivery_ids: set[str] = set()
+    for event in events:
+        if not isinstance(event, dict) or event.get("type") != "assistant":
+            continue
+        stamp = event_timestamp(event)
+        if stamp is None or stamp < last_in:
+            continue
+        for block in content_blocks(event):
+            if (
+                chat_id in delivery_attempt_chat_ids(block)
+                and isinstance(block, dict)
+            ):
+                tool_id = str(block.get("id", ""))
+                if tool_id:
+                    delivery_ids.add(tool_id)
+    if not delivery_ids:
+        return False
+    for event in events:
+        for block in content_blocks(event):
+            if not isinstance(block, dict) or block.get("type") != "tool_result":
+                continue
+            if str(block.get("tool_use_id", "")) in delivery_ids and block.get("is_error") is not True:
+                return True
+    return False
+
+
+def final_answer_text(turn_events: list[object]) -> str:
+    """Останній текст агента в цьому ході — те, що власник мав отримати."""
+    for event in reversed(turn_events):
+        if not isinstance(event, dict) or event.get("type") != "assistant":
+            continue
+        for block in reversed(list(content_blocks(event))):
+            if isinstance(block, dict) and block.get("type") == "text":
+                text = str(block.get("text", "")).strip()
+                if text:
+                    return text
+    return ""
+
+
+def deliver_pending_answer(turn_events: list[object], chat_id: str) -> bool:
+    """Доставити відповідь самотужки, коли агент її написав і не надіслав.
+
+    Спілкування з цим агентом іде лише через Telegram, тож ненадісланий текст —
+    це втрачена відповідь, а не дрібниця. Прохання до моделі «надішли» лишається
+    запасним шляхом: спершу доставляємо тим самим tg-send, яким користується
+    сам агент, коли MCP-інструмент відвалився. Він же ставить позначку доставки,
+    тож сторож стану бачить чат відповіданим, і мовчить у підавлених сесіях.
+    """
+    text = final_answer_text(turn_events)
+    if not text or UNSAFE_FALLBACK_TEXT.search(text):
+        return False
+    sender = Path.home() / "bin/tg-send"
+    if not os.access(sender, os.X_OK):
+        return False
+    try:
+        done = subprocess.run(
+            [str(sender), chat_id, text],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if done.returncode != 0:
+        return False
+    for line in done.stdout.splitlines():
+        line = line.strip()
+        if line == "ok: True":
+            return True
+        try:
+            result = json.loads(line)
+            if (
+                isinstance(result, dict)
+                and set(result) == {"ok"}
+                and result.get("ok") is True
+            ):
+                return True
+        except (json.JSONDecodeError, TypeError):
+            pass
+    return False
+
+
+def main() -> None:
+    try:
+        hook = json.load(sys.stdin)
+        stop_hook_active = hook.get("stop_hook_active") is True
+        transcript_path = Path(str(hook["transcript_path"]))
+        events = read_recent_events(transcript_path)
+        if events is None:
+            return
+    except Exception:
+        return
+
+    turn = active_turn(events)
+    if turn is None:
+        return
+    turn_events, prompt, origin, queued_carrier = turn
+    chat_id = telegram_chat_id(prompt, origin)
+    if chat_id is None:
+        return
+    delivery_id = telegram_delivery_id(prompt, origin)
+
+    remove_stale_cleanup_proof()
+    native_delivery = (
+        successful_delivery(turn_events, chat_id, events)
+        and delivery_is_newer_than_last_incoming(events, chat_id)
+    )
+    proof_status = cleanup_proof_status(delivery_id, chat_id)
+    fallback_delivery = stop_hook_active and proof_status == "delivered"
+    if native_delivery or fallback_delivery:
+        if not complete_started_delivery(
+            delivery_id, allow_offered=queued_carrier
+        ):
+            block_cleanup()
+        elif proof_status is not None and not remove_cleanup_proof(
+            delivery_id, chat_id
+        ):
+            block_cleanup()
+        return
+
+    try:
+        request_clean_restart(events, chat_id)
+    except OSError:
+        pass
+
+    if stop_hook_active and os.path.lexists(cleanup_proof_path()):
+        block_cleanup()
+        return
+
+    if not stop_hook_active:
+        proof_prepared = write_cleanup_proof(delivery_id, chat_id, "prepared")
+        if proof_prepared and deliver_pending_answer(turn_events, chat_id):
+            proof_written = write_cleanup_proof(delivery_id, chat_id, "delivered")
+            if not proof_written:
+                block_cleanup()
+                return
+            if not complete_started_delivery(
+                delivery_id, allow_offered=queued_carrier
+            ):
+                block_cleanup()
+            elif delivery_id is not None and not remove_cleanup_proof(
+                delivery_id, chat_id
+            ):
+                block_cleanup()
+            return
+
+        if proof_prepared and delivery_id is not None:
+            remove_cleanup_proof(delivery_id, chat_id)
+
+    if stop_hook_active:
+        return
+
+    reason = (
+        "This turn arrived from Telegram, but no Telegram delivery completed successfully. "
+        "Your terminal response is invisible to the user. Rewrite it as a user-facing response "
+        "in the user's language, without tool names, paths, IDs, logs, or internal reasoning. Call "
+        "mcp__plugin_telegram_telegram__reply with the chat_id from the latest "
+        "<channel> tag now. Do not merely repeat the answer as terminal text."
+    )
+    print(json.dumps({"decision": "block", "reason": reason, "systemMessage": reason}))
+
+
+if __name__ == "__main__":
+    main()

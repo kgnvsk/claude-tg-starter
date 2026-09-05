@@ -1,26 +1,329 @@
 #!/usr/bin/env bash
-# install-plugins — регистрирует marketplace'ы + ставит плагины, ОБЪЯВЛЕННЫЕ в ~/.claude/settings.json.
+# install-plugins — синхронизирует управляемые плагины, регистрирует marketplace'ы
+# и ставит плагины, ОБЪЯВЛЕННЫЕ в ~/.claude/settings.json.
 # Причина: enabledPlugins в settings.json сам по себе НЕ регистрирует маркетплейсы надёжно
 # (особенно git-url) → делаем marketplace add + plugin install через CLI здесь.
 # Data-driven: читает settings.json, поэтому корректен для любого кита без правок.
 # Идемпотентно. Запускать ПОСЛЕ входа в Claude (Фаза 2), от пользователя claude.
 set -uo pipefail
 
+# The CLI unpacks the plugin tree with whatever umask it inherits, and Debian
+# gives an agent user 002 through pam_umask, so a plugin installed from here
+# lands group-writable. plugin-doctor — called at the end of this very script —
+# refuses group-writable plugin state, so the step installs plugins and then
+# rejects its own work, and update.sh dies with it. Write 0644/0755 instead.
+umask 022
+
 CLAUDE="$HOME/.local/bin/claude"; command -v "$CLAUDE" >/dev/null 2>&1 || CLAUDE=claude
-command -v "$CLAUDE" >/dev/null 2>&1 || { echo "✗ claude CLI не найден — сначала Фаза 2 (вход в Claude)"; exit 1; }
+command -v "$CLAUDE" >/dev/null 2>&1 || { echo "✗ claude CLI не знайдено — спочатку виконай етап 2 (вхід у Claude)"; exit 1; }
 S="$HOME/.claude/settings.json"
-[ -f "$S" ] || { echo "✗ нет $S"; exit 1; }
+[ -f "$S" ] || { echo "✗ немає $S"; exit 1; }
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+POLICY="${CLAUDE_MANAGED_PLUGINS_POLICY:-}"
+if [ -z "$POLICY" ]; then
+  for candidate in \
+    "$SCRIPT_DIR/../product/managed-plugins.json" \
+    "$HOME/.claude/product/managed-plugins.json" \
+    "/opt/claude-tg-starter/assets/product/managed-plugins.json"; do
+    if [ -f "$candidate" ]; then
+      POLICY="$candidate"
+      break
+    fi
+  done
+fi
+[ -n "$POLICY" ] && [ -f "$POLICY" ] || {
+  echo "✗ немає assets/product/managed-plugins.json — безпечно синхронізувати плагіни неможливо" >&2
+  exit 1
+}
 
-echo "==> marketplace add (из extraKnownMarketplaces)"
-python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));[print(v.get("repo") or v.get("url")) for v in d.get("extraKnownMarketplaces",{}).values() if isinstance(v,dict) and (v.get("repo") or v.get("url"))]' "$S" | while read -r m; do
-  [ -n "$m" ] || continue
-  "$CLAUDE" plugin marketplace add "$m" </dev/null >/dev/null 2>&1 && echo "  + $m" || echo "  = $m (уже есть / или ошибка сети)"
-done
+# Process substitutions run asynchronously from the parent shell. Validate the
+# whole settings and policy documents up front so a parser failure cannot look
+# like an empty, successful plugin plan.
+python3 - "$S" "$POLICY" <<'PY' || {
+import json
+import sys
 
-echo "==> plugin install (из enabledPlugins; telegram пропускаем — он в Фазе 3c)"
-python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));[print(k) for k,en in d.get("enabledPlugins",{}).items() if en and not str(k).startswith("telegram@")]' "$S" | while read -r p; do
+settings_path, policy_path = sys.argv[1:3]
+try:
+    with open(settings_path, encoding="utf-8") as handle:
+        data = json.load(handle)
+except (OSError, json.JSONDecodeError) as exc:
+    print(f"FATAL: invalid settings.json: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+
+if not isinstance(data, dict):
+    print("FATAL: settings.json root must be an object", file=sys.stderr)
+    raise SystemExit(1)
+for key in ("extraKnownMarketplaces", "enabledPlugins"):
+    value = data.get(key, {})
+    if not isinstance(value, dict):
+        print(f"FATAL: settings.json {key} must be an object", file=sys.stderr)
+        raise SystemExit(1)
+
+try:
+    with open(policy_path, encoding="utf-8") as handle:
+        policy = json.load(handle)
+except (OSError, json.JSONDecodeError) as exc:
+    print(f"FATAL: invalid managed-plugins.json: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+if not isinstance(policy, dict):
+    print("FATAL: managed-plugins.json root must be an object", file=sys.stderr)
+    raise SystemExit(1)
+for key in ("enabled", "managed"):
+    value = policy.get(key)
+    if not isinstance(value, list) or not all(
+        isinstance(item, str) and item for item in value
+    ):
+        print(
+            f"FATAL: managed-plugins.json {key} must be a string array",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+if not set(policy["enabled"]).issubset(policy["managed"]):
+    print(
+        "FATAL: managed-plugins.json enabled must be a subset of managed",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+PY
+  exit 1
+}
+
+marketplace_is_registered() {
+  local name="$1" source="$2" listing
+  listing="$("$CLAUDE" plugin marketplace list --json </dev/null 2>/dev/null || printf '[]')"
+  python3 -c '
+import json, sys
+name, source = sys.argv[1:3]
+try:
+    rows = json.load(sys.stdin)
+except Exception:
+    rows = []
+def row_source(row):
+    nested = row.get("source")
+    if isinstance(nested, dict):
+        return nested.get("repo") or nested.get("url")
+    return row.get("repo") or row.get("url")
+raise SystemExit(0 if any(
+    isinstance(row, dict)
+    and row.get("name") == name
+    and row_source(row) == source
+    for row in rows
+) else 1)
+' "$name" "$source" <<<"$listing"
+}
+
+plugin_is_installed() {
+  local plugin="$1" listing
+  listing="$("$CLAUDE" plugin list --json </dev/null 2>/dev/null || printf '[]')"
+  python3 -c '
+import json, sys
+plugin = sys.argv[1]
+try:
+    rows = json.load(sys.stdin)
+except Exception:
+    rows = []
+raise SystemExit(0 if any(
+    isinstance(row, dict) and row.get("id") == plugin for row in rows
+) else 1)
+' "$plugin" <<<"$listing"
+}
+
+plugin_is_required() {
+  local plugin="$1"
+  python3 -c '
+import json, sys
+plugin, policy_path = sys.argv[1:3]
+with open(policy_path, encoding="utf-8") as handle:
+    policy = json.load(handle)
+raise SystemExit(0 if plugin in set(policy["enabled"]) else 1)
+' "$plugin" "$POLICY"
+}
+
+marketplace_name_is_registered() {
+  local name="$1" listing
+  listing="$("$CLAUDE" plugin marketplace list --json </dev/null 2>/dev/null || printf '[]')"
+  python3 -c '
+import json, sys
+name = sys.argv[1]
+try:
+    rows = json.load(sys.stdin)
+except Exception:
+    rows = []
+raise SystemExit(0 if any(
+    isinstance(row, dict) and row.get("name") == name for row in rows
+) else 1)
+' "$name" <<<"$listing"
+}
+
+marketplace_has_owner_plugin() {
+  local marketplace="$1" listing
+  listing="$("$CLAUDE" plugin list --json </dev/null 2>/dev/null || printf '[]')"
+  python3 -c '
+import json, sys
+marketplace, settings_path, policy_path = sys.argv[1:4]
+try:
+    installed = json.load(sys.stdin)
+except Exception:
+    installed = []
+with open(settings_path, encoding="utf-8") as handle:
+    settings = json.load(handle)
+with open(policy_path, encoding="utf-8") as handle:
+    policy = json.load(handle)
+managed = set(policy["managed"])
+plugin_ids = set(settings.get("enabledPlugins", {}))
+plugin_ids.update(
+    row.get("id")
+    for row in installed
+    if isinstance(row, dict) and isinstance(row.get("id"), str)
+)
+raise SystemExit(0 if any(
+    plugin_id not in managed
+    and plugin_id.rpartition("@")[2] == marketplace
+    for plugin_id in plugin_ids
+) else 1)
+' "$marketplace" "$S" "$POLICY" <<<"$listing"
+}
+
+failures=0
+
+echo "==> узгодження плагінів (застарілий стан, керований комплектом)"
+while read -r plugin; do
+  [ -n "$plugin" ] || continue
+  if ! plugin_is_installed "$plugin"; then
+    echo "  = $plugin (вже відсутній)"
+    continue
+  fi
+  if "$CLAUDE" plugin uninstall --scope user "$plugin" </dev/null >/dev/null 2>&1; then
+    echo "  - $plugin"
+  elif ! plugin_is_installed "$plugin"; then
+    echo "  - $plugin"
+  else
+    echo "FATAL: не вдалося видалити застарілий плагін $plugin" >&2
+    failures=$((failures + 1))
+  fi
+done < <(python3 -c '
+import json, sys
+policy = json.load(open(sys.argv[1], encoding="utf-8"))
+for plugin in sorted(set(policy["managed"]) - set(policy["enabled"])):
+    print(plugin)
+' "$POLICY")
+
+echo "==> узгодження маркетплейсів (застарілий стан, керований комплектом)"
+while read -r marketplace; do
+  [ -n "$marketplace" ] || continue
+  if marketplace_has_owner_plugin "$marketplace"; then
+    echo "  = $marketplace (збережено: використовується плагін власника)"
+    continue
+  fi
+  if ! marketplace_name_is_registered "$marketplace"; then
+    echo "  = $marketplace (вже відсутній)"
+    continue
+  fi
+  if "$CLAUDE" plugin marketplace remove --scope user "$marketplace" </dev/null >/dev/null 2>&1; then
+    echo "  - $marketplace"
+  elif ! marketplace_name_is_registered "$marketplace"; then
+    echo "  - $marketplace"
+  else
+    echo "FATAL: не вдалося видалити застарілий маркетплейс $marketplace" >&2
+    failures=$((failures + 1))
+  fi
+done < <(python3 -c '
+import json, sys
+policy = json.load(open(sys.argv[1], encoding="utf-8"))
+managed = {
+    plugin.rpartition("@")[2]
+    for plugin in policy["managed"]
+    if "@" in plugin
+}
+enabled = {
+    plugin.rpartition("@")[2]
+    for plugin in policy["enabled"]
+    if "@" in plugin
+}
+for marketplace in sorted(managed - enabled):
+    print(marketplace)
+' "$POLICY")
+
+echo "==> додавання маркетплейсів з extraKnownMarketplaces"
+while IFS=$'\t' read -r name source; do
+  [ -n "$name" ] && [ -n "$source" ] || continue
+  if "$CLAUDE" plugin marketplace add "$source" </dev/null >/dev/null 2>&1; then
+    echo "  + $name ($source)"
+  elif marketplace_is_registered "$name" "$source"; then
+    echo "  = $name (вже зареєстровано)"
+  else
+    echo "FATAL: не вдалося зареєструвати маркетплейс $name ($source)" >&2
+    failures=$((failures + 1))
+  fi
+done < <(python3 -c '
+import json, sys
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+for name, value in data.get("extraKnownMarketplaces", {}).items():
+    if not isinstance(value, dict):
+        continue
+    source = value.get("source", value)
+    if not isinstance(source, dict):
+        continue
+    location = source.get("repo") or source.get("url")
+    if location:
+        print(f"{name}\t{location}")
+' "$S")
+
+echo "==> встановлення плагінів з enabledPlugins; telegram пропускаю — він належить до етапу 3c"
+while read -r p; do
   [ -n "$p" ] || continue
-  "$CLAUDE" plugin install "$p" </dev/null >/dev/null 2>&1 && echo "  + $p" || echo "  = $p (уже стоит / или ошибка)"
-done
+  if "$CLAUDE" plugin install --scope user "$p" </dev/null >/dev/null 2>&1; then
+    echo "  + $p"
+  elif plugin_is_installed "$p"; then
+    echo "  = $p (вже встановлено)"
+  elif ! plugin_is_required "$p"; then
+    echo "WARN: плагін власника $p не вдалося встановити; оновлення комплекту продовжується" >&2
+  else
+    echo "FATAL: не вдалося встановити плагін $p" >&2
+    failures=$((failures + 1))
+  fi
+done < <(python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));[print(k) for k,en in d.get("enabledPlugins",{}).items() if en and not str(k).startswith("telegram@")]' "$S")
 
-echo "✅ install-plugins done. Проверка: $CLAUDE plugin list"
+[ "$failures" -eq 0 ] || exit 1
+
+# The umask above only governs what this run writes. Installs that predate it
+# left whole trees group-writable, and the doctor below walks every one of them.
+[ ! -d "$HOME/.claude/plugins" ] || chmod -R go-w "$HOME/.claude/plugins"
+
+PLUGIN_DOCTOR="$HOME/bin/plugin-doctor"
+[ -x "$PLUGIN_DOCTOR" ] || {
+  echo "FATAL: plugin-doctor недоступний" >&2
+  exit 1
+}
+doctor_failure_plugin() {
+  python3 -c '
+import json, sys
+try:
+    report = json.load(sys.stdin)
+except Exception:
+    raise SystemExit(0)
+plugin = report.get("plugin") if isinstance(report, dict) else ""
+print(plugin if isinstance(plugin, str) else "")
+'
+}
+
+# A plugin already on disk is never reinstalled above, so a contract that has
+# since grown a skill leaves the cache one skill short: the check refuses, the
+# owner's update stops at this step, and the line they get names no way out. The
+# doctor names the plugin it stopped on — update that one and ask again.
+if ! doctor_report="$("$PLUGIN_DOCTOR" --json 2>/dev/null)"; then
+  stale_plugin="$(printf '%s' "$doctor_report" | doctor_failure_plugin)"
+  repaired=1
+  if [ -n "$stale_plugin" ] &&
+     "$CLAUDE" plugin update "$stale_plugin" </dev/null >/dev/null 2>&1; then
+    echo "  ↻ $stale_plugin (оновлено під розширений контракт)"
+    "$PLUGIN_DOCTOR" --json >/dev/null 2>&1 && repaired=0
+  fi
+  if [ "$repaired" -ne 0 ]; then
+    echo "FATAL: встановлені плагіни не пройшли локальну перевірку" >&2
+    exit 1
+  fi
+fi
+
+echo "✅ install-plugins: плагіни та експортовані навички перевірено"

@@ -1,0 +1,370 @@
+#!/usr/bin/env python3
+"""Fixed host bridge for canonical lifecycle helpers; no agent or Telegram process."""
+import argparse
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import sqlite3
+import stat
+import sys
+import tempfile
+from datetime import datetime, timedelta
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+HOME = Path.home()
+ROOT = HOME / '.local/state/novsky-codex/lifecycle'
+
+
+def directory(path):
+    if path == HOME:
+        if path.is_symlink() or not path.is_dir():
+            raise ValueError('unsafe home')
+        return
+    path.relative_to(HOME)
+    directory(path.parent)
+    if path.exists() or path.is_symlink():
+        if path.is_symlink() or not path.is_dir():
+            raise ValueError('unsafe directory')
+    else:
+        path.mkdir(mode=0o700)
+
+
+def regular(path, limit=100_000, private=False):
+    path.relative_to(HOME)
+    directory(path.parent)
+    info = path.lstat()
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > limit or info.st_uid != os.getuid() or (private and info.st_mode & 0o077):
+        raise ValueError('unsafe file')
+    return path
+
+
+def read_json(path):
+    return json.loads(regular(path, private=True).read_text())
+
+
+def atomic(path, data):
+    directory(path.parent)
+    fd, name = tempfile.mkstemp(dir=path.parent, prefix='.native-')
+    try:
+        with os.fdopen(fd, 'w') as output:
+            output.write(data)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(name, path)
+        descriptor = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    finally:
+        Path(name).unlink(missing_ok=True)
+
+
+def save(path, value):
+    atomic(path, json.dumps(value, ensure_ascii=False) + '\n')
+
+
+def module(name):
+    source = regular(HOME / 'bin' / name, 300_000)
+    loader = importlib.machinery.SourceFileLoader(name.replace('-', '_'), str(source))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    result = importlib.util.module_from_spec(spec)
+    sys.modules[loader.name] = result
+    loader.exec_module(result)
+    return result
+
+
+def fields(args, allowed):
+    if not isinstance(args, dict) or set(args) - set(allowed.split()):
+        raise ValueError('unsupported arguments')
+
+
+def text(value, limit=4000):
+    if not isinstance(value, str) or not value.strip() or len(value) > limit or '\0' in value:
+        raise ValueError('invalid text')
+    return value
+
+
+def source_message(owner, identifier):
+    if not isinstance(identifier, int) or identifier < 1:
+        raise ValueError('authenticated message required')
+    path = regular(HOME / '.codex/channels/telegram/messages.db', 2**40)
+    with sqlite3.connect(path.as_uri() + '?mode=ro', uri=True) as db:
+        found = db.execute("SELECT 1 FROM messages WHERE chat_id=? AND user_id=? AND message_id=? AND direction='in' LIMIT 1", (owner, owner, identifier)).fetchone()
+    if not found:
+        raise ValueError('authenticated message missing')
+
+
+def reminder(args, owner, message_id):
+    fields(args, 'action task at text run every timezone quietStart quietEnd until checkpoints')
+    helper = module('reminder-task')
+    action = args.get('action')
+    if action not in ('one', 'repeat', 'sequence', 'status', 'cancel', 'list'):
+        raise ValueError('unsupported reminder action')
+    if 'run' in args and not isinstance(args['run'], bool):
+        raise ValueError('invalid scheduled run')
+    if action == 'sequence' and args.get('run') is True:
+        raise ValueError('scheduled RUN supports one or repeat, not sequence')
+    root = ROOT / 'reminders'
+    if action == 'list':
+        directory(root)
+        with helper.queue_lock(root, ROOT / 'reminders.lock'):
+            paths = list(root.glob('*.rem'))
+            if len(paths) > 1000:
+                raise ValueError('reminder queue too large')
+            tasks = {helper.split_file(regular(path)).headers['TASK'] for path in paths}
+            return [helper.verified_status(root, task) for task in sorted(tasks)]
+    task = helper.task_id(args.get('task', ''))
+    command = [action, '--task', task]
+    if action in ('one', 'repeat', 'sequence'):
+        source_message(owner, message_id)
+        command += ['--chat', owner]
+        if action == 'sequence':
+            checkpoints = args.get('checkpoints')
+            if not isinstance(checkpoints, list) or not 2 <= len(checkpoints) <= 24:
+                raise ValueError('invalid checkpoints')
+            for point in checkpoints:
+                fields(point, 'at text')
+                command += ['--checkpoint', str(point['at']) + '|' + text(point['text'])]
+        else:
+            command += ['--at', str(args['at']), '--text', text(args['text'])]
+            if args.get('run') is True:
+                command += ['--run']
+        if action == 'repeat':
+            for field, flag in [('every', 'every'), ('timezone', 'timezone'), ('quietStart', 'quiet-start'), ('quietEnd', 'quiet-end')]:
+                command += ['--' + flag, str(args[field])]
+            if args.get('until') is not None:
+                command += ['--until', str(args['until'])]
+    parsed = helper.normalize(helper.parser().parse_args(command))
+    directory(root)
+    with helper.queue_lock(root, ROOT / 'reminders.lock'):
+        if action == 'cancel':
+            result = helper.cancel_task(root, task)
+            (ROOT / 'reminder-owners' / (task + '.json')).unlink(missing_ok=True)
+        elif action == 'status':
+            result = helper.verified_status(root, task)
+        else:
+            # Persist the authenticated creator before publishing its queue files.
+            binding = ROOT / 'reminder-owners' / (task + '.json')
+            if not binding.exists():
+                save(binding, {'owner': owner, 'messageId': message_id})
+            result = helper.create_sequence(root, parsed) if action == 'sequence' else helper.create_single(root, parsed, repeat=action == 'repeat')
+    return result
+
+
+def repair(receipt):
+    if receipt['state'] != 'settled':
+        return
+    path = ROOT / 'reminders' / receipt['file']
+    if not path.exists():
+        return
+    current = regular(path).read_bytes()
+    if hashlib.sha256(current).hexdigest() != receipt['sha256']:
+        return
+    if receipt['next'] is None:
+        path.unlink()
+        descriptor = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    else:
+        atomic(path, receipt['next'])
+
+
+def schedule(operation, args, owner):
+    fields(args, 'now' if operation == 'due' else 'key now')
+    now = args['now']
+    if not isinstance(now, int) or now <= 0 or now > 2**40:
+        raise ValueError('invalid clock')
+    helper = module('reminder-task')
+    root = ROOT / 'reminders'
+    directory(root)
+    with helper.queue_lock(root, ROOT / 'reminders.lock'):
+        if operation == 'settle':
+            key = args['key']
+            if not isinstance(key, str) or not re.fullmatch('[a-f0-9]{64}', key):
+                raise ValueError('invalid occurrence')
+            receipt_path = ROOT / 'receipts' / (key + '.json')
+            if receipt_path.exists():
+                receipt = read_json(receipt_path)
+                repair(receipt)
+                return {'state': receipt['state']}
+            claim = read_json(ROOT / 'claims' / (key + '.json'))
+            path = root / claim['file']
+            if not path.exists() or hashlib.sha256(regular(path).read_bytes()).hexdigest() != claim['sha256']:
+                save(receipt_path, {'state': 'cancelled'})
+                return {'state': 'cancelled'}
+            record = helper.split_file(path)
+            following = None
+            if record.headers.get('REPEAT_SECONDS'):
+                record.headers['EPOCH'] = str(now + int(record.headers['REPEAT_SECONDS']))
+                record.headers['COUNT'] = str(int(record.headers.get('COUNT', '0')) + 1)
+                if not record.headers.get('UNTIL_EPOCH') or int(record.headers['EPOCH']) <= int(record.headers['UNTIL_EPOCH']):
+                    following = helper.render(record.headers.items(), record.body)
+            receipt = {**claim, 'state': 'settled', 'next': following}
+            # This durable receipt closes the crash gap before cadence changes.
+            save(receipt_path, receipt)
+            repair(receipt)
+            return {'state': 'settled'}
+        due = []
+        for path in sorted(root.glob('*.rem')):
+            regular(path)
+            sha = hashlib.sha256(path.read_bytes()).hexdigest()
+            key = hashlib.sha256((path.name + ':' + sha).encode()).hexdigest()
+            receipt_path = ROOT / 'receipts' / (key + '.json')
+            if receipt_path.exists():
+                repair(read_json(receipt_path))
+                continue
+            record = helper.split_file(path)
+            headers = record.headers
+            task = helper.task_id(headers.get('TASK', ''))
+            binding = read_json(ROOT / 'reminder-owners' / (task + '.json'))
+            if headers['CHAT'] != owner or binding['owner'] != owner or int(headers['EPOCH']) > now:
+                continue
+            if headers.get('UNTIL_EPOCH') and now > int(headers['UNTIL_EPOCH']):
+                path.unlink()
+                continue
+            if headers.get('REPEAT_SECONDS') and headers.get('QUIET_START'):
+                local = datetime.fromtimestamp(now, ZoneInfo(headers['TIMEZONE']))
+                minute = local.hour * 60 + local.minute
+                start, end = [sum(int(value) * multiplier for value, multiplier in zip(headers[name].split(':'), (60, 1))) for name in ('QUIET_START', 'QUIET_END')]
+                quiet = start <= minute < end if start < end else minute >= start or minute < end
+                if quiet:
+                    following = local.replace(hour=end // 60, minute=end % 60, second=0, microsecond=0)
+                    if following.timestamp() <= now:
+                        following += timedelta(days=1)
+                    headers['EPOCH'] = str(int(following.timestamp()))
+                    atomic(path, helper.render(headers.items(), record.body))
+                    continue
+            claim = {'key': key, 'file': path.name, 'sha256': sha, 'task': task, 'owner': owner, 'messageId': binding['messageId'], 'text': record.body, 'run': headers.get('RUN') == '1'}
+            save(ROOT / 'claims' / (key + '.json'), claim)
+            due.append({name: claim[name] for name in ('key', 'task', 'messageId', 'text', 'run')})
+            if len(due) >= 24:
+                break
+        return due
+
+
+def goal(args):
+    fields(args, 'action id objective criteria constraints criterion evidence reason status')
+    helper = module('agent-goal')
+    helper.GOALS_DIR = ROOT / 'goals'
+    helper.LOCK_FILE = ROOT / 'goals.lock'
+    directory(helper.GOALS_DIR)
+    for path in helper.GOALS_DIR.glob('*.json'):
+        regular(path, private=True)
+    action = args.get('action')
+    command = [action]
+    if action == 'create':
+        command += ['--objective', text(args['objective'])]
+        for field, flag in [('criteria', 'criterion'), ('constraints', 'constraint')]:
+            values = args.get(field, [])
+            if not isinstance(values, list) or len(values) > 20:
+                raise ValueError('invalid criteria')
+            for value in values:
+                command += ['--' + flag, text(value)]
+    elif action in ('show', 'check', 'complete', 'block'):
+        command += [args['id']]
+        for field in (['criterion', 'evidence'] if action == 'check' else ['reason'] if action == 'block' else []):
+            command += ['--' + field, str(args[field]) if field == 'criterion' else text(args[field])]
+    elif action == 'list':
+        if args.get('status'):
+            command += ['--status', args['status']]
+    else:
+        raise ValueError('unsupported goal action')
+    parsed = helper.build_parser().parse_args(command)
+    with helper.locked():
+        return helper.load_goal(parsed.goal_id) if action == 'show' else helper.list_goals(parsed) if action == 'list' else getattr(helper, action)(parsed)
+
+
+def learning(operation, args, owner, message_id):
+    source_message(owner, message_id)
+    helper = module('learning-review')
+    helper.LEARNING_ROOT = ROOT / 'learning'
+    helper.PENDING_DIR = helper.LEARNING_ROOT / 'pending'
+    helper.HISTORY_DIR = helper.LEARNING_ROOT / 'history'
+    helper.LOCK_DIR = helper.LEARNING_ROOT / 'locks'
+    original_target = helper.resolved_target
+    def guarded_target(candidate):
+        path = original_target(candidate)
+        directory(path.parent)
+        if path.exists() or path.is_symlink():
+            regular(path)
+        return path
+    helper.resolved_target = guarded_target
+    action = args.get('action')
+    if operation == 'learning':
+        fields(args, 'action class kind target task outcome proposal acceptance replacement checks')
+        if action != 'propose':
+            raise ValueError('proposal required')
+        staging = ROOT / 'review-inputs' / os.urandom(16).hex()
+        directory(staging)
+        command = ['propose', '--chat-id', owner, '--message-id', str(message_id), '--class', args['class'], '--kind', args['kind'], '--target', args['target']]
+        for name in ('task', 'outcome', 'proposal', 'acceptance', 'replacement'):
+            atomic(staging / (name + '.txt'), text(args[name]))
+            if name != 'replacement':
+                command += ['--' + name + '-file', str(staging / (name + '.txt'))]
+        if args.get('checks') is not None:
+            save(staging / 'checks.json', args['checks'])
+        parsed = helper.build_parser().parse_args(command)
+        result = helper.propose(parsed)
+        save(ROOT / 'reviews' / (result['id'] + '.json'), {'staging': staging.name})
+        return {'status': result['status'], 'id': result['id'], 'previewCommand': '/learn_preview ' + result['id']}
+    fields(args, 'action id')
+    identifier = args['id']
+    helper.candidate_directory(identifier)
+    if action not in ('preview', 'apply', 'rollback', 'reject'):
+        raise ValueError('unsupported review action')
+    staging_name = read_json(ROOT / 'reviews' / (identifier + '.json'))['staging']
+    if not re.fullmatch('[a-f0-9]{32}', staging_name):
+        raise ValueError('invalid snapshot')
+    staging = ROOT / 'review-inputs' / staging_name
+    command = [action, identifier, '--admin-chat-id', owner, '--admin-message-id', str(message_id)]
+    if action in ('preview', 'apply'):
+        command += ['--replacement-file', str(regular(staging / 'replacement.txt', private=True))]
+        if (staging / 'checks.json').exists():
+            command += ['--checks-file', str(regular(staging / 'checks.json', private=True))]
+    if action == 'reject':
+        atomic(staging / 'reason.txt', 'Rejected by the authenticated owner.')
+        command += ['--reason-file', str(staging / 'reason.txt')]
+    if action != 'preview':
+        command += ['--confirm']
+    parsed = helper.build_parser().parse_args(command)
+    helper.recover_incomplete_transactions()
+    with helper.candidate_lock(identifier):
+        return parsed.handler(parsed)
+
+
+def main():
+    if len(sys.argv) != 2 or not re.fullmatch('[a-f0-9]{32}', sys.argv[1]):
+        raise ValueError('invalid request')
+    request = read_json(ROOT / 'requests' / (sys.argv[1] + '.json'))
+    fields(request, 'operation args owner messageId')
+    owner = request['owner']
+    if not isinstance(owner, str) or not re.fullmatch('[1-9][0-9]{0,15}', owner):
+        raise ValueError('invalid owner')
+    access = read_json(HOME / '.codex/channels/telegram/access.json')
+    if owner not in map(str, access.get('admins', [])):
+        raise ValueError('owner required')
+    operation, args, message_id = request['operation'], request['args'], request.get('messageId')
+    if operation == 'reminder':
+        return reminder(args, owner, message_id)
+    if operation in ('due', 'settle'):
+        return schedule(operation, args, owner)
+    if operation == 'goal':
+        source_message(owner, message_id)
+        return goal(args)
+    if operation in ('learning', 'review'):
+        return learning(operation, args, owner, message_id)
+    raise ValueError('unsupported lifecycle operation')
+
+
+if __name__ == '__main__':
+    try:
+        print(json.dumps({'ok': True, 'value': main()}, ensure_ascii=False))
+    except Exception:
+        print(json.dumps({'ok': False, 'error': 'The native lifecycle operation did not confirm success.'}))

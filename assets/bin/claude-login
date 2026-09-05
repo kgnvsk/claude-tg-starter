@@ -15,9 +15,17 @@ SES="clogin-$(id -u)"
 LOG="/tmp/claude-login.$(id -u).log"
 
 authed() { claude auth status 2>/dev/null | grep -q '"loggedIn": *true'; }
+AUTH_ESTABLISHED="${AGENT_ROOT:-$HOME}/.claude/auth-established"
+mark_auth_established() {
+  mkdir -p "$(dirname "$AUTH_ESTABLISHED")"
+  (umask 077; : > "$AUTH_ESTABLISHED")
+  chmod 0600 "$AUTH_ESTABLISHED"
+}
+
 
 if authed; then
-  echo "✅ Уже залогинен:"; claude auth status 2>/dev/null | grep -E '"(email|subscriptionType|authMethod)"'
+  mark_auth_established
+  echo "✅ Вже авторизовано:"; claude auth status 2>/dev/null | grep -E '"(email|subscriptionType|authMethod)"'
   exit 0
 fi
 
@@ -33,27 +41,28 @@ if [ $# -eq 0 ]; then
     sleep 1
   done
   if [ -z "$URL" ]; then
-    echo "⚠ OAuth-URL не появился за 40с. Полный лог логина:"; cat "$LOG"
+    echo "⚠ OAuth-URL не з’явився за 40 с. Повний журнал входу:"; cat "$LOG"
     screen -S "$SES" -X quit 2>/dev/null || true
     exit 1
   fi
-  echo "1) Отдай владельцу этот URL — пусть откроет в браузере и войдёт СВОЕЙ Max-подпиской:"
+  echo "1) Передай власнику цей URL — нехай відкриє його у браузері та увійде зі СВОЄЮ підпискою Max:"
   echo
   echo "   $URL"
   echo
-  echo "2) Владелец копирует код со страницы → выполни:  claude-login <код>"
+  echo "2) Власник копіює код зі сторінки → виконай:  claude-login <код>"
   exit 0
 fi
 
 # ШАГ 2 — скормить вставленный код
 if ! screen -S "$SES" -X stuff "$1"$'\n' 2>/dev/null; then
-  echo "⚠ Сессия логина не найдена — запусти сначала: claude-login"; exit 1
+  echo "⚠ Сесію входу не знайдено — спочатку запусти: claude-login"; exit 1
 fi
 for _ in $(seq 1 20); do authed && break; sleep 1; done
 if authed; then
-  echo "✅ Залогинено по подписке:"; claude auth status 2>/dev/null | grep -E '"(email|subscriptionType|authMethod)"'
+  mark_auth_established
+  echo "✅ Авторизовано через підписку:"; claude auth status 2>/dev/null | grep -E '"(email|subscriptionType|authMethod)"'
   screen -S "$SES" -X quit 2>/dev/null || true
 else
-  echo "⚠ Пока не подтверждено. Хвост лога:"; tail -10 "$LOG"
-  echo "Проверь код или запусти claude-login заново."; exit 1
+  echo "⚠ Підтвердження ще не отримано. Кінець журналу:"; tail -10 "$LOG"
+  echo "Перевір код або запусти claude-login знову."; exit 1
 fi

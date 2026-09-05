@@ -1,0 +1,899 @@
+#!/usr/bin/env python3
+"""Commit and push a secret-free agent backup to its private Git repository."""
+
+from __future__ import annotations
+
+import argparse
+from datetime import datetime, timezone
+import fcntl
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+from pathlib import Path, PurePosixPath
+import re
+import shlex
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+from types import ModuleType
+from urllib import error as urlerror, request
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+
+HOME = Path.home()
+VAULT = HOME / "obsidian-vault"
+STATE_DIR = HOME / ".local/state/agent-github-backup"
+STATE_PATH = STATE_DIR / "state.json"
+LOCK_PATH = STATE_DIR / "run.lock"
+KEY_PATH = STATE_DIR / "github-backup-ed25519"
+PROFILE_PATH = HOME / ".agent-profile.env"
+GITHUB_REMOTE = re.compile(
+    r"^(?:git@github\.com:|ssh://git@github\.com/)"
+    r"([A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))/"
+    r"([A-Za-z0-9][A-Za-z0-9_.-]{0,99})\.git$"
+)
+SHA = re.compile(r"^[0-9a-f]{40}$")
+PROFILE_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+TIMEZONE_NAME = re.compile(r"^[A-Za-z0-9._+-]+(?:/[A-Za-z0-9._+-]+)*$")
+SLOT = re.compile(r"^\d{4}-\d{2}-\d{2}T(?:09|21)$")
+
+
+class BackupError(RuntimeError):
+    def __init__(self, code: str):
+        super().__init__(code)
+        self.code = code
+
+
+def run_process(
+    command: list[str],
+    *,
+    cwd: Path | None = None,
+    environment: dict[str, str] | None = None,
+    input_bytes: bytes | None = None,
+    timeout: int = 60,
+) -> subprocess.CompletedProcess[bytes]:
+    try:
+        return subprocess.run(
+            command,
+            cwd=cwd,
+            env=environment,
+            input=input_bytes,
+            capture_output=True,
+            check=False,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise BackupError("command-unavailable") from error
+
+
+def git(
+    *arguments: str,
+    environment: dict[str, str] | None = None,
+    input_bytes: bytes | None = None,
+    timeout: int = 60,
+) -> subprocess.CompletedProcess[bytes]:
+    return run_process(
+        ["git", *arguments],
+        cwd=VAULT,
+        environment=environment,
+        input_bytes=input_bytes,
+        timeout=timeout,
+    )
+
+
+def decoded(result: subprocess.CompletedProcess[bytes]) -> str:
+    return result.stdout.decode("utf-8", errors="strict").strip()
+
+
+def require_success(
+    result: subprocess.CompletedProcess[bytes],
+    code: str,
+) -> subprocess.CompletedProcess[bytes]:
+    if result.returncode != 0:
+        raise BackupError(code)
+    return result
+
+
+def ensure_state_dir() -> None:
+    current = HOME
+    for part in (".local", "state"):
+        current = current / part
+        if current.is_symlink() or (current.exists() and not current.is_dir()):
+            raise BackupError("state-unsafe")
+    STATE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if STATE_DIR.is_symlink() or not STATE_DIR.is_dir():
+        raise BackupError("state-unsafe")
+    os.chmod(STATE_DIR, 0o700)
+
+
+def lock_run():
+    ensure_state_dir()
+    descriptor = os.open(
+        LOCK_PATH,
+        os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    metadata = os.fstat(descriptor)
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+        os.close(descriptor)
+        raise BackupError("state-unsafe")
+    os.chmod(LOCK_PATH, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(descriptor)
+        raise BackupError("busy")
+    return descriptor
+
+
+def load_state() -> dict:
+    if STATE_PATH.is_symlink():
+        raise BackupError("state-unsafe")
+    if not STATE_PATH.exists():
+        return {
+            "schemaVersion": 1,
+            "remoteIdentity": None,
+            "publicKeyFingerprint": None,
+            "privateConfirmed": False,
+            "lastSuccessfulRevision": None,
+            "lastSuccessfulAt": None,
+            "completedSlots": {},
+        }
+    metadata = STATE_PATH.lstat()
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_nlink != 1
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or metadata.st_size > 64 * 1024
+    ):
+        raise BackupError("state-unsafe")
+    try:
+        state = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise BackupError("state-invalid") from error
+    expected = {
+        "schemaVersion",
+        "remoteIdentity",
+        "publicKeyFingerprint",
+        "privateConfirmed",
+        "lastSuccessfulRevision",
+        "lastSuccessfulAt",
+        "completedSlots",
+    }
+    if (
+        not isinstance(state, dict)
+        or set(state) != expected
+        or state["schemaVersion"] != 1
+        or not isinstance(state["privateConfirmed"], bool)
+        or not isinstance(state["completedSlots"], dict)
+    ):
+        raise BackupError("state-invalid")
+    for key in ("remoteIdentity", "publicKeyFingerprint", "lastSuccessfulRevision", "lastSuccessfulAt"):
+        if state[key] is not None and not isinstance(state[key], str):
+            raise BackupError("state-invalid")
+    revision = state["lastSuccessfulRevision"]
+    if revision is not None and not SHA.fullmatch(revision):
+        raise BackupError("state-invalid")
+    slots = state["completedSlots"]
+    if len(slots) > 64 or any(
+        not isinstance(slot, str)
+        or SLOT.fullmatch(slot) is None
+        or not isinstance(completed_at, str)
+        or len(completed_at) > 64
+        for slot, completed_at in slots.items()
+    ):
+        raise BackupError("state-invalid")
+    return state
+
+
+def write_state(state: dict) -> None:
+    ensure_state_dir()
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=".state.json.",
+        dir=STATE_DIR,
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(state, handle, ensure_ascii=False, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, STATE_PATH)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def profile_timezone() -> str:
+    try:
+        descriptor = os.open(
+            PROFILE_PATH,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+        )
+    except OSError as error:
+        raise BackupError("timezone-invalid") from error
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(metadata.st_mode) & 0o077
+            or metadata.st_size > 64 * 1024
+        ):
+            raise BackupError("timezone-invalid")
+        with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
+            descriptor = -1
+            content = handle.read(64 * 1024 + 1)
+    except (OSError, UnicodeError) as error:
+        raise BackupError("timezone-invalid") from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    if len(content.encode("utf-8")) > 64 * 1024:
+        raise BackupError("timezone-invalid")
+    values: dict[str, str] = {}
+    for line in content.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped.startswith("export "):
+            stripped = stripped[7:].lstrip()
+        name, separator, raw = stripped.partition("=")
+        if not separator or PROFILE_NAME.fullmatch(name) is None or name in values:
+            raise BackupError("timezone-invalid")
+        if raw.startswith("$'"):
+            raise BackupError("timezone-invalid")
+        try:
+            parsed = shlex.split(raw, posix=True) if raw else [""]
+        except ValueError as error:
+            raise BackupError("timezone-invalid") from error
+        if len(parsed) != 1:
+            raise BackupError("timezone-invalid")
+        values[name] = parsed[0]
+    name = values.get("TIMEZONE", "")
+    if len(name) > 128 or TIMEZONE_NAME.fullmatch(name) is None:
+        raise BackupError("timezone-invalid")
+    try:
+        ZoneInfo(name)
+    except (ZoneInfoNotFoundError, ValueError) as error:
+        raise BackupError("timezone-invalid") from error
+    return name
+
+
+def current_utc_time() -> datetime:
+    configured = os.environ.get("AGENT_BACKUP_TEST_NOW")
+    if configured is None or os.environ.get("AGENT_BACKUP_TESTING") != "1":
+        return datetime.now(timezone.utc)
+    try:
+        parsed = datetime.fromisoformat(configured.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise BackupError("clock-invalid") from error
+    if parsed.tzinfo is None:
+        raise BackupError("clock-invalid")
+    return parsed.astimezone(timezone.utc)
+
+
+def require_repository() -> None:
+    if VAULT.is_symlink() or not VAULT.is_dir():
+        raise BackupError("vault-unsafe")
+    git_path = VAULT / ".git"
+    if git_path.is_symlink() or not git_path.is_dir():
+        raise BackupError("repository-missing")
+    branch = require_success(
+        git("symbolic-ref", "--quiet", "--short", "HEAD"),
+        "branch-invalid",
+    )
+    if decoded(branch) != "main":
+        raise BackupError("branch-invalid")
+
+
+def git_config_values(name: str) -> list[str]:
+    result = git("config", "--get-all", name)
+    if result.returncode == 1:
+        return []
+    require_success(result, "remote-invalid")
+    try:
+        values = result.stdout.decode("utf-8", errors="strict").splitlines()
+    except UnicodeDecodeError as error:
+        raise BackupError("remote-invalid") from error
+    if any(not value for value in values):
+        raise BackupError("remote-invalid")
+    return values
+
+
+def configured_push_remote() -> str:
+    push_urls = git_config_values("remote.origin.pushurl")
+    urls = push_urls or git_config_values("remote.origin.url")
+    if len(urls) != 1:
+        raise BackupError("remote-invalid")
+    return urls[0]
+
+
+def remote_identity() -> tuple[str, str]:
+    remotes = require_success(git("remote"), "remote-invalid")
+    names = [line for line in decoded(remotes).splitlines() if line]
+    if names != ["origin"]:
+        raise BackupError("remote-invalid")
+    remote = configured_push_remote()
+    return remote, validate_remote(remote)
+
+
+def validate_remote(remote: str) -> str:
+    testing = os.environ.get("AGENT_BACKUP_TESTING") == "1"
+    if testing:
+        expected = os.environ.get("AGENT_BACKUP_TEST_REMOTE")
+        if not expected:
+            raise BackupError("remote-invalid")
+        try:
+            if Path(remote).resolve(strict=False) != Path(expected).resolve(strict=False):
+                raise BackupError("remote-invalid")
+        except OSError as error:
+            raise BackupError("remote-invalid") from error
+        return "test-local"
+    match = GITHUB_REMOTE.fullmatch(remote)
+    if match is None:
+        raise BackupError("remote-invalid")
+    return f"github:{match.group(1)}/{match.group(2)}"
+
+
+def git_environment(remote: str) -> dict[str, str]:
+    environment = os.environ.copy()
+    if remote.startswith(("git@github.com:", "ssh://git@github.com/")):
+        if KEY_PATH.is_symlink() or not KEY_PATH.is_file():
+            raise BackupError("deploy-key-missing")
+        metadata = KEY_PATH.stat()
+        if stat.S_IMODE(metadata.st_mode) != 0o600 or metadata.st_nlink != 1:
+            raise BackupError("deploy-key-unsafe")
+        environment["GIT_SSH_COMMAND"] = (
+            "/usr/bin/ssh -i "
+            + shlex.quote(str(KEY_PATH))
+            + " -o IdentitiesOnly=yes -o BatchMode=yes "
+            + "-o StrictHostKeyChecking=accept-new"
+        )
+        environment["GIT_CONFIG_GLOBAL"] = os.devnull
+        environment["GIT_CONFIG_NOSYSTEM"] = "1"
+        environment["GIT_TERMINAL_PROMPT"] = "0"
+    return environment
+
+
+def require_private_repository(identity: str) -> None:
+    if os.environ.get("AGENT_BACKUP_TESTING") == "1":
+        visibility = os.environ.get("AGENT_BACKUP_TEST_VISIBILITY", "private")
+        if visibility == "private":
+            return
+        if visibility == "public":
+            raise BackupError("repository-public")
+        raise BackupError("privacy-unverified")
+    prefix = "github:"
+    if not identity.startswith(prefix):
+        raise BackupError("privacy-unverified")
+    repository = identity.removeprefix(prefix)
+    probe = request.Request(
+        f"https://api.github.com/repos/{repository}",
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "agent-github-backup",
+            "X-GitHub-Api-Version": "2026-03-10",
+        },
+    )
+    try:
+        with request.urlopen(probe, timeout=15) as response:
+            if response.status != 200:
+                raise BackupError("privacy-unverified")
+            payload = response.read(64 * 1024 + 1)
+    except urlerror.HTTPError as error:
+        if error.code == 404:
+            return
+        raise BackupError("privacy-unverified") from error
+    except (OSError, TimeoutError, urlerror.URLError) as error:
+        raise BackupError("privacy-unverified") from error
+    if len(payload) > 64 * 1024:
+        raise BackupError("privacy-unverified")
+    try:
+        metadata = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise BackupError("privacy-unverified") from error
+    if not isinstance(metadata, dict) or not isinstance(metadata.get("private"), bool):
+        raise BackupError("privacy-unverified")
+    if metadata["private"] is False:
+        raise BackupError("repository-public")
+
+
+def require_remote_access(environment: dict[str, str]) -> None:
+    result = git("ls-remote", "origin", environment=environment, timeout=30)
+    if result.returncode != 0:
+        raise BackupError("remote-unavailable")
+
+
+def load_backup_module() -> ModuleType:
+    path = Path(__file__).with_name("agent-backup")
+    loader = importlib.machinery.SourceFileLoader("agent_backup_projection", str(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    if spec is None:
+        raise BackupError("projection-unavailable")
+    module = importlib.util.module_from_spec(spec)
+    try:
+        loader.exec_module(module)
+    except (OSError, ValueError) as error:
+        raise BackupError("projection-unavailable") from error
+    return module
+
+
+def safe_vault_paths(backup: ModuleType) -> set[str]:
+    paths: set[str] = set()
+    try:
+        selected = backup.selected_files(include_vault=True)
+        for source, archive_name in selected:
+            prefix = "home/obsidian-vault/"
+            if not archive_name.startswith(prefix):
+                continue
+            backup.read_safe_file(source, archive_name)
+            relative = archive_name.removeprefix(prefix)
+            pure = PurePosixPath(relative)
+            if pure.is_absolute() or ".." in pure.parts or not pure.parts:
+                raise ValueError("unsafe vault path")
+            paths.add(pure.as_posix())
+    except (OSError, ValueError) as error:
+        raise BackupError("unsafe-content") from error
+    return paths
+
+
+def project_external_state(backup: ModuleType) -> set[str]:
+    output = VAULT / ".agent-backup"
+    try:
+        backup.create_projection(output)
+    except (OSError, ValueError) as error:
+        raise BackupError("unsafe-content") from error
+    paths: set[str] = set()
+    for source in output.rglob("*"):
+        if source.is_symlink():
+            raise BackupError("projection-unsafe")
+        if source.is_file():
+            paths.add(source.relative_to(VAULT).as_posix())
+    if ".agent-backup/manifest.json" not in paths:
+        raise BackupError("projection-unsafe")
+    return paths
+
+
+def clean_index() -> None:
+    result = git("diff", "--cached", "--quiet", "--no-ext-diff")
+    if result.returncode not in (0, 1):
+        raise BackupError("index-invalid")
+    if result.returncode == 1:
+        raise BackupError("index-dirty")
+
+
+def tracked_paths() -> set[str]:
+    result = require_success(git("ls-files", "-z"), "index-invalid")
+    try:
+        return {
+            value.decode("utf-8", errors="strict")
+            for value in result.stdout.split(b"\0")
+            if value
+        }
+    except UnicodeDecodeError as error:
+        raise BackupError("index-invalid") from error
+
+
+def tracked_path_allowed(backup: ModuleType, relative: str) -> bool:
+    path = PurePosixPath(relative)
+    if path.is_absolute() or ".." in path.parts or not path.parts:
+        return False
+    if path.parts[0] == ".agent-backup":
+        return True
+    return not backup.is_excluded(Path("obsidian-vault") / Path(*path.parts))
+
+
+def index_backup() -> tuple[Path, bytes | None, int | None]:
+    path = VAULT / ".git/index"
+    if not path.exists():
+        return path, None, None
+    metadata = path.stat()
+    return path, path.read_bytes(), stat.S_IMODE(metadata.st_mode)
+
+
+def restore_index(snapshot: tuple[Path, bytes | None, int | None]) -> None:
+    path, data, mode = snapshot
+    if data is None:
+        path.unlink(missing_ok=True)
+        return
+    descriptor, temporary_name = tempfile.mkstemp(prefix=".index.", dir=path.parent)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, mode or 0o644)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def stage_paths(paths: set[str], backup: ModuleType) -> None:
+    tracked = tracked_paths()
+    if any(not tracked_path_allowed(backup, relative) for relative in tracked):
+        raise BackupError("tracked-unsafe")
+    pathspecs = sorted(paths | tracked)
+    if not pathspecs:
+        raise BackupError("backup-empty")
+    payload = b"\0".join(value.encode("utf-8") for value in pathspecs) + b"\0"
+    result = git(
+        "add",
+        "--force",
+        "-A",
+        "--pathspec-from-file=-",
+        "--pathspec-file-nul",
+        input_bytes=payload,
+    )
+    require_success(result, "index-write-failed")
+
+
+def has_staged_changes() -> bool:
+    result = git("diff", "--cached", "--quiet", "--no-ext-diff")
+    if result.returncode == 0:
+        return False
+    if result.returncode == 1:
+        return True
+    raise BackupError("index-invalid")
+
+
+def commit_backup() -> str:
+    message = "Agent backup " + datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    result = git(
+        "-c",
+        "user.name=Agent Backup",
+        "-c",
+        "user.email=agent-backup@localhost",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "commit",
+        "--no-gpg-sign",
+        "--no-verify",
+        "-m",
+        message,
+    )
+    require_success(result, "commit-failed")
+    return head_revision()
+
+
+def head_revision() -> str:
+    result = require_success(git("rev-parse", "HEAD"), "revision-missing")
+    revision = decoded(result)
+    if not SHA.fullmatch(revision):
+        raise BackupError("revision-invalid")
+    return revision
+
+
+def remote_head(remote: str, environment: dict[str, str]) -> str | None:
+    result = git(
+        "ls-remote",
+        "--exit-code",
+        "origin",
+        "refs/heads/main",
+        environment=environment,
+        timeout=30,
+    )
+    if result.returncode == 2:
+        return None
+    if result.returncode != 0:
+        raise BackupError("remote-unavailable")
+    fields = decoded(result).split()
+    if len(fields) != 2 or fields[1] != "refs/heads/main" or not SHA.fullmatch(fields[0]):
+        raise BackupError("remote-invalid")
+    return fields[0]
+
+
+def push_head(remote: str, environment: dict[str, str], revision: str) -> None:
+    result = git(
+        "-c",
+        "core.hooksPath=/dev/null",
+        "push",
+        "origin",
+        "HEAD:refs/heads/main",
+        environment=environment,
+        timeout=60,
+    )
+    if result.returncode == 0:
+        readback = remote_head(remote, environment)
+        if readback != revision:
+            raise BackupError("remote-mismatch")
+        return
+    try:
+        readback = remote_head(remote, environment)
+    except BackupError:
+        raise BackupError("push-unavailable")
+    if readback is not None and readback != revision:
+        raise BackupError("remote-diverged")
+    raise BackupError("push-unavailable")
+
+
+def run_backup() -> dict:
+    require_repository()
+    clean_index()
+    remote, identity = remote_identity()
+    state = load_state()
+    if state["remoteIdentity"] not in (None, identity):
+        raise BackupError("remote-mismatch")
+    if os.environ.get("AGENT_BACKUP_TESTING") != "1" and (
+        state["remoteIdentity"] != identity or state["privateConfirmed"] is not True
+    ):
+        raise BackupError("not-configured")
+    environment = git_environment(remote)
+    require_private_repository(identity)
+    backup = load_backup_module()
+    vault_paths = safe_vault_paths(backup)
+    projection_paths = project_external_state(backup)
+    snapshot = index_backup()
+    changed = False
+    try:
+        stage_paths(vault_paths | projection_paths, backup)
+        changed = has_staged_changes()
+        revision = commit_backup() if changed else head_revision()
+    except Exception:
+        restore_index(snapshot)
+        raise
+    require_private_repository(identity)
+    push_head(remote, environment, revision)
+    state.update(
+        {
+            "remoteIdentity": identity,
+            "lastSuccessfulRevision": revision,
+            "lastSuccessfulAt": datetime.now(timezone.utc).isoformat(),
+        }
+    )
+    write_state(state)
+    return {
+        "status": "ok",
+        "changed": changed,
+        "revision": revision,
+        "containsSecrets": False,
+    }
+
+
+def backup_status() -> dict:
+    require_repository()
+    remote, identity = remote_identity()
+    state = load_state()
+    if state["remoteIdentity"] not in (None, identity):
+        raise BackupError("remote-mismatch")
+    if os.environ.get("AGENT_BACKUP_TESTING") != "1" and (
+        state["remoteIdentity"] != identity or state["privateConfirmed"] is not True
+    ):
+        raise BackupError("not-configured")
+    manifest = VAULT / ".agent-backup/manifest.json"
+    if not manifest.is_file() or manifest.is_symlink():
+        raise BackupError("not-backed-up")
+    try:
+        revision = head_revision()
+    except BackupError as error:
+        raise BackupError("not-backed-up") from error
+    backed_up_revision = state["lastSuccessfulRevision"]
+    if backed_up_revision is None:
+        raise BackupError("not-backed-up")
+    projection_status = git("status", "--porcelain", "--", ".agent-backup")
+    require_success(projection_status, "index-invalid")
+    if decoded(projection_status):
+        raise BackupError("projection-dirty")
+    environment = git_environment(remote)
+    require_private_repository(identity)
+    try:
+        readback = remote_head(remote, environment)
+    except BackupError as error:
+        raise BackupError("remote-mismatch") from error
+    if readback != revision:
+        raise BackupError("remote-mismatch")
+    if backed_up_revision != revision:
+        raise BackupError("not-backed-up")
+    return {
+        "status": "configured",
+        "revision": revision,
+        "containsSecrets": False,
+    }
+
+
+def scheduled_backup() -> dict:
+    now = current_utc_time()
+    local = now.astimezone(ZoneInfo(profile_timezone()))
+    if local.hour not in (9, 21):
+        return {
+            "status": "not-due",
+            "ran": False,
+            "containsSecrets": False,
+        }
+    slot = local.strftime("%Y-%m-%dT%H")
+    state = load_state()
+    if slot in state["completedSlots"]:
+        return {
+            "status": "already-ran",
+            "ran": False,
+            "slot": slot,
+            "containsSecrets": False,
+        }
+    result = run_backup()
+    state = load_state()
+    slots = state["completedSlots"]
+    slots[slot] = now.isoformat()
+    state["completedSlots"] = {
+        name: slots[name]
+        for name in sorted(slots)[-32:]
+    }
+    write_state(state)
+    return {
+        "status": "scheduled",
+        "ran": True,
+        "slot": slot,
+        "changed": result["changed"],
+        "revision": result["revision"],
+        "containsSecrets": False,
+    }
+
+
+def public_key_material() -> str:
+    if KEY_PATH.is_symlink() or not KEY_PATH.is_file():
+        raise BackupError("deploy-key-missing")
+    metadata = KEY_PATH.stat()
+    if stat.S_IMODE(metadata.st_mode) != 0o600 or metadata.st_nlink != 1:
+        raise BackupError("deploy-key-unsafe")
+    result = run_process(
+        ["ssh-keygen", "-y", "-f", str(KEY_PATH)],
+        timeout=15,
+    )
+    require_success(result, "deploy-key-invalid")
+    try:
+        fields = decoded(result).split()
+    except UnicodeDecodeError as error:
+        raise BackupError("deploy-key-invalid") from error
+    if len(fields) < 2 or fields[0] != "ssh-ed25519":
+        raise BackupError("deploy-key-invalid")
+    return " ".join(fields[:2])
+
+
+def setup_key() -> dict:
+    ensure_state_dir()
+    public_path = KEY_PATH.with_suffix(KEY_PATH.suffix + ".pub")
+    if KEY_PATH.exists() or KEY_PATH.is_symlink():
+        public_key = public_key_material()
+    else:
+        if public_path.exists() or public_path.is_symlink():
+            raise BackupError("deploy-key-unsafe")
+        temporary_directory = Path(
+            tempfile.mkdtemp(prefix=".deploy-key.", dir=STATE_DIR)
+        )
+        temporary_key = temporary_directory / "key"
+        try:
+            result = run_process(
+                [
+                    "ssh-keygen",
+                    "-q",
+                    "-t",
+                    "ed25519",
+                    "-N",
+                    "",
+                    "-C",
+                    "agent-github-backup",
+                    "-f",
+                    str(temporary_key),
+                ],
+                timeout=30,
+            )
+            require_success(result, "deploy-key-create-failed")
+            os.chmod(temporary_key, 0o600)
+            os.chmod(temporary_key.with_suffix(".pub"), 0o644)
+            os.replace(temporary_key, KEY_PATH)
+            os.replace(temporary_key.with_suffix(".pub"), public_path)
+        finally:
+            shutil.rmtree(temporary_directory, ignore_errors=True)
+        public_key = public_key_material()
+    fingerprint = hashlib.sha256(public_key.encode("ascii")).hexdigest()
+    state = load_state()
+    state["publicKeyFingerprint"] = fingerprint
+    write_state(state)
+    return {"status": "key-ready", "publicKey": public_key}
+
+
+def connect_backup(remote: str, confirm_private: bool) -> dict:
+    if not confirm_private:
+        raise BackupError("private-confirmation-required")
+    identity = validate_remote(remote)
+    require_repository()
+    public_key = public_key_material()
+    remotes = require_success(git("remote"), "remote-invalid")
+    names = [line for line in decoded(remotes).splitlines() if line]
+    if not names:
+        require_success(
+            git("remote", "add", "origin", remote),
+            "remote-invalid",
+        )
+    elif names == ["origin"]:
+        if configured_push_remote() != remote:
+            raise BackupError("remote-invalid")
+    else:
+        raise BackupError("remote-invalid")
+    state = load_state()
+    if state["remoteIdentity"] not in (None, identity):
+        raise BackupError("remote-mismatch")
+    environment = git_environment(remote)
+    require_remote_access(environment)
+    require_private_repository(identity)
+    state.update(
+        {
+            "remoteIdentity": identity,
+            "privateConfirmed": True,
+            "publicKeyFingerprint": hashlib.sha256(
+                public_key.encode("ascii")
+            ).hexdigest(),
+        }
+    )
+    write_state(state)
+    receipt = run_backup()
+    receipt["status"] = "connected"
+    return receipt
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest="command", required=True)
+    for name in ("status", "run", "setup-key", "scheduled"):
+        command = commands.add_parser(name)
+        command.add_argument("--json", action="store_true")
+    connect = commands.add_parser("connect")
+    connect.add_argument("--remote", required=True)
+    connect.add_argument("--confirm-private", action="store_true")
+    connect.add_argument("--json", action="store_true")
+    return parser
+
+
+def emit(receipt: dict, *, as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(receipt, ensure_ascii=False, sort_keys=True))
+        return
+    messages = {
+        "ok": "✅ Приватну резервну копію оновлено й перевірено.",
+        "scheduled": "✅ Приватну резервну копію оновлено за розкладом.",
+        "connected": "✅ Приватний GitHub-репозиторій підключено й першу копію перевірено.",
+        "configured": "✅ Приватне резервне копіювання налаштовано й перевірено.",
+    }
+    if receipt["status"] == "key-ready":
+        print(receipt["publicKey"])
+        return
+    if receipt["status"] in {"not-due", "already-ran"}:
+        return
+    print(messages.get(receipt["status"], "Резервне копіювання не виконано."))
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    try:
+        descriptor = lock_run()
+        try:
+            if args.command == "run":
+                receipt = run_backup()
+            elif args.command == "status":
+                receipt = backup_status()
+            elif args.command == "setup-key":
+                receipt = setup_key()
+            elif args.command == "scheduled":
+                receipt = scheduled_backup()
+            else:
+                receipt = connect_backup(args.remote, args.confirm_private)
+        finally:
+            os.close(descriptor)
+        emit(receipt, as_json=args.json)
+        return 0
+    except BackupError as error:
+        emit(
+            {"status": error.code, "containsSecrets": False},
+            as_json=args.json,
+        )
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

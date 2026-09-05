@@ -1,0 +1,369 @@
+#!/usr/bin/env python3
+"""Send one verified outbox file through Telegram's sendDocument endpoint."""
+
+from __future__ import annotations
+
+import json
+import mimetypes
+import os
+from pathlib import Path
+import re
+import secrets
+import sqlite3
+import stat
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+
+MAX_BYTES = 49 * 1024 * 1024
+PHOTO_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp"}
+CHAT_ID = re.compile(r"(?:[1-9][0-9]*|-[1-9][0-9]*)\Z")
+BOT_TOKEN = re.compile(r"[A-Za-z0-9:_-]+\Z")
+
+
+class SendError(Exception):
+    pass
+
+
+def fail(message: str, *, code: int = 1) -> None:
+    print(message, file=sys.stderr)
+    raise SystemExit(code)
+
+
+def test_setting(name: str, default: str) -> str:
+    if os.environ.get("TG_SEND_FILE_TESTING") == "1":
+        return os.environ.get(name, default)
+    return default
+
+
+def telegram_state_dir() -> Path:
+    return Path(
+        os.environ.get("TELEGRAM_STATE_DIR")
+        or Path.home() / ".codex/channels/telegram"
+    )
+
+
+def read_token() -> str:
+    value = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    if value:
+        if BOT_TOKEN.fullmatch(value):
+            return value
+        raise SendError("tg-send-file: Telegram token is invalid")
+    try:
+        for line in (telegram_state_dir() / ".env").read_text(
+            encoding="utf-8"
+        ).splitlines():
+            if line.startswith("TELEGRAM_BOT_TOKEN="):
+                value = line.split("=", 1)[1].strip()
+                if value:
+                    if BOT_TOKEN.fullmatch(value):
+                        return value
+                    raise SendError("tg-send-file: Telegram token is invalid")
+    except (OSError, UnicodeError):
+        pass
+    raise SendError("tg-send-file: Telegram token is unavailable")
+
+
+def ensure_allowed_chat(chat_id: str) -> None:
+    if not CHAT_ID.fullmatch(chat_id):
+        raise SendError("tg-send-file: invalid chat id")
+    try:
+        access = json.loads(
+            (telegram_state_dir() / "access.json").read_text(encoding="utf-8")
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        raise SendError("tg-send-file: access policy is unavailable") from None
+    if not isinstance(access, dict):
+        raise SendError("tg-send-file: access policy is invalid")
+
+    if chat_id.startswith("-"):
+        groups = access.get("groups")
+        allowed = isinstance(groups, dict) and chat_id in groups
+    else:
+        allow_from = access.get("allowFrom")
+        admins = access.get("admins")
+        allowed = chat_id in {
+            str(value)
+            for values in (allow_from, admins)
+            if isinstance(values, list)
+            for value in values
+        }
+    if not allowed:
+        raise SendError("tg-send-file: chat is not allowed")
+
+
+def outbox_root() -> tuple[Path, Path]:
+    configured = test_setting(
+        "TG_SEND_FILE_OUTBOX",
+        str(Path.home() / "telegram-outbox"),
+    )
+    lexical_root = Path(configured).absolute()
+    try:
+        lexical_metadata = lexical_root.lstat()
+    except OSError:
+        raise SendError("tg-send-file: outbox is unavailable") from None
+    if stat.S_ISLNK(lexical_metadata.st_mode):
+        raise SendError("tg-send-file: outbox symlinks are not allowed")
+    if not stat.S_ISDIR(lexical_metadata.st_mode):
+        raise SendError("tg-send-file: outbox is invalid")
+    if stat.S_IMODE(lexical_metadata.st_mode) != 0o700:
+        raise SendError("tg-send-file: outbox must have mode 0700")
+    try:
+        root = lexical_root.resolve(strict=True)
+    except OSError:
+        raise SendError("tg-send-file: outbox is unavailable") from None
+    return lexical_root, root
+
+
+def read_outbox_file(argument: str) -> tuple[str, bytes]:
+    lexical_root, root = outbox_root()
+    supplied = Path(argument)
+    lexical = supplied if supplied.is_absolute() else lexical_root / supplied
+    if ".." in lexical.parts:
+        raise SendError("tg-send-file: file must stay inside the outbox")
+    try:
+        lexical_relative = lexical.relative_to(lexical_root)
+        resolved = lexical.resolve(strict=True)
+        relative = resolved.relative_to(root)
+    except (OSError, ValueError):
+        raise SendError("tg-send-file: file must stay inside the outbox") from None
+    if not relative.parts:
+        raise SendError("tg-send-file: file must be regular")
+
+    current = lexical_root
+    try:
+        for part in lexical_relative.parts:
+            current = current / part
+            if stat.S_ISLNK(current.lstat().st_mode):
+                raise SendError("tg-send-file: symlinks are not allowed")
+    except OSError:
+        raise SendError("tg-send-file: file is unavailable") from None
+
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        descriptor = os.open(resolved, flags)
+    except OSError:
+        raise SendError("tg-send-file: file is unavailable") from None
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise SendError("tg-send-file: file must be regular")
+        if before.st_size > MAX_BYTES:
+            raise SendError("tg-send-file: file exceeds 49 MiB")
+        chunks: list[bytes] = []
+        remaining = MAX_BYTES + 1
+        while remaining:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        data = b"".join(chunks)
+        after = os.fstat(descriptor)
+    except OSError:
+        raise SendError("tg-send-file: file could not be read safely") from None
+    finally:
+        os.close(descriptor)
+
+    if len(data) > MAX_BYTES:
+        raise SendError("tg-send-file: file exceeds 49 MiB")
+    identity = lambda item: (
+        item.st_dev,
+        item.st_ino,
+        item.st_size,
+        item.st_mtime_ns,
+    )
+    if identity(before) != identity(after) or len(data) != after.st_size:
+        raise SendError("tg-send-file: file changed while being read")
+    return resolved.name, data
+
+
+def multipart(
+    chat_id: str,
+    filename: str,
+    data: bytes,
+    caption: str,
+    *,
+    file_field: str,
+    thread_id: int | None = None,
+) -> tuple[bytes, str]:
+    boundary = f"tg-send-file-{secrets.token_hex(16)}"
+    marker = boundary.encode("ascii")
+    ascii_name = re.sub(r"[^A-Za-z0-9._-]", "_", filename) or "document"
+    encoded_name = urllib.parse.quote(filename, safe="")
+    parts = [
+        b"--" + marker,
+        b'Content-Disposition: form-data; name="chat_id"',
+        b"",
+        chat_id.encode("ascii"),
+    ]
+    if thread_id is not None:
+        parts.extend((b"--" + marker, b'Content-Disposition: form-data; name="message_thread_id"',
+                      b"", str(thread_id).encode("ascii")))
+    if caption:
+        parts.extend(
+            (
+                b"--" + marker,
+                b'Content-Disposition: form-data; name="caption"',
+                b"",
+                caption.encode("utf-8"),
+            )
+        )
+    parts.extend(
+        (
+            b"--" + marker,
+            (
+                f'Content-Disposition: form-data; name="{file_field}"; '
+                f'filename="{ascii_name}"; filename*=UTF-8\'\'{encoded_name}'
+            ).encode("ascii"),
+            f"Content-Type: {mimetypes.guess_type(filename)[0] or 'application/octet-stream'}".encode("ascii"),
+            b"",
+            data,
+            b"--" + marker + b"--",
+            b"",
+        )
+    )
+    return b"\r\n".join(parts), boundary
+
+
+def send(chat_id: str, filename: str, data: bytes, caption: str, thread_id: int | None = None) -> int:
+    photo = Path(filename).suffix.lower() in PHOTO_SUFFIXES
+    method = "sendPhoto" if photo else "sendDocument"
+    field = "photo" if photo else "document"
+    body, boundary = multipart(
+        chat_id, filename, data, caption, file_field=field, thread_id=thread_id
+    )
+    base = test_setting("TG_SEND_FILE_API_BASE", "https://api.telegram.org").rstrip("/")
+    timeout_text = test_setting("TG_SEND_FILE_TIMEOUT", "20")
+    try:
+        timeout = float(timeout_text)
+        if not 0 < timeout <= 30:
+            raise ValueError
+    except ValueError:
+        timeout = 20.0
+    request = urllib.request.Request(
+        f"{base}/bot{read_token()}/{method}",
+        data=body,
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            raw = response.read()
+    except urllib.error.HTTPError as error:
+        if error.code >= 500:
+            fail("delivery state unknown: Telegram server failed; do not retry", code=2)
+        fail("not delivered: Telegram rejected the file")
+    except (OSError, TimeoutError, urllib.error.URLError):
+        fail("delivery state unknown: transport failed; do not retry", code=2)
+
+    try:
+        payload = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeError):
+        fail("delivery state unknown: malformed Telegram response; do not retry", code=2)
+    if not isinstance(payload, dict):
+        fail("delivery state unknown: malformed Telegram response; do not retry", code=2)
+    if payload.get("ok") is not True:
+        fail("not delivered: Telegram rejected the file")
+    result = payload.get("result")
+    message_id = result.get("message_id") if isinstance(result, dict) else None
+    if (
+        isinstance(message_id, bool)
+        or not isinstance(message_id, int)
+        or message_id <= 0
+    ):
+        fail("delivery state unknown: Telegram did not prove delivery; do not retry", code=2)
+    return message_id
+
+
+def mark_outbound(chat_id: str) -> None:
+    try:
+        subprocess.run(
+            [str(Path.home() / "bin/tg-fallback-outbound"), chat_id],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        pass
+
+
+def record_outbound(chat_id: str, text: str, message_id: int, thread_id: int | None = None) -> None:
+    """Best-effort history for a file Telegram confirmed as delivered."""
+    try:
+        database = telegram_state_dir() / "messages.db"
+        if not database.is_file():
+            return
+        connection = sqlite3.connect(database, timeout=0.5)
+        try:
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(messages)")}
+            extra = {}
+            if "thread_id" in columns:
+                extra["thread_id"] = thread_id
+            if "conversation_key" in columns:
+                extra["conversation_key"] = (f"topic:{chat_id}:{thread_id}" if thread_id is not None
+                                             else f"group:{chat_id}" if chat_id.startswith("-") else f"user:{chat_id}")
+            extra_names = "".join(f", {name}" for name in extra)
+            extra_placeholders = ", ?" * len(extra)
+            connection.execute(
+                "INSERT OR IGNORE INTO messages"
+                f" (chat_id, user_id, username, direction, text, ts, message_id{extra_names})"
+                f" VALUES (?, NULL, 'bot', 'out', ?, ?, ?{extra_placeholders})",
+                (str(chat_id), text, int(time.time() * 1000), message_id, *extra.values()),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+    except Exception:
+        pass
+
+
+def main(argv: list[str]) -> None:
+    if (
+        os.environ.get("ATARAX_SUPPRESS_TELEGRAM") == "1"
+        and os.environ.get("ATARAX_TASK_DELIVERY") != "1"
+    ):
+        print(
+            "not delivered: this session does not send to Telegram. "
+            "Nothing was sent, and no other channel should be tried."
+        )
+        return
+    thread_id = None
+    if len(argv) >= 5 and argv[-2] == "--thread-id":
+        if not re.fullmatch(r"[1-9]\d{0,9}", argv[-1]) or int(argv[-1]) > 2_147_483_647:
+            fail("tg-send-file: invalid topic id")
+        thread_id = int(argv[-1])
+        argv = argv[:-2]
+    if len(argv) not in (3, 4) or "--thread-id" in argv[3:]:
+        fail("usage: tg-send-file <chat_id> <outbox-file> [caption] [--thread-id <positive_id>]")
+    chat_id, path = argv[1:3]
+    if thread_id is not None and not chat_id.startswith("-"):
+        fail("tg-send-file: topics require a group chat")
+    caption = argv[3] if len(argv) == 4 else ""
+    if len(caption) > 1024:
+        fail("tg-send-file: caption exceeds 1024 characters")
+    try:
+        ensure_allowed_chat(chat_id)
+        filename, data = read_outbox_file(path)
+        if not data:
+            raise SendError("tg-send-file: file is empty")
+        message_id = send(chat_id, filename, data, caption, thread_id)
+    except SendError as error:
+        fail(str(error))
+    record_outbound(
+        chat_id,
+        f"[файл] {filename}" + (f" — {caption}" if caption else ""),
+        message_id,
+        thread_id,
+    )
+    mark_outbound(chat_id)
+    print(json.dumps({"status": "delivered", "messageId": message_id}))
+
+
+if __name__ == "__main__":
+    main(sys.argv)

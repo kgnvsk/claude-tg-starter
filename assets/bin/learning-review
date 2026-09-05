@@ -1,0 +1,1123 @@
+#!/usr/bin/env python3
+"""Готує та перевіряє підтверджені зміни навчання в наявному сховищі Novsky Vault."""
+
+from __future__ import annotations
+
+from pathlib import Path
+import argparse
+from contextlib import contextmanager
+import difflib
+import fcntl
+import hashlib
+import json
+import os
+import re
+import secrets
+import sqlite3
+import subprocess
+import sys
+import tempfile
+from datetime import datetime, timedelta, timezone
+
+
+HOME = Path(os.environ.get("AGENT_ROOT", str(Path.home())))
+CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR", str(HOME / ".claude")))
+TELEGRAM_DIR = Path(
+    os.environ.get(
+        "TELEGRAM_STATE_DIR", str(HOME / ".claude/channels/telegram")
+    )
+)
+MESSAGES_DB = TELEGRAM_DIR / "messages.db"
+ACCESS_FILE = TELEGRAM_DIR / "access.json"
+LEARNING_ROOT = HOME / "obsidian-vault/learning"
+PENDING_DIR = LEARNING_ROOT / "pending"
+HISTORY_DIR = LEARNING_ROOT / "history"
+LOCK_DIR = LEARNING_ROOT / "locks"
+VALID_CLASSES = {"semantic", "procedure"}
+VALID_KINDS = {"duplicate", "refinement", "fix", "exception", "new-skill"}
+MAX_FIELD_CHARS = 4_000
+MAX_EVIDENCE_CHARS = 1_000
+MAX_PENDING_CANDIDATES = 100
+MEMORY_LIMITS = {"memory/USER.md": 1_375, "memory/MEMORY.md": 2_200}
+SECRET_PATTERNS = (
+    re.compile(r"sk-(?:proj-|ant-)?[A-Za-z0-9_-]{20,}"),
+    re.compile(r"\b\d{8,12}:AA[A-Za-z0-9_-]{20,}\b"),
+    re.compile(r"(?:ghp_|github_pat_)[A-Za-z0-9_]{20,}"),
+    re.compile(r"xox[baprs]-[A-Za-z0-9-]{20,}"),
+    re.compile(r"-----BEGIN (?:OPENSSH |RSA |EC )?PRIVATE KEY-----"),
+)
+PROMPTWARE_PATTERNS = (
+    re.compile(r"\bignore (?:all |any )?(?:previous|prior) instructions?\b", re.I),
+    re.compile(r"\b(?:reveal|print|show|leak) (?:the )?system prompt\b", re.I),
+    re.compile(r"\bdeveloper message\b", re.I),
+    re.compile(r"\bjailbreak\b", re.I),
+)
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def atomic_write(path: Path, data: bytes, mode: int = 0o600) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    descriptor, temporary_name = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, mode)
+        os.replace(temporary, path)
+        fsync_directory(path.parent)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def fsync_directory(path: Path) -> None:
+    try:
+        descriptor = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def safe_input_file(path_value: str, label: str) -> Path:
+    path = Path(os.path.abspath(Path(path_value).expanduser()))
+    roots = (Path(os.path.abspath(HOME)), Path("/tmp"))
+    for root in roots:
+        try:
+            relative = path.relative_to(root)
+        except ValueError:
+            continue
+        current = root
+        for part in relative.parts:
+            current /= part
+            if current.is_symlink():
+                raise ValueError(
+                    f"Шлях «{label}» не може містити символічне посилання"
+                )
+        if not current.is_file():
+            raise ValueError(f"Файл «{label}» відсутній або небезпечний")
+        return current
+    raise ValueError(f"Файл «{label}» має бути всередині HOME або /tmp")
+
+
+def read_input(path: str, label: str) -> str:
+    source = safe_input_file(path, label)
+    value = source.read_text(encoding="utf-8").strip()
+    if not value:
+        raise ValueError(f"Поле «{label}» не може бути порожнім")
+    if len(value) > MAX_FIELD_CHARS:
+        raise ValueError(
+            f"Поле «{label}» перевищує {MAX_FIELD_CHARS} символів"
+        )
+    reject_secrets(value, label)
+    reject_promptware(value, label)
+    return value
+
+
+def reject_secrets(value: str, label: str) -> None:
+    if any(pattern.search(value) for pattern in SECRET_PATTERNS):
+        raise ValueError(f"Вміст, схожий на секрет, відхилено в полі «{label}»")
+
+
+def reject_promptware(value: str, label: str) -> None:
+    if any(pattern.search(value) for pattern in PROMPTWARE_PATTERNS):
+        raise ValueError(
+            f"Вміст, схожий на інструкцію, відхилено в полі «{label}»"
+        )
+
+
+def load_access() -> dict:
+    try:
+        value = json.loads(ACCESS_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError("Конфігурація доступу Telegram недоступна") from error
+    if not isinstance(value, dict):
+        raise ValueError("Конфігурація доступу Telegram некоректна")
+    return value
+
+
+def role_for_chat(access: dict, chat_id: str) -> str:
+    admins = {str(item) for item in access.get("admins", [])}
+    allowed = {str(item) for item in access.get("allowFrom", [])}
+    if chat_id in admins:
+        return "admin"
+    if chat_id in allowed:
+        return "client"
+    raise ValueError("Вихідний чат не налаштовано в доступі Telegram")
+
+
+def load_message(chat_id: str, message_id: str) -> dict:
+    if not MESSAGES_DB.is_file():
+        raise ValueError("База повідомлень Telegram недоступна")
+    try:
+        connection = sqlite3.connect(f"file:{MESSAGES_DB}?mode=ro", uri=True, timeout=2)
+        connection.row_factory = sqlite3.Row
+        row = connection.execute(
+            """
+            SELECT chat_id, username, text, ts, message_id
+            FROM messages
+            WHERE CAST(chat_id AS TEXT)=? AND CAST(message_id AS TEXT)=?
+              AND direction='in'
+            ORDER BY rowid DESC
+            LIMIT 1
+            """,
+            (chat_id, message_id),
+        ).fetchone()
+        connection.close()
+    except sqlite3.Error as error:
+        raise ValueError("Не вдалося прочитати базу повідомлень Telegram") from error
+    if row is None:
+        raise ValueError("Вихідне повідомлення Telegram не знайдено")
+    evidence = str(row["text"] or "").strip()[:MAX_EVIDENCE_CHARS]
+    if not evidence:
+        raise ValueError("Вихідне повідомлення Telegram не містить текстового доказу")
+    reject_secrets(evidence, "вихідний доказ")
+    reject_promptware(evidence, "вихідний доказ")
+    return {
+        "chatId": str(row["chat_id"]),
+        "messageId": str(row["message_id"]),
+        "username": str(row["username"] or "unknown")[:128],
+        "timestamp": row["ts"],
+        "excerpt": evidence,
+    }
+
+
+def validate_target(learning_class: str, target: str) -> str:
+    relative = Path(target)
+    if relative.is_absolute() or ".." in relative.parts or target != relative.as_posix():
+        raise ValueError("Ціль має бути нормалізованим відносним шляхом")
+    if learning_class == "semantic":
+        allowed = {"memory/USER.md", "memory/MEMORY.md"}
+        if target not in allowed:
+            raise ValueError(
+                "Семантична ціль має бути memory/USER.md або memory/MEMORY.md"
+            )
+    elif not re.fullmatch(r"skills/[a-z0-9][a-z0-9-]{0,63}/SKILL\.md", target):
+        raise ValueError("Процедурна ціль має бути skills/<name>/SKILL.md")
+    current = CLAUDE_DIR
+    if current.is_symlink():
+        raise ValueError("Основа цілі не може бути символічним посиланням")
+    for part in relative.parts:
+        current /= part
+        if current.is_symlink():
+            raise ValueError("Шлях цілі не може містити символічне посилання")
+    return target
+
+
+def resolved_target(candidate: dict) -> Path:
+    target = validate_target(str(candidate["learningClass"]), str(candidate["target"]))
+    return CLAUDE_DIR / target
+
+
+def require_admin(chat_id: str) -> None:
+    access = load_access()
+    admins = {str(item) for item in access.get("admins", [])}
+    if str(chat_id) not in admins:
+        raise ValueError("Потрібен ідентифікатор чату адміністратора")
+
+
+def verified_admin_message(
+    chat_id: str,
+    message_id: str,
+    candidate_id: str,
+    action: str,
+    token: str | None = None,
+) -> dict:
+    require_admin(chat_id)
+    message = load_message(str(chat_id), str(message_id))
+    expected = f"/learn_{action} {candidate_id}"
+    if token:
+        expected += f" {token}"
+    if message["excerpt"].strip() != expected:
+        raise ValueError(
+            f"Повідомлення адміністратора має точно дорівнювати: {expected}"
+        )
+    return {
+        "chatId": str(chat_id),
+        "messageId": message["messageId"],
+        "username": message["username"],
+        "timestamp": message["timestamp"],
+        "evidenceSha256": hashlib.sha256(expected.encode()).hexdigest(),
+    }
+
+
+def candidate_directory(identifier: str, *, history: bool = False) -> Path:
+    if not re.fullmatch(r"\d{8}T\d{6}Z-[a-f0-9]{10}", identifier):
+        raise ValueError("Некоректний ID кандидата")
+    return (HISTORY_DIR if history else PENDING_DIR) / identifier
+
+
+@contextmanager
+def candidate_lock(identifier: str):
+    candidate_directory(identifier)
+    LOCK_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    lock_path = LOCK_DIR / f"{identifier}.lock"
+    descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
+def load_candidate(identifier: str, *, history: bool = False) -> tuple[dict, Path]:
+    directory = candidate_directory(identifier, history=history)
+    path = directory / "candidate.json"
+    try:
+        candidate = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError("Кандидата на навчання не знайдено або він некоректний") from error
+    if (
+        not isinstance(candidate, dict)
+        or candidate.get("schemaVersion") != 1
+        or candidate.get("id") != identifier
+    ):
+        raise ValueError("Схема кандидата на навчання некоректна")
+    return candidate, directory
+
+
+def bytes_match(path: Path, expected: bytes, should_exist: bool = True) -> bool:
+    if not should_exist:
+        return not path.exists()
+    return path.is_file() and not path.is_symlink() and path.read_bytes() == expected
+
+
+def restore_target(path: Path, existed: bool, data: bytes, mode: int) -> None:
+    if existed:
+        atomic_write(path, data, mode)
+    else:
+        if path.is_symlink():
+            raise ValueError("Шлях цілі не може бути символічним посиланням")
+        path.unlink(missing_ok=True)
+        fsync_directory(path.parent)
+
+
+def load_transaction(path: Path, operation: str) -> dict:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"Незавершений журнал {operation} некоректний") from error
+    if (
+        not isinstance(value, dict)
+        or value.get("schemaVersion") != 1
+        or value.get("operation") != operation
+    ):
+        raise ValueError(f"Незавершений журнал {operation} некоректний")
+    return value
+
+
+def cleanup_pending_transaction(directory: Path) -> None:
+    for name in ("transaction.json", "before", "after", "diff.patch", "checks.json"):
+        (directory / name).unlink(missing_ok=True)
+    fsync_directory(directory)
+
+
+def recover_pending_apply(directory: Path) -> None:
+    transaction = load_transaction(directory / "transaction.json", "apply")
+    candidate, _ = load_candidate(directory.name)
+    if transaction.get("target") != candidate.get("target"):
+        raise ValueError("Ціль незавершеного журналу apply не збігається")
+    before = (directory / "before").read_bytes()
+    after = (directory / "after").read_bytes()
+    if (
+        hashlib.sha256(before).hexdigest() != transaction.get("beforeSha256")
+        or hashlib.sha256(after).hexdigest() != transaction.get("afterSha256")
+    ):
+        raise ValueError("Хеш незавершеного журналу apply не збігається")
+    target = resolved_target(candidate)
+    before_exists = bool(transaction.get("beforeExists"))
+    mode = int(transaction.get("mode", 0o600)) & 0o777
+    if bytes_match(target, after):
+        restore_target(target, before_exists, before, mode)
+    elif not bytes_match(target, before, before_exists):
+        raise ValueError(
+            "Ціль змінилася під час перерваного apply; потрібне ручне відновлення"
+        )
+    candidate["status"] = "pending"
+    candidate.pop("decision", None)
+    atomic_write(
+        directory / "candidate.json",
+        (json.dumps(candidate, ensure_ascii=False, indent=2) + "\n").encode(),
+    )
+    atomic_write(directory / "README.md", render_readme(candidate).encode())
+    cleanup_pending_transaction(directory)
+
+
+def recover_history_transaction(directory: Path) -> None:
+    apply_journal = directory / "transaction.json"
+    rollback_journal = directory / "rollback-transaction.json"
+    candidate, _ = load_candidate(directory.name, history=True)
+    target = resolved_target(candidate)
+    if apply_journal.exists():
+        transaction = load_transaction(apply_journal, "apply")
+        after = (directory / "after").read_bytes()
+        if (
+            candidate.get("status") != "applied"
+            or hashlib.sha256(after).hexdigest() != transaction.get("afterSha256")
+            or not bytes_match(target, after)
+        ):
+            raise ValueError("Зафіксований журнал apply неузгоджений")
+        apply_journal.unlink()
+        fsync_directory(directory)
+    if rollback_journal.exists():
+        transaction = load_transaction(rollback_journal, "rollback")
+        before = (directory / "before").read_bytes()
+        after = (directory / "after").read_bytes()
+        if (
+            hashlib.sha256(before).hexdigest() != transaction.get("rollbackSha256")
+            or hashlib.sha256(after).hexdigest() != transaction.get("appliedSha256")
+        ):
+            raise ValueError("Хеш незавершеного журналу rollback не збігається")
+        before_exists = bool(transaction.get("beforeExists"))
+        mode = int(transaction.get("mode", 0o600)) & 0o777
+        if candidate.get("status") == "applied":
+            if bytes_match(target, before, before_exists):
+                atomic_write(target, after, mode)
+            elif not bytes_match(target, after):
+                raise ValueError(
+                    "Ціль змінилася під час перерваного rollback; "
+                    "потрібне ручне відновлення"
+                )
+        elif candidate.get("status") == "rolled-back":
+            if not bytes_match(target, before, before_exists):
+                raise ValueError("Зафіксований журнал rollback неузгоджений")
+        else:
+            raise ValueError(
+                "Незавершений журнал rollback має некоректний стан кандидата"
+            )
+        rollback_journal.unlink()
+        fsync_directory(directory)
+
+
+def recover_incomplete_transactions() -> None:
+    if PENDING_DIR.is_dir():
+        for directory in PENDING_DIR.iterdir():
+            if directory.is_dir() and not directory.is_symlink() and (directory / "transaction.json").exists():
+                with candidate_lock(directory.name):
+                    if (directory / "transaction.json").exists():
+                        recover_pending_apply(directory)
+    if HISTORY_DIR.is_dir():
+        for directory in HISTORY_DIR.iterdir():
+            if not directory.is_dir() or directory.is_symlink():
+                continue
+            if (directory / "transaction.json").exists() or (directory / "rollback-transaction.json").exists():
+                with candidate_lock(directory.name):
+                    if (directory / "transaction.json").exists() or (directory / "rollback-transaction.json").exists():
+                        recover_history_transaction(directory)
+
+
+def ensure_not_expired(candidate: dict) -> None:
+    try:
+        expiry = datetime.fromisoformat(str(candidate["expiresAt"]))
+    except (KeyError, ValueError) as error:
+        raise ValueError("Термін дії кандидата некоректний") from error
+    if expiry <= utc_now():
+        raise ValueError("Термін дії кандидата минув")
+
+
+def replacement_bytes(candidate: dict, replacement_file: str) -> bytes:
+    path = safe_input_file(replacement_file, "заміна")
+    data = path.read_bytes()
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError("Заміна має бути текстом UTF-8") from error
+    if not text.strip():
+        raise ValueError("Заміна не може бути порожньою")
+    reject_secrets(text, "заміна")
+    reject_promptware(text, "заміна")
+    if candidate["learningClass"] == "semantic":
+        limit = MEMORY_LIMITS[str(candidate["target"])]
+        if len(text) > limit:
+            raise ValueError(f"Заміна перевищує {limit} символів")
+    return data
+
+
+def diff_text(target: str, before: bytes, after: bytes) -> str:
+    try:
+        before_text = before.decode("utf-8")
+        after_text = after.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError("Ціль і заміна мають бути текстом UTF-8") from error
+    return "".join(
+        difflib.unified_diff(
+            before_text.splitlines(keepends=True),
+            after_text.splitlines(keepends=True),
+            fromfile=target,
+            tofile=target,
+        )
+    )
+
+
+def load_checks(path_value: str | None) -> list[dict]:
+    if not path_value:
+        raise ValueError("Для процедурного apply потрібен --checks-file")
+    path = safe_input_file(path_value, "перевірки")
+    raw = path.read_text(encoding="utf-8")
+    reject_secrets(raw, "маніфест перевірок")
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise ValueError("Маніфест перевірок має бути коректним JSON") from error
+    checks = payload.get("checks") if isinstance(payload, dict) else None
+    if not isinstance(checks, list) or not 1 <= len(checks) <= 12:
+        raise ValueError("Маніфест має містити від 1 до 12 перевірок")
+    validated = []
+    for item in checks:
+        if not isinstance(item, dict):
+            raise ValueError("Кожна перевірка має бути об’єктом")
+        kind = item.get("kind")
+        name = item.get("name")
+        contains = item.get("contains", [])
+        absent = item.get("absent", [])
+        if kind not in {"new", "regression", "negative"}:
+            raise ValueError(
+                "Тип перевірки має бути `new`, `regression` або `negative`"
+            )
+        if not isinstance(name, str) or not name.strip() or len(name) > 120:
+            raise ValueError("Назва перевірки некоректна")
+        for label, values in (("contains", contains), ("absent", absent)):
+            if (
+                not isinstance(values, list)
+                or len(values) > 12
+                or not all(
+                    isinstance(value, str) and value and len(value) <= 500
+                    for value in values
+                )
+            ):
+                raise ValueError(
+                    f"Поле перевірки {label} має бути обмеженим масивом рядків"
+                )
+        if not contains and not absent:
+            raise ValueError(
+                "Кожна перевірка потребує тверджень contains або absent"
+            )
+        validated.append(
+            {
+                "kind": kind,
+                "name": name.strip(),
+                "contains": contains,
+                "absent": absent,
+            }
+        )
+    kinds = {item["kind"] for item in validated}
+    if kinds != {"new", "regression", "negative"}:
+        raise ValueError(
+            "Процедурні перевірки мають охоплювати `new`, `regression` і `negative`"
+        )
+    return validated
+
+
+def checks_fingerprint(checks: list[dict] | None) -> str | None:
+    if checks is None:
+        return None
+    canonical = json.dumps(checks, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def run_skill_doctor(failure_message: str) -> dict:
+    doctor = HOME / "bin/skill-doctor"
+    if not doctor.is_file() or doctor.is_symlink():
+        raise ValueError("skill-doctor недоступний")
+    try:
+        doctor_result = subprocess.run(
+            [str(doctor), "--root", str(CLAUDE_DIR / "skills")],
+            cwd=HOME,
+            env={
+                "HOME": str(HOME),
+                "PATH": "/usr/local/bin:/usr/bin:/bin",
+                "LANG": "C.UTF-8",
+                "LC_ALL": "C.UTF-8",
+            },
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise ValueError(failure_message) from error
+    if doctor_result.returncode != 0:
+        raise ValueError(failure_message)
+    return {"status": "passed", "exitCode": doctor_result.returncode}
+
+
+def run_procedure_checks(checks: list[dict], replacement: str) -> dict:
+    doctor_result = run_skill_doctor("skill-doctor відхилив заміну")
+    results = []
+    for check in checks:
+        missing = [value for value in check["contains"] if value not in replacement]
+        forbidden = [value for value in check["absent"] if value in replacement]
+        if missing or forbidden:
+            raise ValueError(f"Перевірка не пройдена: {check['name']}")
+        results.append(
+            {
+                "kind": check["kind"],
+                "name": check["name"],
+                "contains": check["contains"],
+                "absent": check["absent"],
+                "status": "passed",
+            }
+        )
+    return {
+        "status": "passed",
+        "doctor": doctor_result,
+        "checks": results,
+    }
+
+
+def candidate_id(created: datetime, chat_id: str, message_id: str, proposal: str) -> str:
+    digest = hashlib.sha256(
+        f"{created.isoformat()}\0{chat_id}\0{message_id}\0{proposal}".encode()
+    ).hexdigest()[:10]
+    return f"{created.strftime('%Y%m%dT%H%M%SZ')}-{digest}"
+
+
+def render_readme(candidate: dict) -> str:
+    source = candidate["source"]
+    return (
+        f"# Кандидат на навчання {candidate['id']}\n\n"
+        f"- Статус: `{candidate['status']}`\n"
+        f"- Джерело: `@{source['username']}` / чат `{source['chatId']}` / "
+        f"повідомлення `{source['messageId']}` / роль `{source['role']}`\n"
+        f"- Клас: `{candidate['learningClass']}`\n"
+        f"- Тип: `{candidate['kind']}`\n"
+        f"- Ціль: `{candidate['target']}`\n"
+        f"- Створено: `{candidate['createdAt']}`\n"
+        f"- Діє до: `{candidate['expiresAt']}`\n\n"
+        "## Завдання\n\n"
+        f"{candidate['task']}\n\n"
+        "## Спостережений результат\n\n"
+        f"{candidate['outcome']}\n\n"
+        "## Запропонована довготривала зміна\n\n"
+        f"{candidate['proposal']}\n\n"
+        "## Критерій приймання\n\n"
+        f"{candidate['acceptance']}\n\n"
+        "## Вихідний доказ\n\n"
+        f"> {source['excerpt'].replace(chr(10), chr(10) + '> ')}\n"
+    )
+
+
+def propose(arguments: argparse.Namespace) -> dict:
+    if arguments.learning_class not in VALID_CLASSES:
+        raise ValueError("Некоректний клас навчання")
+    if arguments.kind not in VALID_KINDS:
+        raise ValueError("Некоректний тип зміни")
+    target = validate_target(arguments.learning_class, arguments.target)
+    task = read_input(arguments.task_file, "завдання")
+    outcome = read_input(arguments.outcome_file, "результат")
+    proposal = read_input(arguments.proposal_file, "пропозиція")
+    acceptance = read_input(arguments.acceptance_file, "критерій приймання")
+    pending_count = sum(1 for path in PENDING_DIR.glob("*/candidate.json") if path.is_file())
+    if pending_count >= MAX_PENDING_CANDIDATES:
+        raise ValueError("Черга кандидатів на навчання заповнена")
+    access = load_access()
+    role = role_for_chat(access, str(arguments.chat_id))
+    source = load_message(str(arguments.chat_id), str(arguments.message_id))
+    source["role"] = role
+    created = utc_now()
+    identifier = candidate_id(created, source["chatId"], source["messageId"], proposal)
+    candidate = {
+        "schemaVersion": 1,
+        "id": identifier,
+        "status": "pending",
+        "createdAt": created.isoformat(),
+        "expiresAt": (created + timedelta(days=14)).isoformat(),
+        "learningClass": arguments.learning_class,
+        "kind": arguments.kind,
+        "target": target,
+        "task": task,
+        "outcome": outcome,
+        "proposal": proposal,
+        "acceptance": acceptance,
+        "source": source,
+    }
+    candidate_dir = PENDING_DIR / identifier
+    if candidate_dir.exists():
+        raise ValueError("Збіг ідентифікаторів кандидатів")
+    candidate_dir.mkdir(parents=True, mode=0o700)
+    os.chmod(candidate_dir, 0o700)
+    atomic_write(
+        candidate_dir / "candidate.json",
+        (json.dumps(candidate, ensure_ascii=False, indent=2) + "\n").encode(),
+    )
+    atomic_write(candidate_dir / "README.md", render_readme(candidate).encode())
+    return {"status": "pending", "id": identifier, "path": str(candidate_dir)}
+
+
+def preview(arguments: argparse.Namespace) -> str:
+    reviewer = verified_admin_message(
+        arguments.admin_chat_id,
+        arguments.admin_message_id,
+        arguments.candidate_id,
+        "preview",
+    )
+    candidate, _ = load_candidate(arguments.candidate_id)
+    ensure_not_expired(candidate)
+    target = resolved_target(candidate)
+    before = target.read_bytes() if target.is_file() else b""
+    if before:
+        try:
+            before_text = before.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise ValueError("Поточна ціль має бути текстом UTF-8") from error
+        reject_secrets(before_text, "поточна ціль")
+    after = replacement_bytes(candidate, arguments.replacement_file)
+    procedure_checks = (
+        load_checks(arguments.checks_file)
+        if candidate["learningClass"] == "procedure"
+        else None
+    )
+    patch = diff_text(str(candidate["target"]), before, after)
+    approval_token = secrets.token_hex(6)
+    candidate["review"] = {
+        **reviewer,
+        "reviewedAt": utc_now().isoformat(),
+        "approvalToken": approval_token,
+        "beforeSha256": hashlib.sha256(before).hexdigest(),
+        "replacementSha256": hashlib.sha256(after).hexdigest(),
+        "checksSha256": checks_fingerprint(procedure_checks),
+    }
+    directory = candidate_directory(arguments.candidate_id)
+    atomic_write(
+        directory / "candidate.json",
+        (json.dumps(candidate, ensure_ascii=False, indent=2) + "\n").encode(),
+    )
+    atomic_write(directory / "README.md", render_readme(candidate).encode())
+    rendered = patch or "[без змін]\n"
+    return (
+        rendered
+        + f"\nКоманда підтвердження: /learn_apply {arguments.candidate_id} {approval_token}\n"
+    )
+
+
+def apply_change(arguments: argparse.Namespace) -> dict:
+    if not arguments.confirm:
+        raise ValueError("Для apply потрібен --confirm")
+    candidate, pending = load_candidate(arguments.candidate_id)
+    ensure_not_expired(candidate)
+    target = resolved_target(candidate)
+    history = candidate_directory(arguments.candidate_id, history=True)
+    if history.exists():
+        raise ValueError("Історія кандидата вже існує")
+    procedure_checks = (
+        load_checks(arguments.checks_file)
+        if candidate["learningClass"] == "procedure"
+        else None
+    )
+    before_exists = target.is_file()
+    before = target.read_bytes() if before_exists else b""
+    if before_exists:
+        try:
+            before_text = before.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise ValueError("Поточна ціль має бути текстом UTF-8") from error
+        reject_secrets(before_text, "поточна ціль")
+    after = replacement_bytes(candidate, arguments.replacement_file)
+    review = candidate.get("review")
+    if not isinstance(review, dict):
+        raise ValueError("Спочатку адміністратор має переглянути кандидата")
+    approval_token = str(review.get("approvalToken", ""))
+    if not re.fullmatch(r"[a-f0-9]{12}", approval_token):
+        raise ValueError(
+            "Попередній перегляд кандидата не має чинного одноразового токена"
+        )
+    if review.get("approvalTokenConsumedAt"):
+        raise ValueError("Токен підтвердження вже використано")
+    approver = verified_admin_message(
+        arguments.admin_chat_id,
+        arguments.admin_message_id,
+        arguments.candidate_id,
+        "apply",
+        approval_token,
+    )
+    review["approvalTokenConsumedAt"] = utc_now().isoformat()
+    review["approvalMessageId"] = approver["messageId"]
+    atomic_write(
+        pending / "candidate.json",
+        (json.dumps(candidate, ensure_ascii=False, indent=2) + "\n").encode(),
+    )
+    atomic_write(pending / "README.md", render_readme(candidate).encode())
+    if (
+        review.get("beforeSha256") != hashlib.sha256(before).hexdigest()
+        or review.get("replacementSha256") != hashlib.sha256(after).hexdigest()
+        or review.get("checksSha256") != checks_fingerprint(procedure_checks)
+    ):
+        raise ValueError("Заміна або ціль не відповідає перевіреній різниці")
+    patch = diff_text(str(candidate["target"]), before, after)
+    if not patch:
+        raise ValueError("Заміна не змінює ціль")
+    mode = (target.stat().st_mode & 0o777) if before_exists else 0o600
+    original_candidate = json.loads(json.dumps(candidate))
+    transaction = {
+        "schemaVersion": 1,
+        "operation": "apply",
+        "target": candidate["target"],
+        "beforeExists": before_exists,
+        "beforeSha256": hashlib.sha256(before).hexdigest(),
+        "afterSha256": hashlib.sha256(after).hexdigest(),
+        "mode": mode,
+    }
+    try:
+        atomic_write(pending / "before", before)
+        atomic_write(pending / "after", after)
+        atomic_write(pending / "diff.patch", patch.encode())
+        atomic_write(
+            pending / "transaction.json",
+            (json.dumps(transaction, ensure_ascii=False, indent=2) + "\n").encode(),
+        )
+    except OSError as error:
+        cleanup_pending_transaction(pending)
+        raise ValueError("Не вдалося підготувати журнал apply") from error
+    target_changed = False
+    try:
+        atomic_write(target, after, mode)
+        target_changed = True
+        if procedure_checks is None:
+            check_results = {"status": "passed", "checks": ["semantic-size"]}
+        else:
+            check_results = run_procedure_checks(procedure_checks, after.decode("utf-8"))
+        applied_at = utc_now().isoformat()
+        candidate.update(
+            {
+                "status": "applied",
+                "decision": {
+                    "approverChatId": approver["chatId"],
+                    "messageId": approver["messageId"],
+                    "username": approver["username"],
+                    "messageTimestamp": approver["timestamp"],
+                    "evidenceSha256": approver["evidenceSha256"],
+                    "appliedAt": applied_at,
+                    "beforeExists": before_exists,
+                    "beforeSha256": hashlib.sha256(before).hexdigest(),
+                    "afterSha256": hashlib.sha256(after).hexdigest(),
+                    "rollbackToken": secrets.token_hex(6),
+                },
+            }
+        )
+        atomic_write(
+            pending / "checks.json",
+            (json.dumps(check_results, ensure_ascii=False, indent=2) + "\n").encode(),
+        )
+        atomic_write(
+            pending / "candidate.json",
+            (json.dumps(candidate, ensure_ascii=False, indent=2) + "\n").encode(),
+        )
+        atomic_write(pending / "README.md", render_readme(candidate).encode())
+        HISTORY_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.replace(pending, history)
+    except (OSError, ValueError) as error:
+        if target_changed:
+            restore_target(target, before_exists, before, mode)
+        try:
+            atomic_write(
+                pending / "candidate.json",
+                (json.dumps(original_candidate, ensure_ascii=False, indent=2) + "\n").encode(),
+            )
+            atomic_write(pending / "README.md", render_readme(original_candidate).encode())
+            atomic_write(
+                pending / "last-failure.json",
+                (
+                    json.dumps(
+                        {
+                            "status": "failed",
+                            "timestamp": utc_now().isoformat(),
+                            "reason": str(error),
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                    + "\n"
+                ).encode(),
+            )
+        except OSError:
+            pass
+        if isinstance(error, ValueError):
+            raise
+        raise ValueError("Не вдалося зберегти історію навчання") from error
+    try:
+        fsync_directory(PENDING_DIR)
+        fsync_directory(HISTORY_DIR)
+        (history / "transaction.json").unlink(missing_ok=True)
+        fsync_directory(history)
+    except OSError:
+        pass
+    return {
+        "status": "applied",
+        "id": arguments.candidate_id,
+        "target": str(target),
+        "rollbackCommand": (
+            f"/learn_rollback {arguments.candidate_id} "
+            f"{candidate['decision']['rollbackToken']}"
+        ),
+    }
+
+
+def rollback(arguments: argparse.Namespace) -> dict:
+    if not arguments.confirm:
+        raise ValueError("Для rollback потрібен --confirm")
+    candidate, history = load_candidate(arguments.candidate_id, history=True)
+    if candidate.get("status") != "applied":
+        raise ValueError("Відкотити можна лише застосованого кандидата")
+    rollback_token = str(candidate.get("decision", {}).get("rollbackToken", ""))
+    if not re.fullmatch(r"[a-f0-9]{12}", rollback_token):
+        raise ValueError(
+            "Застосований кандидат не має чинного одноразового токена відкату"
+        )
+    approver = verified_admin_message(
+        arguments.admin_chat_id,
+        arguments.admin_message_id,
+        arguments.candidate_id,
+        "rollback",
+        rollback_token,
+    )
+    target = resolved_target(candidate)
+    before_exists = bool(candidate.get("decision", {}).get("beforeExists"))
+    before = (history / "before").read_bytes()
+    expected_after = str(candidate.get("decision", {}).get("afterSha256", ""))
+    current = target.read_bytes() if target.is_file() else None
+    current_mode = (target.stat().st_mode & 0o777) if target.is_file() else 0o600
+    if current is None or hashlib.sha256(current).hexdigest() != expected_after:
+        raise ValueError(
+            "Ціль змінено після застосування; руйнівний відкат відхилено"
+        )
+    expected_before = str(candidate.get("decision", {}).get("beforeSha256", ""))
+    if hashlib.sha256(before).hexdigest() != expected_before:
+        raise ValueError("Хеш знімка для відкату не збігається")
+    try:
+        before.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError("Знімок для відкату має бути текстом UTF-8") from error
+    transaction = {
+        "schemaVersion": 1,
+        "operation": "rollback",
+        "target": candidate["target"],
+        "beforeExists": before_exists,
+        "appliedSha256": hashlib.sha256(current).hexdigest(),
+        "rollbackSha256": hashlib.sha256(before).hexdigest(),
+        "mode": current_mode,
+    }
+    atomic_write(
+        history / "rollback-transaction.json",
+        (json.dumps(transaction, ensure_ascii=False, indent=2) + "\n").encode(),
+    )
+    try:
+        restore_target(target, before_exists, before, current_mode)
+        if candidate["learningClass"] == "procedure":
+            run_skill_doctor("skill-doctor відхилив відкат")
+        candidate["status"] = "rolled-back"
+        candidate.setdefault("events", []).append(
+            {
+                "type": "rollback",
+                "adminChatId": approver["chatId"],
+                "messageId": approver["messageId"],
+                "username": approver["username"],
+                "evidenceSha256": approver["evidenceSha256"],
+                "timestamp": utc_now().isoformat(),
+            }
+        )
+        atomic_write(
+            history / "candidate.json",
+            (json.dumps(candidate, ensure_ascii=False, indent=2) + "\n").encode(),
+        )
+        atomic_write(history / "README.md", render_readme(candidate).encode())
+    except (OSError, ValueError) as error:
+        try:
+            atomic_write(target, current, current_mode)
+            (history / "rollback-transaction.json").unlink(missing_ok=True)
+            fsync_directory(history)
+        except OSError:
+            pass
+        if isinstance(error, ValueError):
+            raise
+        raise ValueError("Не вдалося зберегти історію відкату") from error
+    try:
+        (history / "rollback-transaction.json").unlink(missing_ok=True)
+        fsync_directory(history)
+    except OSError:
+        pass
+    return {"status": "rolled-back", "id": arguments.candidate_id, "target": str(target)}
+
+
+def reject_candidate(arguments: argparse.Namespace) -> dict:
+    if not arguments.confirm:
+        raise ValueError("Для reject потрібен --confirm")
+    approver = verified_admin_message(
+        arguments.admin_chat_id,
+        arguments.admin_message_id,
+        arguments.candidate_id,
+        "reject",
+    )
+    candidate, pending = load_candidate(arguments.candidate_id)
+    reason = read_input(arguments.reason_file, "причина відхилення")
+    candidate.update(
+        {
+            "status": "rejected",
+            "decision": {
+                "approverChatId": approver["chatId"],
+                "messageId": approver["messageId"],
+                "username": approver["username"],
+                "messageTimestamp": approver["timestamp"],
+                "evidenceSha256": approver["evidenceSha256"],
+                "rejectedAt": utc_now().isoformat(),
+                "reason": reason,
+            },
+        }
+    )
+    atomic_write(
+        pending / "candidate.json",
+        (json.dumps(candidate, ensure_ascii=False, indent=2) + "\n").encode(),
+    )
+    atomic_write(pending / "README.md", render_readme(candidate).encode())
+    HISTORY_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    history = candidate_directory(arguments.candidate_id, history=True)
+    if history.exists():
+        raise ValueError("Історія кандидата вже існує")
+    os.replace(pending, history)
+    return {"status": "rejected", "id": arguments.candidate_id}
+
+
+def pending_candidates() -> list[dict]:
+    candidates = []
+    if not PENDING_DIR.is_dir():
+        return candidates
+    for directory in sorted(PENDING_DIR.iterdir(), key=lambda item: item.name):
+        if not directory.is_dir() or directory.is_symlink():
+            continue
+        try:
+            if candidate_directory(directory.name, history=True).exists():
+                continue
+            candidate, _ = load_candidate(directory.name)
+        except ValueError:
+            continue
+        if candidate.get("status") == "pending":
+            candidates.append(candidate)
+    return candidates
+
+
+def digest(arguments: argparse.Namespace) -> dict:
+    candidates = pending_candidates()
+    if not candidates:
+        return {"status": "empty", "count": 0, "sent": False}
+    lines = [f"Кандидатів на навчання в очікуванні: {len(candidates)}"]
+    for candidate in candidates[:20]:
+        source = candidate["source"]
+        expiry = str(candidate["expiresAt"])[:10]
+        line = (
+            "- %s | @%s / %s | %s -> %s | діє до %s"
+            % (
+                candidate["id"],
+                source["username"],
+                source["chatId"],
+                candidate["kind"],
+                candidate["target"],
+                expiry,
+            )
+        )
+        if len("\n".join([*lines, line])) > 3_350:
+            break
+        lines.append(line)
+    lines.append("Відповідай командою: /learn_preview <id>")
+    message = "\n".join(lines)
+    sent = False
+    if arguments.send:
+        access = load_access()
+        admins = [str(item) for item in access.get("admins", []) if str(item)]
+        if not admins:
+            raise ValueError("Для дайджесту не налаштовано адміністратора")
+        sender = HOME / "bin/tg-send"
+        if not sender.is_file() or sender.is_symlink():
+            raise ValueError("tg-send недоступний")
+        try:
+            completed = subprocess.run(
+                [str(sender), admins[0], message],
+                cwd=HOME,
+                env=os.environ.copy(),
+                capture_output=True,
+                text=True,
+                timeout=20,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise ValueError("Не вдалося доставити дайджест навчання") from error
+        if completed.returncode != 0:
+            raise ValueError("Не вдалося доставити дайджест навчання")
+        sent = True
+    return {"status": "pending", "count": len(candidates), "sent": sent}
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    proposal = subparsers.add_parser("propose")
+    proposal.add_argument("--chat-id", required=True)
+    proposal.add_argument("--message-id", required=True)
+    proposal.add_argument("--class", dest="learning_class", required=True)
+    proposal.add_argument("--kind", required=True)
+    proposal.add_argument("--target", required=True)
+    proposal.add_argument("--task-file", required=True)
+    proposal.add_argument("--outcome-file", required=True)
+    proposal.add_argument("--proposal-file", required=True)
+    proposal.add_argument("--acceptance-file", required=True)
+    proposal.set_defaults(handler=propose)
+    preview_parser = subparsers.add_parser("preview")
+    preview_parser.add_argument("candidate_id")
+    preview_parser.add_argument("--admin-chat-id", required=True)
+    preview_parser.add_argument("--admin-message-id", required=True)
+    preview_parser.add_argument("--replacement-file", required=True)
+    preview_parser.add_argument("--checks-file")
+    preview_parser.set_defaults(handler=preview)
+    apply_parser = subparsers.add_parser("apply")
+    apply_parser.add_argument("candidate_id")
+    apply_parser.add_argument("--admin-chat-id", required=True)
+    apply_parser.add_argument("--admin-message-id", required=True)
+    apply_parser.add_argument("--replacement-file", required=True)
+    apply_parser.add_argument("--checks-file")
+    apply_parser.add_argument("--confirm", action="store_true")
+    apply_parser.set_defaults(handler=apply_change)
+    rollback_parser = subparsers.add_parser("rollback")
+    rollback_parser.add_argument("candidate_id")
+    rollback_parser.add_argument("--admin-chat-id", required=True)
+    rollback_parser.add_argument("--admin-message-id", required=True)
+    rollback_parser.add_argument("--confirm", action="store_true")
+    rollback_parser.set_defaults(handler=rollback)
+    reject_parser = subparsers.add_parser("reject")
+    reject_parser.add_argument("candidate_id")
+    reject_parser.add_argument("--admin-chat-id", required=True)
+    reject_parser.add_argument("--admin-message-id", required=True)
+    reject_parser.add_argument("--reason-file", required=True)
+    reject_parser.add_argument("--confirm", action="store_true")
+    reject_parser.set_defaults(handler=reject_candidate)
+    digest_parser = subparsers.add_parser("digest")
+    digest_parser.add_argument("--send", action="store_true")
+    digest_parser.set_defaults(handler=digest)
+    return parser
+
+
+def main() -> None:
+    parser = build_parser()
+    arguments = parser.parse_args()
+    try:
+        recover_incomplete_transactions()
+        if hasattr(arguments, "candidate_id"):
+            with candidate_lock(arguments.candidate_id):
+                result = arguments.handler(arguments)
+        else:
+            result = arguments.handler(arguments)
+    except ValueError as error:
+        print(f"learning-review: {error}", file=sys.stderr)
+        raise SystemExit(2) from error
+    if isinstance(result, str):
+        print(result, end="")
+    else:
+        print(json.dumps(result, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()

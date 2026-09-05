@@ -1,0 +1,2723 @@
+#!/usr/bin/env python3
+"""Classify Telegram session-limit events and maintain a private baseline."""
+
+from dataclasses import dataclass
+from datetime import date, datetime, time, timedelta, timezone
+import copy
+import fcntl
+from heapq import nlargest
+import io
+import json
+import os
+from pathlib import Path, PurePosixPath
+import re
+import sqlite3
+import stat
+import subprocess
+import sys
+import tempfile
+import time as time_module
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+
+STATE_SCHEMA_VERSION = 1
+MAX_STATE_BYTES = 1024 * 1024
+MAX_ANCESTRY_EVENTS = 20_000
+MAX_CONTEXT_BYTES = 8 * 1024 * 1024
+MAX_INCREMENT_BYTES = 64 * 1024 * 1024
+MAX_INCREMENT_EVENTS = 100_000
+MAX_TRANSCRIPT_LINE_BYTES = 16 * 1024 * 1024
+TURN_STATUS_MAX_FILES = 20
+TURN_STATUS_TAIL_BYTES = 16 * 1024 * 1024
+TURN_ACCEPTANCE_CLOCK_SKEW_MS = 300_000
+TURN_ACCEPTANCE_READ_BYTES = 1024 * 1024
+PENDING_DELAY_MS = 120_000
+COOLDOWN_MS = 900_000
+EARLY_WINDOW_MS = 3_600_000
+MAX_EARLY_ATTEMPTS = 2
+RESET_MARGIN_MS = 120_000
+INCIDENT_TTL_MS = 86_400_000
+READINESS_POLLS = 6
+READINESS_SLEEP_SECONDS = 2
+COMMAND_TIMEOUT_SECONDS = 3
+RESTART_TIMEOUT_SECONDS = 15
+ACTION_DEADLINE_SECONDS = 40
+INITIALIZE_LOCK_BUSY_EXIT = 75
+TRANSPORT_PATTERN = "bun.*plugins-official.*telegram"
+NOTICE_TEXT = (
+    "Процес агента перезапущено після підтвердженого ліміту Claude. "
+    "Будь ласка, надішли останнє повідомлення ще раз — автоматично воно не відтворюється."
+)
+OVERLOAD_NOTICE_TEXT = (
+    "⚠️ Anthropic зараз перевантажений. Я не зміг завершити це повідомлення — "
+    "запит не виконано. Надішли його ще раз за кілька хвилин."
+)
+LIMIT_NOTICE_TEXT = (
+    "⏳ Я вперся в ліміт Claude. Це повідомлення не виконане. "
+    "Напиши /health, щоб побачити стан, і повтори запит після скидання ліміту."
+)
+OWNER_OVERLOAD_NOTICE_TEXT = (
+    "⚠️ Один із дозволених чатів не отримав відповідь: Anthropic перевантажений. "
+    "Користувачу вже надіслано прохання повторити запит пізніше."
+)
+OWNER_LIMIT_NOTICE_TEXT = (
+    "⏳ Один із дозволених чатів не отримав відповідь через ліміт Claude. "
+    "Користувачу вже надіслано інструкцію перевірити /health і повторити запит "
+    "після скидання."
+)
+NOTICE_STATE_NAME = "claude-interruption-notices.json"
+NOTICE_LOCK_NAME = "claude-interruption-notices.lock"
+MAX_NOTICE_EVENT_UUIDS = 512
+STATE_KEYS = frozenset(
+    {
+        "schema_version",
+        "transcripts",
+        "handled_event_uuids",
+        "handled_reset_keys",
+        "incident",
+    }
+)
+TRANSCRIPT_METADATA_KEYS = frozenset({"offset", "device", "inode", "ordinal"})
+INCIDENT_KEYS = frozenset(
+    {
+        "event_uuid",
+        "transcript",
+        "event_epoch_ms",
+        "reset_key",
+        "reset_epoch_ms",
+        "limit_origin",
+        "queue",
+        "affected_chats",
+        "pending_keys",
+        "unknown_queue_operation",
+        "reply_evidence",
+        "attempted_pending_keys",
+        "attempts",
+        "notified_chat_ids",
+        "resolved",
+        "expired",
+    }
+)
+CHANNEL_REF_KEYS = frozenset({"chat_id", "message_id"})
+OTHER_QUEUE_KEYS = frozenset({"key", "kind"})
+TELEGRAM_QUEUE_KEYS = frozenset(
+    {"key", "kind", "chat_id", "message_id", "enqueued_at_ms"}
+)
+ATTEMPT_KEYS = frozenset(
+    {"attempt_id", "trigger", "attempted_at_ms", "stage", "notice_chat_ids"}
+)
+SERVICE_NAME = re.compile(r"\A(?!-)[A-Za-z0-9_.@:-]+\.service\Z")
+
+CHANNEL_ENVELOPE = re.compile(
+    r"\A<channel\b(?P<attributes>[^>]*)>.*</channel>\Z",
+    re.DOTALL,
+)
+CHANNEL_ATTRIBUTE = re.compile(
+    r"\s+([A-Za-z_][A-Za-z0-9_.:-]*)\s*=\s*(['\"])(.*?)\2",
+    re.DOTALL,
+)
+ZONE_SEGMENT = r"[A-Za-z][A-Za-z0-9._+-]*"
+# Two provider phrasings: the classic "hit your … limit" and the credits pool
+# of Team/Enterprise seats ("out of usage credits", resets monthly).
+LIMIT_ERROR_PATTERN = re.compile(
+    r"\A(?:You've hit your (?P<kind>session|weekly|usage) limit"
+    r"|You're out of usage credits)\b"
+)
+OVERLOAD_PATTERN = re.compile(r"\bOverloaded\b", re.IGNORECASE)
+LIMIT_PATTERN = re.compile(
+    # Клас ліміту є частиною стабільного ключа дедуплікації.
+    r"\A(?:You've hit your (?P<kind>session|weekly|usage) limit · resets "
+    r"|You're out of usage credits · resets )"
+    r"(?P<hour>(?:[1-9]|1[0-2]))"
+    r"(?::(?P<minute>[0-5][0-9]))?"
+    r"(?P<period>am|pm) "
+    rf"\((?P<zone>UTC|(?:{ZONE_SEGMENT}/)+{ZONE_SEGMENT})\)"
+    r"(?: · progress saved)?\Z"
+)
+NUMERIC_CHAT_ID = re.compile(r"\A-?[0-9]+\Z")
+NUMERIC_MESSAGE_ID = re.compile(r"\A[0-9]+\Z")
+UNIX_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+@dataclass(frozen=True)
+class ChannelRef:
+    chat_id: str
+    message_id: str | None
+
+
+@dataclass(frozen=True)
+class ResetAt:
+    kind: str
+    key: str
+    epoch_ms: int
+
+
+@dataclass(frozen=True)
+class Decision:
+    eligible: bool
+    trigger: str | None
+    suppression: str | None
+
+
+class StateError(RuntimeError):
+    """A state file could not be used without weakening fail-closed behavior."""
+
+
+def _now_ms() -> int:
+    return int(time_module.time() * 1000)
+
+
+def _sleep(seconds: float) -> None:
+    time_module.sleep(seconds)
+
+
+def _monotonic() -> float:
+    return time_module.monotonic()
+
+
+def _channel_attributes(text: object) -> dict[str, str] | None:
+    if not isinstance(text, str):
+        return None
+    envelope = CHANNEL_ENVELOPE.fullmatch(text)
+    if envelope is None:
+        return None
+
+    raw_attributes = envelope.group("attributes")
+    attributes: dict[str, str] = {}
+    position = 0
+    while position < len(raw_attributes):
+        match = CHANNEL_ATTRIBUTE.match(raw_attributes, position)
+        if match is None:
+            return None
+        name, value = match.group(1), match.group(3)
+        if name in attributes:
+            return None
+        attributes[name] = value
+        position = match.end()
+    return attributes
+
+
+def parse_channel(text: object) -> ChannelRef | None:
+    """Parse one exact Telegram outer channel envelope."""
+    attributes = _channel_attributes(text)
+    if attributes is None:
+        return None
+    if "source" not in attributes or "chat_id" not in attributes:
+        return None
+    if attributes["source"] != "plugin:telegram:telegram":
+        return None
+
+    chat_id = attributes["chat_id"]
+    if NUMERIC_CHAT_ID.fullmatch(chat_id) is None:
+        return None
+    message_id = attributes.get("message_id")
+    if (
+        message_id is not None
+        and NUMERIC_MESSAGE_ID.fullmatch(message_id) is None
+    ):
+        return None
+    return ChannelRef(chat_id=chat_id, message_id=message_id)
+
+
+def rendered_assistant_text(event: dict) -> str | None:
+    """Return one assistant event's complete textual rendering."""
+    if not isinstance(event, dict):
+        return None
+    message = event.get("message")
+    if not isinstance(message, dict) or message.get("role") != "assistant":
+        return None
+    content = message.get("content")
+    if not isinstance(content, list) or not content:
+        return None
+
+    text_parts: list[str] = []
+    for block in content:
+        if not isinstance(block, dict) or block.get("type") != "text":
+            return None
+        value = block.get("text")
+        if not isinstance(value, str):
+            return None
+        text_parts.append(value)
+    return "".join(text_parts)
+
+
+def rendered_error(event: dict) -> str | None:
+    """Return a confirmed provider limit even when its trailing copy changes."""
+    rendered = rendered_assistant_text(event)
+    if rendered is None:
+        return None
+    if LIMIT_ERROR_PATTERN.match(rendered) is None:
+        return None
+    return rendered
+
+
+def _event_instant(event_epoch_ms: int) -> datetime | None:
+    if type(event_epoch_ms) is not int:
+        return None
+    try:
+        return UNIX_EPOCH + timedelta(milliseconds=event_epoch_ms)
+    except (OverflowError, ValueError):
+        return None
+
+
+def _valid_local_instants(
+    local_day: date,
+    local_time: time,
+    zone: timezone | ZoneInfo,
+) -> list[datetime]:
+    naive = datetime.combine(local_day, local_time)
+    candidates: dict[int, datetime] = {}
+    for fold in (0, 1):
+        local = naive.replace(tzinfo=zone, fold=fold)
+        utc_value = local.astimezone(timezone.utc)
+        round_trip = utc_value.astimezone(zone)
+        if round_trip.replace(tzinfo=None) != naive or round_trip.fold != fold:
+            continue
+        epoch_value = _datetime_epoch_ms(utc_value)
+        candidates[epoch_value] = local
+    return [candidates[key] for key in sorted(candidates)]
+
+
+def parse_reset(error: str, event_epoch_ms: int) -> ResetAt | None:
+    """Resolve the next real local reset instant at or after the event."""
+    if not isinstance(error, str):
+        return None
+    match = LIMIT_PATTERN.fullmatch(error)
+    event_instant = _event_instant(event_epoch_ms)
+    if match is None or event_instant is None:
+        return None
+
+    zone_name = match.group("zone")
+    try:
+        zone: timezone | ZoneInfo = (
+            timezone.utc if zone_name == "UTC" else ZoneInfo(zone_name)
+        )
+    except (ZoneInfoNotFoundError, ValueError):
+        return None
+
+    hour = int(match.group("hour"))
+    minute_text = match.group("minute")
+    minute = int(minute_text) if minute_text is not None else 0
+    if match.group("period") == "am":
+        hour_24 = 0 if hour == 12 else hour
+    else:
+        hour_24 = 12 if hour == 12 else hour + 12
+    local_time = time(hour_24, minute)
+    local_event_day = event_instant.astimezone(zone).date()
+
+    for day_offset in (0, 1):
+        try:
+            local_day = local_event_day + timedelta(days=day_offset)
+        except OverflowError:
+            return None
+        candidates = _valid_local_instants(local_day, local_time, zone)
+        if not candidates:
+            return None
+        eligible = [
+            candidate
+            for candidate in candidates
+            if candidate.astimezone(timezone.utc) >= event_instant
+        ]
+        if not eligible:
+            continue
+        chosen = min(
+            eligible,
+            key=lambda value: value.astimezone(timezone.utc),
+        )
+        return ResetAt(
+            kind=match.group("kind") or "credits",
+            key=chosen.isoformat(timespec="seconds"),
+            epoch_ms=_datetime_epoch_ms(chosen.astimezone(timezone.utc)),
+        )
+    return None
+
+
+def _valid_uuid_map(events_by_uuid: object) -> bool:
+    if not isinstance(events_by_uuid, dict):
+        return False
+    seen: set[str] = set()
+    for key, value in events_by_uuid.items():
+        if not isinstance(key, str) or not key:
+            return False
+        if not isinstance(value, dict):
+            return False
+        event_uuid = value.get("uuid")
+        if not isinstance(event_uuid, str) or not event_uuid:
+            return False
+        if event_uuid != key or event_uuid in seen:
+            return False
+        seen.add(event_uuid)
+    return True
+
+
+def _active_ancestry_event(event: dict) -> bool:
+    return (
+        event.get("isSidechain") is False
+        and event.get("userType") == "external"
+    )
+
+
+def _carrier_ref(prompt: object, origin: object) -> ChannelRef | None:
+    if not isinstance(origin, dict):
+        return None
+    if origin.get("kind") != "channel":
+        return None
+    if origin.get("server") != "plugin:telegram:telegram":
+        return None
+    ref = parse_channel(prompt)
+    if ref is None:
+        return None
+    origin_chat_id = origin.get("chat_id")
+    if origin_chat_id is not None and origin_chat_id != ref.chat_id:
+        return None
+    origin_message_id = origin.get("message_id")
+    if origin_message_id is not None and origin_message_id != ref.message_id:
+        return None
+    return ref
+
+
+def _ancestry_disposition(event: dict) -> tuple[str, ChannelRef | None]:
+    event_type = event.get("type")
+    if event_type == "assistant":
+        message = event.get("message")
+        if (
+            isinstance(message, dict)
+            and message.get("role") == "assistant"
+            and isinstance(message.get("content"), list)
+        ):
+            return "continue", None
+        return "reject", None
+
+    if event_type == "user":
+        message = event.get("message")
+        if not isinstance(message, dict) or message.get("role") != "user":
+            return "reject", None
+        content = message.get("content")
+        if isinstance(content, str):
+            ref = _carrier_ref(content, event.get("origin"))
+            return ("carrier", ref) if ref is not None else ("reject", None)
+        if isinstance(content, list) and content and all(
+            isinstance(block, dict) and block.get("type") == "tool_result"
+            for block in content
+        ):
+            return "continue", None
+        return "reject", None
+
+    if event_type == "attachment":
+        attachment = event.get("attachment")
+        if not isinstance(attachment, dict):
+            return "reject", None
+        if attachment.get("type") != "queued_command":
+            # Every other attachment — hook injections, reminders, tool and skill
+            # listings — is a transparent node, not a trust boundary: none of them
+            # changes who sent the prompt. Rejecting them ended the walk before it
+            # could reach the Telegram carrier, so a real session-limit stall was
+            # classified as "not ours" and nobody was woken up. The kit's own
+            # SessionStart hooks emit two of those types, which made the failure
+            # near-certain on a stock install. Passing through cannot forge an
+            # origin: only _carrier_ref below decides what counts as one.
+            return "continue", None
+        ref = _carrier_ref(
+            attachment.get("prompt"),
+            attachment.get("origin"),
+        )
+        return ("carrier", ref) if ref is not None else ("reject", None)
+
+    return "reject", None
+
+
+def _embedded_channel_ref(event: dict) -> ChannelRef | None:
+    """Find an exact channel envelope without treating it as trusted evidence."""
+    message = event.get("message")
+    if isinstance(message, dict) and isinstance(message.get("content"), str):
+        ref = parse_channel(message["content"])
+        if ref is not None:
+            return ref
+    attachment = event.get("attachment")
+    if isinstance(attachment, dict) and isinstance(attachment.get("prompt"), str):
+        return parse_channel(attachment["prompt"])
+    return None
+
+
+def telegram_origin(
+    events_by_uuid: dict[str, dict],
+    event: dict,
+) -> ChannelRef | None:
+    """Walk only the event's active parent chain to a Telegram carrier."""
+    if not isinstance(event, dict) or not _valid_uuid_map(events_by_uuid):
+        return None
+    event_uuid = event.get("uuid")
+    if not isinstance(event_uuid, str) or not event_uuid:
+        return None
+    if events_by_uuid.get(event_uuid) is not event:
+        return None
+
+    visited = {event_uuid}
+    parent_uuid = event.get("parentUuid")
+    for _ in range(min(len(events_by_uuid), MAX_ANCESTRY_EVENTS)):
+        if not isinstance(parent_uuid, str) or not parent_uuid:
+            return None
+        if parent_uuid in visited:
+            return None
+        parent = events_by_uuid.get(parent_uuid)
+        if parent is None or not _active_ancestry_event(parent):
+            return None
+        visited.add(parent_uuid)
+
+        disposition, ref = _ancestry_disposition(parent)
+        if disposition == "reject":
+            return None
+        if disposition == "carrier":
+            carrier_parent = parent.get("parentUuid")
+            if carrier_parent is not None and (
+                not isinstance(carrier_parent, str)
+                or not carrier_parent
+                or carrier_parent in visited
+                or carrier_parent not in events_by_uuid
+            ):
+                return None
+            return ref
+        parent_uuid = parent.get("parentUuid")
+    return None
+
+
+def _datetime_epoch_ms(value: datetime) -> int:
+    utc_value = value.astimezone(timezone.utc)
+    delta = utc_value - UNIX_EPOCH
+    return (
+        delta.days * 86_400_000
+        + delta.seconds * 1_000
+        + delta.microseconds // 1_000
+    )
+
+
+def _event_epoch_ms(event: dict) -> int | None:
+    value = event.get("timestamp")
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(
+            value[:-1] + "+00:00" if value.endswith("Z") else value
+        )
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    try:
+        return _datetime_epoch_ms(parsed)
+    except (OverflowError, ValueError):
+        return None
+
+
+def classify_limit(
+    event: dict,
+    events_by_uuid: dict[str, dict],
+) -> dict | None:
+    """Classify one exact main-chain Telegram session-limit event."""
+    if not isinstance(event, dict):
+        return None
+    event_uuid = event.get("uuid")
+    status = event.get("apiErrorStatus")
+    if (
+        event.get("type") != "assistant"
+        or event.get("isApiErrorMessage") is not True
+        or type(status) is not int
+        or status != 429
+        or event.get("isSidechain") is not False
+        or event.get("userType") != "external"
+        or not isinstance(event_uuid, str)
+        or not event_uuid
+    ):
+        return None
+
+    event_epoch_ms = _event_epoch_ms(event)
+    error = rendered_error(event)
+    channel = telegram_origin(events_by_uuid, event)
+    if event_epoch_ms is None or error is None or channel is None:
+        return None
+    reset = parse_reset(error, event_epoch_ms)
+    return {
+        "event_uuid": event_uuid,
+        "event_epoch_ms": event_epoch_ms,
+        "chat_id": channel.chat_id,
+        "message_id": channel.message_id,
+        "reset_key": (
+            f"{reset.kind}:{reset.key}" if reset is not None else None
+        ),
+        "reset_epoch_ms": reset.epoch_ms if reset is not None else None,
+    }
+
+
+def classify_interruption(
+    event: dict,
+    events_by_uuid: dict[str, dict],
+) -> dict | None:
+    """Classify one exact main-chain Telegram provider interruption."""
+    if not isinstance(event, dict):
+        return None
+    status = event.get("apiErrorStatus")
+    event_uuid = event.get("uuid")
+    if (
+        event.get("type") != "assistant"
+        or event.get("isApiErrorMessage") is not True
+        or type(status) is not int
+        or status not in (429, 529)
+        or event.get("isSidechain") is not False
+        or event.get("userType") != "external"
+        or not isinstance(event_uuid, str)
+        or not event_uuid
+    ):
+        return None
+
+    rendered = rendered_assistant_text(event)
+    channel = telegram_origin(events_by_uuid, event)
+    event_epoch_ms = _event_epoch_ms(event)
+    if rendered is None or channel is None or event_epoch_ms is None:
+        return None
+    if status == 429 and LIMIT_ERROR_PATTERN.match(rendered) is not None:
+        kind = "limit"
+    elif status == 529 and OVERLOAD_PATTERN.search(rendered) is not None:
+        kind = "overloaded"
+    else:
+        return None
+    return {
+        "event_uuid": event_uuid,
+        "event_epoch_ms": event_epoch_ms,
+        "chat_id": channel.chat_id,
+        "message_id": channel.message_id,
+        "kind": kind,
+    }
+
+
+def classify_turn_status(
+    chat_id: str,
+    message_id: str,
+    event: dict,
+    events_by_uuid: dict[str, dict],
+) -> str:
+    """Classify one terminal event for one exact Telegram message."""
+    if (
+        not _valid_channel_identifier(chat_id)
+        or not isinstance(message_id, str)
+        or NUMERIC_MESSAGE_ID.fullmatch(message_id) is None
+    ):
+        return "unknown"
+
+    interruption = classify_interruption(event, events_by_uuid)
+    if interruption is not None:
+        if (
+            interruption["chat_id"] == chat_id
+            and interruption["message_id"] == message_id
+        ):
+            return "interrupted"
+        return "unknown"
+
+    if not isinstance(event, dict):
+        return "unknown"
+    channel = telegram_origin(events_by_uuid, event)
+    message = event.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    if (
+        channel != ChannelRef(chat_id, message_id)
+        or event.get("type") != "assistant"
+        or event.get("isSidechain") is not False
+        or event.get("userType") != "external"
+        or (
+            "isApiErrorMessage" in event
+            and event.get("isApiErrorMessage") is not False
+        )
+        or not isinstance(message, dict)
+        or message.get("role") != "assistant"
+        or message.get("stop_reason") != "end_turn"
+        or not isinstance(content, list)
+    ):
+        return "unknown"
+    # A bare empty end_turn confirms only that Claude stopped. It does not prove
+    # that Telegram received a reply, so the watchdog must keep the turn eligible
+    # for recovery instead of silently suppressing it forever.
+    return "unknown"
+
+
+def _valid_relative_transcript(value: object) -> bool:
+    if not isinstance(value, str) or not value or "\\" in value:
+        return False
+    path = PurePosixPath(value)
+    return (
+        not path.is_absolute()
+        and all(part not in ("", ".", "..") for part in path.parts)
+        and path.suffix == ".jsonl"
+        and path.as_posix() == value
+    )
+
+
+def _nonnegative_int(value: object) -> bool:
+    return type(value) is int and value >= 0
+
+
+def _valid_channel_identifier(value: object) -> bool:
+    return isinstance(value, str) and NUMERIC_CHAT_ID.fullmatch(value) is not None
+
+
+def _valid_message_identifier(value: object) -> bool:
+    return value is None or (
+        isinstance(value, str) and NUMERIC_MESSAGE_ID.fullmatch(value) is not None
+    )
+
+
+def _validate_channel_ref(value: object) -> dict:
+    if not isinstance(value, dict) or set(value) != CHANNEL_REF_KEYS:
+        raise StateError("invalid incident channel reference")
+    if not _valid_channel_identifier(value.get("chat_id")):
+        raise StateError("invalid incident chat identifier")
+    if not _valid_message_identifier(value.get("message_id")):
+        raise StateError("invalid incident message identifier")
+    return value
+
+
+def _validate_incident(value: object) -> dict | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict) or set(value) != INCIDENT_KEYS:
+        raise StateError("invalid incident structure")
+    if not isinstance(value.get("event_uuid"), str) or not value["event_uuid"]:
+        raise StateError("invalid incident event identifier")
+    if not _valid_relative_transcript(value.get("transcript")):
+        raise StateError("invalid incident transcript")
+    if not _nonnegative_int(value.get("event_epoch_ms")):
+        raise StateError("invalid incident timestamp")
+    reset_key = value.get("reset_key")
+    reset_epoch_ms = value.get("reset_epoch_ms")
+    if (reset_key is None) != (reset_epoch_ms is None):
+        raise StateError("inconsistent incident reset")
+    if reset_key is not None and (
+        not isinstance(reset_key, str)
+        or not reset_key
+        or not _nonnegative_int(reset_epoch_ms)
+    ):
+        raise StateError("invalid incident reset")
+    _validate_channel_ref(value.get("limit_origin"))
+
+    queue = value.get("queue")
+    if not isinstance(queue, list):
+        raise StateError("invalid incident queue")
+    queue_keys: set[str] = set()
+    telegram_keys: set[str] = set()
+    for entry in queue:
+        if not isinstance(entry, dict):
+            raise StateError("invalid incident queue entry")
+        key = entry.get("key")
+        if not isinstance(key, str) or not key or key in queue_keys:
+            raise StateError("invalid incident queue key")
+        queue_keys.add(key)
+        kind = entry.get("kind")
+        if kind == "other":
+            if set(entry) != OTHER_QUEUE_KEYS:
+                raise StateError("invalid non-Telegram queue entry")
+        elif kind == "telegram":
+            if set(entry) != TELEGRAM_QUEUE_KEYS:
+                raise StateError("invalid Telegram queue entry")
+            if not _valid_channel_identifier(entry.get("chat_id")):
+                raise StateError("invalid queued chat identifier")
+            if not _valid_message_identifier(entry.get("message_id")):
+                raise StateError("invalid queued message identifier")
+            if not _nonnegative_int(entry.get("enqueued_at_ms")):
+                raise StateError("invalid queued timestamp")
+            telegram_keys.add(key)
+        else:
+            raise StateError("invalid incident queue kind")
+
+    affected = value.get("affected_chats")
+    if not isinstance(affected, list):
+        raise StateError("invalid affected chats")
+    affected_pairs: set[tuple[str, str | None]] = set()
+    affected_ids: set[str] = set()
+    for channel in affected:
+        _validate_channel_ref(channel)
+        pair = (channel["chat_id"], channel["message_id"])
+        if pair in affected_pairs:
+            raise StateError("duplicate affected chat")
+        affected_pairs.add(pair)
+        affected_ids.add(channel["chat_id"])
+
+    pending = value.get("pending_keys")
+    if (
+        not isinstance(pending, list)
+        or any(not isinstance(key, str) or not key for key in pending)
+        or len(set(pending)) != len(pending)
+        or not set(pending).issubset(telegram_keys)
+    ):
+        raise StateError("invalid pending queue keys")
+    attempted = value.get("attempted_pending_keys")
+    if (
+        not isinstance(attempted, list)
+        or any(not isinstance(key, str) or not key for key in attempted)
+        or len(set(attempted)) != len(attempted)
+    ):
+        raise StateError("invalid attempted queue keys")
+    if type(value.get("unknown_queue_operation")) is not bool:
+        raise StateError("invalid queue suppression flag")
+
+    evidence = value.get("reply_evidence")
+    if not isinstance(evidence, dict):
+        raise StateError("invalid reply evidence")
+    for chat_id, reply_epoch_ms in evidence.items():
+        if chat_id not in affected_ids or not _nonnegative_int(reply_epoch_ms):
+            raise StateError("invalid reply evidence")
+
+    attempts = value.get("attempts")
+    if not isinstance(attempts, list):
+        raise StateError("invalid attempt history")
+    attempt_ids: set[str] = set()
+    reserved_notice_ids: list[str] = []
+    for attempt in attempts:
+        if not isinstance(attempt, dict) or set(attempt) != ATTEMPT_KEYS:
+            raise StateError("invalid attempt record")
+        attempt_id = attempt.get("attempt_id")
+        trigger = attempt.get("trigger")
+        if (
+            not isinstance(attempt_id, str)
+            or not attempt_id
+            or attempt_id in attempt_ids
+            or not isinstance(trigger, str)
+            or not trigger
+            or not (
+                trigger.startswith("enqueue:")
+                or trigger.startswith("reset:")
+            )
+            or not _nonnegative_int(attempt.get("attempted_at_ms"))
+            or attempt.get("stage") != "reserved"
+        ):
+            raise StateError("invalid attempt record")
+        notice_chat_ids = attempt.get("notice_chat_ids")
+        if (
+            not isinstance(notice_chat_ids, list)
+            or any(
+                not _valid_channel_identifier(chat_id)
+                for chat_id in notice_chat_ids
+            )
+            or len(set(notice_chat_ids)) != len(notice_chat_ids)
+        ):
+            raise StateError("invalid attempt notice reservation")
+        if any(chat_id in reserved_notice_ids for chat_id in notice_chat_ids):
+            raise StateError("duplicate attempt notice reservation")
+        reserved_notice_ids.extend(notice_chat_ids)
+        attempt_ids.add(attempt_id)
+
+    notified = value.get("notified_chat_ids")
+    if (
+        not isinstance(notified, list)
+        or any(not _valid_channel_identifier(chat_id) for chat_id in notified)
+        or len(set(notified)) != len(notified)
+    ):
+        raise StateError("invalid notification state")
+    if notified != reserved_notice_ids:
+        raise StateError("notification reservations are inconsistent")
+    if type(value.get("resolved")) is not bool or type(value.get("expired")) is not bool:
+        raise StateError("invalid incident terminal state")
+    if value["resolved"] and value["expired"]:
+        raise StateError("incident cannot be both resolved and expired")
+    return value
+
+
+def _validate_state(state: object) -> dict:
+    if not isinstance(state, dict) or set(state) != STATE_KEYS:
+        raise StateError("invalid state structure")
+    if type(state.get("schema_version")) is not int:
+        raise StateError("invalid state schema")
+    if state["schema_version"] != STATE_SCHEMA_VERSION:
+        raise StateError("unsupported state schema")
+
+    transcripts = state.get("transcripts")
+    if not isinstance(transcripts, dict):
+        raise StateError("invalid transcript baselines")
+    for relative, metadata in transcripts.items():
+        if not _valid_relative_transcript(relative):
+            raise StateError("invalid transcript identity")
+        if not isinstance(metadata, dict) or set(metadata) != TRANSCRIPT_METADATA_KEYS:
+            raise StateError("invalid transcript metadata")
+        for field in TRANSCRIPT_METADATA_KEYS:
+            value = metadata.get(field)
+            if not _nonnegative_int(value):
+                raise StateError("invalid transcript metadata")
+
+    for field in ("handled_event_uuids", "handled_reset_keys"):
+        values = state.get(field)
+        if not isinstance(values, list):
+            raise StateError("invalid identifier set")
+        if any(not isinstance(value, str) or not value for value in values):
+            raise StateError("invalid identifier set")
+        if len(set(values)) != len(values):
+            raise StateError("duplicate identifier")
+    _validate_incident(state.get("incident"))
+    return state
+
+
+def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict:
+    result: dict = {}
+    for key, value in pairs:
+        if key in result:
+            raise StateError("duplicate state key")
+        result[key] = value
+    return result
+
+
+def _reject_nonfinite(_value: str) -> None:
+    raise StateError("non-finite state number")
+
+
+def load_state(path: Path) -> dict:
+    """Load a valid private state file without repairing it implicitly."""
+    path = Path(path)
+    try:
+        file_stat = path.lstat()
+    except OSError as error:
+        raise StateError("state unavailable") from error
+    if not stat.S_ISREG(file_stat.st_mode) or stat.S_IMODE(file_stat.st_mode) != 0o600:
+        raise StateError("state is not private regular storage")
+    if file_stat.st_size > MAX_STATE_BYTES:
+        raise StateError("state exceeds size limit")
+
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+        try:
+            opened_stat = os.fstat(descriptor)
+            if (
+                opened_stat.st_dev != file_stat.st_dev
+                or opened_stat.st_ino != file_stat.st_ino
+                or not stat.S_ISREG(opened_stat.st_mode)
+                or stat.S_IMODE(opened_stat.st_mode) != 0o600
+                or opened_stat.st_size > MAX_STATE_BYTES
+            ):
+                raise StateError("state changed while opening")
+            chunks: list[bytes] = []
+            remaining = MAX_STATE_BYTES + 1
+            while remaining:
+                chunk = os.read(descriptor, remaining)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            payload = b"".join(chunks)
+        finally:
+            os.close(descriptor)
+    except StateError:
+        raise
+    except OSError as error:
+        raise StateError("state unavailable") from error
+    if len(payload) > MAX_STATE_BYTES:
+        raise StateError("state exceeds size limit")
+
+    try:
+        decoded = payload.decode("utf-8")
+        state = json.loads(
+            decoded,
+            object_pairs_hook=_reject_duplicate_keys,
+            parse_constant=_reject_nonfinite,
+        )
+    except StateError:
+        raise
+    except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as error:
+        raise StateError("state is corrupt") from error
+    return _validate_state(state)
+
+
+def _encoded_state(state: dict) -> bytes:
+    validated = _validate_state(state)
+    try:
+        payload = (
+            json.dumps(
+                validated,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+                allow_nan=False,
+            )
+            + "\n"
+        ).encode("utf-8")
+    except (TypeError, ValueError) as error:
+        raise StateError("state cannot be encoded") from error
+    if len(payload) > MAX_STATE_BYTES:
+        raise StateError("state exceeds size limit")
+    return payload
+
+
+def atomic_write_state(path: Path, state: dict) -> None:
+    """Atomically replace state from a same-directory private temporary file."""
+    path = Path(path)
+    payload = _encoded_state(state)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            dir=path.parent,
+        )
+    except OSError as error:
+        raise StateError("cannot prepare state replacement") from error
+
+    temporary = Path(temporary_name)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "wb") as handle:
+            descriptor = -1
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        os.chmod(path, 0o600, follow_symlinks=False)
+        directory_flags = os.O_RDONLY
+        if hasattr(os, "O_DIRECTORY"):
+            directory_flags |= os.O_DIRECTORY
+        directory_descriptor = os.open(path.parent, directory_flags)
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
+    except OSError as error:
+        raise StateError("cannot replace state") from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _baseline_transcript(
+    transcript: Path,
+    observed_stat: os.stat_result,
+) -> dict[str, int]:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(transcript, flags)
+    except OSError as error:
+        raise StateError("cannot baseline transcript") from error
+    try:
+        opened_stat = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened_stat.st_mode)
+            or opened_stat.st_dev != observed_stat.st_dev
+            or opened_stat.st_ino != observed_stat.st_ino
+        ):
+            raise StateError("transcript changed while baselining")
+        complete_offset = 0
+        cursor = opened_stat.st_size
+        while cursor:
+            start = max(0, cursor - 1024 * 1024)
+            chunk = _read_range(descriptor, start, cursor - start)
+            boundary = chunk.rfind(b"\n")
+            if boundary >= 0:
+                complete_offset = start + boundary + 1
+                break
+            cursor = start
+        return {
+            "offset": complete_offset,
+            "device": opened_stat.st_dev,
+            "inode": opened_stat.st_ino,
+            "ordinal": 0,
+        }
+    finally:
+        os.close(descriptor)
+
+
+def initialize_state(projects_dir: Path, state_path: Path) -> int:
+    """Explicitly baseline regular transcripts at their current byte offsets."""
+    projects_dir = Path(projects_dir)
+    transcripts: dict[str, dict[str, int]] = {}
+    try:
+        projects_stat = projects_dir.lstat()
+        if not stat.S_ISDIR(projects_stat.st_mode):
+            raise StateError("projects root is not a regular directory")
+
+        def raise_walk_error(error: OSError) -> None:
+            raise StateError("cannot completely scan transcripts") from error
+
+        for directory, directory_names, file_names in os.walk(
+            projects_dir,
+            topdown=True,
+            onerror=raise_walk_error,
+            followlinks=False,
+        ):
+            directory_path = Path(directory)
+            directory_names[:] = sorted(
+                name
+                for name in directory_names
+                if not (directory_path / name).is_symlink()
+            )
+            for name in sorted(file_names):
+                if not name.endswith(".jsonl"):
+                    continue
+                transcript = directory_path / name
+                transcript_stat = transcript.lstat()
+                if not stat.S_ISREG(transcript_stat.st_mode):
+                    continue
+                relative = transcript.relative_to(projects_dir).as_posix()
+                transcripts[relative] = _baseline_transcript(
+                    transcript,
+                    transcript_stat,
+                )
+    except StateError:
+        raise
+    except (OSError, ValueError) as error:
+        raise StateError("cannot baseline transcripts") from error
+
+    state = {
+        "schema_version": STATE_SCHEMA_VERSION,
+        "transcripts": transcripts,
+        "handled_event_uuids": [],
+        "handled_reset_keys": [],
+        "incident": None,
+    }
+    atomic_write_state(state_path, state)
+    return len(transcripts)
+
+
+def _discover_transcripts(projects_dir: Path) -> dict[str, tuple[Path, os.stat_result]]:
+    try:
+        root_stat = projects_dir.lstat()
+        if not stat.S_ISDIR(root_stat.st_mode):
+            raise StateError("projects root is not a regular directory")
+
+        discovered: dict[str, tuple[Path, os.stat_result]] = {}
+
+        def raise_walk_error(error: OSError) -> None:
+            raise StateError("cannot completely scan transcripts") from error
+
+        for directory, directory_names, file_names in os.walk(
+            projects_dir,
+            topdown=True,
+            onerror=raise_walk_error,
+            followlinks=False,
+        ):
+            directory_path = Path(directory)
+            safe_directories: list[str] = []
+            for name in sorted(directory_names):
+                candidate = directory_path / name
+                candidate_stat = candidate.lstat()
+                if stat.S_ISDIR(candidate_stat.st_mode):
+                    safe_directories.append(name)
+            directory_names[:] = safe_directories
+            for name in sorted(file_names):
+                if not name.endswith(".jsonl"):
+                    continue
+                transcript = directory_path / name
+                transcript_stat = transcript.lstat()
+                if not stat.S_ISREG(transcript_stat.st_mode):
+                    continue
+                relative = transcript.relative_to(projects_dir).as_posix()
+                if not _valid_relative_transcript(relative):
+                    raise StateError("invalid discovered transcript")
+                discovered[relative] = (transcript, transcript_stat)
+        return discovered
+    except StateError:
+        raise
+    except (OSError, ValueError) as error:
+        raise StateError("cannot discover transcripts") from error
+
+
+def _read_range(descriptor: int, start: int, length: int) -> bytes:
+    chunks: list[bytes] = []
+    position = start
+    remaining = length
+    while remaining:
+        try:
+            chunk = os.pread(descriptor, min(remaining, 1024 * 1024), position)
+        except OSError as error:
+            raise StateError("cannot read transcript") from error
+        if not chunk:
+            raise StateError("transcript changed while reading")
+        chunks.append(chunk)
+        position += len(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def _tail_jsonl(payload: bytes, max_events: int) -> bytes:
+    if not payload or max_events <= 0:
+        return b""
+    parts = payload.rsplit(b"\n", max_events + 1)
+    return b"\n".join(parts[-(max_events + 1) :])
+
+
+def _decode_jsonl(
+    payload: bytes,
+    *,
+    is_new: bool,
+    ordinal: int,
+    max_events: int,
+) -> list[dict]:
+    if not payload:
+        return []
+    if not payload.endswith(b"\n"):
+        raise StateError("internal incomplete transcript range")
+    envelopes: list[dict] = []
+    next_ordinal = ordinal
+    for encoded_line in io.BytesIO(payload):
+        if len(envelopes) >= max_events:
+            raise StateError("transcript event count exceeds limit")
+        if not encoded_line.endswith(b"\n"):
+            raise StateError("incomplete transcript row")
+        line = encoded_line[:-1]
+        if len(line) > MAX_TRANSCRIPT_LINE_BYTES:
+            raise StateError("transcript row exceeds size limit")
+        if not line.strip():
+            raise StateError("empty transcript row")
+        try:
+            record = json.loads(line.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as error:
+            raise StateError("invalid transcript row") from error
+        if not isinstance(record, dict):
+            raise StateError("invalid transcript record")
+        next_ordinal += 1
+        envelopes.append(
+            {"record": record, "ordinal": next_ordinal, "is_new": is_new}
+        )
+    return envelopes
+
+
+def _scan_transcript(
+    transcript: Path,
+    expected_stat: os.stat_result,
+    metadata: dict,
+) -> tuple[dict, list[dict]]:
+    offset = metadata["offset"]
+    if expected_stat.st_size < offset:
+        raise StateError("transcript was truncated")
+    if (
+        expected_stat.st_dev != metadata["device"]
+        or expected_stat.st_ino != metadata["inode"]
+    ):
+        raise StateError("transcript identity changed")
+    increment_size = expected_stat.st_size - offset
+    if increment_size > MAX_INCREMENT_BYTES:
+        raise StateError("transcript increment exceeds size limit")
+
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(transcript, flags)
+    except OSError as error:
+        raise StateError("transcript unavailable") from error
+    try:
+        opened_stat = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened_stat.st_mode)
+            or opened_stat.st_dev != expected_stat.st_dev
+            or opened_stat.st_ino != expected_stat.st_ino
+            or opened_stat.st_size < offset
+        ):
+            raise StateError("transcript changed while opening")
+        if opened_stat.st_size - offset > MAX_INCREMENT_BYTES:
+            raise StateError("transcript increment exceeds size limit")
+        if offset and _read_range(descriptor, offset - 1, 1) != b"\n":
+            raise StateError("transcript checkpoint is not a row boundary")
+        if opened_stat.st_size == offset:
+            return {
+                "offset": offset,
+                "device": opened_stat.st_dev,
+                "inode": opened_stat.st_ino,
+                "ordinal": metadata["ordinal"],
+            }, []
+
+        context_start = max(0, offset - MAX_CONTEXT_BYTES)
+        context_payload = _read_range(
+            descriptor,
+            context_start,
+            offset - context_start,
+        )
+        if context_start:
+            first_boundary = context_payload.find(b"\n")
+            context_payload = (
+                b"" if first_boundary < 0 else context_payload[first_boundary + 1 :]
+            )
+
+        new_payload = _read_range(
+            descriptor,
+            offset,
+            opened_stat.st_size - offset,
+        )
+        last_boundary = new_payload.rfind(b"\n")
+        complete_new = b"" if last_boundary < 0 else new_payload[: last_boundary + 1]
+        context_events = _decode_jsonl(
+            _tail_jsonl(context_payload, MAX_ANCESTRY_EVENTS),
+            is_new=False,
+            ordinal=0,
+            max_events=MAX_ANCESTRY_EVENTS,
+        )
+        new_events = _decode_jsonl(
+            complete_new,
+            is_new=True,
+            ordinal=metadata["ordinal"],
+            max_events=MAX_INCREMENT_EVENTS,
+        )
+        next_metadata = {
+            "offset": offset + len(complete_new),
+            "device": opened_stat.st_dev,
+            "inode": opened_stat.st_ino,
+            "ordinal": metadata["ordinal"] + len(new_events),
+        }
+        return next_metadata, context_events + new_events
+    finally:
+        os.close(descriptor)
+
+
+def scan_incremental(projects_dir: Path, state: dict) -> tuple[dict, list[dict]]:
+    """Read complete new JSONL rows without mutating the caller's checkpoint."""
+    projects_dir = Path(projects_dir)
+    current = copy.deepcopy(state)
+    _validate_state(current)
+    discovered = _discover_transcripts(projects_dir)
+    missing = set(current["transcripts"]) - set(discovered)
+    if missing:
+        raise StateError("checkpointed transcript is unavailable")
+
+    batches: list[dict] = []
+    for relative in sorted(discovered):
+        transcript, transcript_stat = discovered[relative]
+        metadata = current["transcripts"].get(relative)
+        if metadata is None:
+            metadata = {
+                "offset": 0,
+                "device": transcript_stat.st_dev,
+                "inode": transcript_stat.st_ino,
+                "ordinal": 0,
+            }
+        next_metadata, events = _scan_transcript(
+            transcript,
+            transcript_stat,
+            metadata,
+        )
+        current["transcripts"][relative] = next_metadata
+        if any(event["is_new"] for event in events):
+            batches.append({"transcript": relative, "events": events})
+    _validate_state(current)
+    return current, batches
+
+
+def _batch_uuid_map(events: list[dict]) -> dict[str, dict]:
+    result: dict[str, dict] = {}
+    for envelope in events:
+        record = envelope["record"]
+        event_uuid = record.get("uuid")
+        if event_uuid is None:
+            continue
+        if not isinstance(event_uuid, str) or not event_uuid:
+            raise StateError("invalid transcript event identifier")
+        if event_uuid in result:
+            raise StateError("duplicate transcript event identifier")
+        result[event_uuid] = record
+    return result
+
+
+def _turn_status_events(
+    transcript: Path,
+    expected_stat: os.stat_result,
+) -> list[dict]:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(transcript, flags)
+    except OSError as error:
+        raise StateError("turn transcript unavailable") from error
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_dev != expected_stat.st_dev
+            or opened.st_ino != expected_stat.st_ino
+            or opened.st_size != expected_stat.st_size
+        ):
+            raise StateError("turn transcript changed while opening")
+        start = max(0, opened.st_size - TURN_STATUS_TAIL_BYTES)
+        payload = _read_range(descriptor, start, opened.st_size - start)
+        if start:
+            first_boundary = payload.find(b"\n")
+            if first_boundary < 0:
+                return []
+            payload = payload[first_boundary + 1 :]
+        if not payload:
+            return []
+        if not payload.endswith(b"\n"):
+            raise StateError("incomplete turn transcript record")
+        current = transcript.lstat()
+        if (
+            current.st_dev != opened.st_dev
+            or current.st_ino != opened.st_ino
+            or current.st_size != opened.st_size
+        ):
+            raise StateError("turn transcript changed while reading")
+        return _decode_jsonl(
+            payload,
+            is_new=True,
+            ordinal=0,
+            max_events=MAX_ANCESTRY_EVENTS,
+        )
+    finally:
+        os.close(descriptor)
+
+
+def _transcript_accepts_turn(
+    transcript: Path,
+    expected_stat: os.stat_result,
+    expected: ChannelRef,
+) -> bool:
+    """Exhaustively inspect one stable transcript without loading it into memory."""
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(transcript, flags)
+    except OSError as error:
+        raise StateError("turn transcript unavailable") from error
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_dev != expected_stat.st_dev
+            or opened.st_ino != expected_stat.st_ino
+            or opened.st_size != expected_stat.st_size
+        ):
+            raise StateError("turn transcript changed while opening")
+
+        found = False
+        position = 0
+        fragment = b""
+        while position < opened.st_size:
+            length = min(TURN_ACCEPTANCE_READ_BYTES, opened.st_size - position)
+            fragment += _read_range(descriptor, position, length)
+            position += length
+            while True:
+                boundary = fragment.find(b"\n")
+                if boundary < 0:
+                    break
+                encoded_line = fragment[: boundary + 1]
+                fragment = fragment[boundary + 1 :]
+                event = _decode_jsonl(
+                    encoded_line,
+                    is_new=True,
+                    ordinal=0,
+                    max_events=1,
+                )[0]["record"]
+                embedded = _embedded_channel_ref(event)
+                if not _active_ancestry_event(event):
+                    if embedded == expected:
+                        raise StateError("matching carrier has untrusted metadata")
+                    continue
+                disposition, carrier = _ancestry_disposition(event)
+                if disposition == "carrier" and carrier == expected:
+                    found = True
+                elif embedded == expected:
+                    raise StateError("matching carrier has untrusted metadata")
+            if len(fragment) > MAX_TRANSCRIPT_LINE_BYTES:
+                raise StateError("transcript row exceeds size limit")
+        if fragment:
+            raise StateError("incomplete turn transcript record")
+
+        current = transcript.lstat()
+        if (
+            current.st_dev != opened.st_dev
+            or current.st_ino != opened.st_ino
+            or current.st_size != opened.st_size
+            or current.st_mtime_ns != expected_stat.st_mtime_ns
+        ):
+            raise StateError("turn transcript changed while reading")
+        return found
+    finally:
+        os.close(descriptor)
+
+
+def _acceptance_candidates(
+    discovered: dict[str, tuple[Path, os.stat_result]],
+    started_at_ms: int | None,
+) -> dict[str, tuple[Path, os.stat_result]]:
+    if started_at_ms is None:
+        return discovered
+    threshold_ns = max(
+        0,
+        (started_at_ms - TURN_ACCEPTANCE_CLOCK_SKEW_MS) * 1_000_000,
+    )
+    return {
+        relative: item
+        for relative, item in discovered.items()
+        if item[1].st_mtime_ns >= threshold_ns
+    }
+
+
+def _transcript_fingerprint(
+    discovered: dict[str, tuple[Path, os.stat_result]],
+) -> dict[str, tuple[int, int, int, int]]:
+    return {
+        relative: (
+            transcript_stat.st_dev,
+            transcript_stat.st_ino,
+            transcript_stat.st_size,
+            transcript_stat.st_mtime_ns,
+        )
+        for relative, (_transcript, transcript_stat) in discovered.items()
+    }
+
+
+def turn_acceptance(
+    projects_dir: Path,
+    chat_id: str,
+    message_id: str,
+    started_at_ms: int | None = None,
+) -> str:
+    """Prove whether one exact Telegram carrier entered a main transcript."""
+    if (
+        not _valid_channel_identifier(chat_id)
+        or not isinstance(message_id, str)
+        or NUMERIC_MESSAGE_ID.fullmatch(message_id) is None
+        or (
+            started_at_ms is not None
+            and (type(started_at_ms) is not int or started_at_ms <= 0)
+        )
+    ):
+        return "unknown"
+    try:
+        discovered = _discover_transcripts(Path(projects_dir))
+        candidates = _acceptance_candidates(discovered, started_at_ms)
+        expected = ChannelRef(chat_id, message_id)
+        accepted = any(
+            _transcript_accepts_turn(transcript, transcript_stat, expected)
+            for _relative, (transcript, transcript_stat) in sorted(
+                candidates.items()
+            )
+        )
+        verified = _acceptance_candidates(
+            _discover_transcripts(Path(projects_dir)),
+            started_at_ms,
+        )
+        if _transcript_fingerprint(verified) != _transcript_fingerprint(candidates):
+            return "unknown"
+        return "accepted" if accepted else "absent"
+    except (StateError, OSError, OverflowError, TypeError, ValueError):
+        return "unknown"
+
+
+def turn_status(projects_dir: Path, chat_id: str, message_id: str) -> str:
+    """Return a content-free disposition for one exact Telegram message."""
+    if (
+        not _valid_channel_identifier(chat_id)
+        or chat_id.startswith("-")
+        or not isinstance(message_id, str)
+        or NUMERIC_MESSAGE_ID.fullmatch(message_id) is None
+    ):
+        return "unknown"
+    try:
+        discovered = _discover_transcripts(Path(projects_dir))
+        recent = nlargest(
+            TURN_STATUS_MAX_FILES,
+            discovered.items(),
+            key=lambda item: (item[1][1].st_mtime_ns, item[0]),
+        )
+        handled = False
+        for _relative, (transcript, transcript_stat) in recent:
+            events = _turn_status_events(transcript, transcript_stat)
+            events_by_uuid = _batch_uuid_map(events)
+            for envelope in events:
+                status = classify_turn_status(
+                    chat_id,
+                    message_id,
+                    envelope["record"],
+                    events_by_uuid,
+                )
+                if status == "interrupted":
+                    return status
+                if status == "handled":
+                    handled = True
+        return "handled" if handled else "unknown"
+    except (StateError, OSError, OverflowError, TypeError, ValueError):
+        return "unknown"
+
+
+def _new_incident(classified: dict, transcript: str) -> dict:
+    return {
+        "event_uuid": classified["event_uuid"],
+        "transcript": transcript,
+        "event_epoch_ms": classified["event_epoch_ms"],
+        "reset_key": classified["reset_key"],
+        "reset_epoch_ms": classified["reset_epoch_ms"],
+        "limit_origin": {
+            "chat_id": classified["chat_id"],
+            "message_id": classified["message_id"],
+        },
+        "queue": [],
+        "affected_chats": [],
+        "pending_keys": [],
+        "unknown_queue_operation": False,
+        "reply_evidence": {},
+        "attempted_pending_keys": [],
+        "attempts": [],
+        "notified_chat_ids": [],
+        "resolved": False,
+        "expired": False,
+    }
+
+
+def _queue_timestamp(event: dict) -> int | None:
+    return _event_epoch_ms(event)
+
+
+def _queue_key(transcript: str, event: dict, ordinal: int) -> str | None:
+    session_id = event.get("sessionId")
+    timestamp = event.get("timestamp")
+    if (
+        not isinstance(session_id, str)
+        or not session_id
+        or not isinstance(timestamp, str)
+        or not timestamp
+        or not _nonnegative_int(ordinal)
+    ):
+        return None
+    return f"{transcript}:{session_id}:{timestamp}:{ordinal}"
+
+
+def _remember_affected(incident: dict, ref: ChannelRef) -> None:
+    channel = {"chat_id": ref.chat_id, "message_id": ref.message_id}
+    if channel not in incident["affected_chats"]:
+        incident["affected_chats"].append(channel)
+
+
+def _apply_queue_event(
+    incident: dict,
+    transcript: str,
+    event: dict,
+    ordinal: int,
+) -> None:
+    operation = event.get("operation")
+    if operation == "enqueue":
+        enqueued_at_ms = _queue_timestamp(event)
+        key = _queue_key(transcript, event, ordinal)
+        if (
+            enqueued_at_ms is None
+            or enqueued_at_ms < incident["event_epoch_ms"]
+            or key is None
+            or any(entry["key"] == key for entry in incident["queue"])
+            or key in incident["attempted_pending_keys"]
+        ):
+            incident["unknown_queue_operation"] = True
+            return
+        ref = parse_channel(event.get("content"))
+        if ref is None:
+            incident["queue"].append({"key": key, "kind": "other"})
+            return
+        incident["queue"].append(
+            {
+                "key": key,
+                "kind": "telegram",
+                "chat_id": ref.chat_id,
+                "message_id": ref.message_id,
+                "enqueued_at_ms": enqueued_at_ms,
+            }
+        )
+        _remember_affected(incident, ref)
+        return
+    if operation == "dequeue":
+        if incident["queue"]:
+            incident["queue"].pop(0)
+        else:
+            incident["unknown_queue_operation"] = True
+        return
+    incident["unknown_queue_operation"] = True
+
+
+def _native_reply_refs(event: dict, incident_epoch_ms: int) -> list[tuple[str, int]]:
+    if (
+        event.get("type") != "assistant"
+        or event.get("isSidechain") is not False
+        or event.get("userType") != "external"
+        or (
+            "isApiErrorMessage" in event
+            and event.get("isApiErrorMessage") is not False
+        )
+    ):
+        return []
+    event_epoch_ms = _event_epoch_ms(event)
+    if event_epoch_ms is None or event_epoch_ms <= incident_epoch_ms:
+        return []
+    message = event.get("message")
+    if not isinstance(message, dict) or message.get("role") != "assistant":
+        return []
+    content = message.get("content")
+    if not isinstance(content, list):
+        return []
+    refs: list[tuple[str, int]] = []
+    for block in content:
+        if (
+            not isinstance(block, dict)
+            or block.get("type") != "tool_use"
+            or block.get("name") != "mcp__plugin_telegram_telegram__reply"
+        ):
+            continue
+        tool_input = block.get("input")
+        if not isinstance(tool_input, dict):
+            continue
+        raw_chat_id = tool_input.get("chat_id")
+        if type(raw_chat_id) is int:
+            chat_id = str(raw_chat_id)
+        elif isinstance(raw_chat_id, str):
+            chat_id = raw_chat_id
+        else:
+            continue
+        if not _valid_channel_identifier(chat_id):
+            continue
+        refs.append((chat_id, event_epoch_ms))
+    return refs
+
+
+def _record_reply_evidence(incident: dict, event: dict) -> None:
+    affected_ids = {channel["chat_id"] for channel in incident["affected_chats"]}
+    for chat_id, reply_epoch_ms in _native_reply_refs(
+        event,
+        incident["event_epoch_ms"],
+    ):
+        if chat_id not in affected_ids:
+            continue
+        previous = incident["reply_evidence"].get(chat_id)
+        incident["reply_evidence"][chat_id] = (
+            reply_epoch_ms
+            if previous is None
+            else min(previous, reply_epoch_ms)
+        )
+
+
+def _recompute_pending(incident: dict, now_ms: int) -> None:
+    incident["pending_keys"] = [
+        entry["key"]
+        for entry in incident["queue"]
+        if entry["kind"] == "telegram"
+        and now_ms >= entry["enqueued_at_ms"] + PENDING_DELAY_MS
+    ]
+
+
+def _start_incident_if_new(
+    state: dict,
+    transcript: str,
+    event: dict,
+    events_by_uuid: dict[str, dict],
+) -> bool:
+    classified = classify_limit(event, events_by_uuid)
+    if classified is None:
+        return False
+    event_uuid = classified["event_uuid"]
+    reset_key = classified["reset_key"]
+    if event_uuid in state["handled_event_uuids"] or (
+        reset_key is not None
+        and _reset_key_is_handled(state["handled_reset_keys"], reset_key)
+    ):
+        return False
+    state["incident"] = _new_incident(classified, transcript)
+    state["handled_event_uuids"].append(event_uuid)
+    if reset_key is not None:
+        state["handled_reset_keys"].append(reset_key)
+    return True
+
+
+def _reset_key_is_handled(handled_keys: list[str], reset_key: str) -> bool:
+    if reset_key in handled_keys:
+        return True
+    kind, separator, legacy_key = reset_key.partition(":")
+    return bool(separator and kind == "session" and legacy_key in handled_keys)
+
+
+def apply_batch(
+    state: dict,
+    transcript: str,
+    events: list[dict],
+    now_ms: int,
+) -> dict:
+    """Apply one ordered transcript batch and persist identifiers only."""
+    current = copy.deepcopy(state)
+    _validate_state(current)
+    if not _valid_relative_transcript(transcript):
+        raise StateError("invalid batch transcript")
+    if not isinstance(events, list) or not _nonnegative_int(now_ms):
+        raise StateError("invalid transcript batch")
+    for envelope in events:
+        if (
+            not isinstance(envelope, dict)
+            or set(envelope) != {"record", "ordinal", "is_new"}
+            or not isinstance(envelope.get("record"), dict)
+            or not _nonnegative_int(envelope.get("ordinal"))
+            or type(envelope.get("is_new")) is not bool
+        ):
+            raise StateError("invalid transcript event envelope")
+    events_by_uuid = _batch_uuid_map(events)
+
+    for envelope in events:
+        if not envelope["is_new"]:
+            continue
+        event = envelope["record"]
+        incident = current["incident"]
+        if (
+            incident is not None
+            and not incident["resolved"]
+            and now_ms >= incident["event_epoch_ms"] + INCIDENT_TTL_MS
+        ):
+            incident["expired"] = True
+        if incident is not None and (incident["resolved"] or incident["expired"]):
+            _start_incident_if_new(
+                current,
+                transcript,
+                event,
+                events_by_uuid,
+            )
+            continue
+        if incident is None:
+            _start_incident_if_new(
+                current,
+                transcript,
+                event,
+                events_by_uuid,
+            )
+            continue
+
+        if incident["transcript"] != transcript:
+            continue
+        if event.get("type") == "queue-operation":
+            _apply_queue_event(
+                incident,
+                transcript,
+                event,
+                envelope["ordinal"],
+            )
+        else:
+            _record_reply_evidence(incident, event)
+
+    if current["incident"] is not None:
+        _recompute_pending(current["incident"], now_ms)
+    _validate_state(current)
+    return current
+
+
+def _open_descriptor_snapshot() -> set[int] | None:
+    names: list[str] | None = None
+    for descriptor_root in (Path("/proc/self/fd"), Path("/dev/fd")):
+        try:
+            names = os.listdir(descriptor_root)
+            break
+        except OSError:
+            continue
+    if names is None:
+        return None
+    descriptors: set[int] = set()
+    for name in names:
+        try:
+            descriptor = int(name)
+            os.fstat(descriptor)
+        except (OSError, TypeError, ValueError):
+            continue
+        descriptors.add(descriptor)
+    return descriptors
+
+
+def _sqlite_opened_verified_database(
+    before: set[int],
+    expected: os.stat_result,
+) -> bool:
+    after = _open_descriptor_snapshot()
+    if after is None:
+        return False
+    for descriptor in after - before:
+        try:
+            descriptor_stat = os.fstat(descriptor)
+        except OSError:
+            continue
+        if (
+            stat.S_ISREG(descriptor_stat.st_mode)
+            and descriptor_stat.st_dev == expected.st_dev
+            and descriptor_stat.st_ino == expected.st_ino
+        ):
+            return True
+    return False
+
+
+def native_outbound_after(db: Path, chat_id: str, after_ms: int) -> bool:
+    """Check native Telegram delivery metadata without selecting message text."""
+    if not _valid_channel_identifier(chat_id) or not _nonnegative_int(after_ms):
+        return False
+    db = Path(db)
+    descriptor = -1
+    try:
+        db_stat = db.lstat()
+        if not stat.S_ISREG(db_stat.st_mode):
+            return False
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(db, flags)
+        opened_stat = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened_stat.st_mode)
+            or opened_stat.st_dev != db_stat.st_dev
+            or opened_stat.st_ino != db_stat.st_ino
+        ):
+            return False
+        descriptors_before = _open_descriptor_snapshot()
+        if descriptors_before is None:
+            return False
+        uri = f"{db.absolute().as_uri()}?mode=ro"
+        connection = sqlite3.connect(uri, uri=True, timeout=0.1)
+        try:
+            row = connection.execute(
+                """
+                SELECT chat_id, ts, message_id
+                FROM messages
+                WHERE direction='out' AND chat_id=? AND ts>?
+                  AND message_id IS NOT NULL
+                ORDER BY ts LIMIT 1
+                """,
+                (chat_id, after_ms),
+            ).fetchone()
+            current_stat = db.lstat()
+            if (
+                not stat.S_ISREG(current_stat.st_mode)
+                or current_stat.st_dev != opened_stat.st_dev
+                or current_stat.st_ino != opened_stat.st_ino
+                or not _sqlite_opened_verified_database(
+                    descriptors_before,
+                    opened_stat,
+                )
+            ):
+                return False
+        finally:
+            connection.close()
+    except (OSError, RuntimeError, sqlite3.Error, ValueError):
+        return False
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    return row is not None
+
+
+def recovery_confirmed(state: dict, db: Path) -> bool:
+    """Require matching native assistant and native database evidence."""
+    try:
+        current = copy.deepcopy(state)
+        _validate_state(current)
+    except (StateError, TypeError, ValueError):
+        return False
+    incident = current["incident"]
+    if incident is None:
+        return False
+    for chat_id, reply_epoch_ms in sorted(incident["reply_evidence"].items()):
+        if native_outbound_after(db, chat_id, reply_epoch_ms):
+            return True
+    return False
+
+
+def decide_attempt(state: dict, now_ms: int) -> Decision:
+    """Choose one bounded retry identity without performing side effects."""
+    try:
+        current = copy.deepcopy(state)
+        _validate_state(current)
+    except (StateError, TypeError, ValueError):
+        return Decision(False, None, "invalid_state")
+    if not _nonnegative_int(now_ms):
+        return Decision(False, None, "invalid_state")
+    incident = current["incident"]
+    if incident is None or incident["resolved"]:
+        return Decision(False, None, "incident_resolved")
+    if (
+        incident["expired"]
+        or now_ms >= incident["event_epoch_ms"] + INCIDENT_TTL_MS
+    ):
+        return Decision(False, None, "incident_expired")
+    if incident["unknown_queue_operation"]:
+        return Decision(False, None, "unknown_queue_operation")
+
+    attempts = incident["attempts"]
+    attempted_triggers: set[str] = set()
+    for attempt in attempts:
+        if attempt["attempted_at_ms"] > now_ms or attempt["trigger"] in attempted_triggers:
+            return Decision(False, None, "invalid_attempt_history")
+        attempted_triggers.add(attempt["trigger"])
+    if attempts:
+        last_attempt_ms = max(attempt["attempted_at_ms"] for attempt in attempts)
+        if now_ms - last_attempt_ms < COOLDOWN_MS:
+            return Decision(False, None, "cooldown")
+
+    pending_entries = [
+        entry
+        for entry in incident["queue"]
+        if entry["kind"] == "telegram"
+        and now_ms >= entry["enqueued_at_ms"] + PENDING_DELAY_MS
+    ]
+    early_candidates = [
+        entry
+        for entry in pending_entries
+        if f"enqueue:{entry['key']}" not in attempted_triggers
+        and entry["key"] not in incident["attempted_pending_keys"]
+    ]
+    if early_candidates:
+        early_in_window = sum(
+            attempt["trigger"].startswith("enqueue:")
+            and attempt["attempted_at_ms"] > now_ms - EARLY_WINDOW_MS
+            for attempt in attempts
+        )
+        if early_in_window >= MAX_EARLY_ATTEMPTS:
+            return Decision(False, None, "early_retry_budget")
+        return Decision(
+            True,
+            f"enqueue:{early_candidates[0]['key']}",
+            None,
+        )
+
+    reset_key = incident["reset_key"]
+    reset_epoch_ms = incident["reset_epoch_ms"]
+    telegram_waiting = any(
+        entry["kind"] == "telegram" for entry in incident["queue"]
+    )
+    if (
+        reset_key is not None
+        and reset_epoch_ms is not None
+        and telegram_waiting
+        and now_ms >= reset_epoch_ms + RESET_MARGIN_MS
+    ):
+        reset_trigger = f"reset:{reset_key}"
+        if reset_trigger in attempted_triggers:
+            return Decision(False, None, "reset_retry_used")
+        return Decision(True, reset_trigger, None)
+    return Decision(False, None, "no_retry_due")
+
+
+class CommandRunner:
+    """Small argv-only subprocess boundary used by the production runtime."""
+
+    def run(self, argv: list[str], *, timeout: float | None = None):
+        return subprocess.run(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+            shell=False,
+            timeout=timeout,
+        )
+
+
+_runner_factory = CommandRunner
+
+
+def _command_ok(runner, argv: list[str], *, timeout: float) -> bool:
+    try:
+        result = runner.run(argv, timeout=timeout)
+    except (OSError, subprocess.SubprocessError, TimeoutError, ValueError):
+        return False
+    return getattr(result, "returncode", None) == 0
+
+
+def _read_small_regular(path: Path, maximum: int = MAX_STATE_BYTES) -> bytes | None:
+    try:
+        before = path.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise StateError("runtime metadata unavailable") from error
+    if not stat.S_ISREG(before.st_mode) or before.st_size > maximum:
+        raise StateError("invalid runtime metadata")
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise StateError("runtime metadata unavailable") from error
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_dev != before.st_dev
+            or opened.st_ino != before.st_ino
+            or opened.st_size > maximum
+        ):
+            raise StateError("runtime metadata changed while opening")
+        payload = _read_range(descriptor, 0, opened.st_size)
+        after = path.lstat()
+        if after.st_dev != opened.st_dev or after.st_ino != opened.st_ino:
+            raise StateError("runtime metadata changed while reading")
+        return payload
+    finally:
+        os.close(descriptor)
+
+
+def _drop_pending_value(agent_root: Path) -> str:
+    environment_value = os.environ.get("TG_DROP_PENDING_ON_BOOT")
+    if environment_value is not None:
+        if environment_value not in ("0", "1"):
+            raise StateError("invalid drop-pending flag")
+        return environment_value
+    payload = _read_small_regular(agent_root / ".agent-profile.env", 64 * 1024)
+    if payload is None:
+        return "0"
+    try:
+        decoded = payload.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise StateError("invalid agent profile") from error
+    values: list[str] = []
+    for line in decoded.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped.startswith("TG_DROP_PENDING_ON_BOOT="):
+            values.append(stripped.split("=", 1)[1])
+    if not values:
+        return "0"
+    if len(values) != 1 or values[0] not in ("0", "1"):
+        raise StateError("invalid drop-pending flag")
+    return values[0]
+
+
+def _owner_chat_id(agent_root: Path) -> str | None:
+    payload = _read_small_regular(
+        agent_root / ".claude" / "channels" / "telegram" / "access.json",
+        128 * 1024,
+    )
+    if payload is None:
+        return None
+    try:
+        access = json.loads(
+            payload.decode("utf-8"),
+            object_pairs_hook=_reject_duplicate_keys,
+            parse_constant=_reject_nonfinite,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as error:
+        raise StateError("invalid Telegram access policy") from error
+    if not isinstance(access, dict):
+        raise StateError("invalid Telegram access policy")
+    admins = access.get("admins")
+    if not isinstance(admins, list) or not admins:
+        return None
+    value = admins[0]
+    if type(value) is int:
+        value = str(value)
+    if (
+        not isinstance(value, str)
+        or not value
+        or value.startswith("-")
+        or NUMERIC_CHAT_ID.fullmatch(value) is None
+    ):
+        raise StateError("invalid Telegram owner")
+    return value
+
+
+def _restart_hold_status(agent_root: Path) -> str | None:
+    try:
+        hold_payload = _read_small_regular(
+            agent_root / "logs" / "restart-hold.until",
+            128,
+        )
+    except StateError:
+        return "preflight_error"
+    if hold_payload is None:
+        return None
+    try:
+        hold_text = hold_payload.decode("ascii").strip()
+    except UnicodeDecodeError:
+        return "preflight_error"
+    if not hold_text.isdigit():
+        return "preflight_error"
+    if _now_ms() // 1000 < int(hold_text):
+        return "restart_hold"
+    return None
+
+
+def preflight(agent_root: Path, service: str, runner) -> str | None:
+    """Recheck external safety gates without reading channel credentials."""
+    agent_root = Path(agent_root)
+    if not isinstance(service, str) or SERVICE_NAME.fullmatch(service) is None:
+        return "preflight_error"
+    try:
+        hold_status = _restart_hold_status(agent_root)
+        if hold_status is not None:
+            return hold_status
+
+        if not _command_ok(
+            runner,
+            ["systemctl", "is-enabled", "--quiet", service],
+            timeout=COMMAND_TIMEOUT_SECONDS,
+        ):
+            return "service_disabled"
+        if not _command_ok(
+            runner,
+            ["sudo", "systemctl", "is-active", service],
+            timeout=COMMAND_TIMEOUT_SECONDS,
+        ):
+            return "service_inactive"
+
+        health_payload = _read_small_regular(
+            agent_root / "logs" / "health-state.json"
+        )
+        health: dict = {}
+        if health_payload is not None:
+            try:
+                health = json.loads(
+                    health_payload.decode("utf-8"),
+                    object_pairs_hook=_reject_duplicate_keys,
+                    parse_constant=_reject_nonfinite,
+                )
+            except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as error:
+                raise StateError("invalid health state") from error
+            if not isinstance(health, dict):
+                raise StateError("invalid health state")
+            if "claude_authenticated" in health and type(health["claude_authenticated"]) is not bool:
+                raise StateError("invalid health auth state")
+            if health.get("claude_authenticated") is False:
+                return "auth_logged_out"
+            if "restarts_10min" in health and not _nonnegative_int(health["restarts_10min"]):
+                raise StateError("invalid restart count")
+
+        if _drop_pending_value(agent_root) == "1":
+            return "drop_pending_on_boot"
+        if health.get("restarts_10min", 0) >= 2:
+            return "recent_service_restarts"
+    except (StateError, OSError, OverflowError, ValueError):
+        return "preflight_error"
+    return None
+
+
+def _agent_root() -> Path:
+    home = os.environ.get("HOME")
+    if not home:
+        return Path.home()
+    path = Path(home)
+    if not path.is_absolute():
+        raise StateError("HOME must be absolute")
+    return path
+
+
+def _projects_dir(agent_root: Path) -> Path:
+    """Use this instance's Claude config without moving its Telegram state."""
+    configured = os.environ.get("CLAUDE_CONFIG_DIR")
+    if not configured:
+        return agent_root / ".claude" / "projects"
+    config_dir = Path(configured)
+    if not config_dir.is_absolute():
+        raise StateError("CLAUDE_CONFIG_DIR must be absolute")
+    try:
+        config_dir.resolve().relative_to(agent_root.resolve())
+    except ValueError as error:
+        raise StateError("CLAUDE_CONFIG_DIR must stay inside HOME") from error
+    return config_dir / "projects"
+
+
+def _pending_chat_ids(incident: dict) -> list[str]:
+    pending = set(incident["pending_keys"])
+    notified = set(incident["notified_chat_ids"])
+    result: list[str] = []
+    for entry in incident["queue"]:
+        if (
+            entry["kind"] == "telegram"
+            and entry["key"] in pending
+            and entry["chat_id"] not in notified
+            and entry["chat_id"] not in result
+        ):
+            result.append(entry["chat_id"])
+    return result
+
+
+def restart_and_notify(state: dict, service: str, runner) -> bool:
+    """Perform one reserved restart, bounded readiness, and honest notices."""
+    try:
+        _validate_state(state)
+        if SERVICE_NAME.fullmatch(service) is None:
+            return False
+        incident = state["incident"]
+        if incident is None or not incident["attempts"]:
+            return False
+        if _restart_hold_status(_agent_root()) is not None:
+            return False
+        deadline = _monotonic() + ACTION_DEADLINE_SECONDS
+
+        def remaining_timeout(limit: float) -> float:
+            remaining = deadline - _monotonic()
+            return max(0.01, min(limit, remaining))
+
+        if not _command_ok(
+            runner,
+            ["sudo", "systemctl", "restart", service],
+            timeout=remaining_timeout(RESTART_TIMEOUT_SECONDS),
+        ):
+            return False
+
+        ready = False
+        for poll in range(READINESS_POLLS):
+            if _monotonic() >= deadline:
+                break
+            service_ready = _command_ok(
+                runner,
+                ["sudo", "systemctl", "is-active", service],
+                timeout=remaining_timeout(COMMAND_TIMEOUT_SECONDS),
+            )
+            transport_ready = _command_ok(
+                runner,
+                [
+                    "pgrep",
+                    "-u",
+                    str(os.getuid()),
+                    "-f",
+                    TRANSPORT_PATTERN,
+                ],
+                timeout=remaining_timeout(COMMAND_TIMEOUT_SECONDS),
+            )
+            if service_ready and transport_ready:
+                ready = True
+                break
+            if poll + 1 < READINESS_POLLS:
+                remaining = deadline - _monotonic()
+                if remaining <= 0:
+                    break
+                _sleep(min(READINESS_SLEEP_SECONDS, remaining))
+        if not ready:
+            return False
+
+        helper = str(_agent_root() / "bin" / "tg-send")
+        notice_chat_ids = incident["attempts"][-1]["notice_chat_ids"]
+        for chat_id in notice_chat_ids:
+            if _monotonic() >= deadline:
+                break
+            _command_ok(
+                runner,
+                [helper, chat_id, NOTICE_TEXT],
+                timeout=remaining_timeout(COMMAND_TIMEOUT_SECONDS),
+            )
+        return True
+    except (StateError, OSError, OverflowError, ValueError):
+        return False
+
+
+def _open_lifecycle_lock(path: Path) -> int | None:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags, 0o600)
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            os.close(descriptor)
+            raise StateError("lifecycle lock is not regular")
+        os.fchmod(descriptor, 0o600)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(descriptor)
+            return None
+        return descriptor
+    except StateError:
+        raise
+    except OSError as error:
+        raise StateError("lifecycle lock unavailable") from error
+
+
+def _reserve_attempt(state: dict, decision: Decision, now_ms: int) -> None:
+    incident = state["incident"]
+    if incident is None or not decision.eligible or decision.trigger is None:
+        raise StateError("cannot reserve suppressed attempt")
+    attempt_id = f"{now_ms}-{len(incident['attempts']) + 1}"
+    notice_chat_ids = _pending_chat_ids(incident)
+    incident["attempts"].append(
+        {
+            "attempt_id": attempt_id,
+            "trigger": decision.trigger,
+            "attempted_at_ms": now_ms,
+            "stage": "reserved",
+            "notice_chat_ids": notice_chat_ids,
+        }
+    )
+    # At-most-once notification reservation: this marker is persisted with the
+    # attempt before any restart or Telegram side effect. A crash may omit a
+    # notice, but can never duplicate one on a later retry.
+    incident["notified_chat_ids"].extend(notice_chat_ids)
+    if decision.trigger.startswith("enqueue:"):
+        key = decision.trigger.removeprefix("enqueue:")
+        if key not in incident["attempted_pending_keys"]:
+            incident["attempted_pending_keys"].append(key)
+
+
+def _record_suppression(agent_root: Path, reason: str) -> None:
+    if not isinstance(reason, str) or not reason:
+        return
+    path = agent_root / "logs" / "claude-limit-recovery.log"
+    descriptor = -1
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(path, flags, 0o600)
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            return
+        os.fchmod(descriptor, 0o600)
+        payload = (
+            json.dumps(
+                {
+                    "event": "suppressed",
+                    "reason": reason,
+                    "timestamp_ms": _now_ms(),
+                },
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            + "\n"
+        ).encode("utf-8")
+        os.write(descriptor, payload)
+    except (OSError, TypeError, ValueError):
+        pass
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _refresh_transcripts(agent_root: Path, state: dict, now_ms: int) -> dict:
+    state, batches = scan_incremental(
+        _projects_dir(agent_root),
+        state,
+    )
+    for batch in batches:
+        state = apply_batch(
+            state,
+            batch["transcript"],
+            batch["events"],
+            now_ms,
+        )
+    if state["incident"] is not None:
+        _recompute_pending(state["incident"], now_ms)
+        _validate_state(state)
+    return state
+
+
+def _notice_copy(kind: str, *, owner: bool) -> str:
+    if kind == "overloaded":
+        return OWNER_OVERLOAD_NOTICE_TEXT if owner else OVERLOAD_NOTICE_TEXT
+    if kind == "limit":
+        return OWNER_LIMIT_NOTICE_TEXT if owner else LIMIT_NOTICE_TEXT
+    raise StateError("invalid interruption kind")
+
+
+def _notice_recipient_marker(event_uuid: str, recipient: str) -> str:
+    if recipient not in {"affected", "owner"}:
+        raise StateError("invalid notice recipient")
+    return f"notice:{recipient}:{event_uuid}"
+
+
+def _append_notice_checkpoint(handled: list[str], checkpoint: str) -> None:
+    if checkpoint not in handled:
+        handled.append(checkpoint)
+    if len(handled) > MAX_NOTICE_EVENT_UUIDS:
+        del handled[:-MAX_NOTICE_EVENT_UUIDS]
+
+
+def _complete_notice_checkpoint(handled: list[str], event_uuid: str) -> None:
+    for recipient in ("affected", "owner"):
+        marker = _notice_recipient_marker(event_uuid, recipient)
+        if marker in handled:
+            handled.remove(marker)
+    _append_notice_checkpoint(handled, event_uuid)
+
+
+def notification_tick(mode: str) -> int:
+    """Initialize or deliver interruption notices after confirmed sends."""
+    if mode not in {"initialize-notices", "notify"}:
+        return 2
+    descriptor: int | None = None
+    try:
+        agent_root = _agent_root()
+        logs = agent_root / "logs"
+        state_path = logs / NOTICE_STATE_NAME
+        descriptor = _open_lifecycle_lock(logs / NOTICE_LOCK_NAME)
+        if descriptor is None:
+            return INITIALIZE_LOCK_BUSY_EXIT if mode == "initialize-notices" else 0
+        projects_dir = _projects_dir(agent_root)
+        if mode == "initialize-notices":
+            initialize_state(projects_dir, state_path)
+            initialized = load_state(state_path)
+            if initialized["incident"] is not None:
+                raise StateError("initialized notice state contains an incident")
+            return 0
+
+        state = load_state(state_path)
+        retry_state = copy.deepcopy(state)
+        state, batches = scan_incremental(projects_dir, state)
+        reserved: list[dict] = []
+        handled = state["handled_event_uuids"]
+        retry_handled = retry_state["handled_event_uuids"]
+        for batch in batches:
+            events_by_uuid = _batch_uuid_map(batch["events"])
+            for envelope in batch["events"]:
+                if envelope["is_new"] is not True:
+                    continue
+                classified = classify_interruption(
+                    envelope["record"],
+                    events_by_uuid,
+                )
+                if classified is None:
+                    continue
+                event_uuid = classified["event_uuid"]
+                if event_uuid in handled:
+                    continue
+                reserved.append(classified)
+        if not reserved:
+            atomic_write_state(state_path, state)
+            return 0
+
+        try:
+            owner_chat = _owner_chat_id(agent_root)
+        except StateError:
+            owner_chat = None
+        runner = _runner_factory()
+        sender = str(agent_root / "bin" / "tg-send")
+        for interruption in reserved:
+            event_uuid = interruption["event_uuid"]
+            affected_chat = interruption["chat_id"]
+            affected_marker = _notice_recipient_marker(event_uuid, "affected")
+            owner_marker = _notice_recipient_marker(event_uuid, "owner")
+            if affected_marker not in retry_handled:
+                if not _command_ok(
+                    runner,
+                    [
+                        sender,
+                        "--no-watchdog-credit",
+                        affected_chat,
+                        _notice_copy(interruption["kind"], owner=False),
+                    ],
+                    timeout=COMMAND_TIMEOUT_SECONDS,
+                ):
+                    return 1
+                _append_notice_checkpoint(handled, affected_marker)
+                _append_notice_checkpoint(retry_handled, affected_marker)
+                # Keep old transcript offsets until every recipient confirms.
+                # A failed owner copy then retries only the owner destination.
+                atomic_write_state(state_path, retry_state)
+            if (
+                owner_chat is not None
+                and owner_chat != affected_chat
+                and owner_marker not in retry_handled
+            ):
+                if not _command_ok(
+                    runner,
+                    [
+                        sender,
+                        "--no-watchdog-credit",
+                        owner_chat,
+                        _notice_copy(interruption["kind"], owner=True),
+                    ],
+                    timeout=COMMAND_TIMEOUT_SECONDS,
+                ):
+                    return 1
+                _append_notice_checkpoint(handled, owner_marker)
+                _append_notice_checkpoint(retry_handled, owner_marker)
+            _complete_notice_checkpoint(handled, event_uuid)
+            _complete_notice_checkpoint(retry_handled, event_uuid)
+            # Checkpoint each fully delivered event before attempting the next
+            # one, so a later failure cannot duplicate any confirmed recipient.
+            atomic_write_state(state_path, retry_state)
+        if len(handled) > MAX_NOTICE_EVENT_UUIDS:
+            del handled[:-MAX_NOTICE_EVENT_UUIDS]
+        atomic_write_state(state_path, state)
+        return 0
+    except (StateError, OSError, OverflowError, ValueError):
+        return 1
+    finally:
+        if descriptor is not None:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(descriptor)
+
+
+def tick(mode: str) -> int:
+    """Run one initialize, observe, or active scheduler tick."""
+    if mode not in {"initialize", "observe", "active"}:
+        return 2
+    descriptor: int | None = None
+    try:
+        agent_root = _agent_root()
+        logs = agent_root / "logs"
+        state_path = logs / "claude-limit-recovery.json"
+        descriptor = _open_lifecycle_lock(logs / "transport-lifecycle.lock")
+        if descriptor is None:
+            _record_suppression(agent_root, "lifecycle_lock_busy")
+            if mode == "initialize":
+                return INITIALIZE_LOCK_BUSY_EXIT
+            return 0
+        projects_dir = _projects_dir(agent_root)
+        if mode == "initialize":
+            initialize_state(projects_dir, state_path)
+            initialized = load_state(state_path)
+            if initialized["incident"] is not None:
+                raise StateError("initialized state contains an incident")
+            return 0
+
+        state = load_state(state_path)
+        now_ms = _now_ms()
+        state = _refresh_transcripts(agent_root, state, now_ms)
+
+        incident = state["incident"]
+        messages_db = agent_root / ".claude" / "channels" / "telegram" / "messages.db"
+        if incident is not None and recovery_confirmed(state, messages_db):
+            incident["resolved"] = True
+            atomic_write_state(state_path, state)
+            _record_suppression(agent_root, "incident_resolved")
+            return 0
+        if mode == "observe":
+            atomic_write_state(state_path, state)
+            _record_suppression(agent_root, "observe_mode")
+            return 0
+
+        decision = decide_attempt(state, now_ms)
+        if not decision.eligible:
+            if decision.suppression == "incident_expired" and incident is not None:
+                incident["expired"] = True
+            atomic_write_state(state_path, state)
+            _record_suppression(agent_root, decision.suppression or "suppressed")
+            return 0
+
+        runner = _runner_factory()
+        service = os.environ.get(
+            "CLAUDE_TELEGRAM_SERVICE",
+            "claude-telegram.service",
+        )
+        suppression = preflight(agent_root, service, runner)
+        if suppression is not None:
+            atomic_write_state(state_path, state)
+            _record_suppression(agent_root, suppression)
+            return 0
+
+        now_ms = _now_ms()
+        state = _refresh_transcripts(agent_root, state, now_ms)
+        incident = state["incident"]
+        if incident is not None and recovery_confirmed(state, messages_db):
+            incident["resolved"] = True
+            atomic_write_state(state_path, state)
+            _record_suppression(agent_root, "incident_resolved")
+            return 0
+        decision = decide_attempt(state, now_ms)
+        if not decision.eligible:
+            if decision.suppression == "incident_expired" and incident is not None:
+                incident["expired"] = True
+            atomic_write_state(state_path, state)
+            _record_suppression(agent_root, decision.suppression or "suppressed")
+            return 0
+
+        _reserve_attempt(state, decision, now_ms)
+        atomic_write_state(state_path, state)
+        restarted = restart_and_notify(state, service, runner)
+        atomic_write_state(state_path, state)
+        if not restarted:
+            _record_suppression(agent_root, "restart_or_readiness_failed")
+        return 0
+    except (StateError, OSError, OverflowError, ValueError):
+        return 1
+    finally:
+        if descriptor is not None:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(descriptor)
+
+
+def limit_status() -> int:
+    """Refresh transcript evidence and expose one sanitized restart guard."""
+    descriptor: int | None = None
+    try:
+        agent_root = _agent_root()
+        logs = agent_root / "logs"
+        state_path = logs / "claude-limit-recovery.json"
+        descriptor = _open_lifecycle_lock(logs / "transport-lifecycle.lock")
+        if descriptor is None:
+            return 1
+        state = load_state(state_path)
+        now_ms = _now_ms()
+        state = _refresh_transcripts(agent_root, state, now_ms)
+        incident = state["incident"]
+        messages_db = agent_root / ".claude" / "channels" / "telegram" / "messages.db"
+        if incident is not None and recovery_confirmed(state, messages_db):
+            incident["resolved"] = True
+        if (
+            incident is not None
+            and not incident["resolved"]
+            and now_ms >= incident["event_epoch_ms"] + INCIDENT_TTL_MS
+        ):
+            incident["expired"] = True
+        active = bool(
+            incident is not None
+            and not incident["resolved"]
+            and not incident["expired"]
+        )
+        atomic_write_state(state_path, state)
+        print(json.dumps(
+            {"schemaVersion": 1, "active": active},
+            separators=(",", ":"),
+            sort_keys=True,
+        ))
+        return 0
+    except (StateError, OSError, OverflowError, ValueError):
+        return 1
+    finally:
+        if descriptor is not None:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(descriptor)
+
+
+def main() -> int:
+    """Parse the deliberately small CLI without implicit active behavior."""
+    arguments = sys.argv[1:]
+    if not arguments:
+        return tick("observe")
+    if arguments == ["--status"]:
+        return limit_status()
+    if len(arguments) == 4 and arguments[0] == "--turn-acceptance":
+        if NUMERIC_MESSAGE_ID.fullmatch(arguments[3]) is None:
+            return 2
+        status = turn_acceptance(
+            _agent_root() / ".claude" / "projects",
+            arguments[1],
+            arguments[2],
+            int(arguments[3]),
+        )
+        print(status)
+        return 0
+    if len(arguments) == 3 and arguments[0] == "--turn-status":
+        status = turn_status(
+            _agent_root() / ".claude" / "projects",
+            arguments[1],
+            arguments[2],
+        )
+        print(status)
+        return 0
+    if len(arguments) != 1:
+        return 2
+    notice_modes = {
+        "--initialize-notices": "initialize-notices",
+        "--notify": "notify",
+    }
+    notice_mode = notice_modes.get(arguments[0])
+    if notice_mode is not None:
+        return notification_tick(notice_mode)
+    modes = {
+        "--initialize": "initialize",
+        "--observe": "observe",
+        "--active": "active",
+    }
+    mode = modes.get(arguments[0])
+    if mode is None:
+        return 2
+    return tick(mode)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
