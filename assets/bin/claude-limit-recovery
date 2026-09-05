@@ -1785,6 +1785,18 @@ def apply_batch(
     """Apply one ordered transcript batch and persist identifiers only."""
     current = copy.deepcopy(state)
     _validate_state(current)
+    _apply_batch_in_place(current, transcript, events, now_ms)
+    _validate_state(current)
+    return current
+
+
+def _apply_batch_in_place(
+    current: dict,
+    transcript: str,
+    events: list[dict],
+    now_ms: int,
+) -> None:
+    """Apply one batch to an exclusively owned, already validated state."""
     if not _valid_relative_transcript(transcript):
         raise StateError("invalid batch transcript")
     if not isinstance(events, list) or not _nonnegative_int(now_ms):
@@ -1842,8 +1854,6 @@ def apply_batch(
 
     if current["incident"] is not None:
         _recompute_pending(current["incident"], now_ms)
-    _validate_state(current)
-    return current
 
 
 def _open_descriptor_snapshot() -> set[int] | None:
@@ -2432,8 +2442,10 @@ def _refresh_transcripts(agent_root: Path, state: dict, now_ms: int) -> dict:
         _projects_dir(agent_root),
         state,
     )
+    # scan_incremental returns its own deep copy and validates it. Reusing that
+    # private state avoids copying/checking all transcript baselines per batch.
     for batch in batches:
-        state = apply_batch(
+        _apply_batch_in_place(
             state,
             batch["transcript"],
             batch["events"],
@@ -2441,7 +2453,7 @@ def _refresh_transcripts(agent_root: Path, state: dict, now_ms: int) -> dict:
         )
     if state["incident"] is not None:
         _recompute_pending(state["incident"], now_ms)
-        _validate_state(state)
+    _validate_state(state)
     return state
 
 

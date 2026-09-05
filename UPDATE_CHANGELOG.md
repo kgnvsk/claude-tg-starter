@@ -1,8 +1,8 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-09-05.cb4348270e9a`
+- Реліз: `2026-09-05.86ce34babf22`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `cb4348270e9a3a2269c94aaa524e3fc5e1dc90a0`
+- Ревізія вихідного комплекту: `86ce34babf221081e5ec7fa94a4f813451bc5c39`
 - Дата релізу: `2026-09-05`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
@@ -19,10 +19,7 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    fix: advance recovery checkpoints through bounded transcript prefixes
-    fix: preserve delivery guards across cosmetic transcript duplicates
-    fix: preserve recovery scans across cosmetic transcript duplicates
-    fix: keep recovery scanning past unreferenced missing history
+    fix: avoid repeated checkpoint copies during recovery refresh
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не
