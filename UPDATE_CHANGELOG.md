@@ -1,8 +1,8 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-09-05.5835516801e8`
+- Реліз: `2026-09-05.0ad613b97af6`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `5835516801e8e1ff86b9ae4e751c519bb0d5b8db`
+- Ревізія вихідного комплекту: `0ad613b97af610369983dab64d6c483b5f805dec`
 - Дата релізу: `2026-09-05`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
@@ -19,10 +19,9 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    fix: retain the shared base research skill in both Starters
-    fix: keep the empty Starter selection consistent across engines
-    feat: give fresh Starter agents a verified memory and voice foundation
-    docs: define the shared Novsky Starter foundation
+    fix: release Telegram delivery across Claude runtime snapshots
+    test: align connector regressions with owner-selected setup
+    fix: keep SSH control socket paths within the macOS limit
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не

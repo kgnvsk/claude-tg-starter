@@ -64,6 +64,16 @@ CONTINUATION_ATTACHMENT_TYPES = frozenset(
         # Native subagent progress does not sever the original Telegram turn.
         # Delivery still requires the exact chat/receipt; status alone is not proof.
         "task_status",
+        # Claude 2.1.261 records these snapshots within a turn (including after
+        # the reply receipt). They are metadata, not a new user/channel prompt.
+        # Unknown attachment kinds still fail closed; delivery needs a receipt.
+        "instructions",
+        "session_context",
+        "date",
+        "prompt_snapshot",
+        "environment",
+        "model",
+        "deferred_tools_record",
     }
 )
 CHANNEL_ENVELOPE = re.compile(

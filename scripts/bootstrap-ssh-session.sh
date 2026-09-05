@@ -108,8 +108,10 @@ BASE_ROOT="${TMPDIR:-/tmp}"
 BASE_DIR="${BASE_ROOT%/}/claude-premium-ssh-$LOCAL_UID"
 SOCKET="$BASE_DIR/cp-$SOCKET_ID.sock"
 
-# macOS limits Unix-domain socket paths. Fall back to short /tmp when needed.
-if [ "${#SOCKET}" -gt 90 ]; then
+# macOS sun_path holds 104 bytes including NUL. OpenSSH muxserver_listen adds
+# a dot and 16 random characters before binding: 104 - 1 - 17 = 86 bytes.
+# Count bytes, not characters, so a Unicode TMPDIR also gets the short fallback.
+if [ "$(printf '%s' "$SOCKET" | wc -c)" -gt 86 ]; then
   BASE_DIR="/tmp/claude-premium-ssh-$LOCAL_UID"
   SOCKET="$BASE_DIR/cp-$SOCKET_ID.sock"
 fi
