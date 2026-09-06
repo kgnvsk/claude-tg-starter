@@ -13,6 +13,7 @@ import sqlite3
 import stat
 import sys
 import tempfile
+import uuid
 
 
 MALFORMED_WINDOW_SECONDS = 10 * 60
@@ -36,6 +37,7 @@ UNSAFE_FALLBACK_TEXT = re.compile(
     re.IGNORECASE,
 )
 TRANSCRIPT_TAIL_BYTES = 16 * 1024 * 1024
+TEAM_CLIENT = Path('/usr/local/lib/novsky-team/client.py')
 CONTINUATION_ATTACHMENT_TYPES = frozenset(
     {
         "task_reminder",
@@ -879,6 +881,35 @@ def deliver_pending_answer(turn_events: list[object], chat_id: str) -> bool:
     return False
 
 
+def delegated_turn_work(hook: dict, events: list[dict], turn_events: list[dict]) -> dict:
+    """An acknowledgement must not release the owner FIFO during delegation."""
+    if not TEAM_CLIENT.is_file():
+        return {'pending': [], 'reportedAt': None}
+    scope = str(uuid.UUID(hook['session_id']))
+    carrier_id = ancestry_parent_uuid(turn_events[0]) if turn_events else None
+    carrier = next((event for event in events if event.get('uuid') == carrier_id), None)
+    after = event_timestamp(carrier)
+    if after is None:
+        raise ValueError('Native turn timestamp unavailable')
+    result = subprocess.run([sys.executable, str(TEAM_CLIENT), 'turn-work', scope, str(after)],
+                            capture_output=True, text=True, timeout=15, check=True)
+    work = json.loads(result.stdout)
+    if (not isinstance(work, dict) or set(work) != {'pending', 'reportedAt'}
+            or not isinstance(work['pending'], list) or len(work['pending']) > 20):
+        raise ValueError('Invalid delegation state')
+    for task_id in work['pending']:
+        if str(uuid.UUID(task_id)) != task_id:
+            raise ValueError('Invalid delegation identity')
+    reported = work['reportedAt']
+    if reported is not None and (type(reported) not in (int, float) or not 0 < reported < 10**11):
+        raise ValueError('Invalid delegation receipt')
+    return work
+
+
+def block_delegation(reason: str) -> None:
+    print(json.dumps({'decision': 'block', 'reason': reason, 'systemMessage': reason}))
+
+
 def main() -> None:
     try:
         hook = json.load(sys.stdin)
@@ -898,6 +929,21 @@ def main() -> None:
     if chat_id is None:
         return
     delivery_id = telegram_delivery_id(prompt, origin)
+
+    try:
+        work = delegated_turn_work(hook, events, turn_events)
+    except Exception:
+        block_delegation('Could not confirm your delegated work. Retry the existing task status; do not resubmit it or release this Telegram request yet.')
+        return
+    if work['pending']:
+        block_delegation('This Telegram request still has unread delegated work. An acknowledgement is not its final result. Use novsky-team wait for these existing IDs, read their complete final outputs, and deliver the result to Telegram before ending: '+', '.join(work['pending']))
+        return
+    if work['reportedAt'] is not None:
+        # A reply sent before reading a child result is only an acknowledgement.
+        turn_events = [event for event in turn_events if (event_timestamp(event) or 0) >= work['reportedAt']]
+        if not successful_delivery(turn_events, chat_id, events) and not final_answer_text(turn_events):
+            block_delegation('The delegated result was read, but no final Telegram response followed it. Deliver the actual result to this chat before ending; do not resubmit the completed work.')
+            return
 
     remove_stale_cleanup_proof()
     native_delivery = (

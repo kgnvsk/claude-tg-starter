@@ -19,7 +19,7 @@ import { z } from 'zod'
 import { Bot, GrammyError, InlineKeyboard, InputFile, type Context } from 'grammy'
 import type { ReactionTypeEmoji } from 'grammy/types'
 import { randomBytes } from 'crypto'
-import { accessSync, constants, readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, lstatSync, renameSync, realpathSync, chmodSync } from 'fs'
+import { accessSync, constants, existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, lstatSync, renameSync, realpathSync, chmodSync } from 'fs'
 import { homedir } from 'os'
 import { execFileSync } from 'child_process'
 import { join, extname, sep, relative, resolve } from 'path'
@@ -1524,16 +1524,16 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ['chat_id', 'message_id', 'text'],
       },
     },
-    ...(CORPORATE_ENABLED ? [{
+    ...(CORPORATE_ENABLED || (OWNER_CHAT_ID && existsSync(CORPORATE_MODULE)) ? [{
       name: 'corporate_policy_preview',
-      description: 'Create an owner-only preview for changing one corporate user, group, or topic policy. This never applies the change directly; the owner receives Confirm and Cancel buttons in Telegram.',
+      description: 'Ask the human owner to change or revoke a connected agent’s access. Employee, group and topic policies also require corporate mode. This never applies the change directly; the owner receives Confirm and Cancel buttons in Telegram.',
       inputSchema: {
         type: 'object',
         additionalProperties: false,
         properties: {
           subject: {
             type: 'string',
-            description: 'Exact subject: user:<telegram_id>, group:<chat_id>, topic:<chat_id>:<thread_id>, or agent:default — the agent-level policy every conversation without a policy of its own inherits (the owner sets access once for the whole agent).',
+            description: 'Exact subject: user:<telegram_id>, group:<chat_id>, topic:<chat_id>:<thread_id>, agent:default, or agent:installed:<agent_id>:<unix_uid> for a connected agent. For revocation use an empty proposedGrants array. A preview always requires real owner confirmation.',
           },
           proposedGrants: {
             type: 'array',
@@ -1562,7 +1562,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
   try {
     switch (req.params.name) {
       case 'corporate_policy_preview': {
-        if (!CORPORATE_ENABLED || !OWNER_CHAT_ID) {
+        if (!OWNER_CHAT_ID) {
           throw new Error('corporate policy controls are unavailable')
         }
         const subject = args.subject
@@ -1589,6 +1589,16 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
             resourceId: grant.resourceId as string | null,
           }
         })
+        if (subject.startsWith('agent:installed:')) {
+          const { CapabilityStore } = await import(new URL('./capability-store.ts', pathToFileURL(CORPORATE_MODULE)).href)
+          const store = new CapabilityStore(join(STATE_DIR, 'messages.db'), { primaryOwnerId: OWNER_CHAT_ID })
+          const preview = store.createAgentOwnerPreview({ subject, proposedGrants, requestedBy: OWNER_CHAT_ID, expiresAt: Date.now() + 3600000 }, Date.now())
+          const summary = proposedGrants.length ? 'Права підключеного агента:\n' + proposedGrants.map(g => `${store.getResource(g.resourceId)?.label ?? g.resourceId}: ${g.capabilityId}`).join('\n')
+            : 'Відкликати всі надані цьому агенту права на твої ресурси? Твої права не зміняться.'
+          const messageId = await sendCorporateText(OWNER_CHAT_ID, null, null, summary, { policyToken: preview.token })
+          store.bindAgentAccessMessage(preview.token, subject, { chatId: OWNER_CHAT_ID, messageId })
+          return { content: [{ type: 'text', text: 'Запит надіслано власнику. Права зміняться лише після підтвердження.' }] }
+        }
         const corporate = await corporateRuntimeReady()
         if (!corporate) throw new Error('corporate runtime unavailable')
         const preview = await corporate.previewPolicy(
@@ -2061,6 +2071,23 @@ bot.on('callback_query:data', async ctx => {
       ...('message_thread_id' in message && message.message_thread_id != null
         ? { threadId: message.message_thread_id }
         : {}),
+    }
+    let agentDecision: CorporateGatewayPolicyResult | null = null
+    if (kind === 'policy') {
+      try {
+        const access = await import(new URL('./agent-access.ts', pathToFileURL(CORPORATE_MODULE)).href)
+        const result = access.agentAccessDecision(join(STATE_DIR, 'messages.db'), OWNER_CHAT_ID, token, behavior, callbackContext)
+        if (result) agentDecision = result
+      } catch { /* An absent legacy module never grants access. */ }
+    }
+    if (agentDecision) {
+      const label = corporateCallbackLabel('policy', agentDecision)
+      await ctx.answerCallbackQuery({ text: label }).catch(() => {})
+      if (!agentDecision.ok && agentDecision.reason === 'actor') return
+      if ('text' in message && message.text && agentDecision.ok) {
+        await ctx.editMessageText(`${message.text}\n\n${label}`).catch(() => {})
+      }
+      return
     }
     const corporate = await corporateRuntimeReady()
     if (!corporate) {
