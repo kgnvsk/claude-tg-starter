@@ -1,9 +1,9 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-09-05.86ce34babf22`
+- Реліз: `2026-09-06.aea7eb7c4e55`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `86ce34babf221081e5ec7fa94a4f813451bc5c39`
-- Дата релізу: `2026-09-05`
+- Ревізія вихідного комплекту: `aea7eb7c4e55468f33c97668133cc7b4c7ca5d49`
+- Дата релізу: `2026-09-06`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
 
@@ -19,7 +19,8 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    fix: avoid repeated checkpoint copies during recovery refresh
+    fix: bound Telegram metadata and reject incomplete files
+    fix: preserve pre-escaped Telegram formatting
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не

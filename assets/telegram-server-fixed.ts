@@ -1740,14 +1740,14 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       }
       case 'download_attachment': {
         const file_id = args.file_id as string
-        const file = await bot.api.getFile(file_id)
+        const file = await bot.api.getFile(file_id, AbortSignal.timeout(TELEGRAM_FETCH_TIMEOUT_MS))
         if (!file.file_path) throw new Error('Telegram returned no file_path — file may have expired')
         const url = `https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`
         const res = await fetch(url, {
           signal: AbortSignal.timeout(TELEGRAM_FETCH_TIMEOUT_MS),
         })
         if (!res.ok) throw new Error(`download failed: HTTP ${res.status}`)
-        const buf = Buffer.from(await res.arrayBuffer())
+        const buf = await readTelegramFileResponse(res, file.file_size)
         // file_path is from Telegram (trusted), but strip to safe chars anyway
         // so nothing downstream can be tricked by an unexpected extension.
         const rawExt = file.file_path.includes('.') ? file.file_path.split('.').pop()! : 'bin'
@@ -2156,6 +2156,29 @@ bot.on('message:text', async ctx => {
   await handleInbound(ctx, ctx.message.text, undefined)
 })
 
+async function readTelegramFileResponse(response: Response, expectedSize?: number): Promise<Buffer> {
+  const limit = 20 * 1024 * 1024
+  if (!response.ok || !response.body) throw new Error('Telegram file download failed')
+  const length = response.headers.get('content-length')
+  const reader = response.body.getReader()
+  const chunks: Uint8Array[] = []
+  let total = 0
+  try {
+    if ((expectedSize != null && expectedSize > limit) || (length != null && (!/^\d+$/.test(length) || Number(length) > limit))) throw new Error('Telegram file exceeds 20 MB')
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      total += value.byteLength
+      if (total > limit) throw new Error('Telegram file exceeds 20 MB')
+      chunks.push(value)
+    }
+    if ((Number.isSafeInteger(expectedSize) && total !== expectedSize)
+      || (length != null && !response.headers.get('content-encoding') && total !== Number(length))) throw new Error('Incomplete Telegram file')
+    return Buffer.concat(chunks, total)
+  } finally { await reader.cancel().catch(() => {}); reader.releaseLock() }
+}
+// End bounded Telegram download
+
 bot.on('message:photo', async ctx => {
   const caption = ctx.message.caption ?? '(photo)'
   // Defer download until after the gate approves — any user can send photos,
@@ -2165,13 +2188,13 @@ bot.on('message:photo', async ctx => {
     const photos = ctx.message.photo
     const best = photos[photos.length - 1]
     try {
-      const file = await ctx.api.getFile(best.file_id)
+      const file = await ctx.api.getFile(best.file_id, AbortSignal.timeout(TELEGRAM_FETCH_TIMEOUT_MS))
       if (!file.file_path) return undefined
       const url = `https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`
       const res = await fetch(url, {
         signal: AbortSignal.timeout(TELEGRAM_FETCH_TIMEOUT_MS),
       })
-      const buf = Buffer.from(await res.arrayBuffer())
+      const buf = await readTelegramFileResponse(res, file.file_size ?? best.file_size)
       const ext = file.file_path.split('.').pop() ?? 'jpg'
       const path = join(INBOX_DIR, `${Date.now()}-${best.file_unique_id}.${ext}`)
       mkdirSync(INBOX_DIR, { recursive: true })
@@ -2341,7 +2364,7 @@ async function transcribeObservedAttachment(
 
   let localPath: string | undefined
   try {
-    const file = await ctx.api.getFile(attachment.file_id)
+    const file = await ctx.api.getFile(attachment.file_id, AbortSignal.timeout(TELEGRAM_FETCH_TIMEOUT_MS))
     if (!file.file_path) throw new Error('Telegram returned no file_path')
     const url = `https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`
     const res = await fetch(url, {
@@ -2353,7 +2376,7 @@ async function transcribeObservedAttachment(
     const uniqueId = (file.file_unique_id ?? '').replace(/[^a-zA-Z0-9_-]/g, '') || 'voice'
     localPath = join(INBOX_DIR, `${Date.now()}-${uniqueId}.${ext}`)
     mkdirSync(INBOX_DIR, { recursive: true })
-    writeFileSync(localPath, Buffer.from(await res.arrayBuffer()))
+    writeFileSync(localPath, await readTelegramFileResponse(res, file.file_size ?? attachment.size))
 
     const proc = Bun.spawn([
       TRANSCRIBE_TELEGRAM_BIN,
@@ -2388,7 +2411,7 @@ async function downloadCorporateImage(ctx: Context, attachment?: AttachmentMeta)
   }
   const media = await import(new URL('./media.ts', pathToFileURL(CORPORATE_MODULE)).href)
   if (incoming.file_size != null && incoming.file_size > media.MAX_IMAGE_BYTES) throw new Error('image too large')
-  const file = await ctx.api.getFile(incoming.file_id)
+  const file = await ctx.api.getFile(incoming.file_id, AbortSignal.timeout(TELEGRAM_FETCH_TIMEOUT_MS))
   if (!file.file_path || file.file_path.includes('..') || !/^[A-Za-z0-9_./-]+$/.test(file.file_path)) {
     throw new Error('invalid Telegram file path')
   }
@@ -2396,7 +2419,7 @@ async function downloadCorporateImage(ctx: Context, attachment?: AttachmentMeta)
   const response = await fetch(`https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`, {
     signal: AbortSignal.timeout(TELEGRAM_FETCH_TIMEOUT_MS), redirect: 'error',
   })
-  return media.readImageResponse(response, photo ? 'image/jpeg' : document?.mime_type)
+  return media.readImageResponse(response, photo ? 'image/jpeg' : document?.mime_type, file.file_size ?? incoming.file_size)
 }
 
 async function routeInbound(

@@ -4,7 +4,7 @@
   "productId": "starter",
   "displayName": "Novsky Starter",
   "source": "codex/starter/product.json",
-  "sourceRevision": "86ce34babf221081e5ec7fa94a4f813451bc5c39",
+  "sourceRevision": "aea7eb7c4e55468f33c97668133cc7b4c7ca5d49",
   "sourceDirty": false,
   "features": [
     "browser"

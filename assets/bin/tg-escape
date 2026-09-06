@@ -40,7 +40,8 @@ RESERVED = r'_*[]()~`>#+-=|{}.!'
 #   ~ ... ~          strike
 #   || ... ||        spoiler
 TOKEN_RE = re.compile(
-    r'(?P<pre>```.*?```)'
+    r'(?P<escaped>\\[' + re.escape(RESERVED + '\\') + r'])'
+    r'|(?P<pre>```.*?```)'
     r'|(?P<code>`[^`\n]*?`)'
     r'|(?P<link>\[[^\]\n]*?\]\([^)\n]*?\))'
     r'|(?P<bold>\*[^*\n]+?\*)'
@@ -53,13 +54,20 @@ TOKEN_RE = re.compile(
 
 
 def escape_plain(text: str) -> str:
-    """Экранировать каждый reserved-символ в обычном тексте."""
+    """Preserve an existing escape; escape raw punctuation and backslashes once."""
     out = []
-    for ch in text:
-        if ch in RESERVED:
+    pos = 0
+    while pos < len(text):
+        ch = text[pos]
+        if ch == '\\' and pos + 1 < len(text) and text[pos + 1] in RESERVED + '\\':
+            out.append(text[pos:pos + 2])
+            pos += 2
+            continue
+        if ch in RESERVED + '\\':
             out.append('\\' + ch)
         else:
             out.append(ch)
+        pos += 1
     return ''.join(out)
 
 
@@ -84,7 +92,9 @@ def process(text: str) -> str:
         kind = m.lastgroup
         raw = m.group()
 
-        if kind == 'pre':
+        if kind == 'escaped':
+            result.append(raw)
+        elif kind == 'pre':
             inner = raw[3:-3]
             result.append('```' + escape_code_inner(inner) + '```')
         elif kind == 'code':
