@@ -3,8 +3,11 @@
   "engine": "codex",
   "productId": "starter",
   "displayName": "Novsky Starter",
+  "installerCapabilities": [
+    "readonly-plan-v1"
+  ],
   "source": "codex/starter/product.json",
-  "sourceRevision": "7b2ee757625859758e82dded46f97aede51fd682",
+  "sourceRevision": "fcc6bcef3b04df7462c562626e2c1680fcdcb5a2",
   "sourceDirty": false,
   "features": [
     "browser"
@@ -43,11 +46,11 @@
   },
   "sourceFiles": {
     "codex/starter/product.json": "1c1af4deb3585fabd91e7b67b053772711d839d1fc3dd4c32142ea12a13c56a5",
-    "codex/build.py": "0ccaf9372b1d938e053cb54733ed883455914d606818c1194c746d5596609720",
-    "codex/install.py": "f314d7b93cf23b707b418e50817df30b533e6f659624f7e50eaac5b7b453ce8a",
+    "codex/build.py": "20a6768b20687b29ab0966245507d46c7469f3b495e7816d0f697578d7f9d690",
+    "codex/install.py": "f190da8ae0ed27c1474a8b76c7f3603c17bd90c0cc4ca7ae9b67ccf61b69c1d4",
     "codex/install-node.py": "9c14f78bf321ab74ca0b14e38e6056c3d705ff98c3f7e0ac1166b3cf24c34539",
     "codex/dependencies.py": "1baf48535fd53745ce61ba59f7d520d159b5d5fb4f09484c580bcb56b07d75e3",
-    "codex/setup.py": "7b51af31288ac8a0ab56b740a0a94aa4d0a9cbce42a7b80f814357689b38a7d0",
+    "codex/setup.py": "6108aa5faca644e7cf2eb0cb6a35390307bd0d571047bb6fa002abdd012bed33",
     "codex/verify-permissions.py": "4062c6d95d232588a652906ef30d9a3ed5f2a72e6676f9578e1da6d9c39c2998",
     "codex/integrations.py": "ae80dc840bda606838b7a8a2cefff64748c1d42a32c22ef0f390965f32745cde",
     "codex/corporate.py": "430ebc3b1e9d1161328ecdf9b121865c33ea52f74ae49924194b6c17bfb9103d",
@@ -57,7 +60,8 @@
     "codex/skills/novsky-memory/SKILL.md": "3dae69a7871866fcd789794c4bc007d191dabd8e039c4faaf26524072c79858e",
     "codex/skills/novsky-research/SKILL.md": "776d40e34a23adad75de2e2ef277fdca8838edadf8820138e848b924ef6d6ef3",
     "codex/templates/AGENTS.md": "f4ee16ad00dd9550b6adc935cf55c49b7f9b09c7ac2568787b7683e0ad4af542",
-    "codex/templates/NOVSKY.md": "0955de6bd3b04340ed04c36b79818a256eb8273206b7c7e336744225c68f2319",
+    "codex/templates/NOVSKY.md": "e30bf4caa60a5872a7d07893b2887125d62e1715d637cd66537ca8734bf5cdae",
+    "codex/UPGRADING.md": "40b6ed3987d982811ff9b8c81203992747c46a1eae737a55fb010555201e3604",
     "codex/native-lifecycle": "6ca0752158b58aa9a4353841a48e9614b355639267d89682f726d9b5cbcf3720",
     "codex/starter/ROLE.md": "276957f12417fa60c61459f56b6c9a2c4af980918b46b320e92a59dd6bbdd5d1",
     "assets/templates/USER.md": "0175b8704a55cb32f951a53a4d6f1522b950299e3ec5b7c700299258cc8b4e09",
@@ -75,7 +79,7 @@
     "assets/bin/memory-open": "c9ed9335cc4aa96d00260bf643d71e6405caef44eae1e2a4dee0c540ba601d86",
     "assets/bin/memory-search": "6536ec596067f4b6a6b1b6cd30fbc9d90b43f6e1dcd9bae72099be0d8c978da9",
     "assets/bin/reminder-task": "baeb03fa08268de072aafa4415ea7007573b03a0fc172d671f2c3b16e2ce15b0",
-    "assets/bin/skill-doctor": "31c5722d9cb891b0a80b1d75c998470b61359c47ab3d812bf5546d95af5bed1a",
+    "assets/bin/skill-doctor": "23f9dd86a9302eaec6ee43a470d8dc0bc2d60758dde54bc1f43a99679e64510d",
     "assets/bin/speak": "ac377da09cbcbc9cf127ab27be4656fc080033e10071dc28b943c569b9fb25a5",
     "assets/bin/tg-send-file": "4221ac3b0615052c3ac48cde281cc6413de9b39ecb70740b62825819fa282b9e",
     "assets/bin/transcribe": "a328188bc3e49da1740ad9be801e14961ec5bb92b0ed013b305b1ba124d18405",
@@ -89,6 +93,7 @@
     "assets/lib/merge-env.py": "99eea7c790332db713a6242b8a2dd241e15fa5dd4f522b9f05c0525eb29daf7e"
   },
   "files": {
+    "UPGRADING.md": "40b6ed3987d982811ff9b8c81203992747c46a1eae737a55fb010555201e3604",
     "home/.agents/skills/novsky-deliverables/SKILL.md": "0caae32f840d654b70f9e638ad089c773bddb02c9d388ed6bc7d2ddcc39342f2",
     "home/.agents/skills/novsky-integrations/SKILL.md": "a9741a85719db6238837b82576a3a3ebda8ffb196ec7d0c39ac3427ea75f6857",
     "home/.agents/skills/novsky-memory/SKILL.md": "3dae69a7871866fcd789794c4bc007d191dabd8e039c4faaf26524072c79858e",
@@ -111,7 +116,7 @@
     "home/bin/memory-search": "6536ec596067f4b6a6b1b6cd30fbc9d90b43f6e1dcd9bae72099be0d8c978da9",
     "home/bin/native-lifecycle": "6ca0752158b58aa9a4353841a48e9614b355639267d89682f726d9b5cbcf3720",
     "home/bin/reminder-task": "baeb03fa08268de072aafa4415ea7007573b03a0fc172d671f2c3b16e2ce15b0",
-    "home/bin/skill-doctor": "61bedb7926a52870fac67983bde6d72979d31a21cc2cc6748ac9b7e3c555f1f9",
+    "home/bin/skill-doctor": "101697f371333109e47e94bd2efc7cd18a3c56047aa23ab633b19f83569339b6",
     "home/bin/speak": "bd109aab4c3e6c53d060340edb1fc8569c1514852d401b9763d26b95448bde8a",
     "home/bin/tg-send-file": "2904bba276363cf71f718994d206ab3cd41e6488187793088cb1138c716de8f1",
     "home/bin/transcribe": "7962be99f1132268a98f6f13ba3bec0c1978904be5dfe0c6565db9be855ddae9",
@@ -121,9 +126,9 @@
     "installer/corporate.py": "430ebc3b1e9d1161328ecdf9b121865c33ea52f74ae49924194b6c17bfb9103d",
     "installer/dependencies.py": "1baf48535fd53745ce61ba59f7d520d159b5d5fb4f09484c580bcb56b07d75e3",
     "installer/install-node.py": "9c14f78bf321ab74ca0b14e38e6056c3d705ff98c3f7e0ac1166b3cf24c34539",
-    "installer/install.py": "f314d7b93cf23b707b418e50817df30b533e6f659624f7e50eaac5b7b453ce8a",
+    "installer/install.py": "f190da8ae0ed27c1474a8b76c7f3603c17bd90c0cc4ca7ae9b67ccf61b69c1d4",
     "installer/integrations.py": "ae80dc840bda606838b7a8a2cefff64748c1d42a32c22ef0f390965f32745cde",
-    "installer/setup.py": "7b51af31288ac8a0ab56b740a0a94aa4d0a9cbce42a7b80f814357689b38a7d0",
+    "installer/setup.py": "6108aa5faca644e7cf2eb0cb6a35390307bd0d571047bb6fa002abdd012bed33",
     "installer/verify-permissions.py": "4062c6d95d232588a652906ef30d9a3ed5f2a72e6676f9578e1da6d9c39c2998",
     "migration/.claude/settings.json": "2fc36cd88ea5b1049defa6877fe98653f6b81a53f95878c26f79a0a06317e94a",
     "plugin-contract.json": "c5ea9ff8efabb69e2ec79e9082f7fbd3ee6b389376a22227702e446a49ba94d3",
@@ -133,7 +138,7 @@
     "resources/assets/lib/product-config.py": "6f0388647677074592e1256d0b7770e995f0aa841573c21b68d95b933aee3523",
     "resources/scripts/install-browser.sh": "c590b05fda39c781a4a49b4895f5aebf1dce273edfac18ce22e419b2edd8e07e",
     "workspace/AGENTS.md": "f4ee16ad00dd9550b6adc935cf55c49b7f9b09c7ac2568787b7683e0ad4af542",
-    "workspace/NOVSKY.md": "0955de6bd3b04340ed04c36b79818a256eb8273206b7c7e336744225c68f2319",
+    "workspace/NOVSKY.md": "e30bf4caa60a5872a7d07893b2887125d62e1715d637cd66537ca8734bf5cdae",
     "workspace/OWNER.md": "8e5d067bcd0a54c6647f859cb6bc494d58719295ce4ca135c08cb2f47eced48e",
     "workspace/ROLE.md": "276957f12417fa60c61459f56b6c9a2c4af980918b46b320e92a59dd6bbdd5d1"
   }

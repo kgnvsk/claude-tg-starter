@@ -60,6 +60,8 @@ def inspect(root: Path) -> dict:
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     declared = set(manifest.get("skills", {}))
     required = declared
+    preserved_absent = set()
+    disabled_root = None
     managed_policy = Path.home() / ".claude/product/managed-skills.json"
     if root.resolve() == (Path.home() / ".claude/skills").resolve():
         if not managed_policy.is_file():
@@ -85,6 +87,11 @@ def inspect(root: Path) -> dict:
                 "managed skill policy selected must contain unique skill names"
             )
         required = set(selected)
+        absent = policy.get("preservedAbsent", [])
+        if not isinstance(absent, list) or any(not isinstance(name, str) or name not in required for name in absent):
+            raise ValueError("preserved absent skills must be selected skill names")
+        disabled_root = root.with_name("skills.disabled")
+        preserved_absent = {name for name in absent if not (root / name).exists() and not (disabled_root / name).exists()}
     external_exceptions = manifest.get("externalSkillExceptions", {})
     pack_members = {
         skill
@@ -105,24 +112,33 @@ def inspect(root: Path) -> dict:
                 "pack skills missing metadata: " + ", ".join(sorted(missing_metadata))
             )
 
-    installed = {
-        path.parent.name
+    paths = {
+        path.parent.name: path
         for path in root.glob("*/SKILL.md")
         if path.parent.is_dir()
     }
+    if disabled_root is not None:
+        for path in disabled_root.glob("*/SKILL.md"):
+            if path.parent.name in paths:
+                errors.append(f"skill is both enabled and disabled: {path.parent.name}")
+            else:
+                paths[path.parent.name] = path
+    installed = set(paths)
     if installed != required:
         undeclared = installed - required
-        missing = required - installed
+        missing = required - installed - preserved_absent
         if undeclared:
             warnings.append(
                 "owner-managed skill directories: " + ", ".join(sorted(undeclared))
             )
         if missing:
             errors.append("missing skill directories: " + ", ".join(sorted(missing)))
+    if preserved_absent:
+        warnings.append("owner-removed skill directories preserved: " + ", ".join(sorted(preserved_absent)))
 
     names = {}
     for skill in sorted(installed):
-        path = root / skill / "SKILL.md"
+        path = paths[skill]
         text = path.read_text(encoding="utf-8", errors="replace")
         metadata = frontmatter(text)
         name = metadata.get("name", "")

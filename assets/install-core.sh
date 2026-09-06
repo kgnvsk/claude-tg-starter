@@ -380,14 +380,33 @@ install -m 644 -o "$AGENT_USER" -g "$AGENT_USER" "$KIT/assets/telegram-server-fi
 install -m 600 -o "$AGENT_USER" -g "$AGENT_USER" \
   "$KIT/assets/product/telegram-plugin-compat.json" \
   "$H/.claude/product/telegram-plugin-compat.json"
-install -m 644 "$KIT/assets/systemd/claude-telegram.service" /etc/systemd/system/claude-telegram.service
-install -m 644 "$KIT/assets/systemd/claude-telegram@.service" /etc/systemd/system/claude-telegram@.service
+# BEGIN selected agent systemd unit
+# A concrete instance unit keeps a targeted install from changing the shared
+# template used by every other secondary agent on this host.
+if [ "$AGENT_USER" = claude ]; then
+  install -m 644 "$KIT/assets/systemd/claude-telegram.service" "/etc/systemd/system/$AGENT_SERVICE"
+else
+  install -m 644 "$KIT/assets/systemd/claude-telegram@.service" "/etc/systemd/system/$AGENT_SERVICE"
+fi
+# END selected agent systemd unit
 systemctl daemon-reload 2>/dev/null || true
 sed "s|/home/claude|$H|g" "$KIT/assets/systemd/logrotate-cash" > "/etc/logrotate.d/cash-$AGENT_USER"
 chmod 644 "/etc/logrotate.d/cash-$AGENT_USER"
-python3 "$KIT/assets/lib/reconcile-managed-skills.py" \
+# BEGIN managed skill installation
+# Render the candidate before comparing it to the installed checksum. Copying
+# or rendering again below would bypass owner-edit preservation.
+env AGENT_NAME="$AGENT_NAME" OWNER_NAME="$OWNER_NAME" \
+  OWNER_TG_USERNAME="$OWNER_TG_USERNAME" OWNER_CHAT_ID="$OWNER_CHAT_ID" \
+  BOT_USERNAME="$BOT_USERNAME" TIMEZONE="$TIMEZONE" \
+  CALENDAR_EMAIL="$CALENDAR_EMAIL" DEPLOY_DATE="$DEPLOY_DATE" \
+  AGENT_HOME="$H" AGENT_SERVICE="$AGENT_SERVICE" AGENT_USER="$AGENT_USER" \
+  python3 "$KIT/assets/lib/reconcile-managed-skills.py" \
   "$H/.claude/skills" "$KIT/assets/product/managed-skills.json" \
-  "$H/.claude/product/managed-skills.json"
+  "$H/.claude/product/managed-skills.json" \
+  --source "$KIT/assets/skills" \
+  --external-source "$KIT/assets/external-skills" \
+  --baseline "$H/.claude/product/managed-skills-baseline.json"
+# END managed skill installation
 install -m 600 -o "$AGENT_USER" -g "$AGENT_USER" \
   "$KIT/assets/product/runtime.json" "$H/.claude/product/runtime.json"
 install -m 600 -o "$AGENT_USER" -g "$AGENT_USER" \
@@ -396,12 +415,8 @@ install -m 600 -o "$AGENT_USER" -g "$AGENT_USER" \
 install -m 600 -o "$AGENT_USER" -g "$AGENT_USER" \
   "$KIT/assets/product/plugin-contract.json" \
   "$H/.claude/product/plugin-contract.json"
-cp -a "$KIT/assets/skills/." "$H/.claude/skills/"
-cp -a "$KIT/assets/agents/." "$H/.claude/agents/"
-# Role subagents are shipped under assets/agents/roles and become visible to
-# the bot only when named in ACTIVE_ROLES (see agent.env); the raw folder is
-# not left inside ~/.claude/agents.
-rm -rf "$H/.claude/agents/roles"
+# The same checksum applicator protects base and role subagents. It installs
+# selected role files directly, without copying/deleting the raw role folder.
 chown -R "$AGENT_USER:$AGENT_USER" "$H/.claude/skills" "$H/.claude/agents"
 bash "$KIT/assets/lib/activate-role-subagents.sh" "$KIT" "$H" "$AGENT_USER" "${ACTIVE_ROLES:-}"
 
@@ -555,13 +570,8 @@ while IFS= read -r -d '' source; do
   chmod 755 "$destination"
 done < <(find "$KIT/assets/bin" -maxdepth 1 -type f -print0)
 initialize_limit_recovery_state
-while IFS= read -r -d '' source; do
-  destination="$H/.claude/skills/${source#"$KIT/assets/skills/"}"
-  MANAGED_RENDERED_FILES+=("$destination")
-  if grep -q '{{[A-Z_]*}}' "$source"; then
-    render_template "$destination" "$destination"
-  fi
-done < <(find "$KIT/assets/skills" -type f -print0)
+# Managed skills are already rendered and checked by their applicator. Owner
+# text retained there must not pass through the template renderer again.
 if [ -f "$H/obsidian-vault/wiki/hot.md" ] && grep -q '{{[A-Z_]*}}' "$H/obsidian-vault/wiki/hot.md"; then
   render_template "$H/obsidian-vault/wiki/hot.md" "$H/obsidian-vault/wiki/hot.md"
 fi
@@ -760,56 +770,14 @@ runuser -u "$AGENT_USER" -- env HOME="$H" "$H/bin/set-tg-commands" || \
   echo "      WARN: не вдалося опублікувати меню команд Telegram (повтор: ~/bin/set-tg-commands)"
 
 echo "[6/7] необов’язкові інструменти"
-sync_external_skills() {
-  local source="$1"
-  python3 - "$H" "$source" <<'PY'
-import json
-from pathlib import Path
-import shutil
-import sys
-
-home = Path(sys.argv[1])
-expected_source = sys.argv[2]
-lock_path = home / ".agents/.skill-lock.json"
-if not lock_path.is_file():
-    raise SystemExit(f"після встановлення {expected_source} відсутній файл блокування навичок")
-lock = json.loads(lock_path.read_text(encoding="utf-8"))
-selected = [
-    name
-    for name, metadata in lock.get("skills", {}).items()
-    if metadata.get("source") == expected_source
-]
-if not selected:
-    raise SystemExit(f"інсталятор навичок не записав жодної навички з {expected_source}")
-for name in selected:
-    source = home / ".agents/skills" / name
-    destination = home / ".claude/skills" / name
-    if (destination / "SKILL.md").is_file():
-        continue
-    if not (source / "SKILL.md").is_file():
-        raise SystemExit(f"встановлена навичка відсутня в обох каталогах середовища виконання: {name}")
-    shutil.copytree(source, destination, dirs_exist_ok=True)
-PY
-  chown -R "$AGENT_USER:$AGENT_USER" "$H/.claude/skills"
-}
 
 if product_has_feature google-workspace && ! command -v gog >/dev/null 2>&1; then
   bash "$KIT/scripts/install-gog.sh"
 fi
 
 EXTERNAL_SKILLS="$KIT/assets/external-skills"
-# A missing individual skill is fatal below, but a missing directory used to skip
-# the whole step in silence — so an install that shipped none of the vendored
-# skills still reported success. That is what a repository checkout looks like:
-# the sources carry the manifest but not the vendored tree, which only the build
-# produces. Say which artifact is in hand instead of quietly installing half a kit.
-if [ -n "$(python3 "$PRODUCT_CONFIG" list externalSkills)" ] && [ ! -d "$EXTERNAL_SKILLS" ]; then
-  echo "FATAL: $EXTERNAL_SKILLS відсутній, хоча продукт оголошує зовнішні навички." >&2
-  echo "       Схоже, це вихідні файли репозиторію, а не зібраний комплект: вбудовані" >&2
-  echo "       навички з’являються лише під час збирання. Візьми архів <продукт>-kit.zip" >&2
-  echo "       із доставки — у ньому цей каталог уже є." >&2
-  exit 1
-fi
+# Missing packaged sources already fail the common preflight. The final doctor
+# verifies installed skills, including disabled copies and preserved removals.
 if [ -d "$EXTERNAL_SKILLS" ]; then
   while IFS= read -r external_skill; do
     [ -n "$external_skill" ] || continue
@@ -818,14 +786,10 @@ if [ -d "$EXTERNAL_SKILLS" ]; then
       echo "FATAL: оголошена зовнішня навичка відсутня: $external_skill" >&2
       exit 1
     }
-    destination="$H/.claude/skills/$external_skill"
-    rm -rf "$destination"
-    runuser -u "$AGENT_USER" -- cp -a --no-preserve=ownership \
-      "$source" "$destination"
   done < <(python3 "$PRODUCT_CONFIG" list externalSkills)
   chown -R "$AGENT_USER:$AGENT_USER" "$H/.claude/skills"
 fi
-# After every source of skills above: the product's default-off list moves a
+# All packaged skills were reconciled together above. The default-off list moves a
 # skill aside on its first install, and whatever the owner switched off
 # (Novsky → Скіли) stays off — the fresh copy goes to ~/.claude/skills.disabled/<name>,
 # where switching back on is a move, not a reinstall.
@@ -884,15 +848,11 @@ if product_has_feature vercel; then
   }
 fi
 
-if [ ! -d "$EXTERNAL_SKILLS" ] && product_has_feature video-edit; then
-  (
-    cd "$H"
-    runuser -u "$AGENT_USER" -- env HOME="$H" PATH="$H/.local/bin:/usr/local/bin:/usr/bin:/bin" \
-      npx --yes skills add heygen-com/hyperframes -y -g -s '*' -a claude-code </dev/null >/dev/null 2>&1
-  ) || { echo "FATAL: навички HyperFrames не встановлено" >&2; exit 1; }
-  sync_external_skills heygen-com/hyperframes
+if product_has_feature video-edit; then
+  # Missing packaged skills fail the checksum preflight. A live marketplace
+  # reinstall here would bypass it and overwrite owner changes with latest.
   for external_skill in hyperframes media-use talking-head-recut embedded-captions; do
-    [ -f "$H/.claude/skills/$external_skill/SKILL.md" ] || {
+    [ -f "$EXTERNAL_SKILLS/$external_skill/SKILL.md" ] || {
       echo "FATAL: відсутня зовнішня медіанавичка: $external_skill" >&2
       exit 1
     }

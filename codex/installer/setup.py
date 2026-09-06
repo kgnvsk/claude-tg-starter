@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import pwd
 import queue
+import re
 import shlex
 import subprocess
 import threading
@@ -108,12 +109,22 @@ def import_plugins(rpc, stage: Path, expected: list[str]):
 
 
 def check_discovery(rpc, home, manifest):
+    from install import safe_path, skill_destination
     workspace = home / "obsidian-vault"
     entries = rpc.call("skills/list", {"cwds": [str(workspace)], "forceReload": True})["data"]
-    skills = [skill for entry in entries for skill in entry["skills"] if skill["enabled"]]
-    found = {Path(skill["path"]).parent.name for skill in skills}
+    discovered = [skill for entry in entries for skill in entry["skills"]]
+    paths = {skill["path"] for skill in discovered}
+    found = set()
+    for name in manifest["nativeSkills"]:
+        relative = skill_destination(home, ".agents/skills/" + name + "/SKILL.md")
+        path = safe_path(home, relative)
+        # Native enabled:false is still an installed skill. Directory-disabled
+        # skills are intentionally absent from native discovery altogether.
+        if path.is_file() and (str(path) in paths or relative.startswith(".agents/skills.disabled/")):
+            found.add(name)
     if set(manifest["nativeSkills"]) - found:
         raise ValueError("native skill discovery missed: " + ", ".join(sorted(set(manifest["nativeSkills"]) - found)))
+    skills = [skill for skill in discovered if skill["enabled"]]
     contract = json.loads((home / ".local/share/novsky-kit/plugin-contract.json").read_text())["plugins"]
     for plugin, specification in contract.items():
         actual = {Path(skill["path"]).parent.name for skill in skills if skill.get("pluginId") == plugin or plugin.split("@")[0] in Path(skill["path"]).parts}
@@ -151,33 +162,93 @@ print(json.dumps({'vault': vault, 'memory': memory and healthy, 'notes': notes, 
     return result
 
 
-def configure(home, user, manifest, env, data):
-    from install import atomic
-    account = pwd.getpwnam(user)
-    channel = home / ".codex/channels/telegram"
-    access_path = channel / "access.json"
+def plan_configuration(home, data, previous=None):
+    """Validate owner/access and prepare configuration without changing files."""
+    from install import safe_path
+    owner = str(data["ownerChatId"])
+    if not re.fullmatch(r"[1-9][0-9]{0,18}", owner):
+        raise ValueError("invalid owner identity")
+    access_path = safe_path(home, ".codex/channels/telegram/access.json")
+    env_path = safe_path(home, ".codex/channels/telegram/.env")
+    for path in (access_path, env_path):
+        if path.exists() and not path.is_file():
+            raise ValueError("non-file Telegram configuration target")
+    maintenance = data.get("maintenance", False)
+    if not isinstance(maintenance, bool):
+        raise ValueError("invalid maintenance setting")
+    if maintenance and (not access_path.exists() or not env_path.exists()):
+        raise ValueError("existing Telegram configuration is required for maintenance")
+    writes, preserved = [], [access_path] if access_path.exists() else []
     if access_path.exists():
-        access = json.loads(access_path.read_text())
-        if set(map(str, access.get("admins", []))) != {str(data["ownerChatId"])}:
+        try:
+            access = json.loads(access_path.read_text())
+        except ValueError:
+            raise ValueError("invalid existing Telegram access policy") from None
+        if not isinstance(access, dict) or not isinstance(access.get("admins"), list):
+            raise ValueError("invalid existing Telegram access policy")
+        for field in ("admins", "allowFrom"):
+            if field in access and (not isinstance(access[field], list) or any(not re.fullmatch(r"[1-9][0-9]{0,18}", str(value)) for value in access[field])):
+                raise ValueError("invalid existing Telegram access policy")
+        if owner not in set(map(str, access["admins"])):
             raise ValueError("existing memory owner differs from installation owner")
     else:
-        atomic(access_path, json.dumps({"admins": [str(data["ownerChatId"])], "allowFrom": [str(data["ownerChatId"])]}), account.pw_uid, account.pw_gid)
-    env_path = channel / ".env"
+        writes.append((access_path, json.dumps({"admins": [owner], "allowFrom": [owner]}), 0o600))
     existing = env_path.read_text() if env_path.exists() else ""
+    settings = {}
+    entries = [(line, re.match(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$", line)) for line in existing.splitlines()]
+    for line, entry in entries:
+        if entry and entry[1] in ("AGENT_NAME", "OWNER_CHAT_ID", "TZ"):
+            try:
+                values = shlex.split(entry[2], comments=True)
+            except ValueError:
+                raise ValueError("invalid existing Telegram configuration") from None
+            if len(values) > 1:
+                raise ValueError("invalid existing Telegram configuration")
+            settings[entry[1]] = values[0] if values else ""
+    if settings.get("OWNER_CHAT_ID") and settings["OWNER_CHAT_ID"] != owner:
+        raise ValueError("existing memory owner differs from installation owner")
+    if maintenance and not settings.get("OWNER_CHAT_ID"):
+        raise ValueError("existing Telegram owner is required for maintenance")
+    timezone = settings.get("TZ", (previous or {}).get("timezone", "UTC"))
+    if not maintenance:
+        timezone = data.get("timezone", timezone)
+    if not isinstance(timezone, str) or not re.fullmatch(r"[A-Za-z0-9_+\-/]{1,80}", timezone):
+        raise ValueError("invalid timezone")
+    agent_name = settings.get("AGENT_NAME", "Novsky") if maintenance else data.get("agentName", settings.get("AGENT_NAME", "Novsky"))
+    effective = {**data, "ownerChatId": owner, "timezone": timezone, "agentName": agent_name}
+    if maintenance:
+        return {"data": effective, "writes": [], "preserved": [*preserved, env_path], "ownerAccess": "existing-admin"}
     # Preserve existing integrations; only update fields explicitly supplied by
     # Novsky. Semantic memory needs its own explicit setup choice.
-    updates = {"AGENT_NAME": data.get("agentName", "Novsky"), "OWNER_CHAT_ID": str(data["ownerChatId"]), "TZ": data.get("timezone", "UTC")}
+    updates = {"OWNER_CHAT_ID": owner}
+    for key, value, supplied in (("AGENT_NAME", agent_name, "agentName"), ("TZ", timezone, "timezone")):
+        if supplied in data or key not in settings:
+            updates[key] = value
     if data.get("botToken"):
         updates["TELEGRAM_BOT_TOKEN"] = data["botToken"]
     if data.get("openaiApiKey"):
         updates["OPENAI_API_KEY"] = data["openaiApiKey"]
     if data.get("semanticMemory") is not None:
+        if not isinstance(data["semanticMemory"], bool):
+            raise ValueError("invalid semantic memory setting")
         updates["MEMORY_EMBEDDINGS_OPENAI"] = "enabled" if data["semanticMemory"] else "disabled"
     elif "MEMORY_EMBEDDINGS_OPENAI=" not in existing:
         updates["MEMORY_EMBEDDINGS_OPENAI"] = "disabled"
-    lines = [line for line in existing.splitlines() if line.removeprefix("export ").split("=", 1)[0] not in updates]
+    if any(not isinstance(value, str) or any(char in value for char in "\x00\r\n") for value in updates.values()):
+        raise ValueError("invalid Telegram configuration setting")
+    lines = [line for line, entry in entries if not entry or entry[1] not in updates]
     lines.extend(key + "=" + shlex.quote(value) for key, value in updates.items())
-    atomic(env_path, "\n".join(lines) + "\n", account.pw_uid, account.pw_gid, 0o400)
+    writes.append((env_path, "\n".join(lines) + "\n", 0o400))
+    return {"data": effective, "writes": writes, "preserved": preserved,
+            "ownerAccess": "existing-admin" if access_path.exists() else "new-owner"}
+
+
+def configure(home, user, manifest, env, data, configuration=None):
+    from install import atomic
+    configuration = configuration if configuration is not None else plan_configuration(home, data)
+    account = pwd.getpwnam(user)
+    for path, content, mode in configuration["writes"]:
+        atomic(path, content, account.pw_uid, account.pw_gid, mode)
     binary = home / ".local/lib/novsky-runtime/node_modules/.bin/codex"
     stage = home / ".local/share/novsky-kit/migration"
     rpc = RPC(binary, home / "obsidian-vault", {**env, "HOME": str(stage)}, user)

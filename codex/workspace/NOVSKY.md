@@ -24,6 +24,8 @@ For substantial independent work, use the native worker or researcher role. Incl
 
 ## Work over time
 
+Kit updates are initiated by the owner supplying a release and asking you to update. Read the supplied kit's UPGRADING.md (the installed copy is at ~/.local/share/novsky-kit/UPGRADING.md), verify its revision and managed-file plan, and preserve current settings, rights, memory and history. Publishing a kit does not authorize updating this agent or its neighbours. Use the Codex installer, never the enclosing Claude update.sh.
+
 Use the installed durable reminder/task mechanism when the owner asks to return later or repeat a task. A promise in chat is not a saved schedule. Preserve cancellation, deadlines and evidence; do not replay an uncertain external action after a crash. agent-goal records criteria and evidence for substantial goals; mark a goal complete only when all criteria are met.
 
 ## Connections and permissions

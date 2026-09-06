@@ -21,17 +21,32 @@ def digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def assert_stopped(unit: str):
+    result = subprocess.run(["systemctl", "show", unit, "--property=LoadState,ActiveState,MainPID"],
+                            capture_output=True, text=True, timeout=15)
+    fields = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+    # Missing first-install units can return nonzero. An empty or failed D-Bus
+    # query, incomplete state, or a surviving process never proves a safe stop.
+    if (fields.get("LoadState") not in ("loaded", "not-found")
+            or (result.returncode and fields["LoadState"] != "not-found")
+            or fields.get("ActiveState") not in ("inactive", "failed")
+            or fields.get("MainPID") != "0"):
+        raise ValueError("target agent stop was not confirmed; no runtime update was attempted")
+
+
 def safe_path(root: Path, relative: str) -> Path:
     rel = PurePosixPath(relative)
     if not relative or rel.is_absolute() or any(p in ("..", ".", "") for p in relative.split("/")):
         raise ValueError("unsafe payload path")
     current = root
-    if root.is_symlink():
+    if any(path.is_symlink() for path in (root, *root.parents)):
         raise ValueError("symlink root")
     for part in rel.parts:
         current /= part
         if current.is_symlink():
             raise ValueError("symlink in installation path")
+    if any(path.exists() and not path.is_dir() for path in current.parents):
+        raise ValueError("non-directory installation parent")
     return current
 
 
@@ -41,6 +56,11 @@ def verify(root: Path) -> dict:
         raise ValueError("unsupported kit manifest")
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,50}", manifest.get("productId", "")):
         raise ValueError("invalid kit product")
+    if not isinstance(manifest.get("sourceRevision"), str) or not re.fullmatch(r"[0-9a-f]{40}", manifest["sourceRevision"]):
+        raise ValueError("invalid kit revision")
+    for field in ("features", "nativePlugins", "nativeSkills", "nativeAgents"):
+        if not isinstance(manifest.get(field), list) or any(not isinstance(value, str) for value in manifest[field]):
+            raise ValueError("invalid kit " + field)
     expected = manifest["files"]
     actual = set()
     for file in root.rglob("*"):
@@ -81,9 +101,43 @@ def atomic(path: Path, data: bytes | str, uid: int, gid: int, mode: int = 0o600)
             os.unlink(name)
 
 
-def reconcile(root: Path, home: Path, manifest: dict, previous: dict, uid: int, gid: int) -> dict:
-    """Preflight the entire managed tree before writing; preserve owner notes."""
-    writes, baseline = [], {}
+def target_change(path: Path, data: bytes | str | None = None, mode: int | None = None) -> dict:
+    if path.exists() and not path.is_file():
+        raise ValueError("non-file installation target")
+    if not path.exists():
+        action = "create"
+    elif data is not None and path.read_bytes() == (data.encode() if isinstance(data, str) else data) and (mode is None or path.stat().st_mode & 0o777 == mode):
+        action = "unchanged"
+    else:
+        action = "update"
+    return {"path": str(path), "action": action}
+
+
+def skill_destination(home: Path, relative: str) -> str:
+    """Follow the owner's enabled/disabled directory without activating a skill."""
+    parts = PurePosixPath(relative).parts
+    if len(parts) < 4 or parts[0] != ".agents" or parts[1] not in ("skills", "skills.disabled"):
+        return relative
+    active = safe_path(home, ".agents/skills/" + parts[2])
+    disabled = safe_path(home, ".agents/skills.disabled/" + parts[2])
+    if active.exists() and disabled.exists():
+        raise ValueError("skill is both enabled and disabled: " + parts[2])
+    for directory in (active, disabled):
+        if directory.exists() and not directory.is_dir():
+            raise ValueError("non-directory skill target")
+    directory = disabled if disabled.exists() else active
+    return (directory.relative_to(home) / Path(*parts[3:])).as_posix()
+
+
+def plan_reconcile(root: Path, home: Path, manifest: dict, previous: dict) -> dict:
+    """Read every managed target and ownership conflict without creating files."""
+    writes, baseline, targets = [], {}, []
+    previous_files = {}
+    for relative, sha in previous.get("files", {}).items():
+        destination = skill_destination(home, relative)
+        if destination in previous_files:
+            raise ValueError("duplicate managed skill baseline")
+        previous_files[destination] = sha
     preserve = {"workspace/AGENTS.md", "workspace/OWNER.md", "home/.codex/memory/USER.md", "home/.codex/memory/MEMORY.md", "home/.codex/onboarding-state.json"}
     preserved_destinations = set()
     for relative in manifest["files"]:
@@ -93,10 +147,12 @@ def reconcile(root: Path, home: Path, manifest: dict, previous: dict, uid: int, 
             destination = "obsidian-vault/" + relative[10:]
         else:
             destination = ".local/share/novsky-kit/" + relative
+        destination = skill_destination(home, destination)
         path = safe_path(home, destination)
         if relative in preserve:
             preserved_destinations.add(destination)
         data = safe_path(root, relative).read_bytes()
+        mode = 0o755 if relative.startswith("home/bin/") or root.joinpath(relative).stat().st_mode & 0o111 else 0o600
         # Render only executable placeholders with validated, fixed values.
         if relative.startswith("home/bin/"):
             data = data.replace(b"{{AGENT_HOME}}", str(home).encode())
@@ -115,30 +171,44 @@ def reconcile(root: Path, home: Path, manifest: dict, previous: dict, uid: int, 
                 if b"NOVSKY.md" not in existing:
                     data = existing.rstrip() + b"\n\nRead NOVSKY.md and ROLE.md for the installed Novsky runtime and role.\n"
                 else:
+                    targets.append({"path": str(path), "action": "preserve"})
                     continue
             elif relative in preserve:
+                targets.append({"path": str(path), "action": "preserve"})
                 continue
-            elif digest(existing) not in (digest(data), previous.get("files", {}).get(destination)):
+            elif digest(existing) not in (digest(data), previous_files.get(destination)):
                 raise ValueError("locally modified managed file: " + destination)
         if relative not in preserve:
             baseline[destination] = digest(data)
-        mode = 0o755 if relative.startswith("home/bin/") or root.joinpath(relative).stat().st_mode & 0o111 else 0o600
+        change = target_change(path, data, mode)
+        targets.append(change)
         writes.append((path, data, mode))
     # A narrower kit removes only unchanged files owned by the former revision.
     removals = []
-    for relative, sha in previous.get("files", {}).items():
+    for relative, sha in previous_files.items():
         if relative in baseline or relative in preserved_destinations or relative in {"obsidian-vault/AGENTS.md", "obsidian-vault/OWNER.md"}:
             continue
         path = safe_path(home, relative)
+        if path.exists() and not path.is_file():
+            raise ValueError("non-file installation target")
         if path.is_file():
             if digest(path.read_bytes()) != sha:
                 raise ValueError("modified file from previous kit: " + relative)
             removals.append(path)
-    for path, data, mode in writes:
+            targets.append({"path": str(path), "action": "remove"})
+    return {"writes": writes, "removals": removals, "files": baseline, "targets": targets}
+
+
+def apply_reconcile(plan: dict, uid: int, gid: int) -> dict:
+    for path, data, mode in plan["writes"]:
         atomic(path, data, uid, gid, mode)
-    for path in removals:
+    for path in plan["removals"]:
         path.unlink()
-    return baseline
+    return plan["files"]
+
+
+def reconcile(root: Path, home: Path, manifest: dict, previous: dict, uid: int, gid: int) -> dict:
+    return apply_reconcile(plan_reconcile(root, home, manifest, previous), uid, gid)
 
 
 def native_config(home: Path, user: str, browser: dict | None, integrations: Path | None = None) -> str:
@@ -174,13 +244,13 @@ def native_config(home: Path, user: str, browser: dict | None, integrations: Pat
     return text
 
 
-def integration_inventory(home: Path, user: str, manifest: dict) -> dict:
+def integration_inventory(home: Path, user: str, manifest: dict, files: dict | None = None) -> dict:
     from integrations import SUPPORTED_PROGRAMS
     programs = {}
     for name in sorted(SUPPORTED_PROGRAMS):
         if "home/bin/" + name in manifest["files"]:
             path = safe_path(home, "bin/" + name)
-            programs[name] = {"path": str(path), "sha256": digest(path.read_bytes())}
+            programs[name] = {"path": str(path), "sha256": files["bin/" + name] if files is not None else digest(path.read_bytes())}
     return {"schema_version": 1, "owner": user, "home": str(home), "workspace": str(home / "obsidian-vault"), "programs": programs}
 
 
@@ -199,6 +269,11 @@ def starter_configuration(manifest: dict, data: dict, previous: dict) -> dict:
 
 def main():
     data = json.load(sys.stdin)
+    action = data.get("action", "install")
+    if action not in ("install", "plan"):
+        raise ValueError("unsupported installation action")
+    # Read-only planning must not create import caches in the verified payload.
+    sys.dont_write_bytecode = True
     user = data["user"]
     if os.geteuid() != 0 or not re.fullmatch(r"codex-[a-z0-9][a-z0-9-]{0,23}", user):
         raise ValueError("a Novsky Codex account is required")
@@ -208,54 +283,81 @@ def main():
     account = pwd.getpwnam(user)
     if account.pw_uid < 1000 or account.pw_dir != str(home) or json.loads(marker.read_text()).get("user") != user:
         raise ValueError("account is not owned by Novsky")
-    if subprocess.run(["systemctl", "is-active", "--quiet", "codex-telegram@" + user + ".service"]).returncode == 0:
-        raise ValueError("stop and back up the target agent before installation")
+    if action != "plan":
+        assert_stopped("codex-telegram@" + user + ".service")
     root = Path(data["payload"])
     manifest = verify(root)
     if manifest["productId"] != data["productId"]:
         raise ValueError("selected product does not match payload")
     state_path = safe_path(config_dir, user + ".managed.json")
     previous = json.loads(state_path.read_text()) if state_path.exists() else {}
+    if not isinstance(previous, dict) or not isinstance(previous.get("files", {}), dict):
+        raise ValueError("invalid existing managed state")
     fresh_starter = manifest["productId"] == "starter" and not previous.get("revision")
     data = starter_configuration(manifest, data, previous)
-    owner = str(data["ownerChatId"])
-    if not re.fullmatch(r"[1-9][0-9]{0,18}", owner):
-        raise ValueError("invalid owner identity")
-    timezone = data.get("timezone", "UTC")
-    if not re.fullmatch(r"[A-Za-z0-9_+\-/]{1,80}", timezone):
-        raise ValueError("invalid timezone")
-    previous.update(ownerChatId=owner, timezone=timezone)
-    files = reconcile(root, home, manifest, previous, account.pw_uid, account.pw_gid)
-    atomic(home / ".local/share/novsky-kit/manifest.json", json.dumps(manifest), account.pw_uid, account.pw_gid)
+    from setup import configure, plan_configuration
+    configuration = plan_configuration(home, data, previous)
+    data = configuration["data"]
+    previous = {**previous, "ownerChatId": data["ownerChatId"], "timezone": data["timezone"]}
+    plan = plan_reconcile(root, home, manifest, previous)
+    files = plan["files"]
+    manifest_path = safe_path(home, ".local/share/novsky-kit/manifest.json")
+    inventory_path = safe_path(config_dir, user + ".integrations.json")
+    inventory = integration_inventory(home, user, manifest, files)
+    project_config = safe_path(home, "obsidian-vault/.codex/config.toml")
+    # The browser launcher's path is fixed by dependencies.install_browser; it
+    # does not require package installation to render and validate this config.
+    browser = {"command": "/usr/local/bin/novsky-browser-" + user, "args": []} if "browser" in manifest["features"] else None
+    config_text = native_config(home, user, browser, inventory_path)
+    target_change(project_config, config_text)
+    if project_config.exists() and digest(project_config.read_bytes()) not in (digest(config_text.encode()), previous.get("configSha")):
+        raise ValueError("local project configuration needs reconciliation")
+    config_path = safe_path(config_dir, user + ".json")
+    config = json.loads(config_path.read_text())
+    if not isinstance(config, dict):
+        raise ValueError("invalid existing runtime configuration")
+    directories = ("bin", ".agents", ".codex/agents", "obsidian-vault/.codex", ".local/lib", ".local/bin", ".npm-global", ".local/state/novsky-codex", ".local/share/novsky-kit", ".venvs", ".config")
+    for relative in directories:
+        path = safe_path(home, relative)
+        if path.exists() and not path.is_dir():
+            raise ValueError("non-directory installation target")
+    generated = [(manifest_path, json.dumps(manifest), 0o600), (inventory_path, json.dumps(inventory), 0o440),
+                 (project_config, config_text, 0o600), *configuration["writes"]]
+    targets = [*plan["targets"], *(target_change(path, content, mode) for path, content, mode in generated),
+               target_change(state_path), target_change(config_path),
+               *({"path": str(path), "action": "preserve"} for path in configuration["preserved"])]
+    if action == "plan":
+        print(json.dumps({"ok": True, "action": "plan", "coverage": "managed-files", "productId": manifest["productId"],
+                          "revision": manifest["sourceRevision"],
+                          "changes": {name: sum(target["action"] == name for target in targets) for name in ("create", "update", "remove", "preserve", "unchanged")},
+                          "targets": sorted(targets, key=lambda target: target["path"]),
+                          "compatibility": {"engine": "codex", "previousProductId": previous.get("productId"),
+                                            "previousRevision": previous.get("revision"), "ownerAccess": configuration["ownerAccess"],
+                                            "projectConfig": "compatible", "requiresStoppedAgent": True}}))
+        return
+    # Every managed path, config conflict and owner check above is read-only.
+    # Dependency installation and native discovery still need runtime checks.
+    apply_reconcile(plan, account.pw_uid, account.pw_gid)
+    atomic(manifest_path, json.dumps(manifest), account.pw_uid, account.pw_gid)
     # Root-owned baseline is persisted before dependency work so an interrupted
     # first install can retry the same managed files without mistaking them for edits.
     atomic(state_path, json.dumps({**previous, "productId": manifest["productId"], "files": files}), 0, 0)
     safe_env = {"HOME": str(home), "CODEX_HOME": str(home / ".codex"), "NOVSKY_WORKSPACE": str(home / "obsidian-vault"), "PATH": f"{home}/bin:{home}/.local/lib/novsky-node/bin:{home}/.local/lib/novsky-runtime/node_modules/.bin:/usr/local/bin:/usr/bin:/bin", "LANG": "C.UTF-8"}
     from dependencies import install_dependencies
-    browser = install_dependencies(root, home, user, manifest, safe_env)
+    install_dependencies(root, home, user, manifest, safe_env)
     # Linux bwrap needs directory rule ancestors to exist. In particular a
     # Starter without Python feature venvs must still have the protected root.
     from dependencies import directory
-    for relative in ("bin", ".agents", ".codex/agents", "obsidian-vault/.codex", ".local/lib", ".local/bin", ".npm-global", ".local/state/novsky-codex", ".local/share/novsky-kit", ".venvs", ".config"):
+    for relative in directories:
         directory(safe_path(home, relative), user)
-    inventory_path = safe_path(config_dir, user + ".integrations.json")
-    inventory = integration_inventory(home, user, manifest)
     atomic(inventory_path, json.dumps(inventory), 0, account.pw_gid, 0o440)
-    project_config = home / "obsidian-vault/.codex/config.toml"
-    config_text = native_config(home, user, browser, inventory_path)
-    old_config_sha = previous.get("configSha")
-    if project_config.exists() and digest(project_config.read_bytes()) not in (digest(config_text.encode()), old_config_sha):
-        raise ValueError("local project configuration needs reconciliation")
     atomic(project_config, config_text, account.pw_uid, account.pw_gid)
     atomic(state_path, json.dumps({**previous, "productId": manifest["productId"], "files": files,
                                   "configSha": digest(config_text.encode()), "state": "installing"}), 0, 0)
-    from setup import configure
-    result = configure(home, user, manifest, safe_env, data)
+    result = configure(home, user, manifest, safe_env, data, configuration)
     if fresh_starter:
         from setup import verify_starter_foundation
         result["foundation"] = verify_starter_foundation(home, user, safe_env)
-    config_path = safe_path(config_dir, user + ".json")
-    config = json.loads(config_path.read_text())
     config["kit"] = {"home": str(home)}
     from corporate import export_corporate
     corporate = export_corporate(root, home, user, manifest, safe_env)

@@ -5,35 +5,18 @@
 #
 # Role files live in <KIT>/assets/agents/roles/<role>.md. A role listed in
 # ACTIVE_ROLES (comma-separated, or "all") is installed as
-# <AGENT_HOME>/.claude/agents/<role>.md; a role not listed is removed from
-# there — but only files carrying the kit marker, never the owner's own agents.
+# <AGENT_HOME>/.claude/agents/<role>.md; an inactive role is removed only when
+# its checksum proves it unchanged. The shared applicator preserves owner edits in role
+# and base subagents; a kit marker is not evidence that a file is unchanged.
 # Claude Code reads the agents directory at session start: restart the bot after.
 set -euo pipefail
 
 KIT="$1"; H="$2"; AGENT_USER="$3"; ACTIVE_ROLES="${4:-}"
-MARKER='<!-- managed: kit role subagent -->'
-ROLES_DIR="$KIT/assets/agents/roles"
 AGENTS_DIR="$H/.claude/agents"
+BASELINE="$H/.claude/product/managed-agents-baseline.json"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-[ -d "$ROLES_DIR" ] || exit 0
-install -d -o "$AGENT_USER" -g "$AGENT_USER" -m 755 "$AGENTS_DIR"
-
-is_active() {
-  [ "$ACTIVE_ROLES" = "all" ] && return 0
-  printf ',%s,' "$ACTIVE_ROLES" | tr -d ' ' | grep -q ",$1,"
-}
-
-installed=0; removed=0
-for role_file in "$ROLES_DIR"/*.md; do
-  [ -f "$role_file" ] || continue
-  role="$(basename "$role_file" .md)"
-  target="$AGENTS_DIR/$role.md"
-  if is_active "$role"; then
-    install -m 644 -o "$AGENT_USER" -g "$AGENT_USER" "$role_file" "$target"
-    installed=$((installed + 1))
-  elif [ -f "$target" ] && grep -qF "$MARKER" "$target"; then
-    rm -f "$target"
-    removed=$((removed + 1))
-  fi
-done
-echo "рольові субагенти: активних $installed, знято $removed (ACTIVE_ROLES=${ACTIVE_ROLES:-порожньо})"
+python3 "$SCRIPT_DIR/reconcile-managed-skills.py" agents \
+  "$AGENTS_DIR" "$KIT/assets/agents" "$BASELINE" --active-roles "$ACTIVE_ROLES"
+[ ! -d "$AGENTS_DIR" ] || chown -R "$AGENT_USER:$AGENT_USER" "$AGENTS_DIR"
+[ ! -f "$BASELINE" ] || chown "$AGENT_USER:$AGENT_USER" "$BASELINE"
