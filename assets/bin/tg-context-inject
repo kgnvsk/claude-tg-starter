@@ -212,15 +212,16 @@ def compact_chat(data: dict) -> tuple[str | None, str | None]:
 
 
 def recent_chat(chat_id: str, skip_msg_id: str | None) -> str:
-    if not DB.exists():
+    if not DB.exists() or skip_msg_id is None:
         return ""
     try:
         conn = sqlite3.connect(f"file:{DB}?mode=ro", uri=True, timeout=1.0)
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             "SELECT direction, username, text, ts, message_id FROM messages "
-            "WHERE chat_id=? ORDER BY ts DESC LIMIT ?",
-            (chat_id, N_MSGS),
+            "WHERE chat_id=? AND (direction!='in' OR message_id IS NULL "
+            "OR CAST(message_id AS INTEGER) < ?) ORDER BY ts DESC LIMIT ?",
+            (chat_id, int(skip_msg_id), N_MSGS),
         ).fetchall()
         conn.close()
     except Exception:
@@ -229,13 +230,8 @@ def recent_chat(chat_id: str, skip_msg_id: str | None) -> str:
         return ""
     lines = []
     for r in reversed(rows):
-        # The current inbound is already in the prompt — don't repeat it.
-        if (
-            skip_msg_id
-            and r["direction"] == "in"
-            and str(r["message_id"] or "") == skip_msg_id
-        ):
-            continue
+        # The archive also contains queued requests. Only the channel transport
+        # can start those; compaction must not import them ahead of their turn.
         try:
             hhmm = datetime.fromtimestamp(r["ts"] / 1000).strftime("%d.%m %H:%M")
         except Exception:
@@ -281,7 +277,7 @@ def recall_query(text: str) -> str:
     return " ".join(useful[:12])
 
 
-def recalled_chat(chat_id: str, prompt: str) -> str:
+def recalled_chat(chat_id: str, prompt: str, before_message_id: str | None = None) -> str:
     """Older material the last-30 window cannot reach. Empty when unavailable."""
     query = recall_query(prompt)
     if len(query.split()) < MIN_RECALL_WORDS:
@@ -299,6 +295,7 @@ def recalled_chat(chat_id: str, prompt: str) -> str:
                 "--limit", str(RECALL_LIMIT),
                 "--max-chars", str(RECALL_CHARS),
                 "--no-refresh",
+                "--before-message-id", before_message_id or "0",
             ],
             capture_output=True,
             text=True,
@@ -354,7 +351,7 @@ def main() -> None:
         block = recent_chat(chat_id, skip_msg_id)
         if block:
             parts.append(block)
-        recalled = recalled_chat(chat_id, data.get("prompt") or "")
+        recalled = recalled_chat(chat_id, data.get("prompt") or "", skip_msg_id)
         if recalled:
             parts.append(recalled)
 

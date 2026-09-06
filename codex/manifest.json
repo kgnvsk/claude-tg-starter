@@ -4,7 +4,7 @@
   "productId": "starter",
   "displayName": "Novsky Starter",
   "source": "codex/starter/product.json",
-  "sourceRevision": "aea7eb7c4e55468f33c97668133cc7b4c7ca5d49",
+  "sourceRevision": "5acdc95b081af007e249428dfca86dfe4895be92",
   "sourceDirty": false,
   "features": [
     "browser"
@@ -71,7 +71,7 @@
     "assets/bin/learning-review": "7c61f7214dac384f1b284d33d9e4e31cf1d946f8a5dd7ba0853058136e920507",
     "assets/bin/memory-doctor": "3a9101415cb72ece601a8117d79682999ff7f55417948695213ae7caf4d9845e",
     "assets/bin/memory-embeddings-config": "849854df4fcf325881458f6b5da853d06adf202dc43aea28f904493b337de0d4",
-    "assets/bin/memory-index": "85ae98d8e855542e0fa0692b9770f13efd26bee347045284d91efe6cedbf5554",
+    "assets/bin/memory-index": "c92b47cfee9a8861cb74a7ec29746b8b9a0d676a9af72bdf9a08970b388638d9",
     "assets/bin/memory-open": "c9ed9335cc4aa96d00260bf643d71e6405caef44eae1e2a4dee0c540ba601d86",
     "assets/bin/memory-search": "6536ec596067f4b6a6b1b6cd30fbc9d90b43f6e1dcd9bae72099be0d8c978da9",
     "assets/bin/reminder-task": "baeb03fa08268de072aafa4415ea7007573b03a0fc172d671f2c3b16e2ce15b0",
@@ -106,7 +106,7 @@
     "home/bin/learning-review": "0edf2806c75060439a73a6416c1e319e205a2aaf400a79ffa428e951c7bddc38",
     "home/bin/memory-doctor": "3a9101415cb72ece601a8117d79682999ff7f55417948695213ae7caf4d9845e",
     "home/bin/memory-embeddings-config": "1b8d4916300e1182dd6815b09db1247ee2c0cdb775e92c1f17e185e66bdb142c",
-    "home/bin/memory-index": "24c88ee4d9a9fab62340ba386bf6c307c5238ee113db474ce180dd60daea2c3e",
+    "home/bin/memory-index": "bf81f89903c7c285914b533a180e66a00faff82880e8f93cbe7615b6b16893fd",
     "home/bin/memory-open": "c9ed9335cc4aa96d00260bf643d71e6405caef44eae1e2a4dee0c540ba601d86",
     "home/bin/memory-search": "6536ec596067f4b6a6b1b6cd30fbc9d90b43f6e1dcd9bae72099be0d8c978da9",
     "home/bin/native-lifecycle": "6ca0752158b58aa9a4353841a48e9614b355639267d89682f726d9b5cbcf3720",

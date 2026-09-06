@@ -1,8 +1,8 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-09-06.aea7eb7c4e55`
+- Реліз: `2026-09-06.5acdc95b081a`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `aea7eb7c4e55468f33c97668133cc7b4c7ca5d49`
+- Ревізія вихідного комплекту: `5acdc95b081af007e249428dfca86dfe4895be92`
 - Дата релізу: `2026-09-06`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
@@ -19,8 +19,7 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    fix: bound Telegram metadata and reject incomplete files
-    fix: preserve pre-escaped Telegram formatting
+    fix(memory): keep queued Telegram requests out of active context
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не

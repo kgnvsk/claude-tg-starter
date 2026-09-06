@@ -598,6 +598,7 @@ def search(
     limit: int,
     max_chars: int,
     corporate_key: str | None = None,
+    before_message_id: int | None = None,
 ) -> str:
     expression = fts_query(query)
     # A missing chat identity cannot prove an owner context. Shared groups and
@@ -640,6 +641,18 @@ def search(
             else current_chat_sql
         )
         scope_args = [current_chat_scope, current_chat_prefix]
+    if before_message_id is not None:
+        if chat_id is None or before_message_id < 0:
+            raise ValueError("--before-message-id requires --chat-id and a nonnegative ID")
+        prefix = f"telegram/{chat_id}/message/"
+        # Automatic recall must respect the active channel turn, including when
+        # the vector index already contains a later request from its queue.
+        scope_sql = (
+            f"({scope_sql}) AND (d.source!='telegram' OR "
+            "substr(d.body,1,4)!='[in ' OR instr(d.path,?)!=1 OR "
+            "CAST(substr(d.path,?) AS INTEGER) < ?)"
+        )
+        scope_args.extend([prefix, len(prefix) + 1, before_message_id])
     parameters: list[object] = [
         current_chat_scope,
         current_chat_prefix,
@@ -919,6 +932,7 @@ def parser() -> argparse.ArgumentParser:
     search_command.add_argument("--limit", type=int, default=6)
     search_command.add_argument("--max-chars", type=int, default=6000)
     search_command.add_argument("--no-refresh", action="store_true")
+    search_command.add_argument("--before-message-id", type=int)
     get_command = sub.add_parser("get")
     get_command.add_argument("--path", required=True)
     get_command.add_argument("--chat-id")
@@ -950,6 +964,7 @@ def main() -> None:
                         args.limit,
                         max(500, min(args.max_chars, 12_000)),
                         args.corporate_key,
+                        args.before_message_id,
                     ),
                     end="",
                 )
