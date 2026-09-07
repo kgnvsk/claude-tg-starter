@@ -741,7 +741,7 @@ install_managed_crontab() {
   echo "* * * * * /usr/bin/timeout 55 $H/bin/claude-limit-recovery --active"
   echo "* * * * * /usr/bin/timeout 55 $H/bin/claude-limit-recovery --notify"
   echo "* * * * * /usr/bin/timeout 55 $H/bin/relogin-watch"
-  echo "* * * * * /usr/bin/timeout 55 $H/bin/unstick-watch"
+  echo "* * * * * /usr/bin/timeout 180 $H/bin/unstick-watch"
   echo "17 4 * * * /usr/bin/timeout 30 $H/bin/telegram-inbox-prune"
   echo "23 4 * * * find $H/telegram-outbox -xdev -type f -mtime +7 -delete"
   echo "*/5 * * * * /usr/bin/timeout 60 $H/bin/vault-sync"

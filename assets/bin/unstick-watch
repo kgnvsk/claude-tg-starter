@@ -6,6 +6,7 @@ wedged, so a command handled by the agent is useless exactly when it is needed �
 that is why /relogin lives in cron, and why this does too. Reads the owner's
 message straight from the transport's message log and acts outside Claude.
 
+The exact /restart command restarts once without disabling automatic recovery.
 Two things happen on /unstick, in this order:
   1. automatic restarts are parked for a while — when the watchdog is itself the
      thing killing the bot, restarting without parking it just feeds the loop;
@@ -17,9 +18,11 @@ import fcntl
 import json
 import os
 import re
+import signal
 import sqlite3
 import stat
 import subprocess
+import sys
 import tempfile
 import time
 import urllib.parse
@@ -43,7 +46,7 @@ HOLD_SECONDS = 15 * 60
 # uses in ordinary requests — matching them at the start of a sentence would
 # restart the agent in the middle of the very task he just asked for.
 TRIGGER = re.compile(
-    r"^\s*/?(unstick|fix|фикс|отвисни|оживи|перезапустись|розблокуйся|відвисни|перезапустися)\s*[.!]*\s*$",
+    r"^\s*(?:/restart|/?(unstick|fix|фикс|отвисни|оживи|перезапустись|розблокуйся|відвисни|перезапустися)\s*[.!]*)\s*$",
     re.IGNORECASE,
 )
 
@@ -59,6 +62,9 @@ def env_val(key: str) -> str:
 
 
 def owner() -> str:
+    configured = os.environ.get("OWNER_CHAT_ID", env_val("OWNER_CHAT_ID"))
+    if configured:
+        return configured
     data = json.loads(ACCESS_FILE.read_text(encoding="utf-8"))
     ids = data.get("admins") or data.get("allowFrom") or []
     return str(ids[0]) if ids else ""
@@ -81,8 +87,9 @@ def send(chat: str, text: str) -> bool:
                     check=False,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
+                    timeout=5,
                 )
-            except OSError:
+            except (OSError, subprocess.TimeoutExpired):
                 pass
         return delivered
     except Exception:
@@ -390,6 +397,7 @@ def main() -> int:
         latest_out = max(latest_out, fallback_outbound(chat))
 
         fired = False
+        explicit_restart = False
         latest_trigger = 0
         newest = last
         for ts, text in rows:
@@ -397,6 +405,7 @@ def main() -> int:
             if text and TRIGGER.match(text.strip()):
                 fired = True
                 latest_trigger = max(latest_trigger, ts)
+                explicit_restart = text.strip().lower() == '/restart'
 
         # Preserve the existing at-most-once command semantics by checkpointing
         # before the first side effect. Non-trigger advancement uses the same lock
@@ -404,7 +413,7 @@ def main() -> int:
         atomic_write_checkpoint(newest)
         if not fired:
             return 0
-        if latest_out > latest_trigger:
+        if latest_out > latest_trigger and not explicit_restart:
             note("/unstick already received a confirmed reply — restart skipped")
             return 0
 
@@ -415,55 +424,78 @@ def main() -> int:
             return 0
 
         loops = recent_restarts()
-        atomic_write_restart_hold(int(time.time()) + HOLD_SECONDS)
-        note(f"/unstick from owner: holding automatic restarts {HOLD_SECONDS // 60}m, "
-             f"restarts in last 10m={loops}")
+        if not explicit_restart:
+            atomic_write_restart_hold(int(time.time()) + HOLD_SECONDS)
+            note(f"/unstick from owner: holding automatic restarts {HOLD_SECONDS // 60}m, "
+                 f"restarts in last 10m={loops}")
+        else:
+            note('/restart from owner: one service restart, automatic recovery remains enabled')
 
         verdict = (f"Автоперезапуски вимкнено на {HOLD_SECONDS // 60} хв — "
                    f"сторож перезапускав мене {loops} разів за 10 хвилин, саме це й заважало."
                    if loops >= 2 else
                    f"Автоперезапуски вимкнено на {HOLD_SECONDS // 60} хв, щоб нічого не заважало.")
-        started_head = started_fifo_head()
-        delivery_id = started_head[0] if started_head is not None else None
-        origin_chat = (
-            delivery_origin_chat(delivery_id) if delivery_id is not None else None
-        )
-        send(chat, f"🛠 Прийнято. {verdict} Перезапускаюся один раз — "
-                   "напиши мені за хвилину.")
+        if explicit_restart:
+            send(chat, "🔄 Прийнято. Перезапускаю службу один раз.")
+        else:
+            send(chat, f"🛠 Прийнято. {verdict} Перезапускаюся один раз — "
+                       "напиши мені за хвилину.")
 
+        command_name = '/restart' if explicit_restart else '/unstick'
         try:
-            restarted = subprocess.run(
-                ["sudo", "systemctl", "restart", SERVICE],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=30,
-            )
-        except subprocess.TimeoutExpired:
-            note("/unstick: restart timed out")
-            return 0
-        if restarted.returncode != 0:
-            note("/unstick: restart failed")
-            return 0
+            try:
+                stopped = subprocess.run(
+                    ["sudo", "systemctl", "stop", SERVICE],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=30,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                note(f"{command_name}: stop failed or timed out; queue retained")
+                return 0
+            if stopped.returncode != 0:
+                note(f"{command_name}: stop failed; queue retained")
+                return 0
 
-        head_unchanged = (
-            started_head is not None and started_fifo_head() == started_head
-        )
-        if head_unchanged and origin_chat is not None and send(
-                origin_chat,
-                "Незавершений попередній запит не повторюю автоматично, щоб "
-                "випадково не виконати його двічі. Після відновлення надішли його ще раз.",
-        ):
-            if abort_started_fifo_head(delivery_id, started_head[1]):
-                if not remove_matching_cleanup_proof(delivery_id):
-                    note("/unstick: exact cleanup proof retained for Stop retry")
-                note("/unstick: aborted unfinished started delivery")
-            else:
-                note("/unstick: started delivery changed before cleanup")
-        elif head_unchanged and origin_chat is None:
-            note("/unstick: invalid started delivery identity retained")
-        elif delivery_id is not None:
-            note("/unstick: started delivery changed before resend notice")
-        note("/unstick: single restart issued")
+            # An input may start while the acknowledgement is being sent. Inspect
+            # the real interrupted head only after the old consumer has stopped.
+            started_head = started_fifo_head()
+            delivery_id = started_head[0] if started_head is not None else None
+            origin_chat = (
+                delivery_origin_chat(delivery_id) if delivery_id is not None else None
+            )
+
+            head_unchanged = (
+                started_head is not None and started_fifo_head() == started_head
+            )
+            if head_unchanged and origin_chat is not None and send(
+                    origin_chat,
+                    "Незавершений попередній запит не повторюю автоматично, щоб "
+                    "випадково не виконати його двічі. Після відновлення надішли його ще раз.",
+            ):
+                if abort_started_fifo_head(delivery_id, started_head[1]):
+                    if not remove_matching_cleanup_proof(delivery_id):
+                        note(f"{command_name}: exact cleanup proof retained for Stop retry")
+                    note(f"{command_name}: aborted unfinished started delivery")
+                else:
+                    note(f"{command_name}: started delivery changed before cleanup")
+            elif head_unchanged and origin_chat is None:
+                note(f"{command_name}: invalid started delivery identity retained")
+            elif delivery_id is not None:
+                note(f"{command_name}: started delivery changed before resend notice")
+        finally:
+            # A failed/timed-out stop can already have stopped the service. Never
+            # leave it down, including when notification or exact cleanup fails.
+            try:
+                started = subprocess.run(
+                    ["sudo", "systemctl", "start", SERVICE],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=30,
+                )
+                note(f"{command_name}: service start " + ('succeeded' if started.returncode == 0 else 'failed'))
+            except (OSError, subprocess.TimeoutExpired):
+                note(f"{command_name}: service start failed or timed out")
         return 0
     finally:
         try:
@@ -473,4 +505,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    # Cron cancellation must unwind through the service-start finally block.
+    signal.signal(signal.SIGTERM, lambda signum, _frame: sys.exit(128 + signum))
     raise SystemExit(main())

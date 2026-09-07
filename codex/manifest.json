@@ -7,7 +7,7 @@
     "readonly-plan-v1"
   ],
   "source": "codex/starter/product.json",
-  "sourceRevision": "fcc6bcef3b04df7462c562626e2c1680fcdcb5a2",
+  "sourceRevision": "274439d062fa667b5abaf5b38b155df3bfee9d82",
   "sourceDirty": false,
   "features": [
     "browser"

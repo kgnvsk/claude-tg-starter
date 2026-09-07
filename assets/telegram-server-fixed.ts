@@ -18,7 +18,7 @@ import {
 import { z } from 'zod'
 import { Bot, GrammyError, InlineKeyboard, InputFile, type Context } from 'grammy'
 import type { ReactionTypeEmoji } from 'grammy/types'
-import { randomBytes } from 'crypto'
+import { randomBytes, createHash } from 'crypto'
 import { accessSync, constants, existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, lstatSync, renameSync, realpathSync, chmodSync } from 'fs'
 import { homedir } from 'os'
 import { execFileSync } from 'child_process'
@@ -62,6 +62,38 @@ const CORPORATE_TEMPORARILY_UNAVAILABLE =
   '⚠️ Корпоративний режим тимчасово недоступний. Спробуй трохи пізніше.'
 const CORPORATE_FILE_INSPECTION_DISABLED =
   '⚠️ Підтримуються фото та файли JPEG/PNG/GIF/WebP до 3 МБ, голосові й аудіо. Інші файли поки надішли як текст.'
+
+function isOwnerServiceControlInput(
+  chatId: string, senderId: string, chatType: string, text: string, now = Date.now(),
+): boolean {
+  if (chatType !== 'private' || chatId !== senderId) return false
+  let ownerId = OWNER_CHAT_ID
+  if (!ownerId) {
+    try {
+      const access = JSON.parse(readFileSync(join(STATE_DIR, 'access.json'), 'utf8'))
+      ownerId = String((access.admins?.length ? access.admins : access.allowFrom)?.[0] ?? '')
+    } catch { return false }
+  }
+  if (!ownerId || senderId !== ownerId) return false
+  const value = text.trim()
+  if (/^\/?(relogin|релог[іи]н|перевхід)$/iu.test(value)) return true
+  if (/^\/restart$/iu.test(value)) return true
+  // Keep aliases identical to unstick-watch: only a whole owner command is control.
+  if (/^\/?(unstick|fix|фикс|отвисни|оживи|перезапустись|розблокуйся|відвисни|перезапустися)\s*[.!]*$/iu.test(value)) return true
+  const code = /^[A-Za-z0-9_.-]{15,}#([A-Za-z0-9_-]+)$/.exec(value)
+  if (!code) return false
+  try {
+    const flow = JSON.parse(readFileSync(join(STATE_DIR, 'auth-input.json'), 'utf8'))
+    return flow.owner_chat_id === ownerId
+      && Number.isSafeInteger(flow.since_ms) && Number.isSafeInteger(flow.expires_at)
+      && flow.since_ms <= now && now <= flow.expires_at
+      && flow.expires_at - flow.since_ms <= 600_000
+      && createHash('sha256').update(code[1]!).digest('hex') === flow.state_sha256
+  } catch {
+    return false
+  }
+}
+// End owner service control input
 
 if (!TOKEN) {
   process.stderr.write(
@@ -235,13 +267,13 @@ const pendingInboundSecondOffer = MSG_DB.prepare(
   `UPDATE pending_inbound_deliveries
    SET attempts=attempts+1, next_attempt_at=?
    WHERE delivery_id=? AND state='offered'
-     AND attempts<2 AND next_attempt_at<=?`,
+     AND attempts<? AND next_attempt_at<=?`,
 )
 const pendingInboundExhaustedDelete = MSG_DB.prepare(
   `DELETE FROM pending_inbound_deliveries
    WHERE rowid=? AND delivery_id=? AND payload=? AND created_at=? AND state=?
      AND state IN ('queued', 'offered')
-     AND attempts=? AND attempts>=2
+     AND attempts=? AND attempts>=?
      AND next_attempt_at=? AND next_attempt_at<=?
      AND rowid=(SELECT rowid FROM pending_inbound_deliveries
        ORDER BY created_at ASC, rowid ASC LIMIT 1)`,
@@ -263,7 +295,7 @@ const pendingInboundCount = MSG_DB.prepare(
 const MAX_PENDING_INBOUND_DELIVERIES = 1000
 const INBOUND_OFFER_RETRY_MS = 120000
 const MAX_INBOUND_DELIVERY_ATTEMPTS = 2
-const INBOUND_RETRY_NOTICE = '⚠️ Повідомлення двічі не дійшло до обробки. Будь ласка, надішли його ще раз.'
+const INBOUND_RETRY_NOTICE = '⚠️ Повідомлення не вдалося передати в обробку після повторних спроб. Будь ласка, надішли його ще раз.'
 const INBOUND_STARTED_RECOVERY_NOTICE = 'Незавершений попередній запит не повторюю автоматично, щоб випадково не виконати його двічі. Після відновлення надішли його ще раз.'
 
 type InboundNotification = {
@@ -1192,6 +1224,7 @@ async function drainPendingInboundDeliveries(): Promise<void> {
   if (
     SUPPRESS ||
     process.env.TG_TRANSPORT === 'daemon' ||
+    !inboundDrainStarted ||
     pendingInboundDrainActive
   ) return
   pendingInboundDrainActive = true
@@ -1213,6 +1246,7 @@ async function drainPendingInboundDeliveries(): Promise<void> {
           row.created_at,
           row.state,
           row.attempts,
+          MAX_INBOUND_DELIVERY_ATTEMPTS,
           row.next_attempt_at,
           now,
         ).changes === 1
@@ -1267,7 +1301,7 @@ async function drainPendingInboundDeliveries(): Promise<void> {
     const offered = row.state === 'queued'
       ? pendingInboundQueuedOffer.run(nextAttemptAt, row.delivery_id, now)
       : row.state === 'offered'
-        ? pendingInboundSecondOffer.run(nextAttemptAt, row.delivery_id, now)
+        ? pendingInboundSecondOffer.run(nextAttemptAt, row.delivery_id, MAX_INBOUND_DELIVERY_ATTEMPTS, now)
         : null
     if (!offered || offered.changes !== 1) return
 
@@ -1819,10 +1853,17 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
   }
 })
 
-await mcp.connect(new StdioServerTransport())
-if (!SUPPRESS && process.env.TG_TRANSPORT !== 'daemon') {
-  void startPendingInboundDrain()
+// Drain durable input only after the client handshake. Connecting stdio alone
+// does not mean Claude is ready to receive channel notifications.
+let inboundDrainStarted = false
+mcp.oninitialized = () => {
+  if (!SUPPRESS && process.env.TG_TRANSPORT !== 'daemon') {
+    if (inboundDrainStarted) return
+    inboundDrainStarted = true
+    void startPendingInboundDrain()
+  }
 }
+await mcp.connect(new StdioServerTransport())
 
 // When Claude Code closes the MCP connection, stdin gets EOF. Without this
 // the bot keeps polling forever as a zombie, holding the token and blocking
@@ -2594,6 +2635,23 @@ async function handleInbound(
     thread_id: threadId,
     conversation_key: conversationKey,
   })
+
+  // Service control belongs to the out-of-band recovery workers, not the model.
+  // Keep the input in messages.db for that worker, but never block the task FIFO
+  // with /relogin, /restart, /unstick or expose this flow's OAuth code to the model.
+  if (isOwnerServiceControlInput(chat_id, String(from.id), ctx.chat?.type ?? '', text)) {
+    try {
+      const saved = MSG_DB.query(
+        `SELECT user_id,text FROM messages WHERE chat_id=? AND direction='in' AND message_id=?`,
+      ).get(chat_id, msgId ?? null) as { user_id: string; text: string } | null
+      if (!saved || String(saved.user_id) !== String(from.id) || saved.text !== text) {
+        throw new Error('service control input not persisted')
+      }
+    } catch {
+      throw new RetryableInboundDeliveryError(new Error('service control input not persisted'))
+    }
+    return
+  }
 
   // An allowlisted group without a mention is durable PM context, not a Claude
   // turn. Voice/audio is transcribed into durable history without waking Claude.

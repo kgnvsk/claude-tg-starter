@@ -550,7 +550,7 @@ else
     # Self-service re-login: владельцу уходит OAuth-ссылка в TG, код он присылает
     # обратно боту сообщением, скрипт вставляет его в CLI и рестартит сервис.
     # Скрипт сам дебаунсится (20 мин) — безопасно звать каждые 2 минуты.
-    nohup "$H/bin/claude-auth-rescue" >/dev/null 2>&1 &
+    nohup "$H/bin/claude-auth-rescue" 9>&- >/dev/null 2>&1 &
 fi
 
 # 3. Bun telegram MCP alive? Grace-period 4 min before restart — restarting claude-telegram

@@ -9,7 +9,7 @@ the owner got to it — instead of waiting for the next auto-tick (or the agent,
 which may be brain-dead), the owner just types /relogin and gets a fresh link now.
 
 Fires `claude-auth-rescue --force` (bypasses the logged-in check and debounce).
-Only the owner (admins[0] / allowFrom[0]) can trigger it. Never logs message text.
+Only the configured owner can trigger it. Never logs message text.
 """
 import json
 import os
@@ -44,6 +44,9 @@ def env_val(key: str) -> str:
 
 
 def owner() -> str:
+    configured = os.environ.get("OWNER_CHAT_ID", env_val("OWNER_CHAT_ID"))
+    if configured:
+        return configured
     data = json.loads(ACCESS_FILE.read_text(encoding="utf-8"))
     ids = data.get("admins") or data.get("allowFrom") or []
     return str(ids[0]) if ids else ""
