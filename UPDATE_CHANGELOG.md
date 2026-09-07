@@ -1,8 +1,8 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-09-07.edc69754f9f2`
+- Реліз: `2026-09-07.cf3e7a1712e5`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `edc69754f9f204220290c8589bfbe6deb4cbfdb1`
+- Ревізія вихідного комплекту: `cf3e7a1712e509ccdf7ce066ed9c85238087a2b3`
 - Дата релізу: `2026-09-07`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
@@ -19,7 +19,8 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    feat(codex): deploy complete kits from a standalone ZIP
+    fix: install video runtime under the selected agent account
+    fix(install): reject occupied bot identities before changing runtime files
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не

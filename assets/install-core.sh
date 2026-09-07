@@ -148,6 +148,21 @@ validate_install_kit() {
 
 validate_install_kit
 
+# Check the installed runtime identity before writing templates, credentials or
+# cron entries. A wizard may already have replaced the root input agent.env.
+_installed_token="$(python3 "$KIT/assets/lib/merge-env.py" --value "$H/.claude/channels/telegram/.env" TELEGRAM_BOT_TOKEN)"
+if [ -n "$_installed_token" ] && [ "${_installed_token%%:*}" != "${TELEGRAM_BOT_TOKEN%%:*}" ]; then
+  echo "FATAL: каталог $H належить іншому Telegram-боту; для нового агента задай окремий AGENT_USER" >&2
+  exit 1
+fi
+unset _installed_token
+# The late corporate-module check also guards a restart during installation;
+# this early check prevents partial overwrites even for non-corporate kits.
+if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "$AGENT_SERVICE" 2>/dev/null; then
+  echo "FATAL: перед зміною ядра зупини $AGENT_SERVICE через maintenance-оновлення (UPGRADING.md)" >&2
+  exit 1
+fi
+
 # BEGIN Starter foundation preflight
 STARTER_FOUNDATION_REQUIRED=0
 validate_starter_foundation() {
