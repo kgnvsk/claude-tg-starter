@@ -1,8 +1,8 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-09-07.e448ffa328ee`
+- Реліз: `2026-09-07.edc69754f9f2`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `e448ffa328ee5ce64b435b9a9b5a1cbdab0e2db9`
+- Ревізія вихідного комплекту: `edc69754f9f204220290c8589bfbe6deb4cbfdb1`
 - Дата релізу: `2026-09-07`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
@@ -19,8 +19,7 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    fix(corporate): let long research finish under supervision
-    docs: specify progress-based corporate task supervision
+    feat(codex): deploy complete kits from a standalone ZIP
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не

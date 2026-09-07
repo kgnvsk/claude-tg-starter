@@ -1,0 +1,8 @@
+{
+  "botToken": "REPLACE_WITH_YOUR_BOTFATHER_TOKEN",
+  "ownerChatId": "REPLACE_WITH_YOUR_NUMERIC_TELEGRAM_USER_ID",
+  "agentName": "Codex",
+  "ownerName": "Owner",
+  "timezone": "UTC",
+  "openaiApiKey": "REPLACE_WITH_YOUR_OPENAI_API_KEY"
+}

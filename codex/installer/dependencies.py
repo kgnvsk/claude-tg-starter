@@ -15,12 +15,12 @@ import urllib.request
 PLAYWRIGHT_MCP_PACKAGE = '@playwright/mcp@0.0.78'
 
 
-def execute(command, *, user=None, env=None, cwd=None, label="dependency", timeout=900, input=None):
+def execute(command, *, user=None, env=None, cwd=None, label="dependency", timeout=900, input=None, success_codes=(0,)):
     if user:
         command = ["runuser", "-u", user, "--", "env", "-i", *[key + "=" + value for key, value in env.items()], *map(str, command)]
         cwd = cwd or env["HOME"]
     result = subprocess.run(command, cwd=cwd, capture_output=True, timeout=timeout, input=input)
-    if result.returncode:
+    if result.returncode not in success_codes:
         # Package commands may echo repository credentials. Return only the
         # known stage name, never unsanitized command output to Novsky logs.
         raise ValueError(label + " failed (exit " + str(result.returncode) + ")")
@@ -39,9 +39,11 @@ def directory(path, user, mode=0o700):
 def install_chromium_dependencies(node, cli, *, user, env):
     # The pinned package proposes public package names as an unprivileged user;
     # root only invokes apt with the bounded package-name grammar below.
-    dependencies = execute([str(node), str(cli), 'install-deps', '--dry-run', 'chromium'], user=user, env=env, label='browser dependency plan').decode()
+    # Playwright reports missing packages with exit 1 on a fresh Ubuntu. Its
+    # dry-run still succeeds as a plan; only the validated names reach apt.
+    dependencies = execute([str(node), str(cli), 'install-deps', '--dry-run', 'chromium'], user=user, env=env, label='browser dependency plan', success_codes=(0, 1)).decode()
     import re
-    packages = sorted(set(re.findall(r'\b(?:lib[a-z0-9.+-]+|fonts-[a-z0-9-]+|xfonts-[a-z0-9-]+|xvfb)\b', dependencies)))
+    packages = sorted(set(re.findall(r'\b(?:lib[a-z0-9.+-]+|fonts-[a-z0-9-]+|xfonts-[a-z0-9-]+|x11-[a-z0-9-]+|xserver-[a-z0-9-]+|xvfb)\b', dependencies)))
     if not packages and 'All system dependencies are installed.' not in dependencies:
         raise ValueError('browser dependency plan is empty')
     if packages:
