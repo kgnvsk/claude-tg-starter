@@ -1,8 +1,8 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-09-07.f23ffc1c4f9f`
+- Реліз: `2026-09-07.e448ffa328ee`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `f23ffc1c4f9fb009863d7bc4eb0fe170334b6120`
+- Ревізія вихідного комплекту: `e448ffa328ee5ce64b435b9a9b5a1cbdab0e2db9`
 - Дата релізу: `2026-09-07`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
@@ -19,7 +19,8 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    fix: preserve Unicode names in published kit archives
+    fix(corporate): let long research finish under supervision
+    docs: specify progress-based corporate task supervision
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не
