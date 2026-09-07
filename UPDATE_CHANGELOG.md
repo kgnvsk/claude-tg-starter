@@ -1,8 +1,8 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-09-07.274439d062fa`
+- Реліз: `2026-09-07.f23ffc1c4f9f`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `274439d062fa667b5abaf5b38b155df3bfee9d82`
+- Ревізія вихідного комплекту: `f23ffc1c4f9fb009863d7bc4eb0fe170334b6120`
 - Дата релізу: `2026-09-07`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
@@ -19,11 +19,7 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    fix: keep owner recovery reliable through interruption
-    fix(telegram): share retry limits between queue delivery and SQL fences
-    fix(telegram): run owner restart controls outside the model queue
-    fix(telegram): wait for client readiness before draining saved input
-    fix(auth): keep Telegram relogin controls out of the task queue
+    fix: preserve Unicode names in published kit archives
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не
