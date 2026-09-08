@@ -39,10 +39,11 @@ case "$CLAUDE_UPDATE_MAINTENANCE" in
 esac
 export CLAUDE_UPDATE_MAINTENANCE
 
-if [ "$CLAUDE_UPDATE_MAINTENANCE" != 1 ]; then
-  echo "FATAL: update.sh працює лише всередині перевіреного maintenance-вікна з UPGRADING.md" >&2
-  exit 1
-fi
+case "${1:-}" in
+  ""|--license-preflight) ;;
+  *) echo "FATAL: unknown update option" >&2; exit 1 ;;
+esac
+[ "$#" -le 1 ] || { echo "FATAL: unexpected update arguments" >&2; exit 1; }
 
 require_primary_service_stopped() {
   local state status=0
@@ -205,6 +206,17 @@ validate_kit_checkout() {
 }
 
 validate_kit_checkout
+# Wrappers call --license-preflight while the agent is still running. Applying
+# an update always verifies again, including retries on existing installations.
+python3 "$KIT/assets/lib/agent-license.py" --saved-env "$ENV_SAVED" \
+  --bot-env "$H/.claude/channels/telegram/.env"
+if [ "${1:-}" = --license-preflight ]; then
+  exit 0
+fi
+if [ "$CLAUDE_UPDATE_MAINTENANCE" != 1 ]; then
+  echo "FATAL: update.sh працює лише всередині перевіреного maintenance-вікна з UPGRADING.md" >&2
+  exit 1
+fi
 require_valid_restart_hold
 require_primary_service_stopped
 
@@ -404,10 +416,16 @@ cleanup_exports() {
 }
 trap cleanup_exports EXIT
 python3 "$KIT/assets/bin/saved-env-export" "$ENV_SAVED" > "$SAVED_EXPORTS"
+# Novsky can supply a new key privately when migrating an older saved config.
+_requested_license_key="${NOVSKY_LICENSE_KEY:-}"
+_requested_bot_token="${TELEGRAM_BOT_TOKEN:-$(python3 "$KIT/assets/lib/merge-env.py" --value "$H/.claude/channels/telegram/.env" TELEGRAM_BOT_TOKEN)}"
 while IFS= read -r -d '' name && IFS= read -r -d '' value; do
   printf -v "$name" '%s' "$value"
   export "$name"
 done < "$SAVED_EXPORTS"
+[ -z "$_requested_license_key" ] || export NOVSKY_LICENSE_KEY="$_requested_license_key"
+[ -z "$_requested_bot_token" ] || export TELEGRAM_BOT_TOKEN="$_requested_bot_token"
+unset _requested_license_key _requested_bot_token
 rm -f "$SAVED_EXPORTS"
 SAVED_EXPORTS=""
 

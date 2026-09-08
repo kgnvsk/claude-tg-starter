@@ -24,6 +24,16 @@ CODEX_VERSION = "0.153.3"
 BUN_VERSION = "1.3.9"
 
 
+def license_helper():
+    path = ROOT / "installer/agent_license.py"
+    if not path.is_file():
+        path = ROOT.parent / "assets/lib/agent-license.py"
+    spec = importlib.util.spec_from_file_location("agent_license", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def validate_config(value):
     if not isinstance(value, dict):
         raise ValueError("configuration must be a JSON object")
@@ -52,6 +62,8 @@ def validate_config(value):
             raise ValueError("invalid model")
         result["model"] = value["model"]
     result["user"] = "codex-" + result["botToken"].split(":", 1)[0]
+    if "licenseKey" in value and value["licenseKey"] != "":
+        result["licenseKey"] = license_helper().validate_key(value["licenseKey"])
     return result
 
 
@@ -116,7 +128,7 @@ def preflight_config(config):
         if same_bot and path.name != config["user"] + ".json":
             raise ValueError("this Telegram bot is already assigned to another agent")
         if path.name == config["user"] + ".json" and (
-                existing.get("botToken") != config["botToken"] or str(existing.get("ownerChatId")) != config["ownerChatId"]):
+                not same_bot or str(existing.get("ownerChatId")) != config["ownerChatId"]):
             raise ValueError("existing agent identity differs; installation cannot replace its owner or bot")
 
 
@@ -181,6 +193,13 @@ def install(config, root=ROOT):
     check_telegram(config)
     user = config["user"]
     home = Path("/home") / user
+    licensing = None
+    if manifest["productId"] != "starter":
+        licensing = license_helper()
+        key_path = CONFIG_DIR / (user + ".license-key")
+        key = config.get("licenseKey") or licensing.read_key(key_path)
+        licensing.activate(key=key, bot_token=config["botToken"], product=manifest["productId"])
+        config = {**config, "licenseKey": key}
     with agent_lock(user):
         preflight_config(config)
         state = CONFIG_DIR / (user + ".managed.json")
@@ -199,13 +218,18 @@ def install(config, root=ROOT):
         run(["apt-get", "-o", "DPkg::Lock::Timeout=120", "update", "-qq"], timeout=600)
         run(["apt-get", "-o", "DPkg::Lock::Timeout=120", "install", "-y", "-qq", "ca-certificates", "python3", "xz-utils"], timeout=600)
         progress("backup-and-agent-account")
-        runtime = {key: value for key, value in config.items() if key not in ("user", "timezone")}
+        runtime = {key: value for key, value in config.items() if key not in ("user", "timezone", "licenseKey")}
         runtime.update(workspace=str(home / "obsidian-vault"), stateDir=str(home / ".local/state/novsky-codex"),
                        logDir=str(home / "logs"), codexBin=str(home / ".local/lib/novsky-runtime/node_modules/.bin/codex"))
         bootstrap = run(["python3", str(root / "server-bootstrap.py")], input=json.dumps({
             "user": user, "config": runtime, "runtime": {"main.ts": (root / "runtime/main.js").read_text()}, "kit": {},
         }), timeout=600)
         backup = json.loads(bootstrap.stdout)["backup"]
+        if licensing:
+            # Preserve an older saved key in the bootstrap backup before
+            # replacing it. Runtime config still needs directory traversal.
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True, mode=0o711)
+            licensing.store_key(key_path, key)
         # Print the recovery location before network-dependent setup starts.
         print(json.dumps({"backup": backup, "user": user}), file=sys.stderr, flush=True)
         progress("agent-local-node-codex-bun")

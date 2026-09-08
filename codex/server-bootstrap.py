@@ -17,6 +17,14 @@ def runtime_config(path, defaults, *, completed=True):
     if not isinstance(current, dict):
         raise ValueError('invalid existing runtime configuration')
     result = {**defaults, **current}
+    old_bot = re.fullmatch(r'([1-9][0-9]*):[A-Za-z0-9_-]{30,}', str(current.get('botToken', '')))
+    new_bot = re.fullmatch(r'([1-9][0-9]*):[A-Za-z0-9_-]{30,}', str(defaults.get('botToken', '')))
+    if old_bot and new_bot:
+        if old_bot[1] != new_bot[1]:
+            raise ValueError('the existing directory belongs to another Telegram bot')
+        # The caller verified this replacement token; retain the same bot's
+        # identity while preserving its model and integration preferences.
+        result['botToken'] = defaults['botToken']
     # An incomplete first setup may be retried with a corrected API key.
     # Completed installations retain the owner's key, including upgrade retries.
     if not completed and 'openaiApiKey' in defaults:

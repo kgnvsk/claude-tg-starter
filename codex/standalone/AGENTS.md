@@ -17,6 +17,10 @@ Start with the buyer's existing request and supplied information. Ask only for
 missing server/SSH access, the buyer's Telegram bot token, the owner's numeric
 Telegram user ID, and the buyer's OpenAI API key. Accept a path to a private
 configuration file instead of asking the buyer to paste secrets into chat.
+Paid kits also require the purchased key in the private JSON field `licenseKey`.
+One key activates one Telegram bot, verified with Telegram; another bot needs
+another key. Retry, reinstall, update, token rotation and moving that same bot
+to another server reuse its key. Starter is free and leaves `licenseKey` empty.
 The owner ID is a positive numeric ID for the owner's private Telegram chat,
 not a username, channel or group ID.
 
@@ -68,6 +72,14 @@ The configuration path above is an example. Preserve any existing private
 file instead of overwriting it blindly. The default account is
 `codex-<Telegram bot ID>`. Use the exact account, service and backup paths from
 the installation result in subsequent commands; do not guess them.
+
+Activation must succeed before service changes or installation writes. A legacy
+server-bound key must first be migrated on its original server; the installer
+supplies the available SSH host fingerprint. On timeout or refusal, correct the
+reported cause and retry with the same bot; do not edit out the activation gate.
+The installer retains the key in `/etc/novsky/codex/<user>.license-key`, owned by
+root with mode `0600`, for retries and updates. Keep it out of the runtime config
+and deployment report. The running bot does not perform periodic license checks.
 
 Before changing an existing installation, ensure the server-side backup covers
 the affected account, memory, credentials, managed configuration and services.

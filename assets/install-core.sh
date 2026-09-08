@@ -156,6 +156,10 @@ if [ -n "$_installed_token" ] && [ "${_installed_token%%:*}" != "${TELEGRAM_BOT_
   exit 1
 fi
 unset _installed_token
+# Every paid install and retry verifies this bot before package or runtime writes.
+NOVSKY_LICENSE_KEY="${NOVSKY_LICENSE_KEY:-$(python3 "$KIT/assets/lib/merge-env.py" --value "$CONFIG_FILE" NOVSKY_LICENSE_KEY)}"
+export NOVSKY_LICENSE_KEY
+python3 "$KIT/assets/lib/agent-license.py" --saved-env "$CONFIG_FILE"
 # The late corporate-module check also guards a restart during installation;
 # this early check prevents partial overwrites even for non-corporate kits.
 if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "$AGENT_SERVICE" 2>/dev/null; then
@@ -652,7 +656,7 @@ chmod 600 "$CHANNEL_ENV"
 
 : > "$CONFIG_FILE"
 for name in AGENT_NAME OWNER_NAME OWNER_TG_USERNAME OWNER_CHAT_ID ADDITIONAL_ADMIN_CHAT_IDS ALERT_COPY_CHAT_IDS \
-  OWNER_EMAIL BOT_USERNAME TIMEZONE TELEGRAM_BOT_TOKEN OPENAI_API_KEY VOICE_SETUP_STATUS \
+  OWNER_EMAIL BOT_USERNAME TIMEZONE TELEGRAM_BOT_TOKEN NOVSKY_LICENSE_KEY OPENAI_API_KEY VOICE_SETUP_STATUS \
   MEMORY_EMBEDDINGS_OPENAI \
   RECALL_API_KEY RECALL_REGION TG_DROP_PENDING_ON_BOOT TG_CORPORATE_SESSIONS \
   CALENDAR_EMAIL VAULT_LOCALE MODULE_DESIGN_PACK MODULE_CHANNEL_PUBLISH \

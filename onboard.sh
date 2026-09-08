@@ -44,6 +44,7 @@ validate_chat_id() { [[ "$1" =~ ^[0-9]{4,20}$ ]]; }
 validate_admin_ids() { [[ -z "$1" || "$1" =~ ^[0-9]{4,20}(,[0-9]{4,20})*$ ]]; }
 validate_bot_username() { local value="${1#@}"; [[ "$value" =~ ^[A-Za-z0-9_]{1,27}_bot$ ]]; }  # Telegram allows 5-32 chars total, e.g. ab_bot
 validate_bot_token() { [[ "$1" =~ ^[0-9]{6,12}:[A-Za-z0-9_-]{30,}$ ]]; }
+validate_license_key() { [[ -n "$1" && "$1" != *[[:space:]]* && ${#1} -le 1024 ]]; }
 validate_timezone() { [ -f "/usr/share/zoneinfo/$1" ] && [[ "$1" != *..* ]]; }
 validate_email() { [[ -z "$1" || "$1" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]]; }
 validate_openai_key() { [[ -z "$1" || "$1" =~ ^sk-[A-Za-z0-9_-]{20,}$ ]]; }
@@ -145,13 +146,14 @@ write_env_value() {
 ALERT_COPY_CHAT_IDS="${ALERT_COPY_CHAT_IDS:-}"
 PRESERVE_NAMES=(
   ADDITIONAL_ADMIN_CHAT_IDS ALERT_COPY_CHAT_IDS OWNER_EMAIL CALENDAR_EMAIL
-  TELEGRAM_BOT_TOKEN OPENAI_API_KEY MEMORY_EMBEDDINGS_OPENAI
+  TELEGRAM_BOT_TOKEN NOVSKY_LICENSE_KEY OPENAI_API_KEY MEMORY_EMBEDDINGS_OPENAI
   RECALL_API_KEY RECALL_REGION TG_DROP_PENDING_ON_BOOT
   MODULE_DESIGN_PACK MODULE_CHANNEL_PUBLISH MODULE_SOCIAL_BROWSER
   MODULE_TRANSPORT_DAEMON MODULE_VAULT_WEB MODULE_INSTAGRAM_DM
   MODULE_YOUTUBE_COMMENTS CHANNEL_ID SITE_PASSWORD ACTIVE_ROLES
 )
 if [ -r "$ENV_OUT" ]; then
+  _requested_license_key="${NOVSKY_LICENSE_KEY:-}"
   PRESERVED_EXPORTS="$(mktemp)"
   trap 'rm -f "${PRESERVED_EXPORTS:-}"' EXIT
   python3 "$KIT/assets/bin/saved-env-export" \
@@ -162,6 +164,8 @@ if [ -r "$ENV_OUT" ]; then
   while IFS= read -r -d '' name && IFS= read -r -d '' value; do
     printf -v "$name" '%s' "$value"
   done < "$PRESERVED_EXPORTS"
+  [ -z "$_requested_license_key" ] || NOVSKY_LICENSE_KEY="$_requested_license_key"
+  unset _requested_license_key
   rm -f "$PRESERVED_EXPORTS"
   PRESERVED_EXPORTS=""
 fi
@@ -468,6 +472,14 @@ printf '  Додаткові адміністратори: %s\n' "${ADDITIONAL_A
 read -rp "Усе правильно? Записати захищену конфігурацію та встановити ядро? [т/Н]: " confirmed
 case "${confirmed:-}" in y|Y|yes|YES|да|Да|так|Так|т|Т) ;; *) echo "Скасовано, файли не змінено."; exit 0 ;; esac
 
+NOVSKY_LICENSE_KEY="${NOVSKY_LICENSE_KEY:-}"
+if [ "$(python3 "$PRODUCT_CONFIG" get productId)" != starter ] && [ -z "$NOVSKY_LICENSE_KEY" ]; then
+  echo "Один придбаний ключ — один Telegram-бот. Повторне встановлення й оновлення цього бота використовують той самий ключ."
+  ask_secret NOVSKY_LICENSE_KEY "Ключ придбаного комплекту (введення приховано)" 1 validate_license_key
+fi
+export NOVSKY_LICENSE_KEY TELEGRAM_BOT_TOKEN
+python3 "$KIT/assets/lib/agent-license.py" --saved-env "$ENV_OUT"
+
 install -d -m 700 "$CONFIG_DIR"
 if [ -f "$ENV_OUT" ]; then
   cp -a "$ENV_OUT" "$ENV_OUT.backup.$(date -u +%Y%m%dT%H%M%SZ)"
@@ -481,7 +493,7 @@ env_umask="$(umask)"
 umask 077
 : > "$ENV_OUT"
 for name in AGENT_NAME OWNER_NAME OWNER_TG_USERNAME OWNER_CHAT_ID ADDITIONAL_ADMIN_CHAT_IDS ALERT_COPY_CHAT_IDS OWNER_EMAIL \
-            BOT_USERNAME TIMEZONE TELEGRAM_BOT_TOKEN OPENAI_API_KEY VOICE_SETUP_STATUS \
+            BOT_USERNAME TIMEZONE TELEGRAM_BOT_TOKEN NOVSKY_LICENSE_KEY OPENAI_API_KEY VOICE_SETUP_STATUS \
             MEMORY_EMBEDDINGS_OPENAI \
             RECALL_API_KEY RECALL_REGION CALENDAR_EMAIL VAULT_LOCALE TG_DROP_PENDING_ON_BOOT \
             MODULE_DESIGN_PACK MODULE_CHANNEL_PUBLISH MODULE_SOCIAL_BROWSER \

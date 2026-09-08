@@ -1,9 +1,9 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-09-07.cf3e7a1712e5`
+- Реліз: `2026-09-08.c7fa3b9e2616`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `cf3e7a1712e509ccdf7ce066ed9c85238087a2b3`
-- Дата релізу: `2026-09-07`
+- Ревізія вихідного комплекту: `c7fa3b9e26160792235eb59e4f272c3414bf761d`
+- Дата релізу: `2026-09-08`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
 
@@ -19,8 +19,8 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    fix: install video runtime under the selected agent account
-    fix(install): reject occupied bot identities before changing runtime files
+    fix: validate Codex license before stopping for updates
+    fix(install): activate paid Claude and Codex kits for one bot
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не

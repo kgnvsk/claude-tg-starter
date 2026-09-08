@@ -13,6 +13,9 @@ Give your coding agent this request:
 
 ## Prepare
 
+- The purchased kit key for the private `licenseKey` field. One key is for one
+  Telegram bot; retry, update, token rotation and moving the same bot reuse it.
+  Free Starter leaves this field empty and makes no licensing requests.
 - Ubuntu 22.04 or 24.04 with systemd and internet access; SSH access as root
   or an existing authorized route to root for installation.
 - Your own BotFather bot token and your numeric Telegram user ID for your

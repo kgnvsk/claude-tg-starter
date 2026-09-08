@@ -197,7 +197,7 @@ def plan_configuration(home, data, previous=None):
     settings = {}
     entries = [(line, re.match(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$", line)) for line in existing.splitlines()]
     for line, entry in entries:
-        if entry and entry[1] in ("AGENT_NAME", "OWNER_CHAT_ID", "TZ"):
+        if entry and entry[1] in ("AGENT_NAME", "OWNER_CHAT_ID", "TZ", "TELEGRAM_BOT_TOKEN"):
             try:
                 values = shlex.split(entry[2], comments=True)
             except ValueError:
@@ -216,7 +216,17 @@ def plan_configuration(home, data, previous=None):
         raise ValueError("invalid timezone")
     agent_name = settings.get("AGENT_NAME", "Novsky") if maintenance else data.get("agentName", settings.get("AGENT_NAME", "Novsky"))
     effective = {**data, "ownerChatId": owner, "timezone": timezone, "agentName": agent_name}
+    old_token, new_token = settings.get("TELEGRAM_BOT_TOKEN"), data.get("botToken")
+    if old_token and new_token and (not isinstance(new_token, str) or old_token.split(":", 1)[0] != new_token.split(":", 1)[0]):
+        raise ValueError("existing bot identity differs; choose a separate agent")
     if maintenance:
+        if old_token and new_token and old_token != new_token:
+            if not re.fullmatch(r"[1-9][0-9]{4,15}:[A-Za-z0-9_-]{20,100}", new_token):
+                raise ValueError("invalid Telegram bot token")
+            lines = [line for line, entry in entries if not entry or entry[1] != "TELEGRAM_BOT_TOKEN"]
+            lines.append("TELEGRAM_BOT_TOKEN=" + shlex.quote(new_token))
+            writes.append((env_path, "\n".join(lines) + "\n", 0o400))
+            return {"data": effective, "writes": writes, "preserved": preserved, "ownerAccess": "existing-admin"}
         return {"data": effective, "writes": [], "preserved": [*preserved, env_path], "ownerAccess": "existing-admin"}
     # Preserve existing integrations; only update fields explicitly supplied by
     # Novsky. Semantic memory needs its own explicit setup choice.

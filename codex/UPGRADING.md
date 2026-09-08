@@ -29,17 +29,31 @@ update for the administrator and report that application is still pending.
    additional administrators, disabled skills, custom files, Vault, indexes and
    conversation histories. Resolve an actual owner-file conflict with the owner;
    do not erase checksums, remove a file or weaken access to force the update.
-5. Check current tasks and delivery queues; do not interrupt an unrelated owner
+5. Before stopping the agent, require `license-preflight-v1` in the verified
+   manifest's `installerCapabilities`. If it is absent, obtain a newer installer
+   while keeping the agent running; older installers may ignore `action`.
+   Run `installer/install.py` with the same JSON identity on stdin and
+   `action: license-preflight`, `maintenance: true`. Paid kits activate with the
+   current runtime token from `/etc/novsky/codex/<user>.json` and either the
+   private `licenseKey` input or `/etc/novsky/codex/<user>.license-key`.
+   Older paid installations may have no saved key: supply the purchased key
+   privately in the JSON stdin, keeping it out of shell arguments and logs.
+   Keep that same private input for the install step: preflight does not save
+   the key or write local installation state. Starter stays offline. If the key
+   is missing, refused or cannot be verified, keep the service running and
+   resolve the failure before maintenance. A successful file plan alone does
+   not verify the license.
+6. Check current tasks and delivery queues; do not interrupt an unrelated owner
    or employee request. Save a private backup covering every component you will
    change, with a usable recovery procedure. Stop only the named target service
    and confirm its process is gone. Arrange the maintenance command outside the
    process being stopped so stopping yourself cannot abandon the installation.
-6. Run the verified native installer with the same JSON identity and
+7. Run the verified native installer with the same JSON identity and
    `maintenance: true`, omitting `action` (normal install). It preserves the
    existing Telegram `.env`. Do not replace the separate Novsky Telegram bridge,
    shared services or CLIs unless the release supplies and verifies those
    components and you have their specific update procedure.
-7. Restart the target, confirm fresh health and the actual Telegram poller,
+8. Restart the target, confirm fresh health and the actual Telegram poller,
    verify the model, memory search, access policy and an actual delivered reply.
    Report the installed revision and what passed. `systemd active` alone is not
    completion. If installation fails, use the prepared recovery; never replay

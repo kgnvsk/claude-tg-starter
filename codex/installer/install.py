@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """Apply a verified native kit to a Novsky-owned account. JSON input via stdin.
 
-The Novsky account/runtime bootstrap stops the named unit and creates a backup
-before calling this installer. The kit is activated only after setup succeeds.
+The install action requires the caller to stop the named unit and create a
+backup. Plan and license-preflight run without stopping or changing the agent.
 """
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -15,6 +16,18 @@ import re
 import subprocess
 import sys
 import tempfile
+
+
+def license_helper():
+    # Installed payloads carry the exact shared helper beside this installer.
+    # The source-tree fallback is for repository checks and local kit building.
+    path = Path(__file__).resolve().with_name("agent_license.py")
+    if not path.is_file():
+        path = Path(__file__).resolve().parents[1] / "assets/lib/agent-license.py"
+    spec = importlib.util.spec_from_file_location("agent_license", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def digest(data: bytes) -> str:
@@ -270,9 +283,9 @@ def starter_configuration(manifest: dict, data: dict, previous: dict) -> dict:
 def main():
     data = json.load(sys.stdin)
     action = data.get("action", "install")
-    if action not in ("install", "plan"):
+    if action not in ("install", "plan", "license-preflight"):
         raise ValueError("unsupported installation action")
-    # Read-only planning must not create import caches in the verified payload.
+    # Read-only actions must not create import caches in the verified payload.
     sys.dont_write_bytecode = True
     user = data["user"]
     if os.geteuid() != 0 or not re.fullmatch(r"codex-[a-z0-9][a-z0-9-]{0,23}", user):
@@ -283,7 +296,7 @@ def main():
     account = pwd.getpwnam(user)
     if account.pw_uid < 1000 or account.pw_dir != str(home) or json.loads(marker.read_text()).get("user") != user:
         raise ValueError("account is not owned by Novsky")
-    if action != "plan":
+    if action == "install":
         assert_stopped("codex-telegram@" + user + ".service")
     root = Path(data["payload"])
     manifest = verify(root)
@@ -293,6 +306,14 @@ def main():
     previous = json.loads(state_path.read_text()) if state_path.exists() else {}
     if not isinstance(previous, dict) or not isinstance(previous.get("files", {}), dict):
         raise ValueError("invalid existing managed state")
+    config_path = safe_path(config_dir, user + ".json")
+    config = json.loads(config_path.read_text())
+    if not isinstance(config, dict):
+        raise ValueError("invalid existing runtime configuration")
+    if action == "license-preflight" or data.get("maintenance") is True:
+        # Use the current runtime token for both activation and Telegram
+        # configuration; an old setup request must not restore a revoked token.
+        data = {**data, "botToken": config.get("botToken")}
     fresh_starter = manifest["productId"] == "starter" and not previous.get("revision")
     data = starter_configuration(manifest, data, previous)
     from setup import configure, plan_configuration
@@ -312,10 +333,6 @@ def main():
     target_change(project_config, config_text)
     if project_config.exists() and digest(project_config.read_bytes()) not in (digest(config_text.encode()), previous.get("configSha")):
         raise ValueError("local project configuration needs reconciliation")
-    config_path = safe_path(config_dir, user + ".json")
-    config = json.loads(config_path.read_text())
-    if not isinstance(config, dict):
-        raise ValueError("invalid existing runtime configuration")
     directories = ("bin", ".agents", ".codex/agents", "obsidian-vault/.codex", ".local/lib", ".local/bin", ".npm-global", ".local/state/novsky-codex", ".local/share/novsky-kit", ".venvs", ".config")
     for relative in directories:
         path = safe_path(home, relative)
@@ -335,6 +352,19 @@ def main():
                                             "previousRevision": previous.get("revision"), "ownerAccess": configuration["ownerAccess"],
                                             "projectConfig": "compatible", "requiresStoppedAgent": True}}))
         return
+    licensing = None
+    if manifest["productId"] != "starter":
+        licensing = license_helper()
+        key_path = safe_path(config_dir, user + ".license-key")
+        key = data.get("licenseKey") or licensing.read_key(key_path)
+        licensing.activate(key=key, bot_token=data.get("botToken") or config.get("botToken"),
+                           product=manifest["productId"], machine=data.get("machine"))
+    if action == "license-preflight":
+        print(json.dumps({"ok": True, "action": action, "productId": manifest["productId"],
+                          "revision": manifest["sourceRevision"]}))
+        return
+    if licensing:
+        licensing.store_key(key_path, key)
     # Every managed path, config conflict and owner check above is read-only.
     # Dependency installation and native discovery still need runtime checks.
     apply_reconcile(plan, account.pw_uid, account.pw_gid)
