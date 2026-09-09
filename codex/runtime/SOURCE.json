@@ -1,27 +1,27 @@
 {
   "repository": "novsky",
-  "revision": "c88dddf42f5735a11ca2ae029772a2562e9a7439",
-  "sourceDirty": true,
+  "revision": "e46ab00cccbbbb5223f56cd8a4eb86467d062815",
+  "sourceDirty": false,
   "buildCommand": "bun scripts/build-codex-runtime.ts",
   "files": {
-    "src/codex-runtime/activity.ts": "a0cfc8d8e1340042b816e3ff520c09843a7e54a784def21029d333199bc4103b",
+    "src/codex-runtime/activity.ts": "d2d53d2a7ca7590e9b187216353006891d39c473742ae00451582e0546bb2512",
     "src/codex-runtime/archive.ts": "9ae0a8726fede24e577dc3504ffba9af96375f35a7861f21e013a9ad8299e21d",
     "src/codex-runtime/corporate-loader.ts": "47665943a2eb09636839f02f532896cea27e303a12c59d351c639f36553be95d",
     "src/codex-runtime/corporate.ts": "6c88989057bb84a7bfa4b21561dbead97b8025fdf878acc9791dbe181596dc51",
     "src/codex-runtime/formatting.ts": "6fd8063285f65a9f2a6b0a46d26bd97d94e8c4ed32c9fa29ad93aaa300a36122",
-    "src/codex-runtime/kit-tools.ts": "758630646c6557b104eb08aa00dee50cd7f4598b9d13843c0a6150a5c4af0c39",
+    "src/codex-runtime/kit-tools.ts": "a19e31345c0d8398f3b9b617c7da7920fd034d635ea1de0d22c58105ead094c3",
     "src/codex-runtime/lifecycle.ts": "41956ff47d2a14cc1b3686fe1f47d881994ad4b8519ad0de9d88cf3f66529f51",
-    "src/codex-runtime/main.ts": "321e53561a85d7ced3211cdf7980e9df5542eaff95061dbc6d3a1dad628ebbdd",
+    "src/codex-runtime/main.ts": "be683d0775587943bf0cf90940ae6ea0cf8a68dddee8817d651f9b5e8fdf8be7",
     "src/codex-runtime/memory.ts": "af5077f7732e4ce8730df7b1a9a9b46a59fccc6eba903a358caf7f3d5cb0d973",
     "src/codex-runtime/rpc.ts": "dd548c715fb8d18108df3d9cb46c0ef8c43a31b3a78999724ab2f7aa2deebc79",
-    "src/codex-runtime/store.ts": "219f740dc016837c878004a150f48582b46bf9bbf57edbcaaf1cd94e9bb93548",
-    "src/codex-runtime/team-results.ts": "1bec5256d668307d4b6f160a4ecea9df331ee855e8ef1c83d1cd57e3a4498f8a",
+    "src/codex-runtime/store.ts": "eebedc158e787dfaac5340b30b5ee55ae1d7748c3e2422be01eb0fe66cdf74e5",
+    "src/codex-runtime/team-results.ts": "62ac40dbd8bcf117481029f5d051eeefa5ae9c3ed078179099306d46486f507c",
     "src/codex-runtime/team.ts": "9b4ba78fa83bafecf13d2c8143106950ee524fa840f32921cefdd35bad2a0e7b",
     "src/codex-runtime/telegram.ts": "4cf851728fd7d7e3db91189ee9842891b3a648ddeae643964b4c5ae0ed67537c",
     "scripts/build-codex-runtime.ts": "6e60a3d21caad89e39c35c21d505e10737ad79e609bde88128ff463caf458b9c",
-    "src/server/codex/install.py": "61b5a0bb4a551a8d11c3b0e84d854f9e061c281f04edc738eb6c70c13a5b9923",
+    "src/server/codex/install.py": "ea53fa0036b606ee0120937658bb24943d3b3df7c87b9fb06328cb93fd9a78b9",
     "src/server/codex/premium.ts": "a680ec50234cc470d674ca7d266ddaaf91b18c95a811c2f0d9b8f8030f63cd7f"
   },
-  "runtimeSha256": "785372d97915d72bb20d6363b7d4a0615d34d36adf9019723a841839de8e40a7",
-  "bootstrapSha256": "61b5a0bb4a551a8d11c3b0e84d854f9e061c281f04edc738eb6c70c13a5b9923"
+  "runtimeSha256": "317bee2262aff4b2d03c671e98b2277f1b7bd6fe8a193469c4986309b32dbeca",
+  "bootstrapSha256": "ea53fa0036b606ee0120937658bb24943d3b3df7c87b9fb06328cb93fd9a78b9"
 }
