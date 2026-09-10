@@ -62,7 +62,7 @@ echo "==> exercising Playwright through the MCP protocol"
 runuser -u claude-browser -- env HOME="$STATE" \
   node "$RUNTIME/browser-mcp-smoke.mjs"
 setpriv --reuid=claude --regid=claude --init-groups -- \
-  test -r "$SHARE/mcp-tool-smoke.png" || {
+  python3 -c 'import sys; open(sys.argv[1], "rb").read(1)' "$SHARE/mcp-tool-smoke.png" || {
   echo "FATAL: browser screenshot is not readable by the Claude runtime" >&2
   exit 1
 }

@@ -9,7 +9,7 @@
     "standalone-server-v1"
   ],
   "source": "codex/starter/product.json",
-  "sourceRevision": "f76f6dbccf8d53d86ab7d28d657e0b470936deac",
+  "sourceRevision": "bdf5de7af86e6fe6e979f1aef2ef6feb1b34f4e8",
   "sourceDirty": false,
   "features": [
     "browser"
@@ -100,7 +100,7 @@
     "assets/bin/vault-sync": "dd8314b35e4c722e19e385e0d54c77ccfcb30b8cbaf16788c8f28352b83a6b39",
     "assets/browser/browser-mcp-smoke.mjs": "9133a7e1b827bb48c2013ab9271da7d1e9a66f971268e3fbf81d567c87d146b2",
     "assets/browser/browser-smoke.mjs": "39ca27bd5c5de973f3b71902377c642c534453501f84c192c80cfb18570b982f",
-    "scripts/install-browser.sh": "c590b05fda39c781a4a49b4895f5aebf1dce273edfac18ce22e419b2edd8e07e",
+    "scripts/install-browser.sh": "bee768ef42d93dd1d07b3423e32802bb1ce6a600106594afcd33ac9f494268ed",
     "assets/lib/product-config.py": "6f0388647677074592e1256d0b7770e995f0aa841573c21b68d95b933aee3523",
     "assets/lib/merge-env.py": "99eea7c790332db713a6242b8a2dd241e15fa5dd4f522b9f05c0525eb29daf7e"
   },
@@ -149,7 +149,7 @@
     "resources/assets/browser/browser-smoke.mjs": "39ca27bd5c5de973f3b71902377c642c534453501f84c192c80cfb18570b982f",
     "resources/assets/lib/merge-env.py": "99eea7c790332db713a6242b8a2dd241e15fa5dd4f522b9f05c0525eb29daf7e",
     "resources/assets/lib/product-config.py": "6f0388647677074592e1256d0b7770e995f0aa841573c21b68d95b933aee3523",
-    "resources/scripts/install-browser.sh": "c590b05fda39c781a4a49b4895f5aebf1dce273edfac18ce22e419b2edd8e07e",
+    "resources/scripts/install-browser.sh": "bee768ef42d93dd1d07b3423e32802bb1ce6a600106594afcd33ac9f494268ed",
     "runtime/SOURCE.json": "f82461f669febfa47990ebc59441b188b33a0e6af815b86561a2145bfa10bb4c",
     "runtime/main.js": "317bee2262aff4b2d03c671e98b2277f1b7bd6fe8a193469c4986309b32dbeca",
     "server-bootstrap.py": "ea53fa0036b606ee0120937658bb24943d3b3df7c87b9fb06328cb93fd9a78b9",
