@@ -9,7 +9,7 @@
     "standalone-server-v1"
   ],
   "source": "codex/starter/product.json",
-  "sourceRevision": "c9803b0886554cf741b7d3099aab04b559605422",
+  "sourceRevision": "f76f6dbccf8d53d86ab7d28d657e0b470936deac",
   "sourceDirty": false,
   "features": [
     "browser"
@@ -73,7 +73,7 @@
     "codex/skills/novsky-research/SKILL.md": "776d40e34a23adad75de2e2ef277fdca8838edadf8820138e848b924ef6d6ef3",
     "codex/templates/AGENTS.md": "f4ee16ad00dd9550b6adc935cf55c49b7f9b09c7ac2568787b7683e0ad4af542",
     "codex/templates/NOVSKY.md": "1fb0091564df4f0ab7eb08ac56829928cd873d6424b0f1f826293d582a46e6cb",
-    "codex/UPGRADING.md": "0984f0a19ef708ecd2823c8a5641c29431d8c404fdc7695e0bdb3f26d952458c",
+    "codex/UPGRADING.md": "baa616a6b8f52e0d472d11f53fbab1e8c0cc09fb45467e96960b87acd3883841",
     "codex/native-lifecycle": "6ca0752158b58aa9a4353841a48e9614b355639267d89682f726d9b5cbcf3720",
     "codex/starter/ROLE.md": "276957f12417fa60c61459f56b6c9a2c4af980918b46b320e92a59dd6bbdd5d1",
     "assets/templates/USER.md": "0175b8704a55cb32f951a53a4d6f1522b950299e3ec5b7c700299258cc8b4e09",
@@ -105,7 +105,7 @@
     "assets/lib/merge-env.py": "99eea7c790332db713a6242b8a2dd241e15fa5dd4f522b9f05c0525eb29daf7e"
   },
   "files": {
-    "UPGRADING.md": "0984f0a19ef708ecd2823c8a5641c29431d8c404fdc7695e0bdb3f26d952458c",
+    "UPGRADING.md": "baa616a6b8f52e0d472d11f53fbab1e8c0cc09fb45467e96960b87acd3883841",
     "home/.agents/skills/novsky-deliverables/SKILL.md": "0caae32f840d654b70f9e638ad089c773bddb02c9d388ed6bc7d2ddcc39342f2",
     "home/.agents/skills/novsky-integrations/SKILL.md": "a9741a85719db6238837b82576a3a3ebda8ffb196ec7d0c39ac3427ea75f6857",
     "home/.agents/skills/novsky-memory/SKILL.md": "31ad9206a735ef51583b24d20fa6321a3bcd92e977782ad1b206a9e05ad03593",

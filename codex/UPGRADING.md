@@ -62,3 +62,26 @@ update for the administrator and report that application is still pending.
 Missing permissions or an unknown installation layout are a reason to stop
 before changing files and explain what is missing. They are not permission to
 take over another account or bypass the host's restrictions.
+
+## Intentional group silence schema
+
+Releases with intentional group silence add the terminal `no_reply` state to
+the shared corporate module's `conversation_jobs` table. It records an
+observation without a Telegram send, not a delivered answer. The first store
+open may rebuild that table while preserving its rows and dependent objects.
+
+Before step 7, with the target and its workers stopped, save the old module and
+a consistent copy of its corporate SQLite database together, including any
+uncheckpointed WAL state. Record the schema, row counts by state, and dependent
+indexes, triggers and views without message bodies. After migration, before
+resuming work, require `PRAGMA integrity_check` to return `ok`,
+`PRAGMA foreign_key_check` to return no rows, the state CHECK to include
+`no_reply`, unchanged existing row counts and dependent objects, and no table
+named `corporate_jobs_no_reply_upgrade`.
+
+Do not roll back only the module: an older FIFO reader does not recognize
+`no_reply` as terminal and can stall the next answer. If startup verification
+fails before new requests resume, restore the matching module/database backup.
+If the new version has already accepted work, preserve that newer history and
+use a compatible repair or an explicit maintenance migration; never blindly
+restore an older snapshot. Do not relabel silent observations as `delivered`.

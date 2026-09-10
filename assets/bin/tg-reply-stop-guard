@@ -190,11 +190,11 @@ def telegram_state_dir() -> Path:
 
 
 def complete_started_delivery(
-    delivery_id: str | None, *, allow_offered: bool = False
+    delivery_id: str | None, *, allow_offered: bool = False, silent: bool = False
 ) -> bool:
     """Remove the exact completed row; queued carriers may still be offered."""
     if delivery_id is None:
-        return True
+        return not silent
     database = telegram_state_dir() / "messages.db"
     if not database.exists():
         return False
@@ -209,6 +209,37 @@ def complete_started_delivery(
         ).fetchone()
         if table is None:
             return False
+        if silent:
+            # Observation is not proof of delivery. Do not release a row already
+            # reserved by recovery, or any other item in the FIFO.
+            states = ("started", "offered") if allow_offered else ("started",)
+            deleted = connection.execute(
+                "DELETE FROM pending_inbound_deliveries WHERE delivery_id=? "
+                "AND state IN (" + ",".join("?" for _ in states) + ")",
+                (delivery_id, *states),
+            )
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS telegram_silent_deliveries ("
+                "delivery_id TEXT PRIMARY KEY, completed_at INTEGER NOT NULL)"
+            )
+            if deleted.rowcount == 1:
+                connection.execute(
+                    "INSERT OR REPLACE INTO telegram_silent_deliveries VALUES (?,?)",
+                    (delivery_id, int(datetime.now(timezone.utc).timestamp())),
+                )
+                connection.execute(
+                    "DELETE FROM telegram_silent_deliveries WHERE delivery_id NOT IN "
+                    "(SELECT delivery_id FROM telegram_silent_deliveries "
+                    "ORDER BY completed_at DESC, rowid DESC LIMIT 1000)"
+                )
+            connection.commit()
+            remaining = connection.execute(
+                "SELECT 1 FROM pending_inbound_deliveries WHERE delivery_id=?", (delivery_id,)
+            ).fetchone()
+            receipt = connection.execute(
+                "SELECT 1 FROM telegram_silent_deliveries WHERE delivery_id=?", (delivery_id,)
+            ).fetchone()
+            return remaining is None and receipt is not None
         if allow_offered:
             deleted = connection.execute(
                 "DELETE FROM pending_inbound_deliveries "
@@ -850,7 +881,7 @@ def deliver_pending_answer(turn_events: list[object], chat_id: str) -> bool:
     тож сторож стану бачить чат відповіданим, і мовчить у підавлених сесіях.
     """
     text = final_answer_text(turn_events)
-    if not text or UNSAFE_FALLBACK_TEXT.search(text):
+    if chat_id.startswith("-") or text == "NO_REPLY" or not text or UNSAFE_FALLBACK_TEXT.search(text):
         return False
     sender = Path.home() / "bin/tg-send"
     if not os.access(sender, os.X_OK):
@@ -879,6 +910,72 @@ def deliver_pending_answer(turn_events: list[object], chat_id: str) -> bool:
         except (json.JSONDecodeError, TypeError):
             pass
     return False
+
+
+def observation_only(turn_events: list[dict]) -> bool:
+    """Silence cannot replace a tool result, failed send or unfinished task."""
+    return not any(
+        isinstance(block, dict) and block.get("type") == "tool_use"
+        for event in turn_events for block in content_blocks(event)
+    )
+
+
+def explicit_no_reply(turn_events: list[dict]) -> bool:
+    for event in reversed(turn_events):
+        if event.get("type") == "assistant":
+            texts = [block.get("text", "") for block in content_blocks(event)
+                     if isinstance(block, dict) and block.get("type") == "text"]
+            return (all(isinstance(text, str) for text in texts)
+                    and "\n".join(texts).strip() == "NO_REPLY")
+    return False
+
+
+def silence_covers_latest_incoming(
+    events: list[dict], chat_id: str, delivery_id: str | None,
+) -> bool:
+    """A previous NO_REPLY receipt cannot cover an unflushed newer turn."""
+    if delivery_id is None:
+        return False
+    seen: set[str] = set()
+    latest = None
+    for event in events:
+        if event.get("isSidechain") is True:
+            continue
+        event_uuid = event.get("uuid")
+        valid_uuid = isinstance(event_uuid, str) and bool(event_uuid)
+        if valid_uuid:
+            if event_uuid in seen:
+                continue
+            seen.add(event_uuid)
+        disposition, prompt, origin = event_disposition(event)
+        if disposition == "carrier" and telegram_chat_id(prompt, origin) == chat_id:
+            # Transcript copies can repeat an old UUID with a cosmetic slug.
+            # Its first position, not the repeated physical row, orders input.
+            latest = telegram_delivery_id(prompt, origin) if valid_uuid else None
+    return latest == delivery_id
+
+
+def finish_group_observation(
+    turn_events: list[dict], delivery_id: str | None, queued_carrier: bool,
+    *, reported_work: bool = False,
+) -> None:
+    if explicit_no_reply(turn_events) and observation_only(turn_events) and not reported_work:
+        if not complete_started_delivery(delivery_id, allow_offered=queued_carrier, silent=True):
+            reason = ("The group observation could not be settled in the queue. No Telegram "
+                      "response was sent. Keep this request pending and retry Stop; do not "
+                      "send a silence explanation or claim delivery.")
+            print(json.dumps({"decision": "block", "reason": reason, "systemMessage": reason}))
+        return
+    reason = (
+        "Group terminal text is NOT automatically published. If a real response is required, "
+        "send it explicitly with mcp__plugin_telegram_telegram__reply to this turn's chat_id/topic "
+        "(or the documented sender if that tool failed). If this is only observation of "
+        "people talking to each other and no tool/action/task needs a result, finish with "
+        "exactly NO_REPLY as terminal text. Never send NO_REPLY or an explanation of why "
+        "you are staying silent to Telegram. Do not use silence to abandon requested work, "
+        "a refusal that needs delivery, a failed send or a delegated result."
+    )
+    print(json.dumps({"decision": "block", "reason": reason, "systemMessage": reason}))
 
 
 def delegated_turn_work(hook: dict, events: list[dict], turn_events: list[dict]) -> dict:
@@ -967,6 +1064,16 @@ def main() -> None:
         request_clean_restart(events, chat_id)
     except OSError:
         pass
+
+    if chat_id.startswith("-"):
+        # Only explicit sends are publishable in groups. Plain model text may
+        # explain why it should stay silent; forwarding it reverses that intent.
+        if explicit_no_reply(turn_events) and not silence_covers_latest_incoming(events, chat_id, delivery_id):
+            block_delegation('A newer Telegram input has no current disposition in the transcript yet. Retry Stop after its current turn is recorded; do not reuse an older NO_REPLY or send a silence explanation.')
+            return
+        finish_group_observation(turn_events, delivery_id, queued_carrier,
+                                 reported_work=work['reportedAt'] is not None)
+        return
 
     if stop_hook_active and os.path.lexists(cleanup_proof_path()):
         block_cleanup()
