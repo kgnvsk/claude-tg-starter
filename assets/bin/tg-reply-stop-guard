@@ -552,7 +552,7 @@ def event_disposition(event: dict) -> tuple[str, object, object]:
             # але це продовження поточного ходу, не новий Telegram-запит.
             if (
                 attachment.get("commandMode") == "task-notification"
-                and attachment.get("origin") is None
+                and attachment.get("origin") in (None, {"kind": "task-notification"})
             ):
                 return "continuation", None, None
             return "carrier", attachment.get("prompt"), attachment.get("origin")

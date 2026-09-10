@@ -9,7 +9,7 @@
     "standalone-server-v1"
   ],
   "source": "codex/starter/product.json",
-  "sourceRevision": "bdf5de7af86e6fe6e979f1aef2ef6feb1b34f4e8",
+  "sourceRevision": "17b2b6e27fd512cece894b25e42b236f8d24cd3b",
   "sourceDirty": false,
   "features": [
     "browser"
