@@ -21,7 +21,7 @@ import type { ReactionTypeEmoji } from 'grammy/types'
 import { randomBytes, createHash } from 'crypto'
 import { accessSync, constants, existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, lstatSync, renameSync, realpathSync, chmodSync } from 'fs'
 import { homedir } from 'os'
-import { execFileSync } from 'child_process'
+import { execFile, execFileSync } from 'child_process'
 import { join, extname, sep, relative, resolve } from 'path'
 import { pathToFileURL } from 'node:url'
 import { Database } from 'bun:sqlite'
@@ -1193,9 +1193,37 @@ const mcp = new Server(
 
 let pendingInboundDrainActive = false
 
+// The project journal is keyed by the actual admitted Telegram message, not
+// model-generated UUIDs. Only explicit project work crosses this boundary.
+async function projectChatNotification(notification: ClaudeChannelNotification): Promise<ClaudeChannelNotification> {
+  if (notification.method !== 'notifications/claude/channel') return notification
+  const { content, meta } = notification.params
+  if (!OWNER_CHAT_ID || meta.chat_id !== OWNER_CHAT_ID || meta.user_id !== OWNER_CHAT_ID || meta.conversation_key !== `user:${OWNER_CHAT_ID}`) return notification
+  if (!/^\s*(?:(?:в|у)\s+(?:рамках|межах)\s+(?:проекта|проекту|проєкту)|(?:для|по)\s+(?:проекта|проекту|проєкту)|(?:for|within|in)\s+(?:the\s+)?project)\s+/iu.test(content)) return notification
+  if (!/^-?\d+$/.test(meta.chat_id ?? '') || !/^\d+$/.test(meta.message_id ?? '')) return notification
+  const sourceKey = `telegram:${meta.chat_id}:${meta.message_id}`
+  const work: any = await new Promise(resolve => {
+    const child = execFile('/usr/bin/python3', ['/usr/local/lib/novsky-team/client.py', 'project-chat-begin'],
+      { timeout: 15000, maxBuffer: 200000 }, (error, stdout, stderr) => {
+        try { const value = JSON.parse(error ? stderr : stdout); if (typeof value.ok === 'boolean') { resolve(value); return } } catch {}
+        resolve({ ok: false })
+      })
+    child.stdin?.on('error', () => {})
+    child.stdin?.end(JSON.stringify({ sourceKey, text: content }))
+  })
+  const context = work.ok && work.bound
+    ? `Novsky already registered this owner's project request as your own task. Do not create another task. projectId=${work.projectId}, taskId=${work.task.id}, version=${work.task.version}. Read novsky-team project-get and relevant shared documents before working; other members have their own owners. Preserve their work. Before ending, publish only this project's actual result through novsky-team project-task-put with JSON {projectId,taskId,status:"review",result,expectedVersion,requestId}. Use the latest version and a UUID requestId. For a blocker use status:"blocked" and its actual reason. Long results belong in project documents linked from the task. Never publish private chat history or unrelated memory. A chat reply alone does not save the project result.`
+    : 'Project registration was not confirmed. Ask for the exact accessible project name or report the project connection problem before doing this work. Do not create a replacement project, expand access, or claim the work is recorded.'
+  return { ...notification, params: { ...notification.params, meta: { ...meta,
+    novsky_project_context: context,
+    ...(work.ok && work.bound ? { novsky_project_id: work.projectId, novsky_project_task_id: work.task.id } : {}),
+  } } }
+}
+
 async function deliverInboundNotification(
   notification: ClaudeChannelNotification,
 ): Promise<void> {
+  notification = await projectChatNotification(notification)
   let timer: ReturnType<typeof setTimeout> | undefined
   const timeout = new Promise<never>((_resolve, reject) => {
     timer = setTimeout(
@@ -2707,10 +2735,16 @@ async function handleInbound(
 
   await routeInbound(ctx, text, downloadImage, attachment, async deliveryId => {
     const imagePath = downloadImage ? await downloadImage() : undefined
+    let inboundText = text
+    if (ctx.chat?.type === 'private' && chat_id === OWNER_CHAT_ID && String(from.id) === OWNER_CHAT_ID && (attachment?.kind === 'voice' || attachment?.kind === 'audio')) {
+      const saved = MSG_DB.query("SELECT text FROM messages WHERE chat_id=? AND direction='in' AND message_id=?").get(chat_id, msgId ?? null) as {text: string} | null
+      const transcript = saved?.text && saved.text !== text ? saved.text : await transcribeObservedAttachment(ctx, chat_id, msgId, attachment)
+      if (transcript) inboundText = ctx.message?.caption ? `${text}\n${transcript}` : transcript
+    }
     const notification: InboundNotification = {
       method: 'notifications/claude/channel',
       params: {
-        content: text,
+        content: inboundText,
         meta: {
           chat_id,
           delivery_id: deliveryId,

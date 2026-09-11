@@ -9,7 +9,7 @@
     "standalone-server-v1"
   ],
   "source": "codex/starter/product.json",
-  "sourceRevision": "17b2b6e27fd512cece894b25e42b236f8d24cd3b",
+  "sourceRevision": "54c59b7191e2b1303f025534f6be62b605d91962",
   "sourceDirty": false,
   "features": [
     "browser"
@@ -59,8 +59,8 @@
     "assets/lib/agent-license.py": "95c523edbfb2a1149b83c6ac2bc7b9e56cd3ae4cd1f942886d437cef8d9ac335",
     "codex/server.py": "c7c3e9008b0342c5be4a2941aed48cf82bfc96de0b27746040a7cfd04c37510f",
     "codex/server-bootstrap.py": "ea53fa0036b606ee0120937658bb24943d3b3df7c87b9fb06328cb93fd9a78b9",
-    "codex/runtime/SOURCE.json": "f82461f669febfa47990ebc59441b188b33a0e6af815b86561a2145bfa10bb4c",
-    "codex/runtime/main.js": "317bee2262aff4b2d03c671e98b2277f1b7bd6fe8a193469c4986309b32dbeca",
+    "codex/runtime/SOURCE.json": "65c2ad4238adf54ca354c1c88c49c3a983ef264d6dda4fe299d7a4db20aa8601",
+    "codex/runtime/main.js": "be7990c610a66d1fdcfad64c6f41f0b70d623e56545e4eff360aa233b14e107b",
     "codex/standalone/AGENTS.md": "686fd8a65b9edffbb17caa9988c7c91c479dca630237a0b784d88b8e91f99767",
     "codex/standalone/CLAUDE.md": "ee22d276b6165d1b0dad94ebd6487383bbcaafb7447d6b3c51e93774fa422317",
     "codex/standalone/README.md": "d4087c16a832dbef877c133184205aff836a7d42a715dffb663859bdb91fb2bb",
@@ -150,8 +150,8 @@
     "resources/assets/lib/merge-env.py": "99eea7c790332db713a6242b8a2dd241e15fa5dd4f522b9f05c0525eb29daf7e",
     "resources/assets/lib/product-config.py": "6f0388647677074592e1256d0b7770e995f0aa841573c21b68d95b933aee3523",
     "resources/scripts/install-browser.sh": "bee768ef42d93dd1d07b3423e32802bb1ce6a600106594afcd33ac9f494268ed",
-    "runtime/SOURCE.json": "f82461f669febfa47990ebc59441b188b33a0e6af815b86561a2145bfa10bb4c",
-    "runtime/main.js": "317bee2262aff4b2d03c671e98b2277f1b7bd6fe8a193469c4986309b32dbeca",
+    "runtime/SOURCE.json": "65c2ad4238adf54ca354c1c88c49c3a983ef264d6dda4fe299d7a4db20aa8601",
+    "runtime/main.js": "be7990c610a66d1fdcfad64c6f41f0b70d623e56545e4eff360aa233b14e107b",
     "server-bootstrap.py": "ea53fa0036b606ee0120937658bb24943d3b3df7c87b9fb06328cb93fd9a78b9",
     "server.py": "c7c3e9008b0342c5be4a2941aed48cf82bfc96de0b27746040a7cfd04c37510f",
     "standalone/AGENTS.md": "686fd8a65b9edffbb17caa9988c7c91c479dca630237a0b784d88b8e91f99767",

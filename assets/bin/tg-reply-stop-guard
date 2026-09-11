@@ -982,6 +982,14 @@ def delegated_turn_work(hook: dict, events: list[dict], turn_events: list[dict])
     """An acknowledgement must not release the owner FIFO during delegation."""
     if not TEAM_CLIENT.is_file():
         return {'pending': [], 'reportedAt': None}
+    # A plain delivered reply cannot have submitted work. Keep ordinary owner
+    # conversations available during a broker outage; fail closed when this
+    # turn actually used a shell, native agent or team task tool.
+    possible_work = any(isinstance(block, dict) and block.get('type') == 'tool_use' and
+        (block.get('name') in ('Bash', 'Agent', 'Task', 'TaskOutput') or 'novsky_team_' in str(block.get('name', '')))
+        for event in turn_events for block in content_blocks(event))
+    if not possible_work:
+        return {'pending': [], 'reportedAt': None}
     scope = str(uuid.UUID(hook['session_id']))
     carrier_id = ancestry_parent_uuid(turn_events[0]) if turn_events else None
     carrier = next((event for event in events if event.get('uuid') == carrier_id), None)
@@ -1026,6 +1034,22 @@ def main() -> None:
     if chat_id is None:
         return
     delivery_id = telegram_delivery_id(prompt, origin)
+
+    # This marker is added by the admitted Telegram transport, never inferred
+    # from a private answer. Publication is explicit; missing bookkeeping leaves
+    # a visible blocked task and gets one native correction opportunity.
+    attributes = channel_attributes(prompt) or {}
+    if delivery_id and attributes.get('novsky_project_task_id') and TEAM_CLIENT.is_file():
+        try:
+            checked = subprocess.run(['/usr/bin/python3', str(TEAM_CLIENT), 'project-chat-finish'],
+                input=json.dumps({'sourceKey': 'telegram:'+delivery_id, 'outcome': 'completed'}),
+                capture_output=True, text=True, timeout=18)
+            journal = json.loads(checked.stdout if checked.returncode == 0 else checked.stderr)
+        except Exception:
+            journal = {'ok': False}
+        if (not journal.get('ok') or not journal.get('published')) and not stop_hook_active:
+            block_delegation('Your project result has not been confirmed in the shared journal. Do not repeat the work or create another task. Read the existing project/task from novsky_project_context, then publish only this project result (or the real blocker) with novsky-team project-task-put and its current version. Never copy private chat history. If storage remains unavailable, report that the project record is unconfirmed; do not claim it is complete.')
+            return
 
     try:
         work = delegated_turn_work(hook, events, turn_events)
