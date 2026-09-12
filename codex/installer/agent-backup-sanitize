@@ -383,7 +383,7 @@ def _prefix_expression(prefixes):
 
 class _PreparedKnown:
     """Snapshot one stable operation's literals; never cache a mutable set by id."""
-    __slots__=('values','minimum_length','prefixes','short','prefix_pattern')
+    __slots__=('values','minimum_length','prefixes','short','prefix_pattern','introduced')
 
     def __init__(self,known):
         values=[]
@@ -399,6 +399,11 @@ class _PreparedKnown:
             if len(value)<4:short.append(index)
             else:self.prefixes.setdefault(value[:4],[]).append(index)
         self.short=tuple(short)
+        replacement_prefixes={REDACTED[start:start+4] for start in range(len(REDACTED)-3)}
+        # New four-character prefixes are either inside [REDACTED] or cross
+        # one of its bracket boundaries. All other prefixes already existed.
+        self.introduced=tuple(index for index,value in enumerate(values)
+                              if value[:4] in replacement_prefixes or '[' in value[:4] or ']' in value[:4])
         # Zero width retains overlapping prefixes (aaaa and aaab in aaaaab).
         self.prefix_pattern=(re.compile('(?=('+_prefix_expression(tuple(self.prefixes))+'))')
                              if len(values)>=64 and self.prefixes else None)
@@ -419,7 +424,7 @@ class _PreparedKnown:
         return sorted(selected)
 
     def replace(self,text):
-        count=0;after=-1;position=0
+        count=0;after=-1;position=0;expanded=False
         candidates=self.candidates(text)
         while candidates is None or position<len(candidates):
             if candidates is None:
@@ -438,10 +443,14 @@ class _PreparedKnown:
                 else:
                     changed=text.count(value);text=text.replace(value,REDACTED)
             after=index;count+=changed
-            if changed:
+            if changed and not expanded:
                 # A replacement can introduce later literals or new boundaries.
                 # Never revisit an earlier index: the original pass did not.
-                candidates=self.candidates(text,after);position=0
+                # Add every prefix the replacement could introduce once; later
+                # replacements cannot create a prefix outside this same set.
+                candidates=sorted(set(candidates[position+1:])|
+                                  {index for index in self.introduced if index>after})
+                position=0;expanded=True
             else:position+=1
         return text,count
 
