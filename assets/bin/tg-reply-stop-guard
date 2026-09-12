@@ -58,6 +58,9 @@ CONTINUATION_ATTACHMENT_TYPES = frozenset(
         # 19.08 зробив сторожа сліпим на Кеші: ланцюг обривався на ньому,
         # хід ставав невидимим, і мовчазна відповідь пройшла без блокування.
         "total_tokens_reminder",
+        # Native batching reminders also appear after a successful reply.
+        # Preserve the turn ancestry so Stop can close its delivery queue entry.
+        "batching_reminder_sent",
         "auto_mode",
         "edited_text_file",
         # 02.09: Remote Control приєднався до сесії посеред ходу — той самий
