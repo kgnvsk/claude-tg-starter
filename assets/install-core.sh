@@ -777,6 +777,8 @@ install_managed_crontab() {
 }
 
 echo "[5/7] зберігаю наявний crontab; замінюю лише керований блок"
+python3 "$KIT/assets/lib/install-backup-context.py" \
+  --home "$H" --user "$AGENT_USER" --unit "$AGENT_SERVICE" --engine claude
 if [ "$CLAUDE_UPDATE_MAINTENANCE" = 1 ]; then
   echo "      режим обслуговування: залишаю зупинений crontab без змін"
 else

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import deque
 from datetime import datetime, timezone
 import fcntl
 import hashlib
@@ -40,6 +41,7 @@ SHA = re.compile(r"^[0-9a-f]{40}$")
 PROFILE_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 TIMEZONE_NAME = re.compile(r"^[A-Za-z0-9._+-]+(?:/[A-Za-z0-9._+-]+)*$")
 SLOT = re.compile(r"^\d{4}-\d{2}-\d{2}T(?:09|21)$")
+MAX_SUCCESS_AGE_SECONDS = 24 * 60 * 60
 
 
 class BackupError(RuntimeError):
@@ -70,6 +72,21 @@ def run_process(
         raise BackupError("command-unavailable") from error
 
 
+def clean_git_environment() -> dict[str, str]:
+    environment = {
+        name: value for name, value in os.environ.items()
+        if not name.startswith("GIT_")
+    }
+    environment.update(
+        GIT_CONFIG_GLOBAL=os.devnull,
+        GIT_CONFIG_NOSYSTEM="1",
+        GIT_TERMINAL_PROMPT="0",
+        GIT_NO_REPLACE_OBJECTS="1",
+        GIT_GRAFT_FILE=os.devnull,
+    )
+    return environment
+
+
 def git(
     *arguments: str,
     environment: dict[str, str] | None = None,
@@ -79,7 +96,7 @@ def git(
     return run_process(
         ["git", *arguments],
         cwd=VAULT,
-        environment=environment,
+        environment=environment if environment is not None else clean_git_environment(),
         input_bytes=input_bytes,
         timeout=timeout,
     )
@@ -321,7 +338,19 @@ def remote_identity() -> tuple[str, str]:
     if names != ["origin"]:
         raise BackupError("remote-invalid")
     remote = configured_push_remote()
+    require_original_destination(remote)
     return remote, validate_remote(remote)
+
+
+def require_original_destination(remote: str) -> None:
+    if git_config_values("remote.origin.url") != [remote]:
+        raise BackupError("remote-invalid")
+    for options in (("--all",), ("--push", "--all")):
+        resolved = require_success(
+            git("remote", "get-url", *options, "origin"), "remote-invalid"
+        )
+        if decoded(resolved).splitlines() != [remote]:
+            raise BackupError("remote-invalid")
 
 
 def validate_remote(remote: str) -> str:
@@ -343,7 +372,7 @@ def validate_remote(remote: str) -> str:
 
 
 def git_environment(remote: str) -> dict[str, str]:
-    environment = os.environ.copy()
+    environment = clean_git_environment()
     if remote.startswith(("git@github.com:", "ssh://git@github.com/")):
         if KEY_PATH.is_symlink() or not KEY_PATH.is_file():
             raise BackupError("deploy-key-missing")
@@ -351,15 +380,41 @@ def git_environment(remote: str) -> dict[str, str]:
         if stat.S_IMODE(metadata.st_mode) != 0o600 or metadata.st_nlink != 1:
             raise BackupError("deploy-key-unsafe")
         environment["GIT_SSH_COMMAND"] = (
-            "/usr/bin/ssh -i "
+            "/usr/bin/ssh -F /dev/null -i "
             + shlex.quote(str(KEY_PATH))
             + " -o IdentitiesOnly=yes -o BatchMode=yes "
-            + "-o StrictHostKeyChecking=accept-new"
+            + "-o HostName=github.com -o Port=22 -o StrictHostKeyChecking=accept-new"
         )
         environment["GIT_CONFIG_GLOBAL"] = os.devnull
         environment["GIT_CONFIG_NOSYSTEM"] = "1"
         environment["GIT_TERMINAL_PROMPT"] = "0"
     return environment
+
+
+def isolated_git(
+    *arguments: str,
+    environment: dict[str, str],
+    timeout: int = 60,
+) -> subprocess.CompletedProcess[bytes]:
+    # Read local objects, but never use the live repository's transport config,
+    # refs, URL rewrites, hooks or extra push destinations.
+    with tempfile.TemporaryDirectory(prefix=".transport.", dir=STATE_DIR) as name:
+        repository = Path(name)
+        initialized = run_process(
+            ["git", "init", "--bare", "--template=", str(repository)],
+            environment=environment,
+        )
+        require_success(initialized, "transport-unavailable")
+        objects = str(VAULT / ".git/objects")
+        if "\n" in objects or "\r" in objects:
+            raise BackupError("repository-unsafe")
+        (repository / "objects/info/alternates").write_text(objects + "\n")
+        return run_process(
+            ["git", "--git-dir=" + str(repository), "-c", "core.hooksPath=/dev/null", *arguments],
+            cwd=repository,
+            environment=environment,
+            timeout=timeout,
+        )
 
 
 def require_private_repository(identity: str) -> None:
@@ -405,8 +460,8 @@ def require_private_repository(identity: str) -> None:
         raise BackupError("repository-public")
 
 
-def require_remote_access(environment: dict[str, str]) -> None:
-    result = git("ls-remote", "origin", environment=environment, timeout=30)
+def require_remote_access(remote: str, environment: dict[str, str]) -> None:
+    result = isolated_git("ls-remote", remote, environment=environment, timeout=30)
     if result.returncode != 0:
         raise BackupError("remote-unavailable")
 
@@ -571,11 +626,78 @@ def head_revision() -> str:
     return revision
 
 
+def require_safe_history(
+    backup: ModuleType, revision: str, checked: set[str] | None = None,
+) -> set[str]:
+    checked = set() if checked is None else checked
+    shallow = require_success(
+        git("rev-parse", "--is-shallow-repository"), "history-unverifiable"
+    )
+    if decoded(shallow) != "false":
+        raise BackupError("history-unverifiable")
+    reachable = require_success(
+        git("rev-list", "--objects", "--no-object-names", revision),
+        "history-unverifiable",
+    )
+    identifiers = decoded(reachable).splitlines()
+    if not identifiers or any(not SHA.fullmatch(value) for value in identifiers):
+        raise BackupError("history-unverifiable")
+    identifiers = sorted(set(identifiers) - checked)
+    if not identifiers:
+        return checked
+    metadata = require_success(
+        git("cat-file", "--batch-check", input_bytes=("\n".join(identifiers) + "\n").encode()),
+        "history-unverifiable",
+    )
+    lines = decoded(metadata).splitlines()
+    if len(lines) != len(identifiers):
+        raise BackupError("history-unverifiable")
+    objects = deque()
+    for expected, line in zip(identifiers, lines):
+        fields = line.split()
+        if len(fields) != 3 or fields[0] != expected or fields[1] not in {"blob", "tree", "commit", "tag"}:
+            raise BackupError("history-unverifiable")
+        try:
+            size = int(fields[2])
+        except ValueError as error:
+            raise BackupError("history-unverifiable") from error
+        if not 0 <= size <= backup.MAX_FILE_BYTES:
+            raise BackupError("history-unverifiable")
+        objects.append((expected, fields[1], size))
+    # Bound each read instead of loading an entire repository history into RAM.
+    while objects:
+        batch, size = [], 0
+        while objects and (not batch or (size + objects[0][2] <= 8 * 1024 * 1024 and len(batch) < 256)):
+            item = objects.popleft()
+            batch.append(item)
+            size += item[2]
+        result = require_success(
+            git("cat-file", "--batch", input_bytes=("\n".join(item[0] for item in batch) + "\n").encode()),
+            "history-unverifiable",
+        )
+        offset = 0
+        for identifier, kind, size in batch:
+            header = f"{identifier} {kind} {size}\n".encode()
+            if result.stdout[offset:offset + len(header)] != header:
+                raise BackupError("history-unverifiable")
+            offset += len(header)
+            payload = result.stdout[offset:offset + size]
+            if len(payload) != size or result.stdout[offset + size:offset + size + 1] != b"\n":
+                raise BackupError("history-unverifiable")
+            if backup.contains_secret(payload):
+                raise BackupError("history-unsafe")
+            checked.add(identifier)
+            offset += size + 1
+        if offset != len(result.stdout):
+            raise BackupError("history-unverifiable")
+    return checked
+
+
 def remote_head(remote: str, environment: dict[str, str]) -> str | None:
-    result = git(
+    result = isolated_git(
         "ls-remote",
         "--exit-code",
-        "origin",
+        remote,
         "refs/heads/main",
         environment=environment,
         timeout=30,
@@ -591,12 +713,11 @@ def remote_head(remote: str, environment: dict[str, str]) -> str | None:
 
 
 def push_head(remote: str, environment: dict[str, str], revision: str) -> None:
-    result = git(
-        "-c",
-        "core.hooksPath=/dev/null",
+    result = isolated_git(
         "push",
-        "origin",
-        "HEAD:refs/heads/main",
+        "--no-follow-tags",
+        remote,
+        revision + ":refs/heads/main",
         environment=environment,
         timeout=60,
     )
@@ -628,6 +749,10 @@ def run_backup() -> dict:
     environment = git_environment(remote)
     require_private_repository(identity)
     backup = load_backup_module()
+    existing = git("rev-parse", "--verify", "--quiet", "HEAD")
+    if existing.returncode not in (0, 1):
+        raise BackupError("history-unverifiable")
+    checked = require_safe_history(backup, decoded(existing)) if existing.returncode == 0 else set()
     vault_paths = safe_vault_paths(backup)
     projection_paths = project_external_state(backup)
     snapshot = index_backup()
@@ -639,13 +764,14 @@ def run_backup() -> dict:
     except Exception:
         restore_index(snapshot)
         raise
+    require_safe_history(backup, revision, checked)
     require_private_repository(identity)
     push_head(remote, environment, revision)
     state.update(
         {
             "remoteIdentity": identity,
             "lastSuccessfulRevision": revision,
-            "lastSuccessfulAt": datetime.now(timezone.utc).isoformat(),
+            "lastSuccessfulAt": current_utc_time().isoformat(),
         }
     )
     write_state(state)
@@ -691,6 +817,16 @@ def backup_status() -> dict:
         raise BackupError("remote-mismatch")
     if backed_up_revision != revision:
         raise BackupError("not-backed-up")
+    try:
+        successful_at = datetime.fromisoformat(state["lastSuccessfulAt"].replace("Z", "+00:00"))
+        if successful_at.tzinfo is None:
+            raise ValueError("timezone missing")
+        age = (current_utc_time() - successful_at).total_seconds()
+    except (AttributeError, TypeError, ValueError) as error:
+        raise BackupError("not-backed-up") from error
+    if not -300 <= age <= MAX_SUCCESS_AGE_SECONDS:
+        raise BackupError("not-backed-up")
+    require_safe_history(load_backup_module(), revision)
     return {
         "status": "configured",
         "revision": revision,
@@ -816,11 +952,12 @@ def connect_backup(remote: str, confirm_private: bool) -> dict:
             raise BackupError("remote-invalid")
     else:
         raise BackupError("remote-invalid")
+    require_original_destination(remote)
     state = load_state()
     if state["remoteIdentity"] not in (None, identity):
         raise BackupError("remote-mismatch")
     environment = git_environment(remote)
-    require_remote_access(environment)
+    require_remote_access(remote, environment)
     require_private_repository(identity)
     state.update(
         {
@@ -859,6 +996,8 @@ def emit(receipt: dict, *, as_json: bool) -> None:
         "scheduled": "✅ Приватну резервну копію оновлено за розкладом.",
         "connected": "✅ Приватний GitHub-репозиторій підключено й першу копію перевірено.",
         "configured": "✅ Приватне резервне копіювання налаштовано й перевірено.",
+        "history-unsafe": "Копіювання зупинено: історія Git містить секрети. Автоматичне переписування історії не виконується.",
+        "history-unverifiable": "Копіювання зупинено: повну історію Git не вдалося перевірити.",
     }
     if receipt["status"] == "key-ready":
         print(receipt["publicKey"])

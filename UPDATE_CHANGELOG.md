@@ -1,8 +1,8 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-09-12.4da752c3b354`
+- Реліз: `2026-09-12.937691f7f300`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `4da752c3b354c86785fbf08541d5ddc6dfb264d6`
+- Ревізія вихідного комплекту: `937691f7f3000c0c38ec71dbf8189e48fe2e3242`
 - Дата релізу: `2026-09-12`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
@@ -19,8 +19,10 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    test: align corporate fixtures with Linux isolation
-    fix: complete Telegram deliveries across batching reminders
+    Remove credentials before recovery backups and verify restored state
+    Align bundled backup contract and isolate platform test fixtures
+    Handle offline service installs and freeze scoped backup context
+    Add full encrypted agent recovery backups and private GitHub scheduling
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не
@@ -33,6 +35,7 @@ git-об'єкт, і `git cat-file` на неї не спрацює.
 
 ### Вбудовані навички
 
+- `backup-recovery`
 - `research`
 
 ### Зовнішні навички

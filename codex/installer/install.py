@@ -396,6 +396,12 @@ def main():
     else:
         config.pop("corporate", None)
     atomic(config_path, json.dumps(config), account.pw_uid, account.pw_gid, 0o400)
+    collector = subprocess.run(["python3", str(root / "installer/install-backup-context.py"),
+                                "--home", str(home), "--user", user,
+                                "--unit", "codex-telegram@" + user + ".service", "--engine", "codex"],
+                               capture_output=True, timeout=180)
+    if collector.returncode:
+        raise ValueError("encrypted backup context installation failed")
     atomic(state_path, json.dumps({"productId": manifest["productId"], "revision": manifest["sourceRevision"], "payload": str(root), "files": files, "configSha": digest(config_text.encode()), "capabilities": result, "state": "ready"}), 0, 0)
     print(json.dumps({"ok": True, "productId": manifest["productId"], "capabilities": result}))
 

@@ -1,0 +1,493 @@
+#!/usr/bin/env python3
+"""Private GitHub Releases storage for encrypted agent recovery snapshots.
+
+Imported by agent-full-backup. Credentials are supplied in memory by its protected
+file reader, never through this module's command line or an external executable.
+GitHub API contracts: https://docs.github.com/en/rest/releases/releases and
+https://docs.github.com/en/rest/releases/assets .
+"""
+from __future__ import annotations
+
+from contextlib import contextmanager
+from datetime import datetime, timezone
+import hashlib
+import http.client
+import json
+import os
+from pathlib import Path
+import re
+import secrets
+import stat
+from urllib.parse import quote, urlencode, urljoin, urlsplit
+
+API = 'https://api.github.com'
+UPLOADS = 'https://uploads.github.com'
+API_VERSION = '2026-03-10'
+PART_BYTES = 256 * 1024 * 1024
+IO_BYTES = 1024 * 1024
+JSON_BYTES = 2 * 1024 * 1024
+RESTORE_BYTES = 4 * 1024 * 1024
+TIMEOUT = 90
+MAX_PARTS = 998  # GitHub permits 1000 assets, including receipt and restore helper.
+MAX_PAGES = 20
+REPOSITORY = re.compile(r'[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9][A-Za-z0-9_.-]{0,99}')
+INSTALLATION = re.compile(r'[A-Za-z0-9][A-Za-z0-9_-]{7,63}')
+SHA256 = re.compile(r'[0-9a-f]{64}')
+FORMAT = 'agent-full-backup-release/v1'
+MARKER = 'agent-full-backup-complete-v1\n'
+RECEIPT_NAME = 'receipt.json'
+RESTORE_NAME = 'agent-full-restore'
+DOWNLOAD_HOSTS = {'api.github.com', 'release-assets.githubusercontent.com', 'objects.githubusercontent.com', 'github-releases.githubusercontent.com'}
+
+
+class StoreError(RuntimeError):
+    """Stable nonsecret error code; never includes an HTTP response or URL query."""
+    def __init__(self, code: str):
+        self.code = code
+        super().__init__(code)
+
+
+def _integer(value, *, minimum=1):
+    return type(value) is int and value >= minimum
+
+
+def _sha(value):
+    return isinstance(value, str) and SHA256.fullmatch(value) is not None
+
+
+def _json_bytes(value):
+    return (json.dumps(value, sort_keys=True, separators=(',', ':'), ensure_ascii=True) + '\n').encode()
+
+
+def _time(value):
+    if not isinstance(value, str) or len(value) > 64:
+        raise StoreError('snapshot-metadata-invalid')
+    try:
+        result = datetime.fromisoformat(value.replace('Z', '+00:00'))
+        if result.tzinfo is None:
+            raise ValueError()
+        return result.astimezone(timezone.utc).isoformat()
+    except ValueError:
+        raise StoreError('snapshot-metadata-invalid') from None
+
+
+def _validate_inputs(repo, token):
+    if not isinstance(repo, str) or REPOSITORY.fullmatch(repo) is None:
+        raise StoreError('github-repository-invalid')
+    if not isinstance(token, str) or re.fullmatch(r'[A-Za-z0-9_]{1,1024}', token) is None:
+        raise StoreError('github-token-invalid')
+
+
+def _url(url, hosts, code='github-endpoint-invalid'):
+    try:
+        parsed = urlsplit(url)
+        if (parsed.scheme != 'https' or parsed.hostname not in hosts or
+                parsed.port not in (None, 443) or parsed.username is not None or
+                parsed.password is not None or parsed.fragment or
+                any(ord(char) < 33 or ord(char) > 126 for char in url)):
+            raise ValueError()
+        return parsed
+    except (ValueError, TypeError):
+        raise StoreError(code) from None
+
+
+def _status(status, expected):
+    if status in expected:
+        return
+    if status == 401:
+        code = 'github-auth-failed'
+    elif status == 403:
+        code = 'github-permission-denied'
+    elif status == 404:
+        code = 'github-not-found'
+    elif status == 429:
+        code = 'github-rate-limited'
+    elif 300 <= status < 400:
+        code = 'github-redirect-unsafe'
+    elif status >= 500:
+        code = 'github-server-error'
+    else:
+        code = 'github-request-rejected'
+    raise StoreError(code)
+
+
+@contextmanager
+def _response(method, url, *, token=None, data=None, size=None, accept='application/vnd.github+json', content_type='application/json', download=False):
+    parsed = _url(url, DOWNLOAD_HOSTS if download else {'api.github.com', 'uploads.github.com'})
+    headers = {'Accept': accept, 'User-Agent': 'agent-full-backup/1'}
+    if token is not None:
+        if parsed.hostname not in {'api.github.com', 'uploads.github.com'}:
+            raise StoreError('github-redirect-unsafe')
+        headers['Authorization'] = 'Bearer ' + token
+        headers['X-GitHub-Api-Version'] = API_VERSION
+    if data is not None:
+        headers['Content-Type'] = content_type
+        headers['Content-Length'] = str(len(data) if isinstance(data, bytes) else size)
+    connection = None
+    response = None
+    try:
+        connection = http.client.HTTPSConnection(parsed.hostname, timeout=TIMEOUT)
+        target = parsed.path or '/'
+        if parsed.query:
+            target += '?' + parsed.query
+        connection.request(method, target, body=data, headers=headers)
+        response = connection.getresponse()
+        yield response
+    except (OSError, TimeoutError, http.client.HTTPException):
+        raise StoreError('github-network-failed') from None
+    finally:
+        if response is not None:
+            response.close()
+        if connection is not None:
+            connection.close()
+
+
+class _Client:
+    def __init__(self, repo, token, repository_id=None):
+        _validate_inputs(repo, token)
+        self.repo = repo
+        self.token = token
+        self.repository_id = repository_id
+        self.base = '/repos/' + repo
+
+    def json(self, method, path, *, value=None, expected=(200,), data=None, size=None, upload=False):
+        if value is not None:
+            data = _json_bytes(value)
+        with _response(method, (UPLOADS if upload else API) + path, token=self.token,
+                       data=data, size=size,
+                       content_type='application/octet-stream' if upload else 'application/json') as response:
+            _status(response.status, expected)
+            if response.status == 204:
+                return None
+            payload = response.read(JSON_BYTES + 1)
+            if len(payload) > JSON_BYTES:
+                raise StoreError('github-response-invalid')
+            try:
+                return json.loads(payload)
+            except (UnicodeError, ValueError, RecursionError):
+                raise StoreError('github-response-invalid') from None
+
+    def guard(self):
+        repository = check_repository(self.repo, self.token)
+        if repository['repositoryId'] != self.repository_id:
+            raise StoreError('github-repository-mismatch')
+        if repository['permissions'].get('push') is not True:
+            raise StoreError('github-permission-denied')
+
+    def write(self, method, path, **kwargs):
+        self.guard()
+        return self.json(method, path, **kwargs)
+
+    def listing(self, path, *, limit):
+        results = []
+        for page in range(1, MAX_PAGES + 1):
+            value = self.json('GET', path + '?' + urlencode({'per_page': 100, 'page': page}))
+            if not isinstance(value, list) or any(not isinstance(item, dict) for item in value):
+                raise StoreError('github-response-invalid')
+            results.extend(value)
+            if len(results) > limit:
+                raise StoreError('github-list-limit')
+            if len(value) < 100:
+                return results
+        raise StoreError('github-list-limit')
+
+    def download(self, descriptor, *, capture=False):
+        if capture and descriptor['size'] > JSON_BYTES:
+            raise StoreError('github-response-invalid')
+        url = API + self.base + '/releases/assets/' + str(descriptor['id'])
+        authenticated = True
+        for _ in range(6):
+            with _response('GET', url, token=self.token if authenticated else None,
+                           accept='application/octet-stream', download=True) as response:
+                if response.status in (301, 302, 303, 307, 308):
+                    location = response.getheader('Location')
+                    if not isinstance(location, str) or len(location) > 16384:
+                        raise StoreError('github-redirect-unsafe')
+                    redirected = urljoin(url, location)
+                    parsed = _url(redirected, DOWNLOAD_HOSTS, 'github-redirect-unsafe')
+                    # A signed CDN URL carries its own capability. Never forward
+                    # the PAT there, even if a later redirect returns to the API.
+                    authenticated = authenticated and parsed.hostname == 'api.github.com'
+                    url = redirected
+                    continue
+                _status(response.status, (200,))
+                digest = hashlib.sha256()
+                received = 0
+                collected = bytearray() if capture else None
+                while True:
+                    block = response.read(IO_BYTES)
+                    if not block:
+                        break
+                    received += len(block)
+                    if received > descriptor['size']:
+                        raise StoreError('github-asset-mismatch')
+                    digest.update(block)
+                    if collected is not None:
+                        collected.extend(block)
+                if received != descriptor['size'] or digest.hexdigest() != descriptor['sha256']:
+                    raise StoreError('github-asset-mismatch')
+                return bytes(collected) if collected is not None else None
+        raise StoreError('github-redirect-unsafe')
+
+
+def check_repository(repo: str, token: str) -> dict:
+    client = _Client(repo, token)
+    value = client.json('GET', client.base)
+    if not isinstance(value, dict) or not _integer(value.get('id')):
+        raise StoreError('github-response-invalid')
+    if value.get('private') is not True:
+        if value.get('private') is False:
+            raise StoreError('github-repository-public')
+        raise StoreError('github-response-invalid')
+    if not isinstance(value.get('full_name'), str) or value['full_name'].casefold() != repo.casefold():
+        raise StoreError('github-repository-mismatch')
+    if value.get('archived') is True or value.get('disabled') is True:
+        raise StoreError('github-repository-unavailable')
+    permissions = value.get('permissions')
+    if not isinstance(permissions, dict):
+        raise StoreError('github-permission-unverified')
+    safe_permissions = {key: permissions[key] for key in ('pull', 'push', 'admin', 'maintain', 'triage') if type(permissions.get(key)) is bool}
+    return {'repo': repo, 'repositoryId': value['id'], 'private': True, 'permissions': safe_permissions}
+
+
+@contextmanager
+def _file(path):
+    descriptor = None
+    try:
+        descriptor = os.open(Path(path), os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise StoreError('snapshot-file-unsafe')
+        with os.fdopen(descriptor, 'rb') as source:
+            descriptor = None
+            yield source, metadata
+    except OSError:
+        raise StoreError('snapshot-file-unavailable') from None
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _segments(source, offset, size):
+    source.seek(offset)
+    left = size
+    while left:
+        block = source.read(min(IO_BYTES, left))
+        if not block:
+            raise StoreError('archive-mismatch')
+        left -= len(block)
+        yield block
+
+
+def _plan(source, file_metadata, metadata):
+    if not isinstance(metadata, dict) or not _sha(metadata.get('sha256')) or not _integer(metadata.get('size')):
+        raise StoreError('snapshot-metadata-invalid')
+    if metadata['size'] != file_metadata.st_size:
+        raise StoreError('archive-mismatch')
+    if not 0 < PART_BYTES < 2 * 1024**3 or not 0 < IO_BYTES <= 8 * 1024**2:
+        raise StoreError('snapshot-limits-invalid')
+    if (file_metadata.st_size + PART_BYTES - 1) // PART_BYTES > MAX_PARTS:
+        raise StoreError('snapshot-too-large')
+    age_header = b'age-encryption.org/v1\n'
+    if source.read(len(age_header)) != age_header:
+        raise StoreError('archive-not-encrypted')
+    parts = []
+    archive_digest = hashlib.sha256()
+    for offset in range(0, file_metadata.st_size, PART_BYTES):
+        length = min(PART_BYTES, file_metadata.st_size - offset)
+        part_digest = hashlib.sha256()
+        for block in _segments(source, offset, length):
+            archive_digest.update(block)
+            part_digest.update(block)
+        parts.append({'name': f'snapshot.age.part{len(parts)+1:04d}', 'size': length, 'sha256': part_digest.hexdigest(), 'offset': offset})
+    if source.read(1) or archive_digest.hexdigest() != metadata['sha256']:
+        raise StoreError('archive-mismatch')
+    return parts
+
+
+def _asset(value, name, size, digest, seen):
+    if (not isinstance(value, dict) or not _integer(value.get('id')) or value['id'] in seen or
+            value.get('name') != name or type(value.get('size')) is not int or value['size'] != size or
+            value.get('state') != 'uploaded'):
+        raise StoreError('github-asset-invalid')
+    if value.get('digest') not in (None, 'sha256:' + digest):
+        raise StoreError('github-asset-mismatch')
+    seen.add(value['id'])
+    return {'id': value['id'], 'name': name, 'size': size, 'sha256': digest}
+
+
+def _upload(client, release_id, name, data, size, digest, seen):
+    value = client.write('POST', client.base + '/releases/' + str(release_id) + '/assets?' + urlencode({'name': name}),
+                         data=data, size=size, upload=True, expected=(201,))
+    descriptor = _asset(value, name, size, digest, seen)
+    client.download(descriptor)
+    return descriptor
+
+
+def _marker(receipt, receipt_sha):
+    return MARKER + _json_bytes({key: receipt[key] for key in ('installationId', 'repositoryId', 'releaseId', 'tag')} | {'receiptSha256': receipt_sha}).decode().strip()
+
+
+def _asset_set(values, descriptors):
+    if len(values) != len(descriptors):
+        raise StoreError('github-release-incomplete')
+    by_name = {}
+    for value in values:
+        name = value.get('name')
+        if not isinstance(name, str) or name in by_name:
+            raise StoreError('github-release-incomplete')
+        by_name[name] = value
+    seen = set()
+    for descriptor in descriptors:
+        value = by_name.get(descriptor['name'])
+        verified = _asset(value, descriptor['name'], descriptor['size'], descriptor['sha256'], seen)
+        if verified != descriptor:
+            raise StoreError('github-release-incomplete')
+
+
+def _validate_release(value, receipt, receipt_sha, *, draft=False):
+    if (not isinstance(value, dict) or value.get('id') != receipt['releaseId'] or
+            value.get('tag_name') != receipt['tag'] or value.get('draft') is not draft or
+            (not draft and value.get('body') != _marker(receipt, receipt_sha))):
+        raise StoreError('github-release-incomplete')
+
+
+def _receipt_valid(receipt, client, installation_id, release):
+    if not isinstance(receipt, dict) or set(receipt) != {'format', 'privacyPolicy', 'installationId', 'repositoryId', 'releaseId', 'tag', 'createdAt', 'verifiedAt', 'archiveSha256', 'archiveSize', 'parts', 'restoreHelper'}:
+        raise StoreError('github-receipt-invalid')
+    if (receipt['format'] != FORMAT or receipt['privacyPolicy'] != 'no-secrets-v1' or receipt['installationId'] != installation_id or
+            receipt['repositoryId'] != client.repository_id or receipt['releaseId'] != release['id'] or
+            receipt['tag'] != release['tag_name'] or not _sha(receipt['archiveSha256']) or
+            not _integer(receipt['archiveSize'])):
+        raise StoreError('github-receipt-invalid')
+    _time(receipt['verifiedAt'])
+    _time(receipt['createdAt'])
+    parts = receipt['parts']
+    if not isinstance(parts, list) or not 1 <= len(parts) <= MAX_PARTS:
+        raise StoreError('github-receipt-invalid')
+    identities = set()
+    for index, descriptor in enumerate([*parts, receipt['restoreHelper']]):
+        name = f'snapshot.age.part{index+1:04d}' if index < len(parts) else RESTORE_NAME
+        if (not isinstance(descriptor, dict) or set(descriptor) != {'id', 'name', 'size', 'sha256'} or
+                descriptor.get('name') != name or not _integer(descriptor.get('id')) or descriptor['id'] in identities or
+                not _integer(descriptor.get('size')) or descriptor['size'] >= 2 * 1024**3 or not _sha(descriptor.get('sha256'))):
+            raise StoreError('github-receipt-invalid')
+        identities.add(descriptor['id'])
+    if sum(part['size'] for part in parts) != receipt['archiveSize']:
+        raise StoreError('github-receipt-invalid')
+
+
+def _retention(client, installation_id, current_id, retention):
+    deleted, deferred, candidates = [], [], []
+    proofs = {}
+    try:
+        releases = client.listing(client.base + '/releases', limit=100 * MAX_PAGES)
+    except StoreError as error:
+        return [], [{'reason': error.code}]
+    tag_pattern = re.compile(re.escape('agent-backup-' + installation_id + '-') + r'\d{8}T\d{6}Z-[0-9a-f]{12}')
+    for release in releases:
+        if (release.get('draft') is not False or not _integer(release.get('id')) or
+                not isinstance(release.get('tag_name'), str) or tag_pattern.fullmatch(release['tag_name']) is None or
+                not isinstance(release.get('body'), str) or not release['body'].startswith(MARKER)):
+            continue
+        try:
+            marker = json.loads(release['body'][len(MARKER):])
+            if (not isinstance(marker, dict) or set(marker) != {'installationId', 'repositoryId', 'releaseId', 'tag', 'receiptSha256'} or
+                    marker['installationId'] != installation_id or marker['repositoryId'] != client.repository_id or
+                    marker['releaseId'] != release['id'] or marker['tag'] != release['tag_name'] or not _sha(marker['receiptSha256'])):
+                continue
+            assets = client.listing(client.base + '/releases/' + str(release['id']) + '/assets', limit=1000)
+            matches = [asset for asset in assets if asset.get('name') == RECEIPT_NAME]
+            if len(matches) != 1 or not _integer(matches[0].get('size')) or matches[0]['size'] > JSON_BYTES:
+                raise StoreError('github-receipt-invalid')
+            receipt_asset = _asset(matches[0], RECEIPT_NAME, matches[0]['size'], marker['receiptSha256'], set())
+            receipt = json.loads(client.download(receipt_asset, capture=True))
+            _receipt_valid(receipt, client, installation_id, release)
+            _validate_release(release, receipt, marker['receiptSha256'])
+            descriptors = [*receipt['parts'], receipt['restoreHelper'], receipt_asset]
+            _asset_set(assets, descriptors)
+            candidates.append((datetime.fromisoformat(receipt['verifiedAt'].replace('Z', '+00:00')), release['id']))
+            proofs[release['id']] = (receipt, marker['receiptSha256'], descriptors)
+        except (StoreError, ValueError, TypeError, KeyError, RecursionError) as error:
+            deferred.append({'releaseId': release['id'], 'reason': error.code if isinstance(error, StoreError) else 'github-receipt-invalid'})
+    # Never prune without verifying that the newly completed copy is in the list.
+    if current_id not in {identity for _, identity in candidates}:
+        return [], [*deferred, {'reason': 'github-retention-current-unverified'}]
+    candidates.sort(reverse=True)
+    keep = {current_id}
+    for _, identity in candidates:
+        if len(keep) < retention:
+            keep.add(identity)
+    for _, identity in reversed(candidates):
+        if identity in keep:
+            continue
+        try:
+            endpoint = client.base + '/releases/' + str(identity)
+            receipt, digest, descriptors = proofs[identity]
+            _validate_release(client.json('GET', endpoint), receipt, digest)
+            _asset_set(client.listing(endpoint + '/assets', limit=1000), descriptors)
+            client.write('DELETE', endpoint, expected=(204,))
+            deleted.append(identity)
+        except StoreError as error:
+            deferred.append({'releaseId': identity, 'reason': error.code})
+            break  # No destructive workaround for immutable releases or failures.
+    return deleted, deferred
+
+
+def publish_snapshot(repo: str, token: str, archive: Path, metadata: dict, *, installation_id: str, restore_helper: Path, retention: int = 14) -> dict:
+    _validate_inputs(repo, token)
+    if not isinstance(installation_id, str) or INSTALLATION.fullmatch(installation_id) is None:
+        raise StoreError('installation-id-invalid')
+    if type(retention) is not int or not 1 <= retention <= 365:
+        raise StoreError('retention-invalid')
+    repository = check_repository(repo, token)
+    if not isinstance(metadata, dict):
+        raise StoreError('snapshot-metadata-invalid')
+    if metadata.get('privacyPolicy') != 'no-secrets-v1':
+        raise StoreError('secret-free-snapshot-required')
+    if 'repositoryId' in metadata and (not _integer(metadata['repositoryId']) or metadata['repositoryId'] != repository['repositoryId']):
+        raise StoreError('github-repository-mismatch')
+    client = _Client(repo, token, repository['repositoryId'])
+    created_at = _time(metadata.get('createdAt'))
+    with _file(archive) as (source, file_metadata), _file(restore_helper) as (helper, helper_metadata):
+        planned = _plan(source, file_metadata, metadata)
+        if not 0 < helper_metadata.st_size <= RESTORE_BYTES:
+            raise StoreError('restore-helper-invalid')
+        helper_data = helper.read(RESTORE_BYTES + 1)
+        if len(helper_data) != helper_metadata.st_size:
+            raise StoreError('restore-helper-invalid')
+        tag = 'agent-backup-' + installation_id + '-' + datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ') + '-' + secrets.token_hex(6)
+        value = client.write('POST', client.base + '/releases', value={'tag_name': tag, 'name': tag, 'draft': True, 'prerelease': False, 'make_latest': 'false', 'body': 'Encrypted recovery upload in progress. This draft is not a verified backup.'}, expected=(201,))
+        if not isinstance(value, dict) or not _integer(value.get('id')) or value.get('tag_name') != tag or value.get('draft') is not True:
+            raise StoreError('github-release-invalid')
+        release_id = value['id']
+        parts, seen = [], set()
+        for part in planned:
+            parts.append(_upload(client, release_id, part['name'], _segments(source, part['offset'], part['size']), part['size'], part['sha256'], seen))
+        restore = _upload(client, release_id, RESTORE_NAME, helper_data, len(helper_data), hashlib.sha256(helper_data).hexdigest(), seen)
+        receipt = {'format': FORMAT, 'privacyPolicy': 'no-secrets-v1', 'installationId': installation_id, 'repositoryId': repository['repositoryId'], 'releaseId': release_id, 'tag': tag,
+                   'createdAt': created_at, 'verifiedAt': datetime.now(timezone.utc).isoformat(), 'archiveSha256': metadata['sha256'], 'archiveSize': metadata['size'], 'parts': parts, 'restoreHelper': restore}
+        public_receipt = _json_bytes(receipt)
+        receipt_sha = hashlib.sha256(public_receipt).hexdigest()
+        receipt_asset = _upload(client, release_id, RECEIPT_NAME, public_receipt, len(public_receipt), receipt_sha, seen)
+        endpoint = client.base + '/releases/' + str(release_id)
+        draft = client.json('GET', endpoint)
+        _validate_release(draft, receipt, receipt_sha, draft=True)
+        descriptors = [*parts, restore, receipt_asset]
+        _asset_set(client.listing(endpoint + '/assets', limit=1000), descriptors)
+        published = client.write('PATCH', endpoint, value={'draft': False, 'body': _marker(receipt, receipt_sha), 'make_latest': 'false'})
+        _validate_release(published, receipt, receipt_sha)
+        _validate_release(client.json('GET', endpoint), receipt, receipt_sha)
+        _asset_set(client.listing(endpoint + '/assets', limit=1000), descriptors)
+        client.download(receipt_asset)
+        client.guard()
+    deleted, deferred = _retention(client, installation_id, release_id, retention)
+    client.guard()
+    return {'repo': repo, 'repositoryId': repository['repositoryId'], 'releaseId': release_id, 'tag': tag,
+            'url': 'https://github.com/' + repo + '/releases/tag/' + quote(tag, safe=''),
+            'parts': parts, 'archiveSha256': metadata['sha256'], 'archiveSize': metadata['size'], 'receipt': receipt_asset,
+            'restoreHelper': restore, 'verifiedAt': receipt['verifiedAt'], 'retentionDeleted': deleted, 'retentionDeferred': deferred}
+
+
+if __name__ == '__main__':
+    raise SystemExit('This helper is imported by agent-full-backup; it accepts no token arguments.')

@@ -1,0 +1,550 @@
+#!/usr/bin/env python3
+"""Stream a declared agent home scope into an age-encrypted, hashed tar snapshot."""
+
+from __future__ import annotations
+
+import hashlib
+import importlib.machinery
+import importlib.util
+import io
+import json
+import os
+from pathlib import Path, PurePosixPath
+import re
+import sqlite3
+import stat
+import subprocess
+import tarfile
+import tempfile
+import time
+from contextlib import closing
+from datetime import datetime, timezone
+
+
+CHUNK_BYTES = 1024 * 1024
+SQLITE_TIMEOUT_SECONDS = 30.0
+FILE_TIMEOUT_SECONDS = 120.0
+FILE_CAPTURE_ATTEMPTS = 3
+BACKUP_STATE = ".local/state/agent-full-backup"
+EXCLUDED_ROOTS = {
+    BACKUP_STATE: "own-backup-state",
+    "obsidian-vault/.agent-backup": "previous-backup-projection",
+    ".npm/_cacache": "disposable-package-cache",
+    ".npm/_logs": "disposable-package-cache",
+    ".cache/pip": "disposable-package-cache",
+    ".cache/uv": "disposable-package-cache",
+    ".cache/go-build": "disposable-package-cache",
+    ".cache/yarn": "disposable-package-cache",
+    ".cache/ms-playwright": "disposable-download-cache",
+    ".bun/install/cache": "disposable-package-cache",
+    ".local/share/pnpm/store": "disposable-package-cache",
+}
+SYSTEM_ROOTS = ("/etc/systemd/system", "/usr/lib/systemd/system", "/lib/systemd/system", "/etc/cron.d", "/var/spool/cron")
+AGE_IDENTITY = re.compile(rb"AGE-SECRET-KEY-1[023456789ACDEFGHJKLMNPQRSTUVWXYZ]{58}")
+
+
+def _sanitizer():
+    path = Path(__file__).with_name("agent-backup-sanitize")
+    loader = importlib.machinery.SourceFileLoader("agent_snapshot_sanitizer", str(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    if module.POLICY != "no-secrets-v1":
+        raise ValueError("unsupported backup privacy policy")
+    return module
+
+
+def _safe_relative(value, *, allow_dot=False):
+    if not isinstance(value, str) or not value or "\x00" in value or "\\" in value:
+        raise ValueError("unsafe relative path")
+    if value == "." and allow_dot:
+        return value
+    path = PurePosixPath(value)
+    if path.is_absolute() or any(part in ("", ".", "..") for part in value.split("/")):
+        raise ValueError("unsafe relative path")
+    return path.as_posix()
+
+
+def _inside(path, root):
+    return path == root or root in path.parents
+
+
+def _hash_file(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(CHUNK_BYTES), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+class _HashingReader:
+    def __init__(self, stream):
+        self.stream = stream
+        self.digest = hashlib.sha256()
+        self.tail = b""
+
+    def read(self, size=CHUNK_BYTES):
+        data = self.stream.read(min(size if size >= 0 else CHUNK_BYTES, CHUNK_BYTES))
+        self.digest.update(data)
+        return data
+
+
+def _sqlite_copy(source, destination, timeout_seconds):
+    deadline = time.monotonic() + timeout_seconds
+
+    def progress(_status, _remaining, _total):
+        if time.monotonic() >= deadline:
+            raise TimeoutError("SQLite snapshot deadline exceeded")
+
+    descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.close(descriptor)
+    with closing(sqlite3.connect(source.as_uri() + "?mode=ro", uri=True, timeout=0.1)) as original:
+        with closing(sqlite3.connect(destination)) as copied:
+            original.backup(copied, pages=128, progress=progress, sleep=0.05)
+            copied.set_progress_handler(lambda: int(time.monotonic() >= deadline), 10000)
+            if copied.execute("PRAGMA quick_check").fetchone() != ("ok",):
+                raise ValueError("SQLite snapshot integrity check failed")
+            copied.execute("PRAGMA journal_mode=DELETE")
+    destination.chmod(0o600)
+
+
+def _stage_regular(source, destination, timeout_seconds):
+    """Capture one stable file before committing its header/bytes to the tar stream."""
+    deadline = time.monotonic() + timeout_seconds
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    for _attempt in range(FILE_CAPTURE_ATTEMPTS):
+        with os.fdopen(os.open(source, flags), "rb") as original, destination.open("wb") as staged:
+            before = os.fstat(original.fileno())
+            if not stat.S_ISREG(before.st_mode):
+                raise OSError("source is no longer a regular file")
+            reader, remaining = _HashingReader(original), before.st_size
+            while remaining:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("file capture deadline exceeded")
+                block = reader.read(min(CHUNK_BYTES, remaining))
+                if not block:
+                    break
+                staged.write(block)
+                remaining -= len(block)
+            after = os.fstat(original.fileno())
+            current = source.lstat()
+            fingerprint = lambda value: (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_ctime_ns)
+            if not remaining and fingerprint(before) == fingerprint(after) == fingerprint(current):
+                return before, reader.digest.hexdigest()
+    raise TimeoutError("file did not stabilize within capture attempts")
+
+
+def create_snapshot(home: Path, output: Path, recipient: str, *, age_binary: str, context: dict | None = None) -> dict:
+    home = Path(home).expanduser()
+    if home.is_symlink() or not home.is_dir():
+        raise ValueError("agent home must be a real directory")
+    home = home.resolve()
+    if home == Path(home.anchor):
+        raise ValueError("filesystem root is not an agent home")
+    output = Path(output).expanduser()
+    if output.is_symlink() or output.exists():
+        raise ValueError("snapshot output already exists")
+    output = output.absolute()
+    if not isinstance(recipient, str) or not recipient or len(recipient) > 1024 or any(c in recipient for c in "\r\n\x00"):
+        raise ValueError("invalid age recipient")
+    if context is None:
+        context = {}
+    if not isinstance(context, dict):
+        raise ValueError("snapshot context must be an object")
+    try:
+        context_bytes = json.dumps(context, separators=(",", ":"), ensure_ascii=True, allow_nan=False).encode()
+    except (TypeError, ValueError) as error:
+        raise ValueError("snapshot context is not JSON serializable") from error
+    if AGE_IDENTITY.search(context_bytes):
+        raise ValueError("snapshot context contains a recovery identity")
+    sanitizer = _sanitizer()
+    if "system/encrypted-context.tar.gz.age" in context.get("extraFiles", {}):
+        receipt = context.get("systemContextReceipt", {})
+        if not isinstance(receipt, dict) or receipt.get("privacyPolicy") != sanitizer.POLICY:
+            raise ValueError("encrypted system context lacks required privacy policy")
+    declared_exclusions = context.get("excludePaths", {})
+    if not isinstance(declared_exclusions, dict):
+        raise ValueError("excludePaths must map relative paths to reasons")
+    for relative, reason in declared_exclusions.items():
+        _safe_relative(relative)
+        if not isinstance(reason, str) or not reason.strip() or len(reason) > 200:
+            raise ValueError("invalid declared exclusion reason")
+    sqlite_timeout = context.get("sqliteTimeoutSeconds", SQLITE_TIMEOUT_SECONDS)
+    file_timeout = context.get("fileTimeoutSeconds", FILE_TIMEOUT_SECONDS)
+    if any(type(value) not in (int, float) or not 0.1 <= value <= 600 for value in (sqlite_timeout, file_timeout)):
+        raise ValueError("capture timeouts must be between 0.1 and 600 seconds")
+    selected = context.get("includePaths", ["."])
+    if not isinstance(selected, list) or not selected:
+        raise ValueError("includePaths must declare a nonempty scope")
+    selected = sorted(set(_safe_relative(item, allow_dot=True) for item in selected))
+    for relative in selected:
+        source = home / relative
+        for parent in [source, *source.parents]:
+            if parent == home:
+                break
+            if parent.is_symlink():
+                # A selected symlink itself is handled as a link, never followed.
+                if parent != source:
+                    raise ValueError("selected scope follows a symlink")
+    extra = context.get("extraFiles", {})
+    extra_roots = context.get("extraFileRoots", [])
+    if not isinstance(extra, dict) or not isinstance(extra_roots, list):
+        raise ValueError("invalid external context files")
+    approved = [Path(item).resolve() for item in SYSTEM_ROOTS]
+    for item in extra_roots:
+        if not isinstance(item, str) or not Path(item).is_absolute() or Path(item) == Path("/"):
+            raise ValueError("invalid external context root")
+        approved.append(Path(item).resolve())
+    external = []
+    for archive_name, value in sorted(extra.items()):
+        name = _safe_relative(archive_name)
+        if not name.startswith("system/") or not isinstance(value, str) or not Path(value).is_absolute():
+            raise ValueError("invalid external context path")
+        source = Path(value)
+        if source.is_symlink() or not source.is_file():
+            raise ValueError("external context must be a regular file")
+        source = source.resolve()
+        if not any(_inside(source, root) for root in approved):
+            raise ValueError("external context path is outside approved roots")
+        state = home / BACKUP_STATE
+        if _inside(source, state) and not _inside(source, state / "context"):
+            raise ValueError("external context cannot include private backup state")
+        external.append((source, name))
+
+    known_secrets = sanitizer.known_secret_literals(home, include_paths=selected,
+                                                    exclude_paths={**EXCLUDED_ROOTS, **declared_exclusions},
+                                                    sqlite_timeout_seconds=sqlite_timeout)
+    clean_context = sanitizer.sanitize_bytes(context_bytes, path="context.json", known_secrets=known_secrets)
+    if clean_context["data"] is None:
+        raise ValueError("snapshot metadata could not be sanitized")
+    context_bytes = clean_context["data"]
+
+    created = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    home_stat = home.stat()
+    coverage = {
+        "complete": True, "sourceComplete": True, "selectedRoots": selected, "exclusions": [],
+        "externalLinks": [], "captureErrors": [], "sqliteBackups": [],
+        "declaredExclusions": declared_exclusions,
+        "secretSanitization": {"applied": True, "privacyPolicy": sanitizer.POLICY,
+                               "redactedFiles": [], "excludedFiles": 0, "redactions": 0,
+                               "opaqueContentExcluded": True, "sqliteLogicalRebuilds": [],
+                               "sqliteSchemaOmissions": [],
+                               "invalidatedCapabilities": [],
+                               "limitations": ["Unrecognized secrets in ordinary prose cannot be identified with certainty.",
+                                               "Images, binary documents, archives and opaque stores are excluded.",
+                                               "SQLite triggers, views and virtual search tables require rebuilding."]},
+    }
+    reconnect = {}
+    entries = {}
+    sidecars = set()
+    safe_links = {}
+    output.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    process = None
+    temporary_output = None
+
+    def safe_label(name):
+        if sanitizer._plain(name, known_secrets)[1]:
+            return "redacted-path/" + hashlib.sha256(name.encode()).hexdigest()[:24]
+        return name
+
+    def excluded(name, reason):
+        coverage["sourceComplete"] = False
+        coverage["exclusions"].append({"path": safe_label(name), "reason": sanitizer._plain(reason, known_secrets)[0]})
+
+    def failed(name, reason):
+        coverage["complete"] = False
+        coverage["sourceComplete"] = False
+        coverage["captureErrors"].append({"path": safe_label(name), "reason": reason})
+
+    def sanitized(name, report):
+        for item in report.get("reconnect", []):
+            reconnect[json.dumps(item, sort_keys=True)] = item
+        if report["disposition"] == "excluded":
+            excluded(name, report["reason"])
+            coverage["sourceComplete"] = False
+            coverage["secretSanitization"]["excludedFiles"] += 1
+        elif report["disposition"] == "redacted":
+            coverage["sourceComplete"] = False
+            coverage["secretSanitization"]["redactedFiles"].append(safe_label(name))
+            coverage["secretSanitization"]["redactions"] += report["redactions"]
+        if report.get("logicalRebuild"):
+            coverage["secretSanitization"]["sqliteLogicalRebuilds"].append(safe_label(name))
+            if report.get("omittedSchemaObjects"):
+                coverage["secretSanitization"]["sqliteSchemaOmissions"].append({"path": safe_label(name),
+                    "omittedObjects": report["omittedSchemaObjects"], "requiresRebuild": True})
+            if report.get("invalidatedCapabilities"):
+                coverage["secretSanitization"]["invalidatedCapabilities"].append({"path": safe_label(name),
+                    "actions": report["invalidatedCapabilities"], "reason": "approval-token-removed"})
+
+    sanitized("context.json", clean_context)
+    coverage["selectedRoots"] = [safe_label(name) for name in selected]
+    coverage["declaredExclusions"] = {safe_label(name): sanitizer._plain(reason, known_secrets)[0]
+                                      for name, reason in declared_exclusions.items()}
+
+    def metadata(name, file_stat, kind, size=0):
+        return {"type": kind, "size": size, "mode": stat.S_IMODE(file_stat.st_mode), "mtimeNs": file_stat.st_mtime_ns}
+
+    def tar_info(name, data):
+        info = tarfile.TarInfo(name)
+        info.mode = data["mode"]
+        info.mtime = data["mtimeNs"] / 1_000_000_000
+        info.size = data["size"]
+        return info
+
+    try:
+        with tempfile.TemporaryDirectory(prefix=".agent-full-snapshot-", dir=output.parent) as scratch_name:
+            scratch = Path(scratch_name).resolve()
+            descriptor, temporary_name = tempfile.mkstemp(prefix=".agent-full-ciphertext-", dir=output.parent)
+            temporary_output = Path(temporary_name).resolve()
+            with os.fdopen(descriptor, "wb") as ciphertext:
+                process = subprocess.Popen([str(age_binary), "-r", recipient], stdin=subprocess.PIPE, stdout=ciphertext, stderr=subprocess.DEVNULL)
+                with tarfile.open(fileobj=process.stdin, mode="w|gz", format=tarfile.PAX_FORMAT) as archive:
+
+                    def add_directory(name, source_stat=None):
+                        if name in entries:
+                            return
+                        source_stat = source_stat or home_stat
+                        data = metadata(name, source_stat, "directory")
+                        if name == "system" or name.startswith("system/"):
+                            data["mode"] = 0o700
+                        info = tar_info(name, data)
+                        info.type = tarfile.DIRTYPE
+                        archive.addfile(info)
+                        entries[name] = data
+
+                    def add_bytes(name, raw):
+                        data = {"type": "file", "size": len(raw), "mode": 0o600, "mtimeNs": time.time_ns(), "sha256": hashlib.sha256(raw).hexdigest()}
+                        archive.addfile(tar_info(name, data), io.BytesIO(raw))
+                        entries[name] = data
+
+                    def add_regular(source, name, source_stat):
+                        trusted_context = name == "system/encrypted-context.tar.gz.age"
+                        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+                        try:
+                            descriptor = os.open(source, flags)
+                        except OSError:
+                            failed(name, "file-open-failed")
+                            return
+                        with os.fdopen(descriptor, "rb") as stream:
+                            initial = os.fstat(stream.fileno())
+                            if not stat.S_ISREG(initial.st_mode) or (initial.st_dev, initial.st_ino) != (source_stat.st_dev, source_stat.st_ino):
+                                failed(name, "file-identity-changed")
+                                return
+                            header = stream.read(64)
+                            is_sqlite = header[:16] == b"SQLite format 3\x00"
+                            if sanitizer.classify_path(name, is_source=header.startswith(b"#!")) and not trusted_context:
+                                raw = header + stream.read(sanitizer.MAX_BYTES + 1 - len(header))
+                                if len(raw) > sanitizer.MAX_BYTES:
+                                    failed(name, "credential-inventory-inspection-limit")
+                                else:
+                                    sanitized(name, sanitizer.sanitize_bytes(raw, path=name))
+                                return
+                        staged_descriptor, staged_name = tempfile.mkstemp(prefix="file-", dir=scratch)
+                        os.close(staged_descriptor)
+                        staged = Path(staged_name)
+                        cleaned = staged.with_name(staged.name + "-clean")
+                        staged_digest = None
+                        try:
+                            if is_sqlite:
+                                sidecars.update(str(source) + suffix for suffix in ("-wal", "-shm", "-journal"))
+                                try:
+                                    _sqlite_copy(source, staged, sqlite_timeout)
+                                    report = sanitizer.sanitize_sqlite(staged, cleaned, path=name,
+                                                                      known_secrets=known_secrets,
+                                                                      timeout_seconds=sqlite_timeout)
+                                except (OSError, sqlite3.Error, TimeoutError, ValueError):
+                                    failed(name, "sqlite-capture-failed")
+                                    return
+                                sanitized(name, report)
+                                os.replace(cleaned, staged)
+                                staged_digest = _hash_file(staged)
+                            else:
+                                try:
+                                    initial, staged_digest = _stage_regular(source, staged, file_timeout)
+                                except (OSError, TimeoutError):
+                                    failed(name, "file-unstable-or-unreadable")
+                                    return
+                                if trusted_context:
+                                    expected = context["systemContextReceipt"]
+                                    if expected.get("sha256") != staged_digest or expected.get("size") != staged.stat().st_size:
+                                        raise ValueError("sanitized system context receipt mismatch")
+                                else:
+                                    report = sanitizer.sanitize_file(staged, cleaned, path=name,
+                                                                     known_secrets=known_secrets,
+                                                                     timeout_seconds=file_timeout)
+                                    sanitized(name, report)
+                                    if report["disposition"] == "excluded":
+                                        return
+                                    os.replace(cleaned, staged)
+                                    staged_digest = _hash_file(staged)
+                            data = metadata(name, initial, "file", staged.stat().st_size)
+                            with staged.open("rb") as selected_stream:
+                                reader = _HashingReader(selected_stream) if staged_digest is None else selected_stream
+                                archive.addfile(tar_info(name, data), reader)
+                                data["sha256"] = staged_digest or reader.digest.hexdigest()
+                            if is_sqlite:
+                                coverage["sqliteBackups"].append(name)
+                            entries[name] = data
+                        finally:
+                            staged.unlink(missing_ok=True)
+                            cleaned.unlink(missing_ok=True)
+
+                    def walk(source, name):
+                        if name in entries:
+                            return
+                        relative = name.removeprefix("home/")
+                        if safe_label(name) != name:
+                            sanitized(name, {"disposition": "excluded", "reason": "credential-in-path",
+                                             "reconnect": sanitizer.reconnect_for(name)})
+                            return
+                        for root, reason in declared_exclusions.items():
+                            if relative == root or relative.startswith(root + "/"):
+                                excluded(name, "operator-declared: " + reason)
+                                return
+                        if str(source) in sidecars:
+                            excluded(name, "sqlite-sidecar-captured-via-online-backup")
+                            return
+                        for root, reason in EXCLUDED_ROOTS.items():
+                            if relative == root or relative.startswith(root + "/"):
+                                excluded(name, reason)
+                                return
+                        if relative.startswith("backups/") and re.fullmatch(r"agent-(?:full-)?backup-[^/]+\.(?:zip|tar(?:\.gz)?(?:\.age)?|age)", source.name):
+                            excluded(name, "previous-backup-archive")
+                            return
+                        if source == output or source == temporary_output or _inside(source, scratch):
+                            excluded(name, "current-backup-output")
+                            return
+                        try:
+                            source_stat = source.lstat()
+                        except OSError:
+                            failed(name, "file-stat-failed")
+                            return
+                        if not stat.S_ISREG(source_stat.st_mode) and sanitizer.classify_path(relative):
+                            sanitized(name, sanitizer.sanitize_bytes(b"", path=relative))
+                            return
+                        if stat.S_ISLNK(source_stat.st_mode):
+                            try:
+                                target = os.readlink(source)
+                                resolved = source.resolve(strict=False)
+                            except (OSError, RuntimeError):
+                                failed(name, "symlink-resolution-failed")
+                                return
+                            if not _inside(resolved, home):
+                                roots = [Path(root).resolve() for root in ("/usr/bin", "/bin", "/usr/local/bin")]
+                                try:
+                                    info = resolved.stat()
+                                    regenerable = (any(_inside(resolved, root) for root in roots)
+                                        and stat.S_ISREG(info.st_mode) and info.st_uid == 0 and info.st_mode & 0o111
+                                        and not info.st_mode & 0o022)
+                                except OSError:
+                                    regenerable = False
+                                if regenerable:
+                                    excluded(name, "regenerable-operating-system-executable-link")
+                                    return
+                                coverage["complete"] = False
+                                coverage["externalLinks"].append({"path": safe_label(name), "target": safe_label(target)})
+                                excluded(name, "external-symlink-not-followed")
+                                return
+                            if sanitizer.classify_path(resolved.relative_to(home).as_posix()) or safe_label(target) != target:
+                                sanitized(name, {"disposition": "excluded", "reason": "link-to-credential-scope",
+                                                 "reconnect": sanitizer.reconnect_for(str(resolved))})
+                                return
+                            safe_target = os.path.relpath(resolved, source.parent) if Path(target).is_absolute() else target
+                            data = metadata(name, source_stat, "symlink")
+                            data["linkTarget"] = safe_target
+                            data["originalLinkTarget"] = target
+                            safe_links[name] = (resolved, data)
+                        elif stat.S_ISDIR(source_stat.st_mode):
+                            add_directory(name, source_stat)
+                            try:
+                                children = sorted(source.iterdir(), key=lambda child: child.name)
+                            except OSError:
+                                failed(name, "directory-list-failed")
+                                return
+                            for child in children:
+                                walk(child, name + "/" + child.name)
+                        elif stat.S_ISREG(source_stat.st_mode):
+                            add_regular(source, name, source_stat)
+                        else:
+                            excluded(name, "nonpersistent-special-file")
+
+                    add_directory("home", home_stat)
+                    for relative in selected:
+                        source = home / relative
+                        if safe_label(relative) != relative:
+                            sanitized(relative, {"disposition": "excluded", "reason": "credential-in-path",
+                                                 "reconnect": sanitizer.reconnect_for(relative)})
+                            continue
+                        if relative == ".":
+                            for child in sorted(home.iterdir(), key=lambda child: child.name):
+                                walk(child, "home/" + child.name)
+                        else:
+                            for parent in reversed(PurePosixPath(relative).parents):
+                                if str(parent) != ".":
+                                    add_directory("home/" + str(parent), (home / str(parent)).stat())
+                            walk(source, "home/" + relative)
+                    for source, name in external:
+                        if safe_label(name) != name:
+                            sanitized(name, {"disposition": "excluded", "reason": "credential-in-path",
+                                             "reconnect": sanitizer.reconnect_for(name)})
+                            continue
+                        for parent in reversed(PurePosixPath(name).parents):
+                            if str(parent) != ".":
+                                add_directory(str(parent))
+                        add_regular(source, name, source.stat())
+                    for name, (target, data) in safe_links.items():
+                        target_name = "home" if target == home else "home/" + target.relative_to(home).as_posix()
+                        intentionally_excluded = any(target_name == item["path"] or target_name.startswith(item["path"] + "/")
+                                                     for item in coverage["exclusions"])
+                        if intentionally_excluded:
+                            excluded(name, "link-target-intentionally-excluded")
+                        elif target.exists() and target_name not in entries:
+                            failed(name, "symlink-target-outside-captured-scope")
+                        else:
+                            info = tar_info(name, data)
+                            info.type = tarfile.SYMTYPE
+                            info.linkname = data["linkTarget"]
+                            archive.addfile(info)
+                            entries[name] = data
+                    add_bytes("context.json", context_bytes)
+                    inventory = {"schemaVersion": 1, "privacyPolicy": sanitizer.POLICY,
+                                 "integrations": list(reconnect.values())}
+                    if "system/encrypted-context.tar.gz.age" in extra:
+                        inventory["systemInventory"] = "system/reconnect-inventory.json"
+                    add_bytes("reconnect-inventory.json", json.dumps(inventory, sort_keys=True).encode())
+                    manifest = {
+                        "schemaVersion": 1, "format": "agent-full-backup", "createdAt": created,
+                        "privacyPolicy": sanitizer.POLICY,
+                        "rootIdentity": {"path": safe_label(str(home)), "uid": home_stat.st_uid, "gid": home_stat.st_gid, "mode": stat.S_IMODE(home_stat.st_mode)},
+                        "entries": entries, "coverage": coverage,
+                    }
+                    if "system/encrypted-context.tar.gz.age" in extra:
+                        manifest["encryptedContexts"] = ["system/encrypted-context.tar.gz.age"]
+                    raw = json.dumps(manifest, separators=(",", ":"), ensure_ascii=True, allow_nan=False).encode()
+                    info = tarfile.TarInfo("manifest.json")
+                    info.size, info.mode = len(raw), 0o600
+                    archive.addfile(info, io.BytesIO(raw))
+                process.stdin.close()
+                if process.wait(timeout=60) != 0:
+                    raise ValueError("age encryption failed")
+                ciphertext.flush()
+                os.fsync(ciphertext.fileno())
+            digest = _hash_file(temporary_output)
+            size = temporary_output.stat().st_size
+            os.link(temporary_output, output)
+            temporary_output.unlink()
+            return {"path": str(output), "sha256": digest, "size": size, "files": sum(data["type"] == "file" for data in entries.values()), "createdAt": created, "coverage": coverage, "privacyPolicy": sanitizer.POLICY}
+    except (OSError, tarfile.TarError, subprocess.SubprocessError) as error:
+        raise ValueError("snapshot capture or encryption failed") from error
+    finally:
+        if process is not None:
+            if process.stdin is not None and not process.stdin.closed:
+                try:
+                    process.stdin.close()
+                except OSError:
+                    pass
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+        if temporary_output is not None:
+            temporary_output.unlink(missing_ok=True)

@@ -1,51 +1,334 @@
-#!/usr/bin/env bash
-# Serialize vault commits and surface offsite sync failures.
-set -euo pipefail
+#!/usr/bin/env python3
+"""Serialize secret-scanned vault synchronization without changing owner remotes."""
 
-VAULT="$HOME/obsidian-vault"
-LOCK_DIR="$HOME/.claude/memory"
-LOG_DIR="$HOME/logs"
-LOCK_FILE="$LOCK_DIR/vault-sync.lock"
-LOG_FILE="$LOG_DIR/vault-sync.log"
+from __future__ import annotations
 
-[ -d "$VAULT/.git" ] || exit 0
-install -d -m 700 "$LOCK_DIR" "$LOG_DIR"
-touch "$LOG_FILE"
-chmod 600 "$LOG_FILE"
+from contextlib import ExitStack
+from datetime import datetime, timezone
+import fcntl
+import importlib.machinery
+import importlib.util
+import os
+from pathlib import Path
+import re
+import shlex
+import stat
+import sys
+import tempfile
+from urllib.parse import urlsplit
 
-exec 9>"$LOCK_FILE"
-flock -n 9 || exit 0
-exec >>"$LOG_FILE" 2>&1
 
-cd "$VAULT"
-git add -A -- . ':(exclude)learning'
-committed=0
-if ! git diff --cached --quiet; then
-  git commit -m "auto: vault update $(date -u +%Y-%m-%dT%H:%M:%SZ)" --quiet
-  committed=1
-fi
+sys.dont_write_bytecode = True
+HOME = Path.home()
+VAULT = HOME / "obsidian-vault"
+LOG_PATH = HOME / "logs/vault-sync.log"
 
-# Shared team vault: with a remote configured the vault can have several
-# writers (multi-instance boxes) — pull teammates' notes first (rebase keeps
-# our commit on top), then push our own. Without a remote nothing changes.
-if git remote get-url origin >/dev/null 2>&1; then
-  before="$(git rev-parse HEAD)"
-  branch="$(git rev-parse --abbrev-ref HEAD)"
-  if ! git pull --rebase --quiet origin "$branch"; then
-    git rebase --abort >/dev/null 2>&1 || true
-    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) ERROR: vault pull --rebase failed (conflict?); local commit kept, will retry"
-    exit 1
-  fi
-  # Always push after the rebase, even when this tick created no commit. A
-  # previous tick may have committed locally and then lost connectivity; gating
-  # on `committed` would strand that commit forever until another file changed.
-  if ! git push --quiet origin HEAD; then
-    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) ERROR: local vault commits were not pushed"
-    exit 1
-  fi
-  [ "$committed" = 1 ] || [ "$before" != "$(git rev-parse HEAD)" ] || exit 0
-elif [ "$committed" = 0 ]; then
-  exit 0
-fi
 
-echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) vault sync complete"
+class SyncError(RuntimeError):
+    def __init__(self, code: str):
+        super().__init__(code)
+        self.code = code
+
+
+def private_file(path: Path) -> int:
+    current = HOME
+    for part in path.relative_to(HOME).parts[:-1]:
+        current /= part
+        if current.is_symlink() or (current.exists() and not current.is_dir()):
+            raise SyncError("state-unsafe")
+        current.mkdir(mode=0o700, exist_ok=True)
+    descriptor = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    metadata = os.fstat(descriptor)
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+        os.close(descriptor)
+        raise SyncError("state-unsafe")
+    os.fchmod(descriptor, 0o600)
+    return descriptor
+
+
+def log(message: str) -> None:
+    # Git diagnostics can include authenticated URLs, paths and file contents.
+    # Only fixed status messages are ever written to the routine sync log.
+    descriptor = private_file(LOG_PATH)
+    with os.fdopen(descriptor, "a", encoding="utf-8") as handle:
+        handle.write(datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ ") + message + "\n")
+
+
+def load_guard():
+    path = Path(__file__).with_name("agent-github-backup")
+    loader = importlib.machinery.SourceFileLoader("vault_sync_guard", str(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    if spec is None:
+        raise SyncError("dependency-unavailable")
+    module = importlib.util.module_from_spec(spec)
+    try:
+        loader.exec_module(module)
+    except (OSError, ImportError, ValueError) as error:
+        raise SyncError("dependency-unavailable") from error
+    if not callable(getattr(module, "require_safe_history", None)):
+        raise SyncError("dependency-unavailable")
+    return module
+
+
+def quote_config(value: str) -> str:
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n").replace("\t", "\\t").replace("\b", "\\b") + '"'
+
+
+def config_entry(key: str, value: str) -> str:
+    section, rest = key.split(".", 1)
+    if "." in rest:
+        subsection, name = rest.rsplit(".", 1)
+        header = f"[{section} {quote_config(subsection)}]"
+    else:
+        header, name = f"[{section}]", rest
+    return f"{header}\n\t{name} = {quote_config(value)}\n"
+
+
+def transport_config(guard) -> tuple[list[tuple[str, str]], list[str], str] | None:
+    # Read the owner's auth settings once, privately, before staging anything.
+    # Runtime transport gets a new config containing only those auth settings
+    # and the original endpoints; url.* rules and includes never reach it.
+    environment = guard.clean_git_environment()
+    environment.pop("GIT_CONFIG_GLOBAL", None)
+    environment.pop("GIT_CONFIG_NOSYSTEM", None)
+    result = guard.require_success(guard.git("config", "--null", "--list", environment=environment), "remote-invalid")
+    entries = []
+    for record in result.stdout.decode("utf-8", errors="strict").split("\0"):
+        if record:
+            key, separator, value = record.partition("\n")
+            entries.append((key, value if separator else "true"))
+
+    def values(key):
+        return [value for name, value in entries if name == key]
+
+    fetch = values("remote.origin.url")
+    push = values("remote.origin.pushurl") or fetch
+    if not fetch and not push:
+        return None
+    if len(fetch) != 1 or len(push) != 1:
+        raise guard.BackupError("remote-invalid")
+    for arguments, expected in (([], fetch), (["--push"], push)):
+        resolved = guard.require_success(guard.git("remote", "get-url", *arguments, "--all", "origin", environment=environment), "remote-invalid")
+        if guard.decoded(resolved).splitlines() != expected:
+            raise guard.BackupError("remote-invalid")
+    ssh_command = values("core.sshcommand")
+    auth = [
+        (key, value) for key, value in entries
+        if key.startswith(("credential.", "http.")) and not key.endswith(".followredirects")
+    ]
+    return auth, [fetch[0], push[0]], ssh_command[-1] if ssh_command else "ssh"
+
+
+def remote_ssh_target(guard, remote: str) -> tuple[str, list[str]] | None:
+    if not remote or remote.startswith("-") or any(ord(char) < 32 for char in remote):
+        raise guard.BackupError("remote-invalid")
+    if "::" in remote:
+        raise guard.BackupError("remote-invalid")
+    if "://" in remote:
+        parsed = urlsplit(remote)
+        if parsed.scheme not in {"ssh", "https", "http", "git", "file"}:
+            raise guard.BackupError("remote-invalid")
+        if parsed.scheme != "ssh":
+            return None
+        if not parsed.hostname or parsed.password is not None:
+            raise guard.BackupError("remote-invalid")
+        options = (["-l", parsed.username] if parsed.username else []) + (["-p", str(parsed.port)] if parsed.port else [])
+        return parsed.hostname, options
+    match = re.fullmatch(r"(?:([^/@:]+)@)?([^/:]+):(.+)", remote)
+    if match:
+        return match[2], ["-l", match[1]] if match[1] else []
+    return None
+
+
+def freeze_ssh(guard, directory: Path, remote: str, command: str, number: int) -> dict[str, str]:
+    environment = guard.clean_git_environment()
+    target = remote_ssh_target(guard, remote)
+    if target is None:
+        return environment
+    arguments = shlex.split(command)
+    if not arguments or arguments.pop(0) not in {"ssh", "/usr/bin/ssh"}:
+        raise guard.BackupError("transport-auth-unsupported")
+    # Accept SSH options, not arbitrary shell wrappers or a second destination.
+    frozen_arguments = []
+    while arguments:
+        option = arguments.pop(0)
+        if option in {"-4", "-6", "-v", "-q"}:
+            frozen_arguments.append(option)
+        elif option in {"-i", "-F", "-p", "-l", "-J", "-o"} and arguments:
+            value = arguments.pop(0)
+            if value.startswith("~/"):
+                value = str(HOME / value[2:])
+            frozen_arguments.extend((option, value))
+        else:
+            raise guard.BackupError("transport-auth-unsupported")
+    host, options = target
+    if host.startswith("-") or any(char.isspace() for char in host):
+        raise guard.BackupError("remote-invalid")
+    resolved = guard.require_success(guard.run_process(
+        ["/usr/bin/ssh", *frozen_arguments, *options, "-G", host],
+        cwd=VAULT, environment=environment,
+    ), "transport-auth-unavailable")
+    # ssh -G resolves aliases, identity files and option precedence. Its private
+    # output is a valid config snapshot, so later ~/.ssh/config edits cannot
+    # redirect a Git operation that has already passed the endpoint preflight.
+    path = directory / f"ssh-{number}.config"
+    path.write_bytes(resolved.stdout)
+    path.chmod(0o600)
+    environment["GIT_SSH_COMMAND"] = shlex.join(["/usr/bin/ssh", "-F", str(path), "-o", "BatchMode=yes"])
+    environment["GIT_SSH_VARIANT"] = "ssh"
+    return environment
+
+
+class FrozenTransport:
+    def __init__(self, guard, directory: Path, config, revision: str):
+        self.guard, self.directory = guard, directory
+        auth, remotes, ssh_command = config
+        environment = guard.clean_git_environment()
+        guard.require_success(guard.run_process(["git", "init", "--bare", "--template=", str(directory)], environment=environment), "transport-unavailable")
+        text = "[core]\n\trepositoryformatversion = 0\n\tbare = true\n\thooksPath = /dev/null\n"
+        for key, value in auth:
+            text += config_entry(key, value)
+        text += "[http]\n\tfollowRedirects = false\n[protocol]\n\tallow = never\n"
+        for protocol in ("ssh", "https", "http", "git", "file"):
+            text += f'[protocol "{protocol}"]\n\tallow = always\n'
+        self.environments = {}
+        for number, (name, remote) in enumerate(zip(("source", "destination"), remotes)):
+            self.environments[name] = freeze_ssh(guard, directory, remote, ssh_command, number)
+            self.environments[name]["GIT_OBJECT_DIRECTORY"] = str(VAULT / ".git/objects")
+            # Relative local remotes are relative to the vault, not this bare repo.
+            if ":" not in remote and not Path(remote).is_absolute():
+                remote = str(VAULT / remote)
+            text += config_entry(f"remote.{name}.url", remote)
+        path = directory / "config"
+        path.write_text(text, encoding="utf-8")
+        path.chmod(0o600)
+        if revision:
+            guard.require_success(self.git("source", "update-ref", "refs/heads/local", revision), "transport-unavailable")
+
+    def git(self, endpoint: str, *arguments: str):
+        return self.guard.run_process(
+            ["git", f"--git-dir={self.directory}", "-c", "core.hooksPath=/dev/null", *arguments],
+            cwd=VAULT, environment=self.environments[endpoint],
+        )
+
+    def head(self, endpoint: str, branch: str) -> str | None:
+        ref = "refs/heads/" + branch
+        result = self.git(endpoint, "ls-remote", "--exit-code", endpoint, ref)
+        if result.returncode == 2:
+            return None
+        self.guard.require_success(result, "remote-unavailable")
+        fields = self.guard.decoded(result).split()
+        if len(fields) != 2 or fields[1] != ref or not self.guard.SHA.fullmatch(fields[0]):
+            raise self.guard.BackupError("remote-invalid")
+        return fields[0]
+
+    def fetch(self, branch: str) -> str | None:
+        if self.head("source", branch) is None:
+            return None
+        self.guard.require_success(self.git("source", "-c", "fetch.fsckObjects=true", "fetch", "--no-tags", "--no-recurse-submodules", "source", "refs/heads/" + branch), "pull-unavailable")
+        result = self.guard.require_success(self.git("source", "rev-parse", "FETCH_HEAD"), "remote-invalid")
+        revision = self.guard.decoded(result)
+        if not self.guard.SHA.fullmatch(revision):
+            raise self.guard.BackupError("remote-invalid")
+        return revision
+
+    def push(self, branch: str, revision: str) -> None:
+        self.guard.require_success(self.git("destination", "push", "--no-follow-tags", "destination", revision + ":refs/heads/" + branch), "push-unavailable")
+        if self.head("destination", branch) != revision:
+            raise self.guard.BackupError("push-unverified")
+
+
+def synchronize(guard, stack: ExitStack) -> bool:
+    if VAULT.is_symlink() or (VAULT / ".git").is_symlink():
+        raise guard.BackupError("state-unsafe")
+    legacy_lock = private_file(HOME / ".claude/memory/vault-sync.lock")
+    stack.callback(os.close, legacy_lock)
+    try:
+        fcntl.flock(legacy_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as error:
+        raise guard.BackupError("busy") from error
+    stack.callback(os.close, guard.lock_run())
+    if any((VAULT / ".git" / path).exists() for path in ("rebase-apply", "rebase-merge", "MERGE_HEAD", "CHERRY_PICK_HEAD")):
+        raise guard.BackupError("repository-busy")
+    guard.clean_index()
+    branch = guard.decoded(guard.require_success(guard.git("symbolic-ref", "--short", "HEAD"), "branch-invalid"))
+    guard.require_success(guard.git("check-ref-format", "refs/heads/" + branch), "branch-invalid")
+    result = guard.git("rev-parse", "--verify", "HEAD")
+    before = guard.decoded(result) if result.returncode == 0 else ""
+    if before and not guard.SHA.fullmatch(before):
+        raise guard.BackupError("revision-invalid")
+    backup = guard.load_backup_module()
+    checked = guard.require_safe_history(backup, before) if before else set()
+    config = transport_config(guard)
+    transport = None
+    if config is not None:
+        directory = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="vault-sync-", dir=guard.STATE_DIR)))
+        transport = FrozenTransport(guard, directory, config, before)
+    snapshot = guard.index_backup()
+    committed = False
+    try:
+        guard.require_success(guard.git("add", "-A", "--", ".", ":(exclude)learning"), "index-write-failed")
+        if guard.has_staged_changes():
+            tree = guard.decoded(guard.require_success(guard.git("write-tree"), "index-invalid"))
+            checked = guard.require_safe_history(backup, tree, checked)
+            guard.require_success(guard.git(
+                "-c", "core.hooksPath=/dev/null", "-c", "user.name=Agent Vault",
+                "-c", "user.email=agent-vault@localhost", "commit", "--no-gpg-sign", "--no-verify",
+                "-m", "auto: vault update " + datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            ), "commit-failed")
+            committed = True
+    except BaseException:
+        if not committed:
+            guard.restore_index(snapshot)
+        raise
+    if not before and not committed:
+        return False
+    revision = guard.head_revision()
+    checked = guard.require_safe_history(backup, revision, checked)
+    if transport is not None:
+        remote_revision = transport.fetch(branch)
+        if remote_revision:
+            checked = guard.require_safe_history(backup, remote_revision, checked)
+            result = guard.git(
+                "-c", "core.hooksPath=/dev/null", "-c", "user.name=Agent Vault",
+                "-c", "user.email=agent-vault@localhost", "-c", "rebase.updateRefs=false",
+                "rebase", "--no-autostash", "--no-autosquash", "--no-gpg-sign", remote_revision,
+            )
+            if result.returncode:
+                guard.git("-c", "core.hooksPath=/dev/null", "rebase", "--abort")
+                raise guard.BackupError("pull-unavailable")
+            revision = guard.head_revision()
+            guard.require_safe_history(backup, revision, checked)
+        # The exact scanned object ID is sent. Mutable HEAD, config, tags and
+        # remote-tracking refs in the live vault cannot widen or redirect push.
+        transport.push(branch, revision)
+    return committed or before != revision
+
+
+def main() -> int:
+    if not (VAULT / ".git").is_dir():
+        return 0
+    guard = None
+    try:
+        guard = load_guard()
+        with ExitStack() as stack:
+            changed = synchronize(guard, stack)
+        if changed:
+            log("vault sync complete")
+        return 0
+    except Exception as error:
+        if isinstance(error, SyncError) or (guard is not None and isinstance(error, guard.BackupError)):
+            code = error.code
+        else:
+            code = "sync-unavailable"
+        if code == "busy":
+            return 0
+        try:
+            log("ERROR: vault sync failed (" + code + "); local notes kept")
+        except Exception:
+            pass
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

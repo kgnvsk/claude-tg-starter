@@ -1,0 +1,577 @@
+#!/usr/bin/env python3
+"""Standalone, fail-closed credential removal for backup text and logical SQLite.
+
+Unknown binary/media formats are excluded: regex inspection cannot establish that
+an image, encrypted store, or compressed attachment contains no credentials.
+Returned data is internal only; reconnect metadata never contains source values.
+"""
+from __future__ import annotations
+
+from contextlib import closing
+import ast
+import base64
+import hashlib
+import io
+import json
+import os
+from pathlib import Path, PurePosixPath
+import re
+import sqlite3
+import stat
+import time
+import tokenize
+from urllib.parse import quote
+
+POLICY = 'no-secrets-v1'
+REDACTED = '[REDACTED]'
+MAX_LINE = 1024 * 1024
+MAX_BYTES = 8 * 1024 * 1024
+OPAQUE_SUFFIXES = {'.zip','.gz','.tgz','.bz2','.xz','.zst','.7z','.rar','.tar','.age','.gpg','.pgp',
+                   '.p12','.pfx','.jks','.keystore','.bin','.blob','.pickle','.pkl','.pyc','.so','.dylib','.dll',
+                   '.exe','.wasm','.db-wal','.db-shm','.pdf','.doc','.docx','.xls','.xlsx','.ppt','.pptx',
+                   '.odt','.ods','.odp','.epub','.png','.jpg','.jpeg','.webp','.gif','.heic','.avif',
+                   '.mp3','.mp4','.mov','.m4a','.wav','.ogg','.flac','.woff','.woff2','.ttf','.ico'}
+SECRET_WORDS = {'password','passwd','passphrase','secret','token','apikey','accesskey','privatekey',
+                'accesskeyid','secretaccesskey','authorization','cookie','cookies','credential','credentials',
+                'accesstoken','refreshtoken','idtoken','sessiontoken','sessionkey','clientsecret','botoken','bottoken',
+                'authtoken','authtokenkey','bearertoken','oauth','oauthcredentials','encryptionkey','signingkey',
+                'licensekey','webhooksecret','databasepassword','smtpPassword'.lower()}
+KEY_PATTERN = r'(?:[A-Za-z0-9_-]*(?:password|passwd|passphrase|secret|credential|token|api[_-]?key|access[_-]?key|private[_-]?key|session[_-]?key|license[_-]?key)|authorization|cookies?)'
+ASSIGNMENT = re.compile(r'''(?ix)(?P<prefix>(?<![\w-])["']?'''+KEY_PATTERN+r'''["']?\s*[:=]\s*)(?P<value>"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;\}\]\)]+)''')
+PRIVATE_KEY = re.compile(r'-----BEGIN (?:[A-Z ]*PRIVATE KEY|PGP PRIVATE KEY BLOCK)-----[\s\S]*?(?:-----END [A-Z ]+-----|\Z)')
+PATTERNS = (
+    re.compile(r'AGE-SECRET-KEY-1[023456789ACDEFGHJKLMNPQRSTUVWXYZ]{58}'),
+    re.compile(r'\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})'),
+    re.compile(r'\bsk-(?:proj-|ant-[A-Za-z0-9-]+-)?[A-Za-z0-9_-]{20,}'),
+    re.compile(r'\b[0-9]{6,16}:[A-Za-z0-9_-]{30,}'),
+    re.compile(r'\b(?:AKIA|ASIA)[A-Z0-9]{16}\b'),
+    re.compile(r'\bxox[baprs]-[A-Za-z0-9-]{10,}'),
+    re.compile(r'\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+'),
+    re.compile(r'(?i)\b(?:bearer|basic)\s+[A-Za-z0-9_+/=.:~-]+'),
+    re.compile(r'(?i)\b[a-z][a-z0-9+.-]*://[^\s/:]+:[^\s/@]+@'),
+    re.compile(r'''(?i)(?:[?&](?:access_token|token|key|api_key|password|secret|signature|sig|x-amz-credential|x-amz-signature)=)[^&#\s"'`<>${}]+'''),
+    # Opaque literal encodings cannot be inspected as ordinary text. Remove the
+    # encoded payload instead of retaining possible base64/hex credential stores.
+    re.compile(r'(?<![A-Za-z0-9+/=_-])[A-Za-z0-9+/=_-]{80,}(?![A-Za-z0-9+/=_-])'),
+)
+RECONNECT_CATALOG = {
+    'telegram': ('Telegram connection configuration','https://t.me/BotFather'),
+    'openai-codex': ('Codex authentication configuration','https://chatgpt.com/'),
+    'openai-api': ('OpenAI API configuration','https://platform.openai.com/api-keys'),
+    'anthropic-claude': ('Claude authentication configuration','https://claude.ai/login'),
+    'anthropic-api': ('Anthropic API configuration','https://platform.claude.com/settings/keys'),
+    'github': ('GitHub authentication configuration','https://github.com/settings/personal-access-tokens'),
+    'google': ('Google integration configuration','https://accounts.google.com/'),
+    'slack': ('Slack integration configuration','https://slack.com/signin'),
+    'aws': ('AWS integration configuration','https://console.aws.amazon.com/'),
+    'clickup': ('ClickUp integration configuration','https://app.clickup.com/login'),
+    'vercel': ('Vercel integration configuration','https://vercel.com/login'),
+    'apify': ('Apify integration configuration','https://console.apify.com/settings/integrations'),
+    'hubspot': ('HubSpot integration configuration','https://app.hubspot.com/login'),
+    'asana': ('Asana integration configuration','https://app.asana.com/-/login'),
+    'ssh': ('SSH keys and configuration','https://www.openssh.org/manual.html'),
+    'other-integration': ('Credential-bearing configuration (excluded or redacted)',None),
+}
+PROVIDER_FIELDS = {
+    'telegram': {'telegrambottoken','bottoken','telegramapitoken'},
+    'openai-api': {'openaiapikey','openaikey'},
+    'anthropic-api': {'anthropicapikey','claudeapikey'},
+    'github': {'githubtoken','ghtoken','githubpat','githubaccesstoken'},
+    'google': {'googleapikey','googleclientid','googleclientsecret','googlerefreshtoken','googleserviceaccount','googleserviceaccountjson','gogclientsecret','gogtoken','gcalcredentials'},
+    'slack': {'slacktoken','slackbottoken','slackapptoken','slackclientsecret'},
+    'aws': {'awsaccesskeyid','awssecretaccesskey','awssessiontoken'},
+    'clickup': {'clickuptoken','clickupapikey'},
+    'vercel': {'verceltoken'}, 'apify': {'apifytoken','apifyapitoken'},
+    'hubspot': {'hubspottoken','hubspotaccesstoken','hubspotprivateapptoken'},
+    'asana': {'asanatoken','asanapat','asanaaccesstoken'},
+}
+
+def secret_key(name):
+    folded = re.sub('[^a-z0-9]', '', str(name).lower())
+    return folded in SECRET_WORDS or folded.endswith(('password','passwd','passphrase','secret','token','apikey','privatekey','secretkey'))
+
+def source_code_path(path):
+    return Path(str(path)).suffix.lower() in {'.py','.js','.mjs','.cjs','.ts','.tsx','.jsx','.sh','.bash','.zsh','.go','.rs','.rb','.swift','.java','.c','.h','.cpp'}
+
+def credential_authority(path):
+    value=str(path)
+    return (bool(classify_path(value)) or value.startswith(('/etc/','system/etc/')) or value.endswith('.env')
+            or bool(re.search(r'(?:^|/)(?:\.?claude|config|settings(?:\.local)?|integrations?|agent(?:-[^/]+)?)\.(?:json|env|toml|ya?ml)$',value)))
+
+def classify_path(path, *, is_source=False):
+    parts = [part.lower() for part in PurePosixPath(str(path).replace('\\','/')).parts]
+    base = parts[-1] if parts else ''
+    if '.git' in parts: return 'git-history-may-contain-credentials'
+    if any(part in {'.ssh','.gnupg','.aws','.azure','.kube','.docker','keyrings','keyring','login data','cookies','network','session storage','local storage','indexeddb'} for part in parts):
+        return 'credential-or-session-store'
+    if any(part in {'google-chrome','chromium','chromium-browser','brave-browser','microsoft edge','.mozilla','firefox','browser-profile','browser-profile-data','browser-data','browser-profiles','user-data-dir'} for part in parts):
+        return 'browser-profile-cannot-be-sanitized'
+    if base in {'.env','.npmrc','.netrc','.pypirc','.git-credentials','hosts.yml','auth.json','oauth.json','cookies.txt','cookies.sqlite','credentials','credentials.json','.credentials.json','recovery-key.txt','github-token','secret.key','secrets.json'} or base.startswith(('.env.','id_rsa','id_ed25519','id_ecdsa')):
+        return 'credential-file'
+    source_code=is_source or source_code_path(base)
+    if Path(base).suffix in {'.key','.pem','.p12','.pfx','.jks','.keystore'} or not source_code and re.search(r'(?:^|[-_.])(?:credentials?|oauth|tokens?|secrets?|cookies?|passwords?)(?:[-_.]|$)',base):
+        return 'credential-file'
+    return None
+
+def reconnect_for(path,data=b''):
+    lower = str(path).lower()
+    provider = next((name for terms,name in (
+        (('telegram',),'telegram'), (('.codex','novsky/codex'),'openai-codex'),
+        (('.claude','claude-tg'),'anthropic-claude'), (('github','/.config/gh/'),'github'),
+        (('gogcli','gcal','google'),'google'), (('slack',),'slack'), (('.aws','aws'),'aws'),
+        (('clickup',),'clickup'), (('vercel',),'vercel'), (('apify',),'apify'),
+        (('hubspot',),'hubspot'), (('asana',),'asana'), (('.ssh',),'ssh'))
+        if any(term in lower for term in terms)), 'other-integration')
+    # Only fixed field names identify services; account/map keys and all values
+    # are discarded. One .env may configure multiple independent providers.
+    fields=set()
+    if isinstance(data,bytes):
+        try:text=data.decode('utf-8')
+        except UnicodeDecodeError:text=''
+        for match in re.finditer(r'(?m)(?:^|[\s{,])["\']?([A-Za-z][A-Za-z0-9_-]*)["\']?\s*[:=]',text):
+            fields.add(re.sub('[^a-z0-9]','',match.group(1).lower()))
+    providers={name for name,allowed in PROVIDER_FIELDS.items() if fields & allowed}
+    if provider!='other-integration' or not providers:providers.add(provider)
+    return [{'provider':name,'configLocation':RECONNECT_CATALOG[name][0],'scopes':[],
+             'setupUrl':RECONNECT_CATALOG[name][1],'action':'reauthorize'} for name in sorted(providers)]
+
+def _string_values(value):
+    if isinstance(value,str): yield value
+    elif isinstance(value,dict):
+        for item in value.values(): yield from _string_values(item)
+    elif isinstance(value,list):
+        for item in value: yield from _string_values(item)
+
+def _credential_value(value):
+    return (isinstance(value,str) and bool(value) and value!=REDACTED
+            and not re.fullmatch(r'(?i)(?:none|null|undefined|true|false|token|password|secret|changeme|placeholder|dummy|example|test|x+)',value)
+            and not value.startswith(('$','${','{{','os.environ','process.env','getenv(')))
+
+def _code_template(value):
+    return bool(re.search(r'\$\{|\$[A-Za-z_]|%[-+0-9.]*[sdrf]',value))
+
+def _package_integrities(document,path):
+    """Exact SRI digests are public dependency checksums, not opaque auth data."""
+    if Path(str(path)).name not in {'package-lock.json','npm-shrinkwrap.json'}:return set()
+    result=set()
+    def visit(value):
+        if isinstance(value,dict):
+            for key,item in value.items():
+                if key=='integrity' and isinstance(item,str):
+                    match=re.fullmatch(r'sha(256|384|512)-([A-Za-z0-9+/]+={0,2})',item)
+                    if match:
+                        try: digest=base64.b64decode(match.group(2),validate=True)
+                        except ValueError:continue
+                        if len(digest)==int(match.group(1))//8 and base64.b64encode(digest).decode()==match.group(2):result.add(item)
+                else:visit(item)
+        elif isinstance(value,list):
+            for item in value:visit(item)
+    visit(document)
+    return result
+
+def _python_secret_nodes(text):
+    """Credential value expressions, excluding executable regex definitions."""
+    tree=ast.parse(text)
+    parents={child:node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+    found=[]
+    def sensitive(target):
+        return isinstance(target,ast.Name) and secret_key(target.id) or isinstance(target,ast.Attribute) and secret_key(target.attr)
+    def add(value):
+        if isinstance(value,ast.Constant) and isinstance(value.value,(str,bytes)):
+            candidate=value.value.decode('utf-8',errors='replace') if isinstance(value.value,bytes) else value.value
+            if _credential_value(candidate):found.append(value)
+    for node in ast.walk(tree):
+        if isinstance(node,ast.Assign) and any(sensitive(target) for target in node.targets):add(node.value)
+        elif isinstance(node,(ast.AnnAssign,ast.NamedExpr)) and sensitive(node.target):add(node.value)
+        elif isinstance(node,ast.keyword) and node.arg and secret_key(node.arg):add(node.value)
+        elif isinstance(node,ast.Dict):
+            parent=parents.get(node)
+            targets=parent.targets if isinstance(parent,ast.Assign) else [parent.target] if isinstance(parent,ast.AnnAssign) else []
+            regex_definition=any(isinstance(target,ast.Name) and re.search(r'(?:^|_)(?:patterns?|regex(?:es)?)(?:_|$)',target.id.lower()) for target in targets)
+            if regex_definition:continue
+            for key,value in zip(node.keys,node.values):
+                if isinstance(key,ast.Constant) and isinstance(key.value,str) and secret_key(key.value):add(value)
+    return found
+
+def secret_literals(data, *, path):
+    """Harvest literals from an already authorized read; never access files here."""
+    if not isinstance(data,bytes): raise TypeError('sanitizer requires bytes')
+    try: text=data.decode('utf-8')
+    except UnicodeDecodeError: return set()
+    found=set()
+    authority=credential_authority(path) and not source_code_path(path) and not data.startswith(b'#!')
+    def keep(value, *, authoritative=False):
+        if _credential_value(value) and len(value)>=(1 if authoritative else 8):
+            found.add(value.encode())
+            escaped=json.dumps(value,ensure_ascii=True)[1:-1].encode()
+            found.add(escaped)
+            found.add(quote(value,safe='').encode())
+    try: document=json.loads(text)
+    except (ValueError,RecursionError): document=None
+    integrities=_package_integrities(document,path)
+    def visit(value):
+        if isinstance(value,dict):
+            for key,item in value.items():
+                if secret_key(key):
+                    for word in _string_values(item): keep(word,authoritative=True)
+                else: visit(item)
+        elif isinstance(value,list):
+            for item in value: visit(item)
+    if document is not None: visit(document)
+    elif '\n' in text:
+        # Session JSONL is a sequence of independent objects, including small
+        # files which are read in one block by the global inventory pass.
+        for line in text.splitlines():
+            if not line.strip() or len(line)>MAX_LINE:continue
+            try:record=json.loads(line)
+            except (ValueError,RecursionError):continue
+            visit(record)
+    python_source=Path(str(path)).suffix=='.py' or text.startswith('#!') and 'python' in text.splitlines()[0]
+    if python_source:
+        try: nodes=_python_secret_nodes(text)
+        except (SyntaxError,ValueError):nodes=[]
+        for node in nodes:
+            value=node.value
+            if isinstance(value,bytes):
+                try:value=value.decode()
+                except UnicodeDecodeError:continue
+            keep(value,authoritative=True)
+    for match in ASSIGNMENT.finditer(text) if authority else ():
+        raw=match.group('value')
+        if raw[:1] in {'"',"'"}:
+            try: raw=json.loads(raw) if raw[0]=='"' else raw[1:-1]
+            except ValueError: raw=raw[1:-1]
+        keep(raw,authoritative=True)
+    for pattern in (PRIVATE_KEY,*PATTERNS):
+        for match in pattern.finditer(text):
+            if pattern is PATTERNS[-1] and match.group() in integrities:continue
+            if (source_code_path(path) or data.startswith(b'#!')) and _code_template(match.group()):continue
+            keep(match.group())
+    if classify_path(path) and len(data)<=MAX_BYTES:
+        if document is not None:
+            # Auth stores may use provider/account identifiers as map keys.
+            for word in _string_values(document):
+                if len(word)>=8: keep(word)
+        elif not ASSIGNMENT.search(text) and 4<=len(text.strip())<=16384:
+            keep(text.strip())
+    return {word for word in found if word and word != REDACTED.encode()}
+
+def _plain(text,known,*,code=False,assignments=True,opaque=True):
+    count=0
+    for literal in sorted(known,key=len,reverse=True):
+        try: value=literal.decode() if isinstance(literal,bytes) else str(literal)
+        except UnicodeDecodeError: continue
+        if value and value!=REDACTED and value in text:
+            if len(value)<8:
+                text,n=re.subn(r'(?<!\w)'+re.escape(value)+r'(?!\w)',lambda _match:REDACTED,text)
+                count+=n
+            else:
+                count+=text.count(value);text=text.replace(value,REDACTED)
+    text,n=PRIVATE_KEY.subn(REDACTED,text);count+=n
+    for pattern in PATTERNS if opaque else PATTERNS[:-1]:
+        def replace(match):
+            nonlocal count
+            if code and _code_template(match.group()):return match.group()
+            count+=1
+            return REDACTED
+        text=pattern.sub(replace,text)
+    def assignment(match):
+        nonlocal count
+        raw=match.group('value')
+        quotechar=raw[0] if raw[:1] in {'"',"'"} else ''
+        if code and quotechar:
+            literal=raw[1:-1]
+            following=text[match.end():].lstrip()
+            if (not _credential_value(literal) or literal.endswith(('=',':'))
+                    or _code_template(literal)
+                    or following[:1] in {'+','.'}):return match.group()
+            # A closing quote in startswith("BOT_TOKEN=") is not a credential
+            # string opener. Track the current line's literal boundary first.
+            start=text.rfind('\n',0,match.start('value'))+1
+            active=None;escaped=False
+            for char in text[start:match.start('value')]:
+                if escaped:escaped=False;continue
+                if char=='\\':escaped=True;continue
+                if char in {'"',"'"}:
+                    if active==char:active=None
+                    elif active is None:active=char
+            if active==quotechar or raw[1:].startswith(('$','{{')):return match.group()
+        if not quotechar and (code or re.fullmatch(r'(?i)(?:none|null|undefined|true|false|[0-9.]+)',raw)
+                              or raw.startswith(('$','{{','os.','process.','config.','env[','getenv('))):
+            return match.group()
+        count+=1
+        return match.group('prefix')+quotechar+REDACTED+quotechar
+    if assignments:text=ASSIGNMENT.sub(assignment,text)
+    return text,count
+
+def _text(text,known,*,code=False,assignments=True,integrities=()):
+    """Preserve valid JSON and recursively sanitize strings (including chat JSON)."""
+    try: document=json.loads(text)
+    except (ValueError,RecursionError): return _plain(text,known,code=code,assignments=assignments)
+    count=0
+    def visit(value):
+        nonlocal count
+        if isinstance(value,dict):
+            result={}
+            for key,item in value.items():
+                safe_key,n=_plain(key,known);count+=n
+                if re.sub('[^a-z]','',key.lower())=='fencingtoken' and type(item) is int:
+                    result[safe_key]=item
+                elif key=='integrity' and isinstance(item,str) and item in integrities:
+                    result[safe_key],n=_plain(item,known,assignments=False,opaque=False);count+=n
+                elif secret_key(key): result[safe_key]=REDACTED;count+=1
+                else: result[safe_key]=visit(item)
+            return result
+        if isinstance(value,list): return [visit(item) for item in value]
+        if isinstance(value,str):
+            result,n=_text(value,known,assignments=assignments) if value.lstrip().startswith(('{','[')) else _plain(value,known,assignments=assignments)
+            count+=n;return result
+        return value
+    clean=visit(document)
+    whitespace=text[len(text.rstrip()):]
+    return (json.dumps(clean,ensure_ascii=False,separators=(',',':'))+whitespace if count else text),count
+
+def _python(text,known):
+    """Inspect literal tokens, never treat a string's closing quote as a value."""
+    sensitive=_python_secret_nodes(text)
+    lines=text.splitlines(keepends=True)
+    tokens=list(tokenize.generate_tokens(io.StringIO(text).readline))
+    changed=[];count=0
+    for token in tokens:
+        value=token.string
+        if token.type==tokenize.STRING:
+            try: literal=ast.literal_eval(value)
+            except (ValueError,SyntaxError):literal=None
+            if isinstance(literal,(str,bytes)):
+                binary=isinstance(literal,bytes)
+                try: plain=literal.decode() if binary else literal
+                except UnicodeDecodeError:plain=None
+                if plain is not None:
+                    clean,n=_text(plain,known,code=True,assignments=False)
+                    position=(token.start[0],len(lines[token.start[0]-1][:token.start[1]].encode()))
+                    if any((node.lineno,node.col_offset)<=position<(node.end_lineno,node.end_col_offset) for node in sensitive) and plain:
+                        clean=REDACTED;n+=1
+                    if n and clean!=plain:
+                        value=repr(clean.encode() if binary else clean);count+=n
+            elif value.lower().startswith(('f"',"f'",'rf"',"rf'",'fr"',"fr'")):
+                value,n=_plain(value,known,code=True,assignments=False);count+=n
+        elif token.type==tokenize.COMMENT:
+            value,n=_plain(value,known,code=True,assignments=False);count+=n
+        elif token.type==getattr(tokenize,'FSTRING_MIDDLE',-1):
+            value,n=_plain(value,known,code=True,assignments=False);count+=n
+        # TokenInfo coordinates are original; replacing only token spelling
+        # preserves statements, indentation and all expressions around literals.
+        changed.append(token._replace(string=value))
+    if not count:return text,0
+    clean=tokenize.untokenize(changed)
+    ast.parse(clean)
+    return clean,count
+
+def sanitize_bytes(data, *, path, known_secrets=()):
+    if not isinstance(data,bytes): raise TypeError('sanitizer requires bytes')
+    is_source=data.startswith(b'#!') or source_code_path(path)
+    reason=classify_path(path,is_source=is_source)
+    if not reason and (Path(str(path)).suffix.lower() in OPAQUE_SUFFIXES or data.startswith((b'PK\x03\x04',b'\x1f\x8b',b'%PDF-',b'age-encryption.org/',b'SQLite format 3\0'))):
+        reason='opaque-format-not-credential-inspectable'
+    if not reason and len(data)>MAX_BYTES: reason='text-block-exceeds-inspection-limit'
+    if not reason:
+        try: text=data.decode('utf-8')
+        except UnicodeDecodeError: reason='non-utf8-content-not-inspectable'
+        else:
+            if any(ord(char)<32 and char not in '\n\r\t' for char in text): reason='binary-content-not-inspectable'
+    if reason:
+        return {'data':None,'disposition':'excluded','reason':reason,'redactions':0,'reconnect':reconnect_for(path,data)}
+    known=set(known_secrets)|secret_literals(data,path=path)
+    python_source=Path(str(path)).suffix=='.py' or text.startswith('#!') and 'python' in text.splitlines()[0]
+    if python_source:
+        try:clean,count=_python(text,known)
+        except (SyntaxError,tokenize.TokenError,IndentationError) as error:
+            raise ValueError('Python source could not be safely sanitized') from error
+    else:
+        try:integrities=_package_integrities(json.loads(text),path)
+        except (ValueError,RecursionError):integrities=set()
+        clean,count=_text(text,known,code=is_source,integrities=integrities)
+    return {'data':clean.encode(),'disposition':'redacted' if count else 'included','reason':None,
+            'redactions':count,'reconnect':reconnect_for(path,data) if count else []}
+
+def known_secret_literals(home, *, include_paths=None, exclude_paths=None, sqlite_timeout_seconds=30):
+    """Read text with no symlink following; secret values never leave this process."""
+    home=Path(home)
+    roots=include_paths or ['.']
+    exclusions=exclude_paths or {}
+    def excluded(path):
+        relative=path.relative_to(home).as_posix()
+        return any(relative==prefix or relative.startswith(prefix+'/') for prefix in exclusions)
+    def candidates():
+        for selected in roots:
+            relative=PurePosixPath(selected)
+            if relative.is_absolute() or '..' in relative.parts:raise ValueError('unsafe secret inventory scope')
+            root=home/selected
+            if any(parent.is_symlink() for parent in (root,*root.parents) if parent==home or home in parent.parents):continue
+            if excluded(root):continue
+            if root.is_file():yield root;continue
+            for directory,dirs,files in os.walk(root,followlinks=False):
+                dirs[:]=[name for name in dirs if not (Path(directory)/name).is_symlink()
+                         and name not in {'.git','node_modules','__pycache__'} and not excluded(Path(directory)/name)]
+                for name in files:
+                    path=Path(directory)/name
+                    if not excluded(path):yield path
+    found=set()
+    for path in candidates():
+            try:
+                info=path.lstat()
+                if not stat.S_ISREG(info.st_mode) or path.suffix.lower() in OPAQUE_SUFFIXES:continue
+                descriptor=os.open(path,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+                with os.fdopen(descriptor,'rb') as stream:
+                    pinned=os.fstat(stream.fileno())
+                    if (pinned.st_dev,pinned.st_ino)!=(info.st_dev,info.st_ino):raise ValueError('secret inventory file changed')
+                    header=stream.read(16);stream.seek(0)
+                    if header==b'SQLite format 3\0':
+                        try:found.update(_sqlite_secret_literals(path,timeout_seconds=sqlite_timeout_seconds))
+                        except (sqlite3.Error,TimeoutError):
+                            raise ValueError('secret inventory database could not be inspected') from None
+                    elif info.st_size<=MAX_BYTES:
+                        raw=stream.read(MAX_BYTES+1)
+                        found.update(secret_literals(raw,path=str(path.relative_to(home))))
+                    elif classify_path(str(path.relative_to(home))):
+                        raise ValueError('credential source exceeds inspection limit')
+                    else:
+                        while True:
+                            line=stream.readline(MAX_LINE+1)
+                            if not line:break
+                            if len(line)>MAX_LINE:break  # The whole file is excluded by sanitize_file.
+                            found.update(secret_literals(line,path=str(path.relative_to(home))))
+            except (FileNotFoundError,PermissionError):
+                if classify_path(str(path.relative_to(home))):raise ValueError('credential source could not be inspected') from None
+    return found
+
+def _sqlite_secret_literals(path, timeout_seconds=30):
+    found=set();deadline=time.monotonic()+timeout_seconds
+    quoted=lambda name:'"'+name.replace('"','""')+'"'
+    with closing(sqlite3.connect(path.as_uri()+'?mode=ro',uri=True,timeout=0.1)) as database:
+        database.set_progress_handler(lambda:int(time.monotonic()>deadline),1000)
+        database.execute('PRAGMA trusted_schema=OFF')
+        for name,sql in database.execute("SELECT name,sql FROM sqlite_schema WHERE type='table'").fetchall():
+            if not sql or name.startswith('sqlite_') or 'VIRTUAL TABLE' in sql.upper():continue
+            columns=database.execute('PRAGMA table_xinfo('+quoted(name)+')').fetchall()
+            columns=[column for column in columns if not column[6]]
+            if not columns:continue
+            for row in database.execute('SELECT '+','.join(quoted(column[1]) for column in columns)+' FROM '+quoted(name)):
+                secret_row=any(column[1].lower() in {'key','name','setting'} and isinstance(value,str) and secret_key(value) for column,value in zip(columns,row))
+                for column,value in zip(columns,row):
+                    if isinstance(value,str):
+                        found.update(secret_literals(value.encode(),path='database-value.txt'))
+                        if secret_key(column[1]) or secret_row and column[1].lower() in {'value','data','content'}:
+                            found.update(secret_literals(json.dumps({'secret':value}).encode(),path='database-value.txt'))
+    return found
+
+def sanitize_file(source,destination,*,path,known_secrets=(),timeout_seconds=120):
+    with source.open('rb') as header: is_source=header.read(64).startswith(b'#!')
+    reason=classify_path(path,is_source=is_source)
+    if reason or Path(str(path)).suffix.lower() in OPAQUE_SUFFIXES:
+        return sanitize_bytes(b'',path=path,known_secrets=known_secrets)
+    if source.stat().st_size<=MAX_BYTES:
+        result=sanitize_bytes(source.read_bytes(),path=path,known_secrets=known_secrets)
+        if result['data'] is not None:destination.write_bytes(result['data'])
+        return {key:value for key,value in result.items() if key!='data'}
+    deadline=time.monotonic()+timeout_seconds
+    total=0
+    with source.open('rb') as original,destination.open('wb') as output:
+        while True:
+            line=original.readline(MAX_LINE+1)
+            if not line:break
+            if len(line)>MAX_LINE or time.monotonic()>deadline or b'-----BEGIN ' in line:
+                return {'disposition':'excluded','reason':'text-stream-not-safely-inspectable','redactions':0,'reconnect':reconnect_for(path)}
+            result=sanitize_bytes(line,path=path,known_secrets=known_secrets)
+            if result['data'] is None:return {key:value for key,value in result.items() if key!='data'}
+            output.write(result['data']);total+=result['redactions']
+    return {'disposition':'redacted' if total else 'included','reason':None,'redactions':total,'reconnect':reconnect_for(path) if total else []}
+
+def sanitize_sqlite(source,destination,*,path,known_secrets=(),timeout_seconds=30):
+    """Build a fresh logical database, never copy free pages, triggers or BLOBs."""
+    deadline=time.monotonic()+timeout_seconds
+    redactions=0
+    invalidated=0
+    replacements={}
+    def placeholder(value):
+        if value not in replacements:replacements[value]='[REDACTED-'+str(len(replacements)+1).zfill(8)+']'
+        return replacements[value]
+    omitted=0
+    quote_name=lambda value:'"'+value.replace('"','""')+'"'
+    known=set(known_secrets)
+    with closing(sqlite3.connect(source.as_uri()+'?mode=ro',uri=True)) as original, closing(sqlite3.connect(destination)) as output:
+        original.set_progress_handler(lambda:int(time.monotonic()>deadline),1000)
+        output.set_progress_handler(lambda:int(time.monotonic()>deadline),1000)
+        output.execute('PRAGMA secure_delete=ON')
+        output.execute('PRAGMA journal_mode=OFF')
+        for pragma in ('user_version','application_id'):
+            output.execute('PRAGMA '+pragma+'='+str(int(original.execute('PRAGMA '+pragma).fetchone()[0])))
+        tables=original.execute("SELECT name,sql FROM sqlite_schema WHERE type='table'").fetchall()
+        try: shadow={row[1] for row in original.execute('PRAGMA table_list') if row[2] in {'shadow','virtual'}}
+        except sqlite3.Error:shadow=set()
+        omitted+=original.execute("SELECT count(*) FROM sqlite_schema WHERE type IN ('view','trigger','index') AND sql IS NOT NULL").fetchone()[0]
+        table_defs=[]
+        for name,sql in tables:
+            if name.startswith('sqlite_') or name in shadow or not sql or 'VIRTUAL TABLE' in sql.upper() or secret_key(name) or _plain(name,known)[1]:
+                omitted+=1;continue
+            columns=original.execute('PRAGMA table_xinfo('+quote_name(name)+')').fetchall()
+            columns=[column for column in columns if not column[6]]
+            if not columns or any(_plain(column[1],known)[1] for column in columns):omitted+=1;continue
+            table_defs.append((name,columns,sql))
+            for column in columns:
+                default=column[4]
+                if secret_key(column[1]) and isinstance(default,str) and default[:1] in {'"',"'"}:
+                    known.add(default[1:-1].replace("''", "'").encode())
+            # First pass: credentials stored by key/value or secret column must
+            # also disappear from ordinary chat strings in this same database.
+            for row in original.execute('SELECT '+','.join(quote_name(column[1]) for column in columns)+' FROM '+quote_name(name)):
+                secret_row=any(str(column[1]).lower() in {'key','name','setting'} and isinstance(value,str) and secret_key(value) for column,value in zip(columns,row))
+                for column,value in zip(columns,row):
+                    if isinstance(value,str):
+                        known.update(secret_literals(value.encode(),path='database-value.txt'))
+                        if secret_key(column[1]) or secret_row and str(column[1]).lower() in {'value','data','content'}:known.add(value.encode())
+        output.execute('PRAGMA trusted_schema=OFF')
+        for name,columns,sql in table_defs:
+            clean_schema,count=_plain(sql,known)
+            redactions+=count
+            output.execute(clean_schema)
+            select='SELECT '+','.join(quote_name(column[1]) for column in columns)+' FROM '+quote_name(name)
+            insert='INSERT INTO '+quote_name(name)+' ('+','.join(quote_name(column[1]) for column in columns)+') VALUES ('+','.join('?' for _ in columns)+')'
+            for row in original.execute(select):
+                if time.monotonic()>deadline:raise TimeoutError('SQLite sanitization deadline exceeded')
+                secret_row=any(str(column[1]).lower() in {'key','name','setting'} and isinstance(value,str) and secret_key(value) for column,value in zip(columns,row))
+                clean=[]
+                inactive_states={'corporate_actions':{'previewed','approved'},
+                                 'corporate_policy_previews':{'pending','approved'},
+                                 'corporate_resource_previews':{'pending','claimed'}}
+                invalidate=name in inactive_states and any(column[1]=='token' and isinstance(value,str) and value for column,value in zip(columns,row))
+                for column,value in zip(columns,row):
+                    if name=='conversation_jobs' and column[1]=='fencing_token' and column[2].upper()=='INTEGER' and type(value) is int:
+                        pass
+                    elif invalidate and column[1]=='state' and value in inactive_states[name]:
+                        value='expired';invalidated+=1
+                    elif isinstance(value,bytes):value=b'' if column[3] else None;redactions+=1
+                    elif secret_key(column[1]) or secret_row and str(column[1]).lower() in {'value','data','content'}:
+                        value=placeholder(value) if isinstance(value,str) else None;redactions+=1
+                    elif isinstance(value,str):
+                        value,count=_text(value,known);redactions+=count
+                    clean.append(value)
+                output.execute(insert,clean)
+        kept_tables={name for name,_columns,_sql in table_defs}
+        for name,table,sql in original.execute("SELECT name,tbl_name,sql FROM sqlite_schema WHERE type='index' AND sql IS NOT NULL"):
+            if table not in kept_tables or _plain(name,known)[1]:continue
+            clean_schema,count=_plain(sql,known)
+            redactions+=count
+            output.execute(clean_schema)
+            omitted-=1
+        if any(name=='sqlite_sequence' for name,_sql in tables):
+            for name,sequence in original.execute('SELECT name,seq FROM sqlite_sequence'):
+                if name in kept_tables and isinstance(sequence,int):
+                    output.execute('DELETE FROM sqlite_sequence WHERE name=?',(name,))
+                    output.execute('INSERT INTO sqlite_sequence(name,seq) VALUES (?,?)',(name,sequence))
+        output.commit();output.execute('VACUUM')
+        if output.execute('PRAGMA quick_check').fetchone()!=('ok',):raise ValueError('sanitized SQLite failed integrity check')
+    destination.chmod(0o600)
+    return {'disposition':'redacted' if redactions or omitted else 'included','reason':None,'redactions':redactions,
+            'omittedSchemaObjects':omitted,'logicalRebuild':True,'invalidatedCapabilities':invalidated,
+            'reconnect':reconnect_for(path) if redactions else []}

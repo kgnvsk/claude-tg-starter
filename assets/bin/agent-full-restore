@@ -1,0 +1,404 @@
+#!/usr/bin/env python3
+"""Standalone verified restoration into a new directory; never applies or starts services."""
+
+from __future__ import annotations
+
+import argparse
+import gzip
+import hashlib
+import json
+import os
+from pathlib import Path, PurePosixPath
+import posixpath
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tarfile
+import tempfile
+
+
+CHUNK_BYTES = 1024 * 1024
+MAX_MANIFEST_BYTES = 64 * 1024 * 1024
+MAX_RECEIPT_BYTES = 2 * 1024 * 1024
+MAX_INVENTORY_BYTES = 64 * 1024
+PRIVACY_POLICY = "no-secrets-v1"
+SYSTEM_INVENTORY = "system/reconnect-inventory.json"
+ENCRYPTED_CONTEXT = "system/encrypted-context.tar.gz.age"
+SHA256 = re.compile(r"[0-9a-f]{64}")
+# This helper travels alone with release assets. Keep this schema aligned with
+# agent-backup-sanitize; only exact catalog values are accepted from an archive.
+RECONNECT_CATALOG = {
+    "telegram": ("Telegram connection configuration", "https://t.me/BotFather"),
+    "openai-codex": ("Codex authentication configuration", "https://chatgpt.com/"),
+    "openai-api": ("OpenAI API configuration", "https://platform.openai.com/api-keys"),
+    "anthropic-claude": ("Claude authentication configuration", "https://claude.ai/login"),
+    "anthropic-api": ("Anthropic API configuration", "https://platform.claude.com/settings/keys"),
+    "github": ("GitHub authentication configuration", "https://github.com/settings/personal-access-tokens"),
+    "google": ("Google integration configuration", "https://accounts.google.com/"),
+    "slack": ("Slack integration configuration", "https://slack.com/signin"),
+    "aws": ("AWS integration configuration", "https://console.aws.amazon.com/"),
+    "clickup": ("ClickUp integration configuration", "https://app.clickup.com/login"),
+    "vercel": ("Vercel integration configuration", "https://vercel.com/login"),
+    "apify": ("Apify integration configuration", "https://console.apify.com/settings/integrations"),
+    "hubspot": ("HubSpot integration configuration", "https://app.hubspot.com/login"),
+    "asana": ("Asana integration configuration", "https://app.asana.com/-/login"),
+    "ssh": ("SSH keys and configuration", "https://www.openssh.org/manual.html"),
+    "other-integration": ("Credential-bearing configuration (excluded or redacted)", None),
+}
+
+
+def _safe_name(name):
+    if not isinstance(name, str) or not name or "\x00" in name or "\\" in name:
+        raise ValueError("unsafe archive path")
+    if name.startswith("/") or any(part in ("", ".", "..") for part in name.split("/")):
+        raise ValueError("unsafe archive path")
+    if name not in ("home", "system", "context.json", "manifest.json", "reconnect-inventory.json") and not name.startswith(("home/", "system/")):
+        raise ValueError("unsafe archive path namespace")
+    return name
+
+
+def _safe_link(name, target):
+    if not isinstance(target, str) or not target or target.startswith("/") or "\x00" in target or "\\" in target:
+        raise ValueError("unsafe archive link")
+    resolved = posixpath.normpath(posixpath.join(posixpath.dirname(name), target))
+    if resolved != "home" and not resolved.startswith("home/"):
+        raise ValueError("unsafe archive link target")
+    if not name.startswith("home/"):
+        raise ValueError("unsafe archive link namespace")
+
+
+def _unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate manifest key")
+        result[key] = value
+    return result
+
+
+def _verify_part(path, descriptor, destination=None, archive_digest=None):
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    with os.fdopen(os.open(path, flags), "rb") as stream:
+        initial = os.fstat(stream.fileno())
+        if not stat.S_ISREG(initial.st_mode) or initial.st_size != descriptor["size"]:
+            raise ValueError("receipt asset size or type mismatch")
+        digest, size = hashlib.sha256(), 0
+        while True:
+            block = stream.read(min(CHUNK_BYTES, descriptor["size"] - size + 1))
+            if not block:
+                break
+            size += len(block)
+            if size > descriptor["size"]:
+                raise ValueError("receipt asset size mismatch")
+            digest.update(block)
+            if destination is not None:
+                destination.write(block)
+            if archive_digest is not None:
+                archive_digest.update(block)
+        final = os.fstat(stream.fileno())
+        if size != descriptor["size"] or digest.hexdigest() != descriptor["sha256"]:
+            raise ValueError("receipt asset checksum mismatch")
+        if (initial.st_size, initial.st_mtime_ns, initial.st_ctime_ns) != (final.st_size, final.st_mtime_ns, final.st_ctime_ns):
+            raise ValueError("receipt asset changed during verification")
+
+
+def restore_release(receipt_file: Path, identity_file: Path, output: Path, *, age_binary: str) -> dict:
+    """Verify downloaded release assets beside receipt.json, assemble and restore."""
+    receipt_file = Path(receipt_file).expanduser()
+    output = Path(output).expanduser().absolute()
+    if output.is_symlink() or (output.exists() and (not output.is_dir() or any(output.iterdir()))):
+        raise ValueError("restore output must be an empty real directory")
+    if not output.parent.is_dir():
+        raise ValueError("restore output parent must exist")
+    try:
+        if receipt_file.is_symlink() or not receipt_file.is_file() or receipt_file.stat().st_size > MAX_RECEIPT_BYTES:
+            raise ValueError("invalid receipt file")
+        with receipt_file.open("rb") as stream:
+            receipt = json.loads(stream.read(MAX_RECEIPT_BYTES + 1), object_pairs_hook=_unique_object)
+        if not isinstance(receipt, dict) or receipt.get("format") != "agent-full-backup-release/v1":
+            raise ValueError("unsupported receipt format")
+        if receipt.get("privacyPolicy") != PRIVACY_POLICY:
+            raise ValueError("unsupported receipt privacy policy")
+        parts, helper = receipt.get("parts"), receipt.get("restoreHelper")
+        if not isinstance(parts, list) or not 1 <= len(parts) <= 998:
+            raise ValueError("invalid receipt parts")
+        for index, descriptor in enumerate([*parts, helper]):
+            name = f"snapshot.age.part{index + 1:04d}" if index < len(parts) else "agent-full-restore"
+            if (not isinstance(descriptor, dict) or descriptor.get("name") != name
+                    or type(descriptor.get("size")) is not int or not 0 < descriptor["size"] < 2 * 1024 ** 3
+                    or not isinstance(descriptor.get("sha256"), str) or SHA256.fullmatch(descriptor["sha256"]) is None):
+                raise ValueError("invalid receipt part descriptor")
+        if (type(receipt.get("archiveSize")) is not int or receipt["archiveSize"] != sum(part["size"] for part in parts)
+                or not isinstance(receipt.get("archiveSha256"), str) or SHA256.fullmatch(receipt["archiveSha256"]) is None):
+            raise ValueError("invalid receipt archive descriptor")
+        _verify_part(receipt_file.parent / helper["name"], helper)
+        with tempfile.TemporaryDirectory(prefix=".agent-full-parts-", dir=output.parent) as directory:
+            assembled = Path(directory) / "snapshot.age"
+            descriptor = os.open(assembled, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            whole_digest = hashlib.sha256()
+            with os.fdopen(descriptor, "wb") as destination:
+                for part in parts:
+                    _verify_part(receipt_file.parent / part["name"], part, destination, whole_digest)
+                destination.flush()
+                os.fsync(destination.fileno())
+            if whole_digest.hexdigest() != receipt["archiveSha256"]:
+                raise ValueError("receipt archive checksum mismatch")
+            return restore_snapshot(assembled, identity_file, output, age_binary=age_binary)
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError) as error:
+        raise ValueError("receipt or downloaded assets could not be verified") from error
+
+
+def _verify_reconnect_inventory(temporary, manifest, observed, *, system_context):
+    name = SYSTEM_INVENTORY if system_context else "reconnect-inventory.json"
+    descriptor = observed.get(name, {})
+    if descriptor.get("type") != "file" or not 0 < descriptor["size"] <= MAX_INVENTORY_BYTES:
+        raise ValueError("missing or invalid reconnect inventory file")
+    declared = manifest.get("encryptedContexts", [])
+    if declared not in ([], [ENCRYPTED_CONTEXT]) or (system_context and declared):
+        raise ValueError("unsupported encrypted context declaration")
+    has_nested = bool(declared)
+    if (ENCRYPTED_CONTEXT in observed) != has_nested:
+        raise ValueError("encrypted context does not match its declaration")
+    if system_context and manifest.get("reconnectInventory") != SYSTEM_INVENTORY:
+        raise ValueError("invalid system reconnect inventory reference")
+    try:
+        with (temporary / name).open("rb") as stream:
+            inventory = json.loads(stream.read(MAX_INVENTORY_BYTES + 1), object_pairs_hook=_unique_object)
+    except (OSError, ValueError, RecursionError) as error:
+        raise ValueError("invalid reconnect inventory JSON") from error
+    fields = {"schemaVersion", "privacyPolicy", "integrations"}
+    if has_nested:
+        fields.add("systemInventory")
+    if (not isinstance(inventory, dict) or set(inventory) != fields
+            or type(inventory.get("schemaVersion")) is not int or inventory["schemaVersion"] != 1
+            or inventory.get("privacyPolicy") != PRIVACY_POLICY
+            or not isinstance(inventory.get("integrations"), list)
+            or (has_nested and inventory.get("systemInventory") != SYSTEM_INVENTORY)):
+        raise ValueError("invalid reconnect inventory schema or privacy policy")
+    for row in inventory["integrations"]:
+        provider = row.get("provider") if isinstance(row, dict) else None
+        if not isinstance(provider, str) or provider not in RECONNECT_CATALOG:
+            raise ValueError("invalid reconnect inventory integration")
+        location, setup_url = RECONNECT_CATALOG[provider]
+        if row != {"provider": provider, "configLocation": location, "scopes": [],
+                   "setupUrl": setup_url, "action": "reauthorize"}:
+            raise ValueError("invalid reconnect inventory integration")
+
+
+def _extract_verified(archive, identity_file, temporary, age_binary, *, system_context=False):
+    """Extract only into private staging; authenticate before applying metadata."""
+    process = None
+    observed = {}
+    manifest = None
+    try:
+        process = subprocess.Popen([str(age_binary), "-d", "-i", str(identity_file), str(archive)], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        # gzip.GzipFile bounds inflated reads; tarfile's r|gz stream can inflate a
+        # small compressed block into tens of MiB at once for sparse attachments.
+        with gzip.GzipFile(fileobj=process.stdout, mode="rb") as decompressed, tarfile.open(fileobj=decompressed, mode="r|", ignore_zeros=True) as contents:
+            for info in contents:
+                name = _safe_name(info.name)
+                if system_context and name not in ("system", "manifest.json") and not name.startswith("system/"):
+                    raise ValueError("unsafe system context namespace")
+                if name in observed or (name == "manifest.json" and manifest is not None):
+                    raise ValueError("duplicate archive member")
+                if manifest is not None:
+                    raise ValueError("manifest must be the final archive member")
+                if not (info.isfile() or info.isdir() or info.issym()) or info.sparse is not None:
+                    raise ValueError("unsupported archive member or link")
+                if system_context and info.issym():
+                    raise ValueError("system context links are not permitted")
+                if info.mode < 0 or info.mode > 0o7777 or info.size < 0:
+                    raise ValueError("unsafe archive metadata")
+                if not info.isfile() and info.size:
+                    raise ValueError("unsafe archive directory or link size")
+                parent = str(PurePosixPath(name).parent)
+                if parent != "." and (parent not in observed or observed[parent]["type"] != "directory"):
+                    raise ValueError("archive path has no declared directory parent")
+                target = temporary / name
+                kind = "file" if info.isfile() else "directory" if info.isdir() else "symlink"
+                data = {"type": kind, "size": info.size, "mode": info.mode}
+                if info.isdir():
+                    target.mkdir(mode=0o700)
+                elif info.issym():
+                    _safe_link(name, info.linkname)
+                    data["linkTarget"] = info.linkname
+                else:
+                    source = contents.extractfile(info)
+                    if name == "manifest.json":
+                        if info.size > MAX_MANIFEST_BYTES:
+                            raise ValueError("manifest is too large")
+                        try:
+                            manifest = json.loads(source.read(info.size), object_pairs_hook=_unique_object)
+                        except (json.JSONDecodeError, UnicodeDecodeError) as error:
+                            raise ValueError("invalid manifest") from error
+                        if not isinstance(manifest, dict):
+                            raise ValueError("invalid manifest")
+                        continue
+                    descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+                    digest, size = hashlib.sha256(), 0
+                    with os.fdopen(descriptor, "wb") as destination:
+                        while True:
+                            block = source.read(CHUNK_BYTES)
+                            if not block:
+                                break
+                            destination.write(block)
+                            digest.update(block)
+                            size += len(block)
+                    if size != info.size:
+                        raise ValueError("archive file size mismatch")
+                    data["sha256"] = digest.hexdigest()
+                observed[name] = data
+        # Parsing tar's end markers alone does not authenticate age's final chunk.
+        while process.stdout.read(CHUNK_BYTES):
+            pass
+        process.stdout.close()
+        if process.wait(timeout=60) != 0:
+            raise ValueError("age decryption or authentication failed")
+        format_name = "agent-system-context/v1" if system_context else "agent-full-backup"
+        if not isinstance(manifest, dict) or manifest.get("format") != format_name:
+            raise ValueError("missing or unsupported manifest")
+        if manifest.get("privacyPolicy") != PRIVACY_POLICY:
+            raise ValueError("unsupported archive privacy policy")
+        expected = manifest.get("entries")
+        required = {"system"} if system_context else {"context.json", "home"}
+        if not isinstance(expected, dict) or set(expected) != set(observed) or not required <= set(expected):
+            raise ValueError("manifest does not match archive members")
+        if not system_context and (manifest.get("schemaVersion") != 1 or not isinstance(manifest.get("coverage"), dict)
+                                   or not isinstance(manifest.get("rootIdentity"), dict)):
+            raise ValueError("invalid manifest metadata")
+        for name, actual in observed.items():
+            recorded = expected[name]
+            if not isinstance(recorded, dict) or any(recorded.get(key) != value for key, value in actual.items()):
+                raise ValueError("manifest hash or metadata mismatch")
+            timestamp = recorded.get("mtimeNs")
+            if isinstance(timestamp, bool) or not isinstance(timestamp, int):
+                raise ValueError("invalid manifest timestamp")
+        _verify_reconnect_inventory(temporary, manifest, observed, system_context=system_context)
+        return manifest, observed
+    except (OSError, EOFError, tarfile.TarError, subprocess.SubprocessError) as error:
+        raise ValueError("archive validation or decryption failed") from error
+    finally:
+        if process is not None:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+            if process.stdout is not None:
+                process.stdout.close()
+
+
+def _write_manifest(path, manifest):
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+        json.dump(manifest, stream, ensure_ascii=True, separators=(",", ":"))
+
+
+def _restore_system_context(temporary, manifest, observed, identity_file, age_binary):
+    declared = manifest.get("encryptedContexts", [])
+    nested_name = ENCRYPTED_CONTEXT
+    if declared not in ([], [nested_name]):
+        raise ValueError("unsupported encrypted context declaration")
+    if not declared:
+        return {}
+    if observed.get(nested_name, {}).get("type") != "file":
+        raise ValueError("declared encrypted system context is missing")
+    with tempfile.TemporaryDirectory(prefix=".system-context-", dir=temporary) as directory:
+        staging = Path(directory)
+        nested, captured = _extract_verified(temporary / nested_name, identity_file, staging, age_binary, system_context=True)
+        saved_manifest = "system/encrypted-context.manifest.json"
+        if saved_manifest in observed or saved_manifest in captured:
+            raise ValueError("system context manifest path collision")
+        for name, data in captured.items():
+            if name in observed and (observed[name]["type"] != "directory" or data["type"] != "directory"):
+                raise ValueError("system context archive path collision")
+        # All nested members are validated regular files/directories. Ancestors
+        # precede children and outer symlinks have not been created yet.
+        for name, data in captured.items():
+            target = temporary / name
+            if data["type"] == "directory":
+                target.mkdir(mode=0o700, exist_ok=True)
+            else:
+                os.rename(staging / name, target)
+        _write_manifest(temporary / saved_manifest, nested)
+        return nested["entries"]
+
+
+def restore_snapshot(archive: Path, identity_file: Path, output: Path, *, age_binary: str) -> dict:
+    archive, identity_file, output = Path(archive).expanduser(), Path(identity_file).expanduser(), Path(output).expanduser()
+    if output.is_symlink() or (output.exists() and (not output.is_dir() or any(output.iterdir()))):
+        raise ValueError("restore output must be an empty real directory")
+    output = output.absolute()
+    if not output.parent.is_dir() or output == Path(output.anchor):
+        raise ValueError("restore output parent must exist")
+    if archive.is_symlink() or not archive.is_file() or identity_file.is_symlink() or not identity_file.is_file():
+        raise ValueError("archive and identity must be regular files")
+    temporary = Path(tempfile.mkdtemp(prefix=".agent-full-restore-", dir=output.parent))
+    try:
+        manifest, observed = _extract_verified(archive, identity_file, temporary, age_binary)
+        nested = _restore_system_context(temporary, manifest, observed, identity_file, age_binary)
+        expected = {**manifest["entries"], **nested}
+        for name, data in expected.items():
+            if data["type"] == "symlink":
+                os.symlink(data["linkTarget"], temporary / name)
+        for name, data in expected.items():
+            if data["type"] == "symlink":
+                try:
+                    (temporary / name).resolve(strict=False).relative_to((temporary / "home").resolve())
+                except (OSError, RuntimeError, ValueError) as error:
+                    raise ValueError("unsafe resolved archive link") from error
+        _write_manifest(temporary / "manifest.json", manifest)
+        directories = {name for name, data in expected.items() if data["type"] == "directory"}
+        for name in [item for item in expected if item not in directories] + sorted(directories, key=lambda item: item.count("/"), reverse=True):
+            data = expected[name]
+            path = temporary / name
+            if data["type"] != "symlink":
+                # Privileged ownership and setuid/setgid bits are never applied to an extracted archive.
+                os.chmod(path, data["mode"] & 0o1777)
+            os.utime(path, ns=(data["mtimeNs"], data["mtimeNs"]), follow_symlinks=False)
+        if output.is_symlink() or (output.exists() and (not output.is_dir() or any(output.iterdir()))):
+            raise ValueError("restore output must remain empty")
+        os.rename(temporary, output)
+        return {"path": str(output), "files": sum(item["type"] == "file" for item in expected.values()),
+                "createdAt": manifest.get("createdAt"), "coverage": manifest["coverage"], "rootIdentity": manifest["rootIdentity"],
+                "systemContextVerified": bool(nested), "privacyPolicy": manifest.get("privacyPolicy"),
+                "reconnectInventory": str(output / "reconnect-inventory.json") if "reconnect-inventory.json" in expected else None,
+                "verified": True}
+    except OSError as error:
+        raise ValueError("archive validation or restoration failed") from error
+    finally:
+        if temporary.exists():
+            # Restore may already have applied read-only directory permissions.
+            for current, dirs, _files in os.walk(temporary, topdown=True, followlinks=False):
+                os.chmod(current, 0o700)
+                for directory in dirs:
+                    path = Path(current) / directory
+                    if not path.is_symlink():
+                        os.chmod(path, 0o700)
+            shutil.rmtree(temporary)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("archive", nargs="?", type=Path, help="single encrypted archive (alternative to --receipt)")
+    parser.add_argument("--receipt", type=Path, help="receipt.json beside all downloaded release parts and the restore helper")
+    parser.add_argument("--identity", "--identity-file", dest="identity_file", required=True, type=Path)
+    parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--age-binary", default="age")
+    args = parser.parse_args()
+    if (args.archive is None) == (args.receipt is None):
+        parser.error("choose exactly one archive or --receipt")
+    try:
+        if args.receipt is not None:
+            result = restore_release(args.receipt, args.identity_file, args.output, age_binary=args.age_binary)
+        else:
+            result = restore_snapshot(args.archive, args.identity_file, args.output, age_binary=args.age_binary)
+    except ValueError as error:
+        print(json.dumps({"status": "error", "error": str(error)}), file=sys.stderr)
+        return 2
+    print(json.dumps(result, ensure_ascii=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,514 @@
+#!/usr/bin/env python3
+"""Encrypted, verified offsite recovery snapshots. Never print credential contents."""
+from __future__ import annotations
+
+import argparse
+from datetime import datetime, timezone
+import fcntl
+import getpass
+import hashlib
+import importlib.machinery
+import importlib.util
+import io
+import json
+import os
+from pathlib import Path
+import platform
+import plistlib
+import pwd
+import re
+import secrets
+import shlex
+import shutil
+import stat
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+from urllib import request
+
+VERSION = 1
+PRIVACY_POLICY = "no-secrets-v1"
+INTERVAL = 12 * 3600
+AGE_VERSION = "v1.3.2"
+AGE_DIGESTS = {
+    "linux-amd64": "cbe24006683f8eb669266162894b9a522a1af52f2665fbc63a4bb032ed26ac10",
+    "linux-arm64": "6b8dc4333c53a5a57c9e5834e3a48f92605d7154014cd07269ff3327db5d37f4",
+    "darwin-arm64": "e2020b073c44f692685a24d6abc378817eb81ffaaf49fd0531ef8565f767f2f5",
+    "darwin-amd64": "1d1e4bc66e1427edad7739ae7616157de0e79db8b6d2a1497d7d9925fb06a539",
+}
+RECIPIENT = re.compile(r"^age1[023456789acdefghjklmnpqrstuvwxyz]{58}$")
+ERROR_CODE = re.compile(r"^[a-z][a-z0-9-]{0,80}$")
+
+
+class BackupError(RuntimeError):
+    pass
+
+
+def helper(name):
+    path = Path(__file__).resolve().with_name(name)
+    loader = importlib.machinery.SourceFileLoader(name.replace("-", "_"), str(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[loader.name] = module
+    loader.exec_module(module)
+    return module
+
+
+def protected_read(path: Path, limit=128 * 1024) -> bytes:
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    with os.fdopen(descriptor, "rb") as stream:
+        info = os.fstat(stream.fileno())
+        if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                or info.st_uid != os.geteuid() or info.st_mode & 0o077 or info.st_size > limit):
+            raise BackupError("private-file-unsafe")
+        data = stream.read(limit + 1)
+        if len(data) > limit:
+            raise BackupError("private-file-too-large")
+        return data
+
+
+def atomic(path: Path, data: bytes, mode=0o600):
+    if path.is_symlink():
+        raise BackupError("state-unsafe")
+    descriptor, name = tempfile.mkstemp(prefix=".write-", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(name, mode)
+        os.replace(name, path)
+    finally:
+        Path(name).unlink(missing_ok=True)
+
+
+def json_bytes(data):
+    return (json.dumps(data, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode()
+
+
+def process(args, **kwargs):
+    try:
+        result = subprocess.run(args, capture_output=True, timeout=kwargs.pop("timeout", 30), **kwargs)
+    except (OSError, subprocess.TimeoutExpired):
+        raise BackupError("command-unavailable") from None
+    if result.returncode:
+        raise BackupError("command-failed")
+    return result.stdout
+
+
+def age_tools(state_dir: Path):
+    """Install only digest-pinned official binaries, without a remote shell script."""
+    destination = state_dir / "tools"
+    if destination.is_symlink():
+        raise BackupError("state-unsafe")
+    destination.mkdir(mode=0o700, exist_ok=True)
+    if all((destination / name).is_file() and not (destination / name).is_symlink()
+           for name in ("age", "age-keygen")):
+        return str(destination / "age"), str(destination / "age-keygen")
+    arch = {"x86_64": "amd64", "aarch64": "arm64", "arm64": "arm64"}.get(platform.machine())
+    target = platform.system().lower() + "-" + str(arch)
+    expected = AGE_DIGESTS.get(target)
+    if not expected:
+        raise BackupError("age-platform-unsupported")
+    url = f"https://github.com/FiloSottile/age/releases/download/{AGE_VERSION}/age-{AGE_VERSION}-{target}.tar.gz"
+    with request.urlopen(url, timeout=60) as response:
+        data = response.read(32 * 1024 * 1024 + 1)
+    if len(data) > 32 * 1024 * 1024 or hashlib.sha256(data).hexdigest() != expected:
+        raise BackupError("age-download-invalid")
+    with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as archive:
+        for name in ("age", "age-keygen"):
+            member = archive.getmember("age/" + name)
+            if not member.isfile() or member.size > 20 * 1024 * 1024:
+                raise BackupError("age-download-invalid")
+            atomic(destination / name, archive.extractfile(member).read(), mode=0o700)
+    return str(destination / "age"), str(destination / "age-keygen")
+
+
+class Backup:
+    def __init__(self, home: Path):
+        self.home = home.absolute()
+        if not self.home.is_dir() or any(p.is_symlink() for p in (self.home, *self.home.parents)):
+            raise BackupError("home-unsafe")
+        self.directory = self.home / ".local/state/agent-full-backup"
+        current = self.home
+        for part in (".local", "state", "agent-full-backup"):
+            current /= part
+            if current.is_symlink() or (current.exists() and not current.is_dir()):
+                raise BackupError("state-unsafe")
+            current.mkdir(mode=0o700, exist_ok=True)
+        os.chmod(self.directory, 0o700)
+        self.config_path = self.directory / "config.json"
+        self.state_path = self.directory / "state.json"
+        self.identity_path = self.directory / "recovery-key.txt"
+        self.token_path = self.directory / "github-token"
+
+    def load(self, path):
+        if not path.exists() and not path.is_symlink():
+            return {}
+        try:
+            result = json.loads(protected_read(path))
+        except (ValueError, UnicodeError):
+            raise BackupError("state-invalid") from None
+        if not isinstance(result, dict):
+            raise BackupError("state-invalid")
+        return result
+
+    def save(self, path, value):
+        atomic(path, json_bytes(value))
+
+    def lock(self):
+        descriptor = os.open(self.directory / "run.lock",
+                             os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_nlink != 1:
+            os.close(descriptor)
+            raise BackupError("state-unsafe")
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(descriptor)
+            raise BackupError("busy") from None
+        return descriptor
+
+    def prepare(self):
+        config = self.load(self.config_path)
+        if config.get("recipient"):
+            self.validate_identity(config, require_present=not config.get("keySavedAt"))
+            return {"recipient": config["recipient"], "recoveryKeyPath": str(self.identity_path),
+                    "recoveryKeyPresent": self.identity_path.exists(), "keySaved": bool(config.get("keySavedAt"))}
+        age, keygen = age_tools(self.directory)
+        if self.identity_path.exists() or self.identity_path.is_symlink():
+            # A failed first attempt may have created a usable key. Never rotate it silently.
+            protected_read(self.identity_path)
+        else:
+            process([keygen, "-o", str(self.identity_path)])
+            os.chmod(self.identity_path, 0o600)
+        recipient = process([keygen, "-y", str(self.identity_path)]).decode().strip()
+        if not RECIPIENT.fullmatch(recipient):
+            raise BackupError("recovery-key-invalid")
+        config.update(schemaVersion=VERSION, installationId=secrets.token_hex(12), recipient=recipient,
+                      enabled=False, retention=14, intervalSeconds=INTERVAL)
+        self.save(self.config_path, config)
+        return {"recipient": recipient, "recoveryKeyPath": str(self.identity_path),
+                "recoveryKeyPresent": True, "keySaved": False}
+
+    def validate_identity(self, config, require_present=True):
+        if not self.identity_path.exists() and not self.identity_path.is_symlink():
+            if require_present:
+                raise BackupError("recovery-key-missing")
+            return
+        protected_read(self.identity_path)
+        _, keygen = age_tools(self.directory)
+        recipient = process([keygen, "-y", str(self.identity_path)]).decode().strip()
+        if recipient != config.get("recipient"):
+            raise BackupError("recovery-key-mismatch")
+
+    def confirm_key_saved(self):
+        config = self.load(self.config_path)
+        if not RECIPIENT.fullmatch(config.get("recipient", "")):
+            raise BackupError("prepare-required")
+        self.validate_identity(config, require_present=not config.get("keySavedAt"))
+        config["keySavedAt"] = int(time.time())
+        self.save(self.config_path, config)
+        return {"keySaved": True}
+
+    def connect(self, repo: str, token: str):
+        config = self.load(self.config_path)
+        if not config.get("recipient"):
+            raise BackupError("prepare-required")
+        if not re.fullmatch(r"[A-Za-z0-9_]{20,255}", token):
+            raise BackupError("token-invalid")
+        repository = helper("agent-backup-github-store").check_repository(repo, token)
+        repository_id = repository.get("id", repository.get("repositoryId"))
+        if not isinstance(repository_id, int) or repository_id <= 0:
+            raise BackupError("repository-invalid")
+        if config.get("repositoryId") and config["repositoryId"] != repository_id:
+            raise BackupError("repository-change-requires-new-backup-profile")
+        atomic(self.token_path, token.encode())
+        config.update(repository=repo, repositoryId=repository_id)
+        self.save(self.config_path, config)
+        return {"repository": repo, "repositoryId": repository_id, "private": True,
+                "configured": bool(config.get("keySavedAt")), "enabled": bool(config.get("enabled"))}
+
+    def context(self):
+        configured = self.load(self.directory / "context.json")
+        context = dict(configured)
+        context.update(sourceHome=str(self.home), platform=platform.system(), architecture=platform.machine())
+        system_required = configured.get("systemContextRequired", platform.system() == "Linux" and Path("/run/systemd/system").is_dir())
+        if system_required:
+            config = self.load(self.config_path)
+            directory = self.directory / "context"
+            if directory.is_symlink():
+                raise BackupError("system-context-unsafe")
+            receipt = self.load(directory / "system-context.json")
+            try:
+                when = datetime.fromisoformat(receipt.get("createdAt", "").replace("Z", "+00:00"))
+                age = datetime.now(timezone.utc).timestamp() - when.timestamp()
+            except (ValueError, TypeError):
+                raise BackupError("system-context-not-ready") from None
+            if (receipt.get("format") != "agent-system-context-receipt/v1"
+                    or receipt.get("privacyPolicy") != PRIVACY_POLICY
+                    or receipt.get("recipient") != config.get("recipient")
+                    or receipt.get("installationId") != config.get("installationId")
+                    or receipt.get("profileId") != configured.get("systemContextProfileId")
+                    or age < -300 or age > 3 * 3600):
+                raise BackupError("system-context-not-ready")
+            path = directory / "system-context.tar.gz.age"
+            data = protected_read(path, 32 * 1024 * 1024)
+            if len(data) != receipt.get("size") or hashlib.sha256(data).hexdigest() != receipt.get("sha256"):
+                raise BackupError("system-context-invalid")
+            # The root collector refreshes its pair independently. Freeze the
+            # validated ciphertext so a long home capture keeps this receipt's bytes.
+            frozen = directory / "snapshot-system-context.tar.gz.age"
+            atomic(frozen, data)
+            context["systemContextReceipt"] = receipt
+            context["extraFileRoots"] = [*context.get("extraFileRoots", []), str(directory)]
+            context["extraFiles"] = {**context.get("extraFiles", {}), "system/encrypted-context.tar.gz.age": str(frozen)}
+        # Capture the current owned crontab, not an installer-time copy. Never print it.
+        if shutil.which("crontab"):
+            result = subprocess.run(["crontab", "-l"], capture_output=True, timeout=15)
+            if result.returncode and b"no crontab" not in result.stderr.lower():
+                raise BackupError("cron-capture-failed")
+            if result.returncode == 0:
+                cron = result.stdout
+                prefixes = context.get("userCrontabPrefixes")
+                if prefixes is not None:
+                    if (not isinstance(prefixes, list) or not prefixes
+                            or any(not isinstance(prefix, str) or not prefix.endswith("/")
+                                   or not prefix.startswith(str(self.home) + "/")
+                                   or ".." in Path(prefix).parts or "\n" in prefix or "\r" in prefix
+                                   for prefix in prefixes)):
+                        raise BackupError("cron-scope-invalid")
+                elif context.get("sharedAccount"):
+                    # Farm agents share a Unix uid but their owners do not share tasks/configuration.
+                    prefixes = [str(self.home) + "/"]
+                if prefixes is not None:
+                    lines = cron.decode().splitlines()
+                    cron = ("\n".join(line for line in lines
+                                      if (not line.lstrip().startswith("#") and any(prefix in line for prefix in prefixes))
+                                      or re.match(r"^(?:SHELL|PATH|TZ|CRON_TZ)=", line)) + "\n").encode()
+                    context["userCrontabScope"] = {"includedPrefixes": prefixes, "otherAccountJobsExcluded": True}
+                directory = self.directory / "context"
+                if directory.is_symlink():
+                    raise BackupError("state-unsafe")
+                directory.mkdir(mode=0o700, exist_ok=True)
+                atomic(directory / "crontab", cron)
+                context["extraFileRoots"] = [*context.get("extraFileRoots", []), str(directory)]
+                context["extraFiles"] = {**context.get("extraFiles", {}), "system/user-crontab": str(directory / "crontab")}
+        return context
+
+    def install_schedule(self):
+        config = self.load(self.config_path)
+        context = self.load(self.directory / "context.json")
+        if context.get("scheduleProvisioned") is True:
+            # The root installer provisions a user job before the model's sandbox starts.
+            # Enabling only changes the user's own backup state, not system permissions.
+            config["enabled"] = True
+            config["scheduleInstalledAt"] = int(time.time())
+            self.save(self.config_path, config)
+            return
+        label = "com.novsky.agent-backup." + config["installationId"]
+        script = str(Path(__file__).resolve())
+        if platform.system() == "Darwin":
+            directory = Path(pwd.getpwuid(os.geteuid()).pw_dir) / "Library/LaunchAgents"
+            if any(p.is_symlink() for p in (directory, *directory.parents)):
+                raise BackupError("schedule-path-unsafe")
+            directory.mkdir(parents=True, exist_ok=True)
+            path = directory / (label + ".plist")
+            data = {"Label": label, "ProgramArguments": [sys.executable, script, "--home", str(self.home), "scheduled"],
+                    "StartInterval": 3600, "RunAtLoad": False,
+                    "EnvironmentVariables": {"HOME": str(self.home)},
+                    "StandardOutPath": str(self.directory / "scheduled.log"),
+                    "StandardErrorPath": str(self.directory / "scheduled.log")}
+            atomic(path, plistlib.dumps(data))
+            subprocess.run(["launchctl", "bootout", "gui/" + str(os.geteuid()), str(path)], capture_output=True, timeout=15)
+            process(["launchctl", "bootstrap", "gui/" + str(os.geteuid()), str(path)])
+        else:
+            current = subprocess.run(["crontab", "-l"], capture_output=True, timeout=15)
+            if current.returncode and b"no crontab" not in current.stderr.lower():
+                raise BackupError("schedule-read-failed")
+            lines = current.stdout.decode().splitlines()
+            marker = "# " + label
+            lines = [line for line in lines if marker not in line]
+            minute = int(config["installationId"][:4], 16) % 60
+            command = shlex.join([sys.executable, script, "--home", str(self.home), "scheduled"])
+            lines.append(f"{minute} * * * * {command} >>{shlex.quote(str(self.directory / 'scheduled.log'))} 2>&1 {marker}")
+            # Re-read before replacing so concurrent configuration is not knowingly lost.
+            latest = subprocess.run(["crontab", "-l"], capture_output=True, timeout=15)
+            if latest.stdout != current.stdout or latest.returncode != current.returncode:
+                raise BackupError("schedule-changed-retry")
+            process(["crontab", "-"], input=("\n".join(lines) + "\n").encode())
+        config["enabled"] = True
+        config["scheduleInstalledAt"] = int(time.time())
+        self.save(self.config_path, config)
+
+    def run(self, scheduled=False):
+        config = self.load(self.config_path)
+        state = self.load(self.state_path)
+        now = int(time.time())
+        configured = bool(config.get("repositoryId") and config.get("keySavedAt") and self.token_path.exists())
+        if not configured:
+            if scheduled:
+                return {"status": "setup-required"}
+            raise BackupError("setup-required")
+        current_policy = (state.get("lastSnapshot") or {}).get("privacyPolicy") == PRIVACY_POLICY
+        if scheduled and (not config.get("enabled") or current_policy and now - (state.get("lastSuccessAt") or 0) < INTERVAL):
+            return {"status": "not-due"}
+        state.update(lastAttemptAt=now, running=True, lastError=None)
+        self.save(self.state_path, state)
+        work = None
+        try:
+            work = Path(tempfile.mkdtemp(prefix="snapshot-", dir=self.directory))
+            token = protected_read(self.token_path).decode().strip()
+            store = helper("agent-backup-github-store")
+            checked = store.check_repository(config["repository"], token)
+            if checked.get("id", checked.get("repositoryId")) != config["repositoryId"]:
+                raise BackupError("repository-identity-changed")
+            age, _ = age_tools(self.directory)
+            metadata = helper("agent-full-snapshot").create_snapshot(
+                self.home, work / "snapshot.tar.gz.age", config["recipient"], age_binary=age, context=self.context())
+            self.save(self.directory / "last-capture.json", {"createdAt": metadata.get("createdAt"), "coverage": metadata.get("coverage", {})})
+            if metadata.get("privacyPolicy") != PRIVACY_POLICY:
+                raise BackupError("secret-free-snapshot-required")
+            if metadata.get("coverage", {}).get("complete") is False:
+                raise BackupError("snapshot-coverage-incomplete")
+            metadata["repositoryId"] = config["repositoryId"]
+            publication = store.publish_snapshot(config["repository"], token, Path(metadata["path"]), metadata,
+                                                  installation_id=config["installationId"],
+                                                  restore_helper=Path(__file__).resolve().with_name("agent-full-restore"),
+                                                  retention=config.get("retention", 14))
+            state.update(lastSuccessAt=int(time.time()), lastPublication=publication,
+                         lastSnapshot={k: metadata.get(k) for k in ("sha256", "size", "files", "createdAt", "privacyPolicy")},
+                         running=False, lastError=None)
+            self.save(self.state_path, state)
+            return {"status": "verified", "repository": config["repository"], "publication": publication,
+                    "snapshot": state["lastSnapshot"]}
+        except Exception as exc:
+            code = str(getattr(exc, "code", ""))
+            if isinstance(exc, BackupError):
+                code = str(exc)
+            if not ERROR_CODE.fullmatch(code):
+                code = "backup-failed"
+            state.update(lastError=code, lastFailureAt=int(time.time()), running=False)
+            self.save(self.state_path, state)
+            self.notify_failure(config, state)
+            raise BackupError(code) from None
+        finally:
+            if work is not None:
+                shutil.rmtree(work)
+
+    def notify_failure(self, config, state):
+        # Notification destinations are explicit verified owner IDs, never an allowlist.
+        notification = config.get("notification") or self.load(self.directory / "context.json").get("notification", {})
+        chat_id = str(notification.get("ownerChatId", ""))
+        if not re.fullmatch(r"[1-9][0-9]{3,19}", chat_id):
+            return
+        now = int(time.time())
+        if now - state.get("lastNotificationAttemptAt", 0) < 24 * 3600:
+            return
+        state["lastNotificationAttemptAt"] = now  # At-most-once even if the response is lost.
+        self.save(self.state_path, state)
+        try:
+            native = notification.get("telegramConfigFile")
+            path = Path(native or notification["telegramEnvFile"])
+            if ".." in path.parts or any(p.is_symlink() for p in (path, *path.parents)):
+                return
+            if native:
+                allowed = {self.home / 'config.json', self.home / '.local/state/novsky-codex/config.json',
+                           Path('/etc/novsky/codex') / (self.home.name + '.json')}
+                if path not in allowed:
+                    return
+                token = json.loads(protected_read(path)).get('botToken', '')
+            else:
+                path.resolve().relative_to(self.home.resolve())
+                env = protected_read(path).decode()
+                match = re.search(r"^(?:export\s+)?(?:TELEGRAM_BOT_TOKEN|BOT_TOKEN)\s*=\s*['\"]?([0-9]+:[A-Za-z0-9_-]+)", env, re.M)
+                token = match[1] if match else ''
+            if not re.fullmatch(r'[0-9]+:[A-Za-z0-9_-]+', token):
+                return
+            prior = "Попередню успішну копію збережено. " if state.get("lastSuccessAt") else "Першу успішну копію ще не створено. "
+            message = ("Автоматичний повний бекап GitHub не вдалося завершити. " + prior +
+                       "Напиши мені «перевір бекап»: перевіримо доступ до приватного репозиторію, строк дії токена та вільне місце.")
+            payload = json.dumps({"chat_id": chat_id, "text": message}).encode()
+            req = request.Request("https://api.telegram.org/bot" + token + "/sendMessage", data=payload,
+                                  headers={"Content-Type": "application/json"}, method="POST")
+            with request.urlopen(req, timeout=20) as response:
+                result = json.loads(response.read(16384))
+            if result.get("ok"):
+                state["lastNotificationAt"] = now
+                self.save(self.state_path, state)
+        except Exception:
+            pass  # Never log the Telegram request URL or credential-bearing exception.
+
+    def status(self):
+        config, state = self.load(self.config_path), self.load(self.state_path)
+        complete = bool(config.get("repositoryId") and config.get("keySavedAt") and self.token_path.exists())
+        last = state.get("lastSuccessAt")
+        current_policy = (state.get("lastSnapshot") or {}).get("privacyPolicy") == PRIVACY_POLICY
+        return {"schemaVersion": VERSION, "configured": complete, "enabled": bool(config.get("enabled")),
+                "privacyPolicy": PRIVACY_POLICY, "lastCopyMatchesPolicy": current_policy,
+                "repository": config.get("repository"), "keySaved": bool(config.get("keySavedAt")),
+                "lastSuccessAt": last, "lastAttemptAt": state.get("lastAttemptAt"),
+                "lastError": state.get("lastError"), "fresh": bool(current_policy and last and time.time() - last < INTERVAL + 3600),
+                "lastPublication": state.get("lastPublication"), "lastSnapshot": state.get("lastSnapshot")}
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--home", type=Path, default=Path.home())
+    commands = parser.add_subparsers(dest="command", required=True)
+    for name in ("prepare", "confirm-key-saved", "run", "scheduled", "enable"):
+        commands.add_parser(name)
+    status = commands.add_parser("status")
+    status.add_argument("--json", action="store_true", help="JSON is always used; retained for agent callers")
+    connect = commands.add_parser("connect")
+    connect.add_argument("--repo", required=True)
+    group = connect.add_mutually_exclusive_group()
+    group.add_argument("--token-file", type=Path)
+    group.add_argument("--token-stdin", action="store_true", help="Protected runner pipe; never echo it")
+    args = parser.parse_args()
+    descriptor = None
+    try:
+        backup = Backup(args.home)
+        if args.command != "status":
+            descriptor = backup.lock()
+        if args.command == "prepare":
+            result = backup.prepare()
+        elif args.command == "confirm-key-saved":
+            result = backup.confirm_key_saved()
+        elif args.command == "connect":
+            if args.token_file:
+                token = protected_read(args.token_file, 4096).decode().strip()
+            elif args.token_stdin:
+                token = sys.stdin.read(4097).strip()
+            else:
+                if not sys.stdin.isatty():
+                    raise BackupError("secure-token-input-required")
+                token = getpass.getpass("GitHub token (hidden): ").strip()
+            result = backup.connect(args.repo, token)
+        elif args.command == "enable":
+            if not backup.status()["configured"]:
+                raise BackupError("setup-required")
+            backup.install_schedule()
+            result = backup.run()
+        elif args.command == "status":
+            result = backup.status()
+        else:
+            result = backup.run(scheduled=args.command == "scheduled")
+        print(json.dumps({"ok": True, **result}, ensure_ascii=False))
+        return 0
+    except Exception as exc:
+        code = str(exc) if isinstance(exc, BackupError) else str(getattr(exc, "code", ""))
+        if not ERROR_CODE.fullmatch(code):
+            code = "operation-failed"
+        print(json.dumps({"ok": False, "error": code}))
+        return 1
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,6 +1,7 @@
 {
   "schemaVersion": 1,
   "selected": [
+    "backup-recovery",
     "research"
   ],
   "managed": [
@@ -13,6 +14,7 @@
     "apify-social-research",
     "asana-tasks",
     "auto-publisher",
+    "backup-recovery",
     "brand-fonts",
     "business-systems-integration",
     "channel-publishing",

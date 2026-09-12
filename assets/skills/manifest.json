@@ -16,11 +16,19 @@
       "description": "General research and owner workflows",
       "enabledByDefault": true,
       "skills": [
+        "backup-recovery",
         "research"
       ]
     }
   },
   "skills": {
+    "backup-recovery": {
+      "risk": "external-write",
+      "requires": [
+        "owner-private-github-repository",
+        "offsite-recovery-key"
+      ]
+    },
     "research": {
       "risk": "network",
       "requires": [
