@@ -9,7 +9,7 @@
     "standalone-server-v1"
   ],
   "source": "codex/starter/product.json",
-  "sourceRevision": "937691f7f3000c0c38ec71dbf8189e48fe2e3242",
+  "sourceRevision": "4cf9282f659d0e107061ff98007e15a177c28e91",
   "sourceDirty": false,
   "features": [
     "browser"
@@ -62,7 +62,7 @@
     "assets/lib/agent-backup-context.py": "1f42de9ec0daaf82080fef29f6b9f3cfca96b9df7772f22b305d8b35ec1441f2",
     "assets/lib/install-backup-context.py": "1df53dfce715ae24eb82ab243f2f9263aafb20e2b19b5300e0bd25b84d62cb65",
     "assets/bin/agent-full-backup": "6e3bde66e6b5d572c550df1ff4c466a74812e430034f05223e1669eec77f261f",
-    "assets/bin/agent-backup-sanitize": "a00c3fc8c1aa1d4aed100ab1dfcfa415029eb7538e5a6d49ca4558aec945abf4",
+    "assets/bin/agent-backup-sanitize": "517a44a65e73f1604cad7436a4fad1b981a81ebbca93bf838d00b29c6264ac4a",
     "codex/server.py": "c7c3e9008b0342c5be4a2941aed48cf82bfc96de0b27746040a7cfd04c37510f",
     "codex/server-bootstrap.py": "ea53fa0036b606ee0120937658bb24943d3b3df7c87b9fb06328cb93fd9a78b9",
     "codex/runtime/SOURCE.json": "65c2ad4238adf54ca354c1c88c49c3a983ef264d6dda4fe299d7a4db20aa8601",
@@ -131,7 +131,7 @@
     "home/.codex/onboarding-state.json": "57176f2fd78ba747db7bf8ffaef471322d980fd25f3612c1f6d8550bedd3452c",
     "home/bin/agent-backup": "fe3c593cd8c8674ab1780154decdcb5f215fef381a710eb4f064096c39d0a6a2",
     "home/bin/agent-backup-github-store": "318b484508262693e021844aa7df45d5b125ee965a24c18b9ca9b1ba64418ec1",
-    "home/bin/agent-backup-sanitize": "a00c3fc8c1aa1d4aed100ab1dfcfa415029eb7538e5a6d49ca4558aec945abf4",
+    "home/bin/agent-backup-sanitize": "517a44a65e73f1604cad7436a4fad1b981a81ebbca93bf838d00b29c6264ac4a",
     "home/bin/agent-full-backup": "6e3bde66e6b5d572c550df1ff4c466a74812e430034f05223e1669eec77f261f",
     "home/bin/agent-full-restore": "956419902b572e6116bae5686aee5c19a30c1318cf7b9b67fc00f553f376401c",
     "home/bin/agent-full-snapshot": "a2bdae15035911fbb6a9f9c574bacb8816e51e403271513a40f14ce059f9ce2e",
@@ -154,7 +154,7 @@
     "home/bin/ukargparse.py": "50bae922beaa0173a070b5d27aefefa73f64bcd89bb18223f4c3a29ca3e28ecc",
     "home/bin/vault-sync": "1f0c812ad0c5b3a5b1882f328f1a8301faf789c95fe05596f1e8097f8383e798",
     "installer/agent-backup-context.py": "1f42de9ec0daaf82080fef29f6b9f3cfca96b9df7772f22b305d8b35ec1441f2",
-    "installer/agent-backup-sanitize": "a00c3fc8c1aa1d4aed100ab1dfcfa415029eb7538e5a6d49ca4558aec945abf4",
+    "installer/agent-backup-sanitize": "517a44a65e73f1604cad7436a4fad1b981a81ebbca93bf838d00b29c6264ac4a",
     "installer/agent-full-backup": "6e3bde66e6b5d572c550df1ff4c466a74812e430034f05223e1669eec77f261f",
     "installer/agent_license.py": "95c523edbfb2a1149b83c6ac2bc7b9e56cd3ae4cd1f942886d437cef8d9ac335",
     "installer/corporate.py": "430ebc3b1e9d1161328ecdf9b121865c33ea52f74ae49924194b6c17bfb9103d",

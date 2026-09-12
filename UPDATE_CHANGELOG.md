@@ -1,8 +1,8 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-09-12.937691f7f300`
+- Реліз: `2026-09-12.4cf9282f659d`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `937691f7f3000c0c38ec71dbf8189e48fe2e3242`
+- Ревізія вихідного комплекту: `4cf9282f659d0e107061ff98007e15a177c28e91`
 - Дата релізу: `2026-09-12`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
@@ -19,10 +19,7 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    Remove credentials before recovery backups and verify restored state
-    Align bundled backup contract and isolate platform test fixtures
-    Handle offline service installs and freeze scoped backup context
-    Add full encrypted agent recovery backups and private GitHub scheduling
+    Preserve scripts and long conversation records in recovery backups
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не

@@ -24,8 +24,8 @@ from urllib.parse import quote
 
 POLICY = 'no-secrets-v1'
 REDACTED = '[REDACTED]'
-MAX_LINE = 1024 * 1024
 MAX_BYTES = 8 * 1024 * 1024
+MAX_LINE = MAX_BYTES
 OPAQUE_SUFFIXES = {'.zip','.gz','.tgz','.bz2','.xz','.zst','.7z','.rar','.tar','.age','.gpg','.pgp',
                    '.p12','.pfx','.jks','.keystore','.bin','.blob','.pickle','.pkl','.pyc','.so','.dylib','.dll',
                    '.exe','.wasm','.db-wal','.db-shm','.pdf','.doc','.docx','.xls','.xlsx','.ppt','.pptx',
@@ -147,6 +147,12 @@ def _credential_value(value):
             and not re.fullmatch(r'(?i)(?:none|null|undefined|true|false|token|password|secret|changeme|placeholder|dummy|example|test|x+)',value)
             and not value.startswith(('$','${','{{','os.environ','process.env','getenv(')))
 
+def _empty_assignment_comment(match):
+    # In TOKEN= # explanation the whitespace starts a comment, not a value.
+    # TOKEN=# and quoted "#" remain possible credentials, including old keys
+    # in commented assignments which still need cross-file removal.
+    return match.group('value').startswith('#') and match.group('prefix')[-1:].isspace()
+
 def _code_template(value):
     return bool(re.search(r'\$\{|\$[A-Za-z_]|%[-+0-9.]*[sdrf]',value))
 
@@ -237,6 +243,7 @@ def secret_literals(data, *, path):
                 except UnicodeDecodeError:continue
             keep(value,authoritative=True)
     for match in ASSIGNMENT.finditer(text) if authority else ():
+        if _empty_assignment_comment(match):continue
         raw=match.group('value')
         if raw[:1] in {'"',"'"}:
             try: raw=json.loads(raw) if raw[0]=='"' else raw[1:-1]
@@ -256,12 +263,28 @@ def secret_literals(data, *, path):
             keep(text.strip())
     return {word for word in found if word and word != REDACTED.encode()}
 
+class _PreparedKnown:
+    """Snapshot one stable operation's literals; never cache a mutable set by id."""
+    __slots__=('values','minimum_length')
+
+    def __init__(self,known):
+        values=[]
+        # Preserve raw-length order: UTF-8 byte and decoded lengths can differ.
+        for literal in sorted(known,key=len,reverse=True):
+            try: value=literal.decode() if isinstance(literal,bytes) else str(literal)
+            except UnicodeDecodeError: continue
+            if value and value!=REDACTED:values.append(value)
+        self.values=tuple(values)
+        self.minimum_length=min(map(len,values),default=0)
+
+def _prepare_known(known):
+    return known if isinstance(known,_PreparedKnown) else _PreparedKnown(known)
+
 def _plain(text,known,*,code=False,assignments=True,opaque=True):
     count=0
-    for literal in sorted(known,key=len,reverse=True):
-        try: value=literal.decode() if isinstance(literal,bytes) else str(literal)
-        except UnicodeDecodeError: continue
-        if value and value!=REDACTED and value in text:
+    prepared=_prepare_known(known)
+    for value in prepared.values if prepared.minimum_length<=len(text) else ():
+        if value in text:
             if len(value)<8:
                 text,n=re.subn(r'(?<!\w)'+re.escape(value)+r'(?!\w)',lambda _match:REDACTED,text)
                 count+=n
@@ -277,6 +300,7 @@ def _plain(text,known,*,code=False,assignments=True,opaque=True):
         text=pattern.sub(replace,text)
     def assignment(match):
         nonlocal count
+        if code and _empty_assignment_comment(match):return match.group()
         raw=match.group('value')
         quotechar=raw[0] if raw[:1] in {'"',"'"} else ''
         if code and quotechar:
@@ -306,6 +330,7 @@ def _plain(text,known,*,code=False,assignments=True,opaque=True):
 
 def _text(text,known,*,code=False,assignments=True,integrities=()):
     """Preserve valid JSON and recursively sanitize strings (including chat JSON)."""
+    known=_prepare_known(known)
     try: document=json.loads(text)
     except (ValueError,RecursionError): return _plain(text,known,code=code,assignments=assignments)
     count=0
@@ -331,9 +356,24 @@ def _text(text,known,*,code=False,assignments=True,integrities=()):
     whitespace=text[len(text.rstrip()):]
     return (json.dumps(clean,ensure_ascii=False,separators=(',',':'))+whitespace if count else text),count
 
+def _comment(text,known,*,shebang=False):
+    if shebang:
+        # Do not hide a complete credential by splitting off its '#!' prefix.
+        # Only the standalone structural characters may be preserved safely.
+        if any(len(value)>1 and (text.startswith(value) or text.startswith(value,1))
+               for value in _prepare_known(known).values):
+            raise ValueError('Python source could not be safely sanitized')
+        clean,count=_plain(text[2:],known,code=True,assignments=False)
+        return '#!'+clean,count
+    clean,count=_plain(text,known,code=True,assignments=False)
+    # A removed credential may include the leading '#'. Keep the token a
+    # comment; its remaining prose must never become executable source.
+    return (clean if clean.startswith('#') else '# '+clean),count
+
 def _python(text,known):
     """Inspect literal tokens, never treat a string's closing quote as a value."""
     sensitive=_python_secret_nodes(text)
+    known=_prepare_known(known)
     lines=text.splitlines(keepends=True)
     tokens=list(tokenize.generate_tokens(io.StringIO(text).readline))
     changed=[];count=0
@@ -356,7 +396,7 @@ def _python(text,known):
             elif value.lower().startswith(('f"',"f'",'rf"',"rf'",'fr"',"fr'")):
                 value,n=_plain(value,known,code=True,assignments=False);count+=n
         elif token.type==tokenize.COMMENT:
-            value,n=_plain(value,known,code=True,assignments=False);count+=n
+            value,n=_comment(value,known,shebang=token.start==(1,0) and value.startswith('#!'));count+=n
         elif token.type==getattr(tokenize,'FSTRING_MIDDLE',-1):
             value,n=_plain(value,known,code=True,assignments=False);count+=n
         # TokenInfo coordinates are original; replacing only token spelling
@@ -383,6 +423,11 @@ def sanitize_bytes(data, *, path, known_secrets=()):
         return {'data':None,'disposition':'excluded','reason':reason,'redactions':0,'reconnect':reconnect_for(path,data)}
     known=set(known_secrets)|secret_literals(data,path=path)
     python_source=Path(str(path)).suffix=='.py' or text.startswith('#!') and 'python' in text.splitlines()[0]
+    shell_source=not python_source and (text.startswith('#!') or Path(str(path)).suffix.lower() in {'.sh','.bash','.zsh'})
+    # Shell comments and heredocs need syntax-aware handling. A genuine '#'
+    # credential must fail capture rather than turn comment prose into commands.
+    if shell_source and '#' in text and (b'#' in known or '#' in known):
+        raise ValueError('Shell source could not be safely sanitized')
     if python_source:
         try:clean,count=_python(text,known)
         except (SyntaxError,tokenize.TokenError,IndentationError) as error:
@@ -480,7 +525,9 @@ def sanitize_file(source,destination,*,path,known_secrets=(),timeout_seconds=120
         while True:
             line=original.readline(MAX_LINE+1)
             if not line:break
-            if len(line)>MAX_LINE or time.monotonic()>deadline or b'-----BEGIN ' in line:
+            if len(line)<=MAX_LINE and time.monotonic()>deadline:
+                raise TimeoutError('text sanitization deadline exceeded')
+            if len(line)>MAX_LINE or b'-----BEGIN ' in line:
                 return {'disposition':'excluded','reason':'text-stream-not-safely-inspectable','redactions':0,'reconnect':reconnect_for(path)}
             result=sanitize_bytes(line,path=path,known_secrets=known_secrets)
             if result['data'] is None:return {key:value for key,value in result.items() if key!='data'}
@@ -531,6 +578,7 @@ def sanitize_sqlite(source,destination,*,path,known_secrets=(),timeout_seconds=3
                         known.update(secret_literals(value.encode(),path='database-value.txt'))
                         if secret_key(column[1]) or secret_row and str(column[1]).lower() in {'value','data','content'}:known.add(value.encode())
         output.execute('PRAGMA trusted_schema=OFF')
+        known=_prepare_known(known)
         for name,columns,sql in table_defs:
             clean_schema,count=_plain(sql,known)
             redactions+=count
