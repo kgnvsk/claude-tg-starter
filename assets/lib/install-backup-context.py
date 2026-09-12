@@ -272,7 +272,25 @@ def required_files(home, unit, engine):
     return sorted(set(files))
 
 
-def install(home, user, unit, engine, *, source_dir=None):
+def agent_python(value, uid):
+    """Validate a selected user runtime without ever executing it as root."""
+    if (not isinstance(value, str) or len(value) > 4096
+            or any(c in value for c in '\r\n\x00%')):
+        raise ValueError('invalid backup Python path')
+    path = Path(value)
+    if not path.is_absolute() or '..' in path.parts or not re.fullmatch(r'python3(?:\.\d+)?', path.name):
+        raise ValueError('invalid backup Python path')
+    no_links(path)
+    with _directory(path.parent, {0, uid}) as (parent, verify):
+        info = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
+        _metadata(info, {0, uid})
+        if not info.st_mode & 0o111:
+            raise ValueError('backup Python is not executable')
+        verify()
+    return str(path)
+
+
+def install(home, user, unit, engine, *, source_dir=None, python_binary=None):
     if os.geteuid() != 0 or not re.fullmatch(r"[a-zA-Z0-9@_.-]+\.service", unit):
         raise ValueError("root and an exact agent unit are required")
     account = pwd.getpwnam(user)
@@ -284,6 +302,8 @@ def install(home, user, unit, engine, *, source_dir=None):
         raise ValueError("agent home does not belong to account")
     if not home.is_dir() or home.stat().st_uid != account.pw_uid:
         raise ValueError("agent home ownership mismatch")
+    if python_binary is not None:
+        python_binary = agent_python(python_binary, account.pw_uid)
     files = required_files(home, unit, engine)
     profile = hashlib.sha256(str(home).encode()).hexdigest()[:24]
     agent_cron = CRON_DIRECTORY / ("novsky-agent-full-backup-" + profile)
@@ -321,6 +341,9 @@ def install(home, user, unit, engine, *, source_dir=None):
     context = json.loads(_read(config_path, {account.pw_uid}, limit=128 * 1024)) if config_path.is_file() else {}
     if not isinstance(context, dict):
         raise ValueError("backup context configuration invalid")
+    selected_python = python_binary if python_binary is not None else context.get('pythonExecutable')
+    if selected_python is not None:
+        context['pythonExecutable'] = agent_python(selected_python, account.pw_uid)
     context.update(systemContextRequired=True, systemContextProfileId=profile,
                    sharedAccount=home != Path(account.pw_dir), engine=engine, unit=unit,
                    scheduleProvisioned=True)
@@ -341,7 +364,7 @@ def install(home, user, unit, engine, *, source_dir=None):
     write(ROOT / sanitizer.name, _read(sanitizer, {0}), mode=0o700)
     command = f"* * * * * root /usr/bin/python3 {ROOT}/agent-backup-context.py --all --age-binary {age} >/dev/null 2>&1\n"
     write(cron, ("# Encrypted system context only; no model calls or bot restarts.\n" + command).encode(), mode=0o644)
-    scheduled = shlex.join(["/usr/bin/python3", str(home / "bin/agent-full-backup"), "--home", str(home), "scheduled"])
+    scheduled = shlex.join([selected_python or "/usr/bin/python3", str(home / "bin/agent-full-backup"), "--home", str(home), "scheduled"])
     minute = int(profile[:4], 16) % 60
     write(agent_cron, (f"# Full encrypted backup for one agent; enabled only after owner setup.\n{minute} * * * * {user} {scheduled} >>{shlex.quote(str(state / 'scheduled.log'))} 2>&1\n").encode(), mode=0o644)
     write(target, (json.dumps(policy, sort_keys=True) + "\n").encode())
@@ -355,9 +378,10 @@ def main():
     parser.add_argument("--user", required=True)
     parser.add_argument("--unit", required=True)
     parser.add_argument("--engine", choices=("claude", "codex"), required=True)
+    parser.add_argument("--python-binary", help="Existing Python used only by the agent's backup job")
     args = parser.parse_args()
     try:
-        result = install(args.home, args.user, args.unit, args.engine)
+        result = install(args.home, args.user, args.unit, args.engine, python_binary=args.python_binary)
         print(json.dumps({"ok": True, **result}))
     except Exception:
         print(json.dumps({"ok": False, "error": "backup-context-install-failed"}))

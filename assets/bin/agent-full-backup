@@ -299,6 +299,34 @@ class Backup:
                 context["extraFiles"] = {**context.get("extraFiles", {}), "system/user-crontab": str(directory / "crontab")}
         return context
 
+    def use_configured_python(self):
+        """Keep manual captures on the same interpreter as the installed schedule."""
+        value = self.load(self.directory / 'context.json').get('pythonExecutable')
+        if value is None:
+            return
+        # A runtime under the agent's home must never acquire root privileges.
+        if os.geteuid() == 0:
+            raise BackupError('backup-runtime-root-forbidden')
+        if (not isinstance(value, str) or len(value) > 4096
+                or any(c in value for c in '\r\n\x00%')):
+            raise BackupError('backup-runtime-unsafe')
+        path = Path(value)
+        if not path.is_absolute() or '..' in path.parts or not re.fullmatch(r'python3(?:\.\d+)?', path.name):
+            raise BackupError('backup-runtime-unsafe')
+        try:
+            if path.resolve(strict=True) != path:
+                raise BackupError('backup-runtime-unsafe')
+            info = path.lstat()
+        except OSError:
+            raise BackupError('backup-runtime-unavailable') from None
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid not in {0, os.geteuid()}
+                or info.st_mode & 0o022 or not info.st_mode & 0o111):
+            raise BackupError('backup-runtime-unsafe')
+        if path == Path(sys.executable).resolve():
+            return
+        os.execv(str(path), [str(path), str(Path(__file__).resolve()), *sys.argv[1:]])
+        raise BackupError('backup-runtime-exec-failed')
+
     def install_schedule(self):
         config = self.load(self.config_path)
         context = self.load(self.directory / "context.json")
@@ -472,6 +500,8 @@ def main():
     descriptor = None
     try:
         backup = Backup(args.home)
+        if args.command in {'run', 'scheduled', 'enable'}:
+            backup.use_configured_python()
         if args.command != "status":
             descriptor = backup.lock()
         if args.command == "prepare":

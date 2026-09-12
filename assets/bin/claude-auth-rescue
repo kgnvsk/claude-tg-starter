@@ -81,10 +81,9 @@ PROC_ROOT = Path("/proc")
 URL_TIMEOUT_S = 75        # waiting for the OAuth URL to appear in CLI output
 CODE_TIMEOUT_S = 600      # waiting for the owner to send the code back
 DEBOUNCE_S = 1200         # min gap between rescue attempts
-# Авто-спроби обмежені: кожна нова вбиває попередню login-сесію і робить
-# код, який власник уже відкрив, недійсним (Бухтич, 29.08.2026). Після
-# двох авто-спроб зупиняємось і чекаємо ручного /relogin (він іде з --force).
-AUTO_ATTEMPTS_CAP = 2
+# One automatic link per outage. After it, only the owner's /relogin may
+# start another flow; an ignored link must not become a stream of reminders.
+AUTO_ATTEMPTS_CAP = 1
 ATTEMPTS_FILE = AGENT_ROOT / ".claude/auth-rescue-auto-attempts"
 POLLER_START_TIMEOUT_S = 60
 POLLER_POLL_INTERVAL_S = 1
@@ -122,7 +121,7 @@ def looks_like_code(text: str) -> bool:
     return bool(re.fullmatch(r"[A-Za-z0-9_#\-\.]{15,}", text))
 
 
-def logged_in() -> bool:
+def logged_in() -> bool | None:
     try:
         probe = subprocess.run(
             [str(CLAUDE_BIN), "auth", "status"],
@@ -141,10 +140,12 @@ def logged_in() -> bool:
         # шле власнику посилання на новий вхід.
         if "SELF-KILL GUARD" in out or '"decision": "block"' in out or "PermissionDenied" in out:
             log("auth probe blocked by hook — не вважаю це втратою логіну")
-            return True
-        return '"loggedIn": true' in out
+            return None
+        status = json.loads(probe.stdout or "")
+        authenticated = status.get("loggedIn") if isinstance(status, dict) else None
+        return authenticated if type(authenticated) is bool else None
     except Exception:
-        return False
+        return None
 
 
 def listener_port(pid: int) -> str:
@@ -496,28 +497,27 @@ def main(force: bool = False) -> int:
         return 0
     # force = owner typed /relogin: send a fresh link now, even if the current
     # login still looks alive and regardless of the auto-debounce.
-    if not force and logged_in():
-        mark_auth_established()
-        try:
-            os.unlink(ATTEMPTS_FILE)
-        except FileNotFoundError:
-            pass
-        return 0
+    if not force:
+        authenticated = logged_in()
+        if authenticated is not False:
+            if authenticated is True:
+                mark_auth_established()
+                try:
+                    os.unlink(ATTEMPTS_FILE)
+                except FileNotFoundError:
+                    pass
+            # A blocked, malformed or timed-out probe is not proof of recovery
+            # and must neither send a link nor reset the one-shot marker.
+            return 0
     if not force and not AUTH_ESTABLISHED.exists():
         log("initial Claude auth pending; auto-rescue disabled")
         return 0
     if not force and debounced():
         log("debounced")
         return 0
-    # cap: дві авто-спроби на один збій — кожна нова вбиває попередню
-    # login-сесію і робить відкритий власником код недійсним. Далі чекаємо
-    # ручного /relogin (він іде з force і скидає лічильник).
-    if force:
-        try:
-            os.unlink(ATTEMPTS_FILE)
-        except FileNotFoundError:
-            pass
-    else:
+    # Manual retries bypass the cap but keep it consumed. If the owner ignores
+    # that link too, the next health tick still must not send another one.
+    if not force:
         try:
             _n = int(ATTEMPTS_FILE.read_text(encoding="ascii").strip() or "0")
         except Exception:
@@ -525,8 +525,9 @@ def main(force: bool = False) -> int:
         if _n >= AUTO_ATTEMPTS_CAP:
             log(f"auto-rescue capped after {_n} attempts; waiting for /relogin")
             return 0
-        ATTEMPTS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        ATTEMPTS_FILE.write_text(str(_n + 1), encoding="ascii")
+    ATTEMPTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    ATTEMPTS_FILE.write_text(str(AUTO_ATTEMPTS_CAP), encoding="ascii")
+    ATTEMPTS_FILE.chmod(0o600)
     save_state()
 
     token = bot_token()
@@ -560,9 +561,9 @@ def main(force: bool = False) -> int:
 
     if not url:
         os.kill(pid, signal.SIGKILL)
-        log("no oauth url captured — will retry on next tick (no user spam)")
+        log("no oauth url captured; waiting for /relogin")
         try:
-            STATE_FILE.unlink()  # снять debounce → следующий cron-тик (5 мин) повторит
+            STATE_FILE.unlink()
         except OSError:
             pass
         return 1
@@ -599,9 +600,6 @@ def main(force: bool = False) -> int:
         )
     if not code:
         os.kill(pid, signal.SIGKILL)
-        send(token, chat,
-             "⌛ Код не надійшов за 10 хвилин — посилання втратило чинність. "
-             "Приблизно за 20 хвилин надішлю нове, або напиши адміністратору.")
         log("code wait timeout")
         return 1
 

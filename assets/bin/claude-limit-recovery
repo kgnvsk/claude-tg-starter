@@ -68,6 +68,8 @@ OWNER_LIMIT_NOTICE_TEXT = (
 NOTICE_STATE_NAME = "claude-interruption-notices.json"
 NOTICE_LOCK_NAME = "claude-interruption-notices.lock"
 MAX_NOTICE_EVENT_UUIDS = 512
+ACCOUNT_NOTICE_KINDS = frozenset({"subscription_expired", "subscription_required", "billing"})
+ACCOUNT_NOTICE_PREFIX = "account-notice:"
 STATE_KEYS = frozenset(
     {
         "schema_version",
@@ -548,6 +550,37 @@ def classify_limit(
     }
 
 
+def provider_failure_kind(status: int | None, rendered: str) -> str | None:
+    """Classify only provider output; a generic 401/403 cannot prove billing."""
+    if not isinstance(rendered, str) or (status is not None and type(status) is not int):
+        return None
+    if status == 429 and (LIMIT_ERROR_PATTERN.match(rendered) is not None
+                         or re.match(r"\AYou're out of usage credits\b", rendered)):
+        return "limit"
+    if status == 529 and OVERLOAD_PATTERN.search(rendered) is not None:
+        return "overloaded"
+    text = re.sub(r"\AAPI Error:\s*[0-9]{3}\s*", "", rendered.strip())
+    if text.startswith("{"):
+        try:
+            payload = json.loads(text)
+            error = payload.get("error") if isinstance(payload, dict) else None
+            text = error.get("message", "") if isinstance(error, dict) else ""
+        except (ValueError, TypeError):
+            return None
+    if not isinstance(text, str):
+        return None
+    if status in (400, 401, 402, 403):
+        if re.match(r"\A(?:(?:your|the) (?:Claude )?)?subscription (?:has |is )?(?:expired|ended)\b", text, re.I):
+            return "subscription_expired"
+        if re.match(r"\A(?:no active subscription|your account does not have an active subscription|(?:your )?subscription is inactive)\b", text, re.I):
+            return "subscription_required"
+        if re.match(r"\A(?:(?:your )?credit balance is too low|payment (?:required|failed)|please pay your overdue invoice)\b", text, re.I):
+            return "billing"
+    if status == 401 or (status is None and text.startswith("Failed to authenticate: OAuth ")):
+        return "auth"
+    return None
+
+
 def classify_interruption(
     event: dict,
     events_by_uuid: dict[str, dict],
@@ -561,7 +594,7 @@ def classify_interruption(
         event.get("type") != "assistant"
         or event.get("isApiErrorMessage") is not True
         or type(status) is not int
-        or status not in (429, 529)
+        or status not in (400, 401, 402, 403, 429, 529)
         or event.get("isSidechain") is not False
         or event.get("userType") != "external"
         or not isinstance(event_uuid, str)
@@ -574,11 +607,10 @@ def classify_interruption(
     event_epoch_ms = _event_epoch_ms(event)
     if rendered is None or channel is None or event_epoch_ms is None:
         return None
-    if status == 429 and LIMIT_ERROR_PATTERN.match(rendered) is not None:
-        kind = "limit"
-    elif status == 529 and OVERLOAD_PATTERN.search(rendered) is not None:
-        kind = "overloaded"
-    else:
+    kind = provider_failure_kind(status, rendered)
+    # OAuth is handled by the one-shot auth helper. Sending a second generic
+    # interruption message here would duplicate its owner login notification.
+    if kind not in {"limit", "overloaded", *ACCOUNT_NOTICE_KINDS}:
         return None
     return {
         "event_uuid": event_uuid,
@@ -2462,7 +2494,49 @@ def _notice_copy(kind: str, *, owner: bool) -> str:
         return OWNER_OVERLOAD_NOTICE_TEXT if owner else OVERLOAD_NOTICE_TEXT
     if kind == "limit":
         return OWNER_LIMIT_NOTICE_TEXT if owner else LIMIT_NOTICE_TEXT
+    if kind in ACCOUNT_NOTICE_KINDS:
+        if not owner:
+            return "⚠️ Агент тимчасово недоступний через стан облікового запису Claude. Потрібна дія власника."
+        if kind == "subscription_expired":
+            return ("⚠️ Claude повідомив, що підписка завершилася. Відкрий Claude → Settings → Billing "
+                    "та перевір поновлення. Після поновлення напиши /relogin, якщо потрібен повторний вхід. "
+                    "Автоматично повторювати це повідомлення не буду.")
+        if kind == "subscription_required":
+            return ("⚠️ Claude повідомив, що немає активної підписки. Перевір план у Claude → Settings → Billing. "
+                    "Після підключення напиши /relogin, якщо потрібен повторний вхід. "
+                    "Автоматично повторювати це повідомлення не буду.")
+        return ("⚠️ Claude повідомив про проблему з оплатою або недостатній баланс. "
+                "Перевір оплату в обліковому записі Claude чи Anthropic Console, яким користується агент. "
+                "Автоматично повторювати повідомлення не буду.")
     raise StateError("invalid interruption kind")
+
+
+def _account_success_at(batches: list[dict]) -> int:
+    """Only a later real Telegram model answer clears an account outage latch."""
+    latest = 0
+    for batch in batches:
+        events = _batch_uuid_map(batch["events"])
+        for envelope in batch["events"]:
+            event = envelope["record"]
+            message = event.get("message")
+            if (envelope["is_new"] is not True or event.get("type") != "assistant"
+                or event.get("isSidechain") is not False or event.get("userType") != "external"
+                or event.get("isApiErrorMessage") is True or not isinstance(message, dict)
+                or message.get("model") in (None, "<synthetic>")
+                or not rendered_assistant_text(event) or telegram_origin(events, event) is None):
+                continue
+            latest = max(latest, _event_epoch_ms(event) or 0)
+    return latest
+
+
+def _clear_account_notices_before(state: dict, success_at: int) -> None:
+    if not success_at:
+        return
+    for key in state["handled_reset_keys"][:]:
+        if key.startswith(ACCOUNT_NOTICE_PREFIX):
+            timestamp = key.rsplit(":", 1)[-1]
+            if timestamp.isdigit() and int(timestamp) < success_at:
+                state["handled_reset_keys"].remove(key)
 
 
 def _notice_recipient_marker(event_uuid: str, recipient: str) -> str:
@@ -2509,6 +2583,9 @@ def notification_tick(mode: str) -> int:
         state = load_state(state_path)
         retry_state = copy.deepcopy(state)
         state, batches = scan_incremental(projects_dir, state)
+        success_at = _account_success_at(batches)
+        _clear_account_notices_before(state, success_at)
+        _clear_account_notices_before(retry_state, success_at)
         reserved: list[dict] = []
         handled = state["handled_event_uuids"]
         retry_handled = retry_state["handled_event_uuids"]
@@ -2539,6 +2616,14 @@ def notification_tick(mode: str) -> int:
         sender = str(agent_root / "bin" / "tg-send")
         for interruption in reserved:
             event_uuid = interruption["event_uuid"]
+            account_prefix = f"{ACCOUNT_NOTICE_PREFIX}{interruption['kind']}:"
+            if interruption["kind"] in ACCOUNT_NOTICE_KINDS and (
+                interruption["event_epoch_ms"] <= success_at
+                or any(key.startswith(account_prefix) for key in state["handled_reset_keys"])
+            ):
+                _complete_notice_checkpoint(handled, event_uuid)
+                _complete_notice_checkpoint(retry_handled, event_uuid)
+                continue
             affected_chat = interruption["chat_id"]
             affected_marker = _notice_recipient_marker(event_uuid, "affected")
             owner_marker = _notice_recipient_marker(event_uuid, "owner")
@@ -2549,7 +2634,9 @@ def notification_tick(mode: str) -> int:
                         sender,
                         "--no-watchdog-credit",
                         affected_chat,
-                        _notice_copy(interruption["kind"], owner=False),
+                        _notice_copy(interruption["kind"], owner=(
+                            interruption["kind"] in ACCOUNT_NOTICE_KINDS and affected_chat == owner_chat
+                        )),
                     ],
                     timeout=COMMAND_TIMEOUT_SECONDS,
                 ):
@@ -2579,6 +2666,10 @@ def notification_tick(mode: str) -> int:
                 _append_notice_checkpoint(retry_handled, owner_marker)
             _complete_notice_checkpoint(handled, event_uuid)
             _complete_notice_checkpoint(retry_handled, event_uuid)
+            if interruption["kind"] in ACCOUNT_NOTICE_KINDS:
+                key = f"{account_prefix}{interruption['event_epoch_ms']}"
+                state["handled_reset_keys"].append(key)
+                retry_state["handled_reset_keys"].append(key)
             # Checkpoint each fully delivered event before attempting the next
             # one, so a later failure cannot duplicate any confirmed recipient.
             atomic_write_state(state_path, retry_state)

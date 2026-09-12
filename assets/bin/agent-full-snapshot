@@ -214,6 +214,7 @@ def create_snapshot(home: Path, output: Path, recipient: str, *, age_binary: str
     known_secrets = sanitizer.known_secret_literals(home, include_paths=selected,
                                                     exclude_paths={**EXCLUDED_ROOTS, **declared_exclusions},
                                                     sqlite_timeout_seconds=sqlite_timeout)
+    prepared_secrets = sanitizer._prepare_known(known_secrets)
     clean_context = sanitizer.sanitize_bytes(context_bytes, path="context.json", known_secrets=known_secrets)
     if clean_context["data"] is None:
         raise ValueError("snapshot metadata could not be sanitized")
@@ -228,10 +229,12 @@ def create_snapshot(home: Path, output: Path, recipient: str, *, age_binary: str
         "secretSanitization": {"applied": True, "privacyPolicy": sanitizer.POLICY,
                                "redactedFiles": [], "excludedFiles": 0, "redactions": 0,
                                "opaqueContentExcluded": True, "sqliteLogicalRebuilds": [],
+                               "binaryAttachmentsIncluded": True,
                                "sqliteSchemaOmissions": [],
                                "invalidatedCapabilities": [],
                                "limitations": ["Unrecognized secrets in ordinary prose cannot be identified with certainty.",
-                                               "Images, binary documents, archives and opaque stores are excluded.",
+                                               "Supported documents and media are retained; no OCR is performed.",
+                                               "Generic archives, encrypted stores and unsupported binary formats are excluded.",
                                                "SQLite triggers, views and virtual search tables require rebuilding."]},
     }
     reconnect = {}
@@ -243,13 +246,13 @@ def create_snapshot(home: Path, output: Path, recipient: str, *, age_binary: str
     temporary_output = None
 
     def safe_label(name):
-        if sanitizer._plain(name, known_secrets)[1]:
+        if sanitizer._plain(name, prepared_secrets)[1]:
             return "redacted-path/" + hashlib.sha256(name.encode()).hexdigest()[:24]
         return name
 
     def excluded(name, reason):
         coverage["sourceComplete"] = False
-        coverage["exclusions"].append({"path": safe_label(name), "reason": sanitizer._plain(reason, known_secrets)[0]})
+        coverage["exclusions"].append({"path": safe_label(name), "reason": sanitizer._plain(reason, prepared_secrets)[0]})
 
     def failed(name, reason):
         coverage["complete"] = False
@@ -278,7 +281,7 @@ def create_snapshot(home: Path, output: Path, recipient: str, *, age_binary: str
 
     sanitized("context.json", clean_context)
     coverage["selectedRoots"] = [safe_label(name) for name in selected]
-    coverage["declaredExclusions"] = {safe_label(name): sanitizer._plain(reason, known_secrets)[0]
+    coverage["declaredExclusions"] = {safe_label(name): sanitizer._plain(reason, prepared_secrets)[0]
                                       for name, reason in declared_exclusions.items()}
 
     def metadata(name, file_stat, kind, size=0):
@@ -371,6 +374,7 @@ def create_snapshot(home: Path, output: Path, recipient: str, *, age_binary: str
                                 else:
                                     report = sanitizer.sanitize_file(staged, cleaned, path=name,
                                                                      known_secrets=known_secrets,
+                                                                     prepared_known=prepared_secrets,
                                                                      timeout_seconds=file_timeout)
                                     sanitized(name, report)
                                     if report["disposition"] == "excluded":

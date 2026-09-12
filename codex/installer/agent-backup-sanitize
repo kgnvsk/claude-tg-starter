@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """Standalone, fail-closed credential removal for backup text and logical SQLite.
 
-Unknown binary/media formats are excluded: regex inspection cannot establish that
-an image, encrypted store, or compressed attachment contains no credentials.
+Ordinary media/documents retain their bytes after known-literal inspection.
+This does not recognize a password drawn in an image. Unknown containers and
+credential stores remain excluded.
 Returned data is internal only; reconnect metadata never contains source values.
 """
 from __future__ import annotations
 
 from contextlib import closing
+from functools import lru_cache
 import ast
 import base64
 import hashlib
@@ -20,6 +22,8 @@ import sqlite3
 import stat
 import time
 import tokenize
+import zipfile
+import xml.etree.ElementTree as ET
 from urllib.parse import quote
 
 POLICY = 'no-secrets-v1'
@@ -31,6 +35,20 @@ OPAQUE_SUFFIXES = {'.zip','.gz','.tgz','.bz2','.xz','.zst','.7z','.rar','.tar','
                    '.exe','.wasm','.db-wal','.db-shm','.pdf','.doc','.docx','.xls','.xlsx','.ppt','.pptx',
                    '.odt','.ods','.odp','.epub','.png','.jpg','.jpeg','.webp','.gif','.heic','.avif',
                    '.mp3','.mp4','.mov','.m4a','.wav','.ogg','.flac','.woff','.woff2','.ttf','.ico'}
+ATTACHMENT_CHUNK = 1024 * 1024
+OFFICE_MAX_UNPACKED = 2 * 1024 * 1024 * 1024
+OFFICE_PARTS = {
+    '.docx': ('word/document.xml', 'wordprocessingml.document', 'wordprocessingml/2006/main', 'document'),
+    '.xlsx': ('xl/workbook.xml', 'spreadsheetml.sheet', 'spreadsheetml/2006/main', 'workbook'),
+    '.pptx': ('ppt/presentation.xml', 'presentationml.presentation', 'presentationml/2006/main', 'presentation'),
+}
+ODF_TYPES = {'.odt': 'text', '.ods': 'spreadsheet', '.odp': 'presentation'}
+ATTACHMENT_SUFFIXES = set(OFFICE_PARTS) | set(ODF_TYPES) | {
+    '.png','.jpg','.jpeg','.gif','.webp','.bmp','.tif','.tiff','.ico','.heic','.heif','.avif',
+    '.mp3','.mp4','.m4v','.mov','.m4a','.aac','.wav','.ogg','.oga','.opus','.flac','.webm','.mkv','.avi','.pdf',
+}
+ARCHIVE_SUFFIXES = {'.zip','.gz','.tgz','.bz2','.xz','.zst','.7z','.rar','.tar','.age','.gpg','.pgp',
+                    '.p12','.pfx','.jks','.keystore'}
 SECRET_WORDS = {'password','passwd','passphrase','secret','token','apikey','accesskey','privatekey',
                 'accesskeyid','secretaccesskey','authorization','cookie','cookies','credential','credentials',
                 'accesstoken','refreshtoken','idtoken','sessiontoken','sessionkey','clientsecret','botoken','bottoken',
@@ -85,10 +103,58 @@ PROVIDER_FIELDS = {
     'hubspot': {'hubspottoken','hubspotaccesstoken','hubspotprivateapptoken'},
     'asana': {'asanatoken','asanapat','asanaaccesstoken'},
 }
+# Exact, independently verified upstream test fixtures. This affects only
+# deriving global literals from that unchanged source; local credential fields,
+# provider-shaped keys, and values found in real credential stores stay redacted.
+PUBLIC_FIXTURE_LITERAL_SHA256 = {
+    # Provenance and the scope of these exceptions: docs/backup-public-fixtures.md.
+    '83e6052809302cff840ae97c77663622646fd02207e73fe92ef3059cdf7f09bd': frozenset({
+        '785f3ec7eb32f30b90cd0fcf3657d388b5ff4297f2f9716ff66e9b69c05ddd09',
+    }),
+    'cfd530f234c2e79e67b507a22e7ca7dcdebc0fdae8c4268f6b3a786e86aa6b21': frozenset({
+        '8254c329a92850f6d539dd376f4816ee2764517da5e0235514af433164480d7a',
+    }),
+    'fe2a89e63317d14792b3815cdfbdf6221f89465d0b98a8f876b17f0444298c84': frozenset({
+        '8254c329a92850f6d539dd376f4816ee2764517da5e0235514af433164480d7a',
+    }),
+}
 
 def secret_key(name):
     folded = re.sub('[^a-z0-9]', '', str(name).lower())
     return folded in SECRET_WORDS or folded.endswith(('password','passwd','passphrase','secret','token','apikey','privatekey','secretkey'))
+
+def _credential_key(name, *, authority=False, auth_context=False):
+    """Ordinary code/data names are candidates, not credential-store authority."""
+    if authority:return secret_key(name)
+    folded=re.sub('[^a-z0-9]','',str(name).lower())
+    if folded in {'token','cookie','cookies','oauth'}:return auth_context
+    if folded.endswith('token'):
+        return (folded.endswith(('accesstoken','refreshtoken','idtoken','sessiontoken','authtoken',
+                                 'bearertoken','bottoken','apitoken','csrftoken','xsrftoken','oauthtoken'))
+                or any(folded in names for names in PROVIDER_FIELDS.values()))
+    return secret_key(name)
+
+def _auth_context(names):
+    fields={re.sub('[^a-z0-9]','',str(name).lower()) for name in names}
+    return (any(_credential_key(name) for name in fields)
+            or bool(fields & {'tokentype','expiresin','expiresat','refreshtoken'}))
+
+def _json_field_context(names, inherited_auth=False):
+    fields={re.sub('[^a-z0-9]','',str(field).lower()) for field in names}
+    context=inherited_auth or _auth_context(fields)
+    lexical=bool(fields & {'padtoken','eostoken','bostoken','unktoken','vocab','vocabulary','merges'})
+    return context,lexical
+
+def _json_credential_key(name, *, authority=False, context=False, lexical=False):
+    folded=re.sub('[^a-z0-9]','',str(name).lower())
+    if folded in {'token','cookie','cookies','oauth'}:
+        # A sole token in a login result is still a credential. Only positive
+        # tokenizer metadata can disambiguate ordinary data; auth context wins.
+        return authority or context or not lexical
+    return _credential_key(name,authority=authority,auth_context=context)
+
+def _auth_container(name):
+    return re.sub('[^a-z0-9]','',str(name).lower()) in {'auth','authentication','authorization','credentials','oauth','session'}
 
 def source_code_path(path):
     return Path(str(path)).suffix.lower() in {'.py','.js','.mjs','.cjs','.ts','.tsx','.jsx','.sh','.bash','.zsh','.go','.rs','.rb','.swift','.java','.c','.h','.cpp'}
@@ -97,6 +163,28 @@ def credential_authority(path):
     value=str(path)
     return (bool(classify_path(value)) or value.startswith(('/etc/','system/etc/')) or value.endswith('.env')
             or bool(re.search(r'(?:^|/)(?:\.?claude|config|settings(?:\.local)?|integrations?|agent(?:-[^/]+)?)\.(?:json|env|toml|ya?ml)$',value)))
+
+INVENTORY_DATA_DIRS = {'.git','node_modules','__pycache__','.venv','venv','site-packages',
+                       'dist-packages','tests','test','fixtures','__fixtures__','examples'}
+
+def credential_inventory_source(path):
+    """Only access stores supply credentials to redact across unrelated files.
+
+    An ordinary history, program or vocabulary is sanitized locally; its sample
+    field values must not become global credentials for every other program.
+    """
+    parts=PurePosixPath(str(path).replace('\\','/')).parts
+    base=parts[-1].lower() if parts else ''
+    # Explicit stores remain authoritative even in a project called "tests".
+    # Parent names distinguish generic config examples, never actual .env files.
+    if (base=='.env' or base.startswith('.env.') or base.endswith('.env')
+            or base in {'.npmrc','.netrc','.pypirc','.git-credentials','hosts.yml',
+                        'auth.json','oauth.json','credentials','credentials.json',
+                        '.credentials.json','secrets.json','github-token','secret.key'}):return True
+    if any(part.lower() in INVENTORY_DATA_DIRS for part in parts):return False
+    if source_code_path(path):return False
+    if Path(str(path)).suffix.lower() in {'.md','.mdx','.rst','.html','.jsonl','.log'}:return False
+    return credential_authority(path)
 
 def classify_path(path, *, is_source=False):
     parts = [part.lower() for part in PurePosixPath(str(path).replace('\\','/')).parts]
@@ -109,7 +197,8 @@ def classify_path(path, *, is_source=False):
     if base in {'.env','.npmrc','.netrc','.pypirc','.git-credentials','hosts.yml','auth.json','oauth.json','cookies.txt','cookies.sqlite','credentials','credentials.json','.credentials.json','recovery-key.txt','github-token','secret.key','secrets.json'} or base.startswith(('.env.','id_rsa','id_ed25519','id_ecdsa')):
         return 'credential-file'
     source_code=is_source or source_code_path(base)
-    if Path(base).suffix in {'.key','.pem','.p12','.pfx','.jks','.keystore'} or not source_code and re.search(r'(?:^|[-_.])(?:credentials?|oauth|tokens?|secrets?|cookies?|passwords?)(?:[-_.]|$)',base):
+    documentation=Path(base).suffix in {'.md','.mdx','.rst','.html'}
+    if Path(base).suffix in {'.key','.pem','.p12','.pfx','.jks','.keystore'} or not (source_code or documentation) and re.search(r'(?:^|[-_.])(?:credentials?|oauth|tokens?|secrets?|cookies?|passwords?)(?:[-_.]|$)',base):
         return 'credential-file'
     return None
 
@@ -180,23 +269,40 @@ def _python_secret_nodes(text):
     tree=ast.parse(text)
     parents={child:node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
     found=[]
-    def sensitive(target):
-        return isinstance(target,ast.Name) and secret_key(target.id) or isinstance(target,ast.Attribute) and secret_key(target.attr)
+    def sensitive(target,value):
+        name=target.id if isinstance(target,ast.Name) else target.attr if isinstance(target,ast.Attribute) else ''
+        statement=parents.get(target);scope=parents.get(statement)
+        if (isinstance(target,ast.Name) and isinstance(scope,ast.ClassDef)
+                and any((isinstance(base,ast.Name) and base.id in {'Enum','StrEnum'})
+                        or (isinstance(base,ast.Attribute) and base.attr in {'Enum','StrEnum'}) for base in scope.bases)
+                and isinstance(value,ast.Constant) and isinstance(value.value,str)
+                and re.sub('[^a-z0-9]','',name.lower())==re.sub('[^a-z0-9]','',value.value.lower())):
+            return False  # An enum's own spelling is a schema label.
+        return _credential_key(name)
     def add(value):
         if isinstance(value,ast.Constant) and isinstance(value.value,(str,bytes)):
             candidate=value.value.decode('utf-8',errors='replace') if isinstance(value.value,bytes) else value.value
+            # Source defaults and display masks are not stored account secrets.
+            # Credential files still harvest these exact values, and an
+            # independently known credential always overrides this classification.
+            if not candidate.strip() or re.fullmatch(r'\*{3,}',candidate):return
             if _credential_value(candidate):found.append(value)
     for node in ast.walk(tree):
-        if isinstance(node,ast.Assign) and any(sensitive(target) for target in node.targets):add(node.value)
-        elif isinstance(node,(ast.AnnAssign,ast.NamedExpr)) and sensitive(node.target):add(node.value)
-        elif isinstance(node,ast.keyword) and node.arg and secret_key(node.arg):add(node.value)
+        if isinstance(node,ast.Assign) and any(sensitive(target,node.value) for target in node.targets):add(node.value)
+        elif isinstance(node,(ast.AnnAssign,ast.NamedExpr)) and sensitive(node.target,node.value):add(node.value)
+        elif isinstance(node,ast.keyword) and node.arg:
+            call=parents.get(node)
+            names=[item.arg for item in call.keywords if item.arg] if isinstance(call,ast.Call) else []
+            if _credential_key(node.arg,auth_context=_auth_context(names)):add(node.value)
         elif isinstance(node,ast.Dict):
             parent=parents.get(node)
             targets=parent.targets if isinstance(parent,ast.Assign) else [parent.target] if isinstance(parent,ast.AnnAssign) else []
             regex_definition=any(isinstance(target,ast.Name) and re.search(r'(?:^|_)(?:patterns?|regex(?:es)?)(?:_|$)',target.id.lower()) for target in targets)
             if regex_definition:continue
+            names=[key.value for key in node.keys if isinstance(key,ast.Constant) and isinstance(key.value,str)]
+            context=_auth_context(names)
             for key,value in zip(node.keys,node.values):
-                if isinstance(key,ast.Constant) and isinstance(key.value,str) and secret_key(key.value):add(value)
+                if isinstance(key,ast.Constant) and isinstance(key.value,str) and _credential_key(key.value,auth_context=context):add(value)
     return found
 
 def secret_literals(data, *, path):
@@ -215,19 +321,20 @@ def secret_literals(data, *, path):
     try: document=json.loads(text)
     except (ValueError,RecursionError): document=None
     integrities=_package_integrities(document,path)
-    def visit(value):
+    def visit(value, inherited_auth=False):
         if isinstance(value,dict):
+            context,lexical=_json_field_context(value,inherited_auth)
             for key,item in value.items():
-                if secret_key(key):
+                if _json_credential_key(key,authority=authority,context=context,lexical=lexical):
                     for word in _string_values(item): keep(word,authoritative=True)
-                else: visit(item)
+                else: visit(item,context or _auth_container(key))
         elif isinstance(value,list):
-            for item in value: visit(item)
+            for item in value: visit(item,inherited_auth)
     if document is not None: visit(document)
     elif '\n' in text:
         # Session JSONL is a sequence of independent objects, including small
         # files which are read in one block by the global inventory pass.
-        for line in text.splitlines():
+        for line in text.split('\n'):
             if not line.strip() or len(line)>MAX_LINE:continue
             try:record=json.loads(line)
             except (ValueError,RecursionError):continue
@@ -236,13 +343,15 @@ def secret_literals(data, *, path):
     if python_source:
         try: nodes=_python_secret_nodes(text)
         except (SyntaxError,ValueError):nodes=[]
+        public_fixtures=PUBLIC_FIXTURE_LITERAL_SHA256.get(hashlib.sha256(data).hexdigest(),()) if nodes else ()
         for node in nodes:
             value=node.value
             if isinstance(value,bytes):
                 try:value=value.decode()
                 except UnicodeDecodeError:continue
+            if hashlib.sha256(value.encode()).hexdigest() in public_fixtures:continue
             keep(value,authoritative=True)
-    for match in ASSIGNMENT.finditer(text) if authority else ():
+    for match in ASSIGNMENT.finditer(text) if authority and document is None else ():
         if _empty_assignment_comment(match):continue
         raw=match.group('value')
         if raw[:1] in {'"',"'"}:
@@ -263,9 +372,18 @@ def secret_literals(data, *, path):
             keep(text.strip())
     return {word for word in found if word and word != REDACTED.encode()}
 
+def _prefix_expression(prefixes):
+    """Factor four-character literal prefixes into a shallow regex trie."""
+    if len(prefixes)==1:return re.escape(prefixes[0])
+    groups={}
+    for prefix in prefixes:
+        if not prefix:return ''
+        groups.setdefault(prefix[0],[]).append(prefix[1:])
+    return '(?:'+'|'.join(re.escape(char)+_prefix_expression(tails) for char,tails in groups.items())+')'
+
 class _PreparedKnown:
     """Snapshot one stable operation's literals; never cache a mutable set by id."""
-    __slots__=('values','minimum_length')
+    __slots__=('values','minimum_length','prefixes','short','prefix_pattern')
 
     def __init__(self,known):
         values=[]
@@ -276,20 +394,62 @@ class _PreparedKnown:
             if value and value!=REDACTED:values.append(value)
         self.values=tuple(values)
         self.minimum_length=min(map(len,values),default=0)
+        self.prefixes={};short=[]
+        for index,value in enumerate(values):
+            if len(value)<4:short.append(index)
+            else:self.prefixes.setdefault(value[:4],[]).append(index)
+        self.short=tuple(short)
+        # Zero width retains overlapping prefixes (aaaa and aaab in aaaaab).
+        self.prefix_pattern=(re.compile('(?=('+_prefix_expression(tuple(self.prefixes))+'))')
+                             if len(values)>=64 and self.prefixes else None)
+
+    def candidates(self,text,after=-1):
+        if self.minimum_length>len(text):return []
+        if len(self.values)<64:return None
+        selected={index for index in self.short if index>after}
+        matched=set()
+        for match in self.prefix_pattern.finditer(text) if self.prefix_pattern is not None else ():
+            prefix=match.group(1)
+            values=self.prefixes[prefix]
+            if prefix not in matched:
+                # Dense buckets use the original remaining linear sequence.
+                if len(values)>max(256,len(self.values)//4):return None
+                matched.add(prefix)
+                selected.update(index for index in values if index>after)
+        return sorted(selected)
+
+    def replace(self,text):
+        count=0;after=-1;position=0
+        candidates=self.candidates(text)
+        while candidates is None or position<len(candidates):
+            if candidates is None:
+                for value in self.values[after+1:]:
+                    if value not in text:continue
+                    if len(value)<8:
+                        text,changed=re.subn(r'(?<!\w)'+re.escape(value)+r'(?!\w)',lambda _match:REDACTED,text)
+                    else:
+                        changed=text.count(value);text=text.replace(value,REDACTED)
+                    count+=changed
+                return text,count
+            index=candidates[position];value=self.values[index];changed=0
+            if value in text:
+                if len(value)<8:
+                    text,changed=re.subn(r'(?<!\w)'+re.escape(value)+r'(?!\w)',lambda _match:REDACTED,text)
+                else:
+                    changed=text.count(value);text=text.replace(value,REDACTED)
+            after=index;count+=changed
+            if changed:
+                # A replacement can introduce later literals or new boundaries.
+                # Never revisit an earlier index: the original pass did not.
+                candidates=self.candidates(text,after);position=0
+            else:position+=1
+        return text,count
 
 def _prepare_known(known):
     return known if isinstance(known,_PreparedKnown) else _PreparedKnown(known)
 
 def _plain(text,known,*,code=False,assignments=True,opaque=True):
-    count=0
-    prepared=_prepare_known(known)
-    for value in prepared.values if prepared.minimum_length<=len(text) else ():
-        if value in text:
-            if len(value)<8:
-                text,n=re.subn(r'(?<!\w)'+re.escape(value)+r'(?!\w)',lambda _match:REDACTED,text)
-                count+=n
-            else:
-                count+=text.count(value);text=text.replace(value,REDACTED)
+    text,count=_prepare_known(known).replace(text)
     text,n=PRIVATE_KEY.subn(REDACTED,text);count+=n
     for pattern in PATTERNS if opaque else PATTERNS[:-1]:
         def replace(match):
@@ -328,28 +488,44 @@ def _plain(text,known,*,code=False,assignments=True,opaque=True):
     if assignments:text=ASSIGNMENT.sub(assignment,text)
     return text,count
 
-def _text(text,known,*,code=False,assignments=True,integrities=()):
+def _text(text,known,*,code=False,assignments=True,integrities=(),authority=False):
     """Preserve valid JSON and recursively sanitize strings (including chat JSON)."""
     known=_prepare_known(known)
     try: document=json.loads(text)
-    except (ValueError,RecursionError): return _plain(text,known,code=code,assignments=assignments)
+    except (ValueError,RecursionError):
+        if not code and '\n' in text:
+            # JSONL syntax belongs to each record, including in small files.
+            # Split only LF: Unicode separators can occur inside JSON strings.
+            lines=text.split('\n')
+            try:
+                for line in lines:
+                    if line.strip():json.loads(line)
+            except (ValueError,RecursionError):pass
+            else:
+                count=0
+                for index,line in enumerate(lines):
+                    if line.strip():
+                        lines[index],n=_text(line,known,assignments=assignments,integrities=integrities,authority=authority);count+=n
+                return '\n'.join(lines),count
+        return _plain(text,known,code=code,assignments=assignments)
     count=0
-    def visit(value):
+    def visit(value, inherited_auth=False):
         nonlocal count
         if isinstance(value,dict):
             result={}
+            context,lexical=_json_field_context(value,inherited_auth)
             for key,item in value.items():
                 safe_key,n=_plain(key,known);count+=n
                 if re.sub('[^a-z]','',key.lower())=='fencingtoken' and type(item) is int:
                     result[safe_key]=item
                 elif key=='integrity' and isinstance(item,str) and item in integrities:
                     result[safe_key],n=_plain(item,known,assignments=False,opaque=False);count+=n
-                elif secret_key(key): result[safe_key]=REDACTED;count+=1
-                else: result[safe_key]=visit(item)
+                elif _json_credential_key(key,authority=authority,context=context,lexical=lexical): result[safe_key]=REDACTED;count+=1
+                else: result[safe_key]=visit(item,context or _auth_container(key))
             return result
-        if isinstance(value,list): return [visit(item) for item in value]
+        if isinstance(value,list): return [visit(item,inherited_auth) for item in value]
         if isinstance(value,str):
-            result,n=_text(value,known,assignments=assignments) if value.lstrip().startswith(('{','[')) else _plain(value,known,assignments=assignments)
+            result,n=_text(value,known,assignments=assignments,authority=authority) if value.lstrip().startswith(('{','[')) else _plain(value,known,assignments=assignments)
             count+=n;return result
         return value
     clean=visit(document)
@@ -369,6 +545,21 @@ def _comment(text,known,*,shebang=False):
     # A removed credential may include the leading '#'. Keep the token a
     # comment; its remaining prose must never become executable source.
     return (clean if clean.startswith('#') else '# '+clean),count
+
+def _fstring(text,known):
+    # Python 3.10 exposes an entire f-string as one STRING token. Only literal
+    # values are data; replacing its operators or quote delimiters breaks code.
+    tree=ast.parse(text,mode='eval')
+    count=0
+    for node in ast.walk(tree):
+        if not isinstance(node,ast.Constant) or not isinstance(node.value,(str,bytes)):continue
+        binary=isinstance(node.value,bytes)
+        try:plain=node.value.decode() if binary else node.value
+        except UnicodeDecodeError:continue
+        clean,n=_text(plain,known,code=True,assignments=False)
+        if n and clean!=plain:
+            node.value=clean.encode() if binary else clean;count+=n
+    return (ast.unparse(tree) if count else text),count
 
 def _python(text,known):
     """Inspect literal tokens, never treat a string's closing quote as a value."""
@@ -394,7 +585,7 @@ def _python(text,known):
                     if n and clean!=plain:
                         value=repr(clean.encode() if binary else clean);count+=n
             elif value.lower().startswith(('f"',"f'",'rf"',"rf'",'fr"',"fr'")):
-                value,n=_plain(value,known,code=True,assignments=False);count+=n
+                value,n=_fstring(value,known);count+=n
         elif token.type==tokenize.COMMENT:
             value,n=_comment(value,known,shebang=token.start==(1,0) and value.startswith('#!'));count+=n
         elif token.type==getattr(tokenize,'FSTRING_MIDDLE',-1):
@@ -407,8 +598,171 @@ def _python(text,known):
     ast.parse(clean)
     return clean,count
 
+class _UnsafeAttachment(ValueError):
+    pass
+
+
+def _attachment_expression(values, depth=0):
+    """Factor four prefix bytes so a native matcher skips unrelated literals."""
+    if b'' in values:return b''
+    if len(values)==1:return re.escape(values[0])
+    if depth==4:return b'(?:'+b'|'.join(re.escape(value) for value in values)+b')'
+    groups={}
+    for value in values:groups.setdefault(value[:1],[]).append(value[1:])
+    return b'(?:'+b'|'.join(re.escape(prefix)+_attachment_expression(rest,depth+1)
+                          for prefix,rest in groups.items())+b')'
+
+
+@lru_cache(maxsize=2)
+def _attachment_matcher(literals):
+    # The immutable cache key detects changes to a caller's mutable known set.
+    values=sorted({value if isinstance(value,bytes) else str(value).encode()
+                   for value in literals if value and value not in {REDACTED,REDACTED.encode()}})
+    if not values:return None,0
+    return re.compile(_attachment_expression(values)),max(map(len,values))-1
+
+
+def _attachment_literals(known):
+    return frozenset(known.values if isinstance(known,_PreparedKnown) else known)
+
+
+def _scan_attachment(stream, matcher, deadline, *, output=None, limit=None):
+    pattern,overlap=matcher
+    carry=b'';total=0
+    while True:
+        if time.monotonic()>deadline:raise TimeoutError('attachment inspection deadline exceeded')
+        block=stream.read(ATTACHMENT_CHUNK)
+        if not block:break
+        total+=len(block)
+        if limit is not None and total>limit:raise _UnsafeAttachment('office-inspection-limit')
+        window=carry+block
+        if pattern is not None and pattern.search(window):raise _UnsafeAttachment('attachment-known-secret')
+        if output is not None:output.write(block)
+        carry=window[-overlap:] if overlap else b''
+    return total
+
+
+def _archive_header(header):
+    return (header.startswith((b'PK\x03\x04',b'PK\x05\x06',b'\x1f\x8b',b'BZh',b'\xfd7zXZ\x00',
+                               b'7z\xbc\xaf\x27\x1c',b'Rar!',b'\x28\xb5\x2f\xfd',b'age-encryption.org/',
+                               b'-----BEGIN PGP',b'SQLite format 3\x00'))
+            or header[257:262]==b'ustar')
+
+
+def _attachment_format(header,suffix):
+    if suffix in OFFICE_PARTS or suffix in ODF_TYPES:return header.startswith(b'PK\x03\x04')
+    signatures={'.png':(b'\x89PNG\r\n\x1a\n',),'.jpg':(b'\xff\xd8\xff',),'.jpeg':(b'\xff\xd8\xff',),
+                '.gif':(b'GIF87a',b'GIF89a'),'.bmp':(b'BM',),'.tif':(b'II*\x00',b'MM\x00*'),
+                '.tiff':(b'II*\x00',b'MM\x00*'),'.ico':(b'\x00\x00\x01\x00',),
+                '.ogg':(b'OggS',),'.oga':(b'OggS',),'.opus':(b'OggS',),'.flac':(b'fLaC',),
+                '.webm':(b'\x1aE\xdf\xa3',),'.mkv':(b'\x1aE\xdf\xa3',),'.pdf':(b'%PDF-',)}
+    if suffix in signatures:return header.startswith(signatures[suffix])
+    if suffix in {'.webp','.wav','.avi'}:
+        return header.startswith(b'RIFF') and header[8:12]=={'.webp':b'WEBP','.wav':b'WAVE','.avi':b'AVI '}[suffix]
+    if suffix in {'.mp3','.aac'}:
+        return header.startswith(b'ID3') or len(header)>1 and header[0]==255 and header[1]&224==224
+    if suffix in {'.mp4','.m4v','.mov','.m4a','.heic','.heif','.avif'}:
+        return header[4:8]==b'ftyp' or suffix=='.mov' and header[4:8] in {b'moov',b'mdat',b'wide'}
+    return False
+
+
+def _attachment_path_reason(path):
+    reason=classify_path(path)
+    if reason:return reason
+    parts=PurePosixPath(str(path).replace('\\','/')).parts
+    if any(part.lower()=='.env' or part.lower().startswith('.env.') or part.lower().endswith('.env') for part in parts):
+        return 'credential-file'
+    return None
+
+
+def _office_xml(archive,name,root_tag,deadline,select=()):
+    selected=[];root=None
+    with archive.open(name) as stream:
+        for event,node in ET.iterparse(stream,events=('start','end')):
+            if time.monotonic()>deadline:raise TimeoutError('attachment inspection deadline exceeded')
+            if root is None:root=node.tag
+            if event=='end':
+                if node.tag in select:selected.append(dict(node.attrib))
+                node.clear()
+    if root!=root_tag:raise _UnsafeAttachment('office-structure-invalid')
+    return selected
+
+
+def _inspect_office(stream,suffix,matcher,deadline):
+    with zipfile.ZipFile(stream) as archive:
+        members=archive.infolist();names=set();total=0
+        if len(members)>10000:raise _UnsafeAttachment('office-inspection-limit')
+        for member in members:
+            name=member.filename;parts=PurePosixPath(name).parts
+            if (not name or name!=member.orig_filename or '\\' in name or '\x00' in name
+                    or name.startswith('/') or re.match(r'^[A-Za-z]:',name)
+                    or any(part in {'','..','.'} for part in name.rstrip('/').split('/'))
+                    or name.casefold() in names):raise _UnsafeAttachment('office-entry-unsafe')
+            names.add(name.casefold())
+            mode=stat.S_IFMT(member.external_attr>>16)
+            if mode not in {0,stat.S_IFREG,stat.S_IFDIR}:raise _UnsafeAttachment('office-entry-unsafe')
+            if member.flag_bits&1 or member.compress_type not in {zipfile.ZIP_STORED,zipfile.ZIP_DEFLATED}:
+                raise _UnsafeAttachment('office-encrypted-or-unsupported-entry')
+            if (_attachment_path_reason(name) or any(part.lower() in {'embeddings','objectreplacements'} for part in parts)
+                    or Path(name).suffix.lower() in ARCHIVE_SUFFIXES | set(OFFICE_PARTS) | set(ODF_TYPES)):
+                raise _UnsafeAttachment('office-secret-or-nested-container')
+            if member.is_dir():continue
+            total+=member.file_size
+            if total>OFFICE_MAX_UNPACKED:raise _UnsafeAttachment('office-inspection-limit')
+            with archive.open(member) as entry:
+                header=entry.read(512)
+                if _archive_header(header):raise _UnsafeAttachment('office-secret-or-nested-container')
+                entry.seek(0)
+                if _scan_attachment(entry,matcher,deadline,limit=member.file_size)!=member.file_size:
+                    raise _UnsafeAttachment('office-entry-invalid')
+        if suffix in OFFICE_PARTS:
+            part,mime,namespace,element=OFFICE_PARTS[suffix]
+            types_ns='{http://schemas.openxmlformats.org/package/2006/content-types}'
+            types=_office_xml(archive,'[Content_Types].xml',types_ns+'Types',deadline,(types_ns+'Override',))
+            if not any(row.get('PartName')=='/'+part and row.get('ContentType')=='application/vnd.openxmlformats-officedocument.'+mime+'.main+xml' for row in types):
+                raise _UnsafeAttachment('office-structure-invalid')
+            rel_ns='{http://schemas.openxmlformats.org/package/2006/relationships}'
+            relations=_office_xml(archive,'_rels/.rels',rel_ns+'Relationships',deadline,(rel_ns+'Relationship',))
+            if not any(row.get('Type')=='http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument'
+                       and row.get('Target') in {part,'/'+part} and row.get('TargetMode')!='External' for row in relations):
+                raise _UnsafeAttachment('office-structure-invalid')
+            _office_xml(archive,part,'{http://schemas.openxmlformats.org/'+namespace+'}'+element,deadline)
+        else:
+            with archive.open('mimetype') as stream:
+                mime=stream.read(256)
+            if mime!=('application/vnd.oasis.opendocument.'+ODF_TYPES[suffix]).encode():
+                raise _UnsafeAttachment('office-structure-invalid')
+            ns='{urn:oasis:names:tc:opendocument:xmlns:manifest:1.0}'
+            rows=_office_xml(archive,'META-INF/manifest.xml',ns+'manifest',deadline,(ns+'encryption-data',))
+            if rows:raise _UnsafeAttachment('office-encrypted-or-unsupported-entry')
+            _office_xml(archive,'content.xml','{urn:oasis:names:tc:opendocument:xmlns:office:1.0}document-content',deadline)
+
+
+def _inspect_attachment(stream,path,known,deadline,output=None):
+    reason=_attachment_path_reason(path)
+    try:
+        if reason:raise _UnsafeAttachment(reason)
+        suffix=Path(str(path)).suffix.lower()
+        stream.seek(0);header=stream.read(512)
+        if not _attachment_format(header,suffix):raise _UnsafeAttachment('attachment-format-invalid')
+        matcher=_attachment_matcher(_attachment_literals(known))
+        if suffix in OFFICE_PARTS or suffix in ODF_TYPES:_inspect_office(stream,suffix,matcher,deadline)
+        stream.seek(0);_scan_attachment(stream,matcher,deadline,output=output)
+    except _UnsafeAttachment as error:reason=str(error)
+    except (zipfile.BadZipFile,ET.ParseError,KeyError,NotImplementedError,RuntimeError,EOFError,ValueError):
+        reason='office-structure-invalid'
+    return {'disposition':'excluded' if reason else 'included','reason':reason,'redactions':0,
+            'reconnect':reconnect_for(path) if reason else []}
+
+
 def sanitize_bytes(data, *, path, known_secrets=()):
+    return _sanitize_bytes(data,path=path,known_secrets=known_secrets)
+
+def _sanitize_bytes(data, *, path, known_secrets, prepared_known=None):
     if not isinstance(data,bytes): raise TypeError('sanitizer requires bytes')
+    if Path(str(path)).suffix.lower() in ATTACHMENT_SUFFIXES:
+        report=_inspect_attachment(io.BytesIO(data),path,known_secrets,time.monotonic()+120)
+        return {'data':data if report['disposition']=='included' else None,**report}
     is_source=data.startswith(b'#!') or source_code_path(path)
     reason=classify_path(path,is_source=is_source)
     if not reason and (Path(str(path)).suffix.lower() in OPAQUE_SUFFIXES or data.startswith((b'PK\x03\x04',b'\x1f\x8b',b'%PDF-',b'age-encryption.org/',b'SQLite format 3\0'))):
@@ -421,7 +775,10 @@ def sanitize_bytes(data, *, path, known_secrets=()):
             if any(ord(char)<32 and char not in '\n\r\t' for char in text): reason='binary-content-not-inspectable'
     if reason:
         return {'data':None,'disposition':'excluded','reason':reason,'redactions':0,'reconnect':reconnect_for(path,data)}
-    known=set(known_secrets)|secret_literals(data,path=path)
+    local=secret_literals(data,path=path)
+    reuse=prepared_known is not None and local.issubset(known_secrets)
+    known=known_secrets if reuse else set(known_secrets)|local
+    prepared=prepared_known if reuse else known
     python_source=Path(str(path)).suffix=='.py' or text.startswith('#!') and 'python' in text.splitlines()[0]
     shell_source=not python_source and (text.startswith('#!') or Path(str(path)).suffix.lower() in {'.sh','.bash','.zsh'})
     # Shell comments and heredocs need syntax-aware handling. A genuine '#'
@@ -429,18 +786,35 @@ def sanitize_bytes(data, *, path, known_secrets=()):
     if shell_source and '#' in text and (b'#' in known or '#' in known):
         raise ValueError('Shell source could not be safely sanitized')
     if python_source:
-        try:clean,count=_python(text,known)
+        if not local and not _plain(text,prepared,code=True)[1]:
+            return {'data':data,'disposition':'included','reason':None,'redactions':0,'reconnect':[]}
+        try:clean,count=_python(text,prepared)
         except (SyntaxError,tokenize.TokenError,IndentationError) as error:
             raise ValueError('Python source could not be safely sanitized') from error
     else:
+        if is_source:
+            prepared=_prepare_known(prepared)
+            javascript=Path(str(path)).suffix.lower() in {'.js','.mjs','.cjs','.ts','.tsx','.jsx'}
+            hash_declaration=javascript and re.fullmatch(r'''\s*(?:export\s+)?(?:const|let|var)\s+[A-Za-z_$][\w$]*\s*=\s*(?:"#"|'#')\s*;?\s*''',text)
+            for value in prepared.values:
+                if len(value)>=8:continue
+                # This complete simple declaration proves '#' is string data.
+                # Other JS/TS contexts may contain escaped private identifiers.
+                if value=='#' and hash_declaration:continue
+                # Without a lexer, even a quoted short match cannot be proven
+                # independent of executable syntax. Refuse instead of corrupting
+                # a program; retain these credentials in the global inventory.
+                if value in text and re.search(r'(?<!\w)'+re.escape(value)+r'(?!\w)',text):
+                    raise ValueError('Source code could not be safely sanitized')
         try:integrities=_package_integrities(json.loads(text),path)
         except (ValueError,RecursionError):integrities=set()
-        clean,count=_text(text,known,code=is_source,integrities=integrities)
+        clean,count=_text(text,prepared,code=is_source,integrities=integrities,
+                          authority=credential_authority(path) and not is_source)
     return {'data':clean.encode(),'disposition':'redacted' if count else 'included','reason':None,
             'redactions':count,'reconnect':reconnect_for(path,data) if count else []}
 
 def known_secret_literals(home, *, include_paths=None, exclude_paths=None, sqlite_timeout_seconds=30):
-    """Read text with no symlink following; secret values never leave this process."""
+    """Read declared credential stores, not all agent data; never follow symlinks."""
     home=Path(home)
     roots=include_paths or ['.']
     exclusions=exclude_paths or {}
@@ -457,12 +831,14 @@ def known_secret_literals(home, *, include_paths=None, exclude_paths=None, sqlit
             if root.is_file():yield root;continue
             for directory,dirs,files in os.walk(root,followlinks=False):
                 dirs[:]=[name for name in dirs if not (Path(directory)/name).is_symlink()
-                         and name not in {'.git','node_modules','__pycache__'} and not excluded(Path(directory)/name)]
+                         and name.lower() not in {'.git','__pycache__'} and not excluded(Path(directory)/name)]
                 for name in files:
                     path=Path(directory)/name
                     if not excluded(path):yield path
     found=set()
     for path in candidates():
+            relative=path.relative_to(home).as_posix()
+            if not credential_inventory_source(relative):continue
             try:
                 info=path.lstat()
                 if not stat.S_ISREG(info.st_mode) or path.suffix.lower() in OPAQUE_SUFFIXES:continue
@@ -478,16 +854,10 @@ def known_secret_literals(home, *, include_paths=None, exclude_paths=None, sqlit
                     elif info.st_size<=MAX_BYTES:
                         raw=stream.read(MAX_BYTES+1)
                         found.update(secret_literals(raw,path=str(path.relative_to(home))))
-                    elif classify_path(str(path.relative_to(home))):
-                        raise ValueError('credential source exceeds inspection limit')
                     else:
-                        while True:
-                            line=stream.readline(MAX_LINE+1)
-                            if not line:break
-                            if len(line)>MAX_LINE:break  # The whole file is excluded by sanitize_file.
-                            found.update(secret_literals(line,path=str(path.relative_to(home))))
+                        raise ValueError('credential source exceeds inspection limit')
             except (FileNotFoundError,PermissionError):
-                if classify_path(str(path.relative_to(home))):raise ValueError('credential source could not be inspected') from None
+                raise ValueError('credential source could not be inspected') from None
     return found
 
 def _sqlite_secret_literals(path, timeout_seconds=30):
@@ -510,17 +880,39 @@ def _sqlite_secret_literals(path, timeout_seconds=30):
                             found.update(secret_literals(json.dumps({'secret':value}).encode(),path='database-value.txt'))
     return found
 
-def sanitize_file(source,destination,*,path,known_secrets=(),timeout_seconds=120):
+def sanitize_file(source,destination,*,path,known_secrets=(),timeout_seconds=120,prepared_known=None):
+    if Path(str(path)).suffix.lower() in ATTACHMENT_SUFFIXES:
+        try:
+            with source.open('rb') as original,destination.open('wb') as output:
+                result=_inspect_attachment(original,path,known_secrets,time.monotonic()+timeout_seconds,output)
+            if result['disposition']=='excluded':destination.unlink(missing_ok=True)
+            return result
+        except BaseException:
+            destination.unlink(missing_ok=True)
+            raise
     with source.open('rb') as header: is_source=header.read(64).startswith(b'#!')
     reason=classify_path(path,is_source=is_source)
     if reason or Path(str(path)).suffix.lower() in OPAQUE_SUFFIXES:
         return sanitize_bytes(b'',path=path,known_secrets=known_secrets)
     if source.stat().st_size<=MAX_BYTES:
-        result=sanitize_bytes(source.read_bytes(),path=path,known_secrets=known_secrets)
+        result=_sanitize_bytes(source.read_bytes(),path=path,known_secrets=known_secrets,prepared_known=prepared_known)
         if result['data'] is not None:destination.write_bytes(result['data'])
         return {key:value for key,value in result.items() if key!='data'}
     deadline=time.monotonic()+timeout_seconds
     total=0
+    # A historical credential may be copied in a different record of this same
+    # conversation. Collect locally before writing, including references before
+    # the credential field. Never add history examples to the global inventory.
+    known=set(known_secrets)
+    with source.open('rb') as original:
+        while True:
+            line=original.readline(MAX_LINE+1)
+            if not line:break
+            if time.monotonic()>deadline:raise TimeoutError('text sanitization deadline exceeded')
+            if len(line)>MAX_LINE or b'-----BEGIN ' in line:
+                return {'disposition':'excluded','reason':'text-stream-not-safely-inspectable','redactions':0,'reconnect':reconnect_for(path)}
+            known.update(secret_literals(line,path=path))
+    prepared=prepared_known if prepared_known is not None and known.issubset(known_secrets) else _prepare_known(known)
     with source.open('rb') as original,destination.open('wb') as output:
         while True:
             line=original.readline(MAX_LINE+1)
@@ -529,7 +921,7 @@ def sanitize_file(source,destination,*,path,known_secrets=(),timeout_seconds=120
                 raise TimeoutError('text sanitization deadline exceeded')
             if len(line)>MAX_LINE or b'-----BEGIN ' in line:
                 return {'disposition':'excluded','reason':'text-stream-not-safely-inspectable','redactions':0,'reconnect':reconnect_for(path)}
-            result=sanitize_bytes(line,path=path,known_secrets=known_secrets)
+            result=_sanitize_bytes(line,path=path,known_secrets=known,prepared_known=prepared)
             if result['data'] is None:return {key:value for key,value in result.items() if key!='data'}
             output.write(result['data']);total+=result['redactions']
     return {'disposition':'redacted' if total else 'included','reason':None,'redactions':total,'reconnect':reconnect_for(path) if total else []}

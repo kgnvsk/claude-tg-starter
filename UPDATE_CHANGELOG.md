@@ -1,8 +1,8 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-09-12.4cf9282f659d`
+- Реліз: `2026-09-12.12047fa16636`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `4cf9282f659d0e107061ff98007e15a177c28e91`
+- Ревізія вихідного комплекту: `12047fa166368b7a28c33db75a527ae95a1d534b`
 - Дата релізу: `2026-09-12`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
@@ -19,7 +19,13 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    Preserve scripts and long conversation records in recovery backups
+    Preserve backup attachments and reuse credential inventory
+    Use access stores for backup credential inventory
+    fix(auth): limit automatic relogin and classify account interruptions
+    fix(backup): route agent setup to complete backup tooling
+    fix(backup): scan large JSON objects in linear time
+    Fix source-aware credential redaction and large backup inventories
+    fix(backup): preserve the selected Python runtime for captures
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не
