@@ -4,6 +4,9 @@
 from pathlib import Path, PurePosixPath
 import argparse
 import hashlib
+import importlib.machinery
+import importlib.util
+from functools import lru_cache
 import json
 import os
 import re
@@ -57,7 +60,7 @@ EXCLUDED_NAMES = {
 }
 SECRET_SUFFIXES = (".key", ".pem", ".p12", ".pfx")
 MAX_FILE_BYTES = 100 * 1024 * 1024
-MANAGED_PATH = re.compile(r"^bin/[a-z0-9][a-z0-9.-]*$")
+MANAGED_PATH = re.compile(r"^bin/[a-z0-9][a-z0-9_.-]*$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 SECRET_PATTERNS = (
     re.compile(rb"sk-(?:proj-|ant-)?[A-Za-z0-9_-]{20,}"),
@@ -86,8 +89,27 @@ def is_excluded(relative: Path) -> bool:
     return False
 
 
+@lru_cache(maxsize=8)
+def connection_literals(home: str, fingerprint: tuple) -> frozenset[bytes]:
+    # Shared scanner handles arbitrary custom names and encoded literal copies.
+    loader = importlib.machinery.SourceFileLoader("legacy_backup_sanitizer", str(Path(__file__).with_name("agent-backup-sanitize")))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    sanitizer = importlib.util.module_from_spec(spec)
+    loader.exec_module(sanitizer)
+    return frozenset(sanitizer.known_secret_literals(Path(home), include_paths=[".config/novsky/secrets.json"]))
+
+
 def contains_secret(data: bytes) -> bool:
-    return any(pattern.search(data) for pattern in SECRET_PATTERNS)
+    if any(pattern.search(data) for pattern in SECRET_PATTERNS): return True
+    private = HOME / ".config/novsky/secrets.json"
+    for candidate in (private, private.parent, private.parent.parent):
+        if candidate.is_symlink(): raise ValueError("unsafe connection store")
+    try: info = private.stat()
+    except FileNotFoundError: return False
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        raise ValueError("unsafe connection store")
+    fingerprint = (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+    return any(value in data for value in connection_literals(str(HOME), fingerprint))
 
 
 def safe_managed_customizations() -> list[tuple[Path, str]]:

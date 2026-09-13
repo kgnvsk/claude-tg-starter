@@ -341,6 +341,13 @@ def _load_sanitizer(home):
 
 def _sanitize_sources(sources, sanitizer, policy):
     raw_sources, known = [], set()
+    # System units may contain accidental copies of keys that now live only in
+    # the agent store. Read only that fixed private inventory, never agent code.
+    try:
+        known.update(sanitizer.known_secret_literals(Path(policy["agentHome"]),
+                     include_paths=[".config/novsky/secrets.json"]))
+    except (OSError, ValueError):
+        raise ContextError("connection-store-unsafe") from None
     for source, stream, info in sources:
         raw = stream.read(SOURCE_LIMIT + 1)
         if len(raw) != info.st_size or _fingerprint(info) != _fingerprint(os.fstat(stream.fileno())):

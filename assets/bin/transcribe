@@ -5,15 +5,21 @@
 # Usage: transcribe <audio_file>
 set -e
 
+# Re-enter once with the current store value; the parent bot need not restart.
+if [ "${1:-}" = "--novsky-provider-ready" ]; then
+  shift
+else
+  if [ -f "$HOME/.claude/channels/telegram/.env" ]; then
+    set -a
+    . "$HOME/.claude/channels/telegram/.env"
+    set +a
+  fi
+  exec python3 "$(dirname "$0")/agent-provider-run" openai /bin/bash "$0" --novsky-provider-ready "$@"
+fi
+
 [ -z "$1" ] && { echo "Usage: transcribe <audio>" >&2; exit 1; }
 [ ! -f "$1" ] && { echo "Not found: $1" >&2; exit 1; }
 
-# Load env
-if [ -f "$HOME/.claude/channels/telegram/.env" ]; then
-  set -a
-  . "$HOME/.claude/channels/telegram/.env"
-  set +a
-fi
 [ -z "$OPENAI_API_KEY" ] && { echo "No OPENAI_API_KEY" >&2; exit 1; }
 
 SRC="$1"
@@ -28,10 +34,9 @@ if [ "$EXT" = "oga" ]; then
 fi
 
 try_key() {
-  curl -sS -X POST "https://api.openai.com/v1/audio/transcriptions" \
+  printf 'Authorization: Bearer %s\n' "$1" | curl -H @- -sS -X POST "https://api.openai.com/v1/audio/transcriptions" \
     --connect-timeout "${TRANSCRIBE_CONNECT_TIMEOUT_SECONDS:-10}" \
     --max-time "${TRANSCRIBE_MAX_TIME_SECONDS:-120}" \
-    -H "Authorization: Bearer $1" \
     -F "file=@$SRC" \
     -F "model=gpt-4o-mini-transcribe" \
     -F "response_format=json"
@@ -46,7 +51,7 @@ if echo "$RESP" | jq -e '.error' >/dev/null 2>&1; then
   case "$ERR_MSG $ERR_CODE" in
     *quota*|*billing*|*insufficient*|*invalid_api_key*|*account_deactivated*)
       if [ -n "$OPENAI_API_KEY_FALLBACK" ]; then
-        echo "Primary key failed ($ERR_CODE), trying fallback..." >&2
+        echo "Primary key failed, trying fallback..." >&2
         RESP=$(try_key "$OPENAI_API_KEY_FALLBACK")
       fi
       ;;
@@ -54,7 +59,7 @@ if echo "$RESP" | jq -e '.error' >/dev/null 2>&1; then
 fi
 
 if echo "$RESP" | jq -e '.error' >/dev/null 2>&1; then
-  echo "OpenAI: $(echo "$RESP" | jq -r '.error.message')" >&2
+  echo "OpenAI transcription request failed" >&2
   exit 1
 fi
 

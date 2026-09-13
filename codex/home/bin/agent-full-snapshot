@@ -437,7 +437,7 @@ def create_snapshot(home: Path, output: Path, recipient: str, *, age_binary: str
                                 return
                             if not _inside(resolved, home):
                                 if (relative.startswith('.config/pulse/') and source.name.endswith('-runtime')
-                                        and resolved.parent == Path('/tmp') and resolved.name.startswith('pulse-')):
+                                        and resolved.parent == Path('/tmp').resolve() and resolved.name.startswith('pulse-')):
                                     excluded(name, 'regenerable-audio-runtime-link')
                                     return
                                 roots = [Path(root).resolve() for root in ("/usr/bin", "/bin", "/usr/local/bin")]

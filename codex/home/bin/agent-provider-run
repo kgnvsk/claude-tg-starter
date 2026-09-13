@@ -1,0 +1,21 @@
+#!/usr/bin/env python3
+"""Reload a fixed provider key for one child, without putting it in argv/stdout."""
+import os
+from pathlib import Path
+import sys
+from agent_connections import provider_environment
+
+
+def main():
+    if len(sys.argv) < 3:
+        print('usage: agent-provider-run PROVIDER COMMAND [ARG ...]', file=sys.stderr)
+        return 2
+    try:
+        environment = provider_environment(Path.home().resolve(), sys.argv[1], os.environ)
+        os.execvpe(sys.argv[2], sys.argv[2:], environment)
+    except (OSError, ValueError):
+        print('Provider configuration unavailable.', file=sys.stderr)
+        return 1
+
+
+if __name__ == '__main__': raise SystemExit(main())

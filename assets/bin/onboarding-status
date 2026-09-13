@@ -156,6 +156,15 @@ def env_value(name: str) -> str:
 
 
 def env_has(name: str) -> bool:
+    if name == "OPENAI_API_KEY":
+        try:
+            from agent_connections import provider_environment
+        except ModuleNotFoundError:
+            from assets.bin.agent_connections import provider_environment
+        try:
+            return bool(provider_environment(Path.home().resolve(), "openai", strict_env_values()).get(name))
+        except (OSError, ValueError):
+            return False
     return bool(env_value(name))
 
 
@@ -222,6 +231,11 @@ def memory_semantic_details() -> dict[str, object]:
         if consent not in {"enabled", "disabled"}:
             raise ValueError("invalid MEMORY_EMBEDDINGS_OPENAI setting")
         consented = consent == "enabled"
+        try:
+            from agent_connections import provider_environment
+        except ModuleNotFoundError:
+            from assets.bin.agent_connections import provider_environment
+        values = provider_environment(Path.home().resolve(), "openai", values)
         primary_key = values.get("OPENAI_API_KEY", "")
         fallback_key = values.get("OPENAI_API_KEY_FALLBACK", "")
         key_present = bool(primary_key or fallback_key)
@@ -336,6 +350,17 @@ def codex_authenticated() -> bool:
     command = str(CODEX_BIN) if CODEX_BIN.is_file() else "codex"
     code, output = command_output([command, "login", "status"])
     return code == 0 and "Logged in" in output
+
+
+def connection_present(provider: str) -> bool:
+    try:
+        from agent_connections import load_value
+    except ModuleNotFoundError:
+        from assets.bin.agent_connections import load_value
+    try:
+        return bool(load_value(HOME.resolve(), provider))
+    except (OSError, ValueError):
+        return False
 
 
 def vercel_authenticated() -> bool:
@@ -655,12 +680,7 @@ check_values = {
     ),
     "meeting_secretary": lambda: env_has("RECALL_API_KEY"),
     "memory_backup": lambda: has_backup,
-    "apify_social_data": lambda: (
-        (HOME / ".config/apify-token").is_file()
-        and bool(
-            (HOME / ".config/apify-token").read_text(encoding="utf-8").strip()
-        )
-    ),
+    "apify_social_data": lambda: connection_present("apify"),
     "asana_tasks": lambda: (
         (HOME / ".config/asana-token").is_file()
         and (HOME / "bin/asana-tasks").is_file()
@@ -903,7 +923,7 @@ required_hints = {
     ),
     "vercel_cli": "встановити Vercel CLI",
     "vercel_auth": (
-        "зберегти Vercel token у ~/.config/vercel-token (chmod 600)"
+        "додати Vercel token у Підключеннях або через ~/bin/set-vercel-token"
     ),
     "video_edit": "перевстановити та перевірити середовище video-edit",
     "sec_edgar": "налаштувати ідентифікацію SEC через ~/bin/set-sec-identity",
@@ -924,7 +944,7 @@ optional_hints = {
     "meeting_secretary": "підключити Recall.ai API key",
     "memory_backup": "налаштувати зовнішній git remote для пам’яті",
     "vercel_auth": (
-        "зберегти Vercel token у ~/.config/vercel-token (chmod 600)"
+        "додати Vercel token у Підключеннях або через ~/bin/set-vercel-token"
     ),
     "apify_social_data": "підключити Apify API token через ~/bin/set-apify-token",
     "asana_tasks": "підключити Asana через ~/bin/set-asana-token",

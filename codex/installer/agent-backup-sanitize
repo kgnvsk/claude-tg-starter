@@ -191,6 +191,8 @@ def classify_path(path, *, is_source=False):
     parts = [part.lower() for part in PurePosixPath(str(path).replace('\\','/')).parts]
     base = parts[-1] if parts else ''
     if '.git' in parts: return 'git-history-may-contain-credentials'
+    if 'novsky' in parts and (base == '.connections.lock' or base.startswith('.connections-') and base.endswith('.tmp')):
+        return 'credential-file'
     if any(part in {'.ssh','.gnupg','.aws','.azure','.kube','.docker','keyrings','keyring','login data','cookies','network','session storage','local storage','indexeddb'} for part in parts):
         return 'credential-or-session-store'
     if any(part in {'google-chrome','chromium','chromium-browser','brave-browser','microsoft edge','.mozilla','firefox','browser-profile','browser-profile-data','browser-data','browser-profiles','user-data-dir'} for part in parts):
@@ -208,7 +210,31 @@ def classify_path(path, *, is_source=False):
         return 'credential-file'
     return None
 
+def connection_store_rows(path, data):
+    """Canonical names are validated metadata; all secret values are discarded."""
+    if not str(path).replace('\\','/').endswith('/.config/novsky/secrets.json'): return []
+    try: document=json.loads(data)
+    except (ValueError,UnicodeError,RecursionError): return []
+    if not isinstance(document,dict) or document.get('schemaVersion')!=1 or not isinstance(document.get('values'),dict):return []
+    providers={'github':('github','GITHUB_TOKEN'),'vercel':('vercel','VERCEL_TOKEN'),
+               'apify':('apify','APIFY_TOKEN'),'openai':('openai-api','OPENAI_API_KEY')}
+    rows=[]
+    for key,value in document['values'].items():
+        if not isinstance(key,str) or ':' not in key or not isinstance(value,str):continue
+        provider,name=key.split(':',1)
+        if provider=='custom':
+            if not re.fullmatch(r'[A-Z][A-Z0-9_]{0,63}',name):continue
+            target='other-integration'
+        elif provider in providers and name==providers[provider][1]:target=providers[provider][0]
+        else:continue
+        rows.append({'provider':target,'configLocation':RECONNECT_CATALOG[target][0],
+                     'scopes':[],'setupUrl':RECONNECT_CATALOG[target][1],'action':'reauthorize',
+                     'canonicalName':name,'reconnectHint':'Add an API key in Connections.'})
+    return rows
+
 def reconnect_for(path,data=b''):
+    connections=connection_store_rows('/'+str(path).lstrip('/'),data)
+    if connections:return connections
     lower = str(path).lower()
     provider = next((name for terms,name in (
         (('telegram',),'telegram'), (('wa-bridge','whatsapp'),'whatsapp'), (('.codex','novsky/codex'),'openai-codex'),
@@ -336,6 +362,16 @@ def secret_literals(data, *, path):
                 else: visit(item,context or _auth_container(key))
         elif isinstance(value,list):
             for item in value: visit(item,inherited_auth)
+    # Custom keys need no TOKEN/SECRET suffix. The v1 values map is itself
+    # credential authority, including interrupted atomic writes in this folder.
+    canonical=str(path).replace('\\','/')
+    if ('/.config/novsky/' in '/'+canonical and isinstance(document,dict)
+            and document.get('schemaVersion')==1 and isinstance(document.get('values'),dict)):
+        for value in document['values'].values():
+            if isinstance(value,str) and value:
+                # An owner-saved key is authoritative even if it resembles a
+                # placeholder; documentation fixture heuristics do not apply.
+                found.update((value.encode(), json.dumps(value,ensure_ascii=True)[1:-1].encode(), quote(value,safe='').encode()))
     if document is not None: visit(document)
     elif '\n' in text:
         # Session JSONL is a sequence of independent objects, including small
@@ -831,11 +867,14 @@ def _sanitize_bytes(data, *, path, known_secrets, prepared_known=None):
 def known_secret_literals(home, *, include_paths=None, exclude_paths=None, sqlite_timeout_seconds=30):
     """Read declared credential stores, not all agent data; never follow symlinks."""
     home=Path(home)
-    roots=include_paths or ['.']
+    # The canonical store supplies redaction literals even for a vault-only
+    # export and even when its own path is explicitly excluded from capture.
+    canonical_store='.config/novsky/secrets.json'
+    roots=list(dict.fromkeys([*(include_paths or ['.']), canonical_store]))
     exclusions=exclude_paths or {}
     def excluded(path):
         relative=path.relative_to(home).as_posix()
-        return any(relative==prefix or relative.startswith(prefix+'/') for prefix in exclusions)
+        return relative!=canonical_store and any(relative==prefix or relative.startswith(prefix+'/') for prefix in exclusions)
     def candidates():
         for selected in roots:
             relative=PurePosixPath(selected)

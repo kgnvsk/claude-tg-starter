@@ -198,6 +198,85 @@ function createBackupChat(deps = { run, api, privateRead }) {
 var chat = createBackupChat();
 var handleBackupMessage = chat.handle;
 
+// src/codex-runtime/connections.ts
+import { spawnSync } from "child_process";
+import { lstatSync as lstatSync2, realpathSync } from "fs";
+var readKey = `import json, os, stat, sys
+fds=[]
+try:
+ home=json.load(sys.stdin)['home']
+ fd=os.open(home,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW);fds.append(fd)
+ uid=os.fstat(fd).st_uid
+ for part in ('.config','novsky'):
+  try: fd=os.open(part,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=fd)
+  except FileNotFoundError: print('null');sys.exit(0)
+  fds.append(fd);s=os.fstat(fd)
+  if s.st_uid!=uid or s.st_mode&0o022 or (part=='novsky' and stat.S_IMODE(s.st_mode)!=0o700): raise ValueError()
+ try: fd=os.open('secrets.json',os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=fd)
+ except FileNotFoundError: print('null');sys.exit(0)
+ fds.append(fd);s=os.fstat(fd)
+ if not stat.S_ISREG(s.st_mode) or s.st_uid!=uid or s.st_nlink!=1 or stat.S_IMODE(s.st_mode)!=0o600 or s.st_size>1048576: raise ValueError()
+ raw=os.read(fd,1048577)
+ if len(raw)>1048576: raise ValueError()
+ doc=json.loads(raw)
+ if not isinstance(doc,dict) or doc.get('schemaVersion')!=1 or not isinstance(doc.get('values'),dict): raise ValueError()
+ values=doc['values'];name='openai:OPENAI_API_KEY'
+ if name not in values: print('null')
+ elif values[name] is None: print(json.dumps(''))
+ elif isinstance(values[name],str) and 8<=len(values[name])<=16384 and all(33<=ord(c)<=126 for c in values[name]): print(json.dumps(values[name]))
+ else: raise ValueError()
+except Exception: sys.exit(1)
+finally:
+ for fd in reversed(fds): os.close(fd)
+`;
+var snapshots = new WeakMap;
+function identity(home) {
+  const parts = [home, home + "/.config", home + "/.config/novsky", home + "/.config/novsky/secrets.json"];
+  return parts.map((path) => {
+    try {
+      const s = lstatSync2(path, { bigint: true });
+      if (s.isSymbolicLink())
+        throw new Error;
+      return [s.dev, s.ino, s.mode, s.uid, s.gid, s.nlink, s.size, s.mtimeNs, s.ctimeNs].join(":");
+    } catch (error) {
+      if (error.code === "ENOENT")
+        return "missing";
+      throw error;
+    }
+  }).join("|");
+}
+function runtimeOpenAIKey(config) {
+  if (!config.kit)
+    return config.openaiApiKey ?? "";
+  try {
+    const home = realpathSync(config.kit.home), fileIdentity = identity(home), stamp = home + "|" + config.kit.python + "|" + fileIdentity;
+    if (process.platform === "win32") {
+      if (fileIdentity.endsWith("|missing"))
+        return config.openaiApiKey ?? "";
+      throw new Error;
+    }
+    const snapshot = snapshots.get(config);
+    if (snapshot?.identity === stamp)
+      return snapshot.value === null ? config.openaiApiKey ?? "" : snapshot.value;
+    const result = spawnSync(config.kit.python ?? "/usr/bin/python3", ["-I", "-S", "-B", "-c", readKey], {
+      input: JSON.stringify({ home }),
+      encoding: "utf8",
+      timeout: 5000,
+      maxBuffer: 32768
+    });
+    if (result.status !== 0 || result.error)
+      throw new Error;
+    const value = JSON.parse(result.stdout);
+    if (value !== null && typeof value !== "string")
+      throw new Error;
+    if (identity(home) === fileIdentity)
+      snapshots.set(config, { identity: stamp, value });
+    return value === null ? config.openaiApiKey ?? "" : value;
+  } catch {
+    throw new Error("Agent connection store unavailable");
+  }
+}
+
 // src/codex-runtime/activity.ts
 function itemPhase(item) {
   if (item?.type === "agentMessage")
@@ -545,21 +624,21 @@ class AppServerRpc {
 }
 
 // src/codex-runtime/memory.ts
-import { constants as constants2, lstatSync as lstatSync3, mkdirSync, readdirSync } from "fs";
+import { constants as constants2, lstatSync as lstatSync4, mkdirSync, readdirSync } from "fs";
 import { lstat as lstat2, open, realpath } from "fs/promises";
 import { dirname as dirname2, isAbsolute, join as join2, posix, relative, sep, win32 } from "path";
 import { spawn as spawn4 } from "child_process";
 
 // src/codex-runtime/archive.ts
 import { Database } from "bun:sqlite";
-import { chmodSync, lstatSync as lstatSync2 } from "fs";
+import { chmodSync, lstatSync as lstatSync3 } from "fs";
 
 class MessageArchive {
   db;
   closed = false;
   constructor(path) {
     for (const file of [path, path + "-wal", path + "-shm"]) {
-      const stat = lstatSync2(file, { throwIfNoEntry: false });
+      const stat = lstatSync3(file, { throwIfNoEntry: false });
       if (stat && (!stat.isFile() || stat.isSymbolicLink()))
         throw new Error("Unsafe memory archive");
     }
@@ -641,7 +720,7 @@ function kitProcessEnv(home, workspace, inherited = process.env, platform = proc
   };
 }
 function directory(path) {
-  const stat = lstatSync3(path, { throwIfNoEntry: false });
+  const stat = lstatSync4(path, { throwIfNoEntry: false });
   if (stat) {
     if (!stat.isDirectory() || stat.isSymbolicLink())
       throw new Error("Unsafe native memory directory");
@@ -871,7 +950,7 @@ ${escaped}
 // src/local-runtime/claude.ts
 import { Database as Database2 } from "bun:sqlite";
 import { createHash, randomUUID as randomUUID2 } from "crypto";
-import { chmodSync as chmodSync2, lstatSync as lstatSync5, mkdirSync as mkdirSync3, realpathSync as realpathSync2 } from "fs";
+import { chmodSync as chmodSync2, lstatSync as lstatSync6, mkdirSync as mkdirSync3, realpathSync as realpathSync3 } from "fs";
 import { open as open5 } from "fs/promises";
 import { dirname as dirname6, isAbsolute as isAbsolute5, join as join7, resolve as resolve5 } from "path";
 import { spawn as spawn6 } from "child_process";
@@ -60727,12 +60806,12 @@ class ClaudeRpc {
         throw new RpcError("protocol");
     }
     mkdirSync3(config2.stateDir, { recursive: true, mode: 448 });
-    if (realpathSync2(config2.stateDir) !== config2.stateDir || !lstatSync5(config2.stateDir).isDirectory())
+    if (realpathSync3(config2.stateDir) !== config2.stateDir || !lstatSync6(config2.stateDir).isDirectory())
       throw new RpcError("protocol");
     const file2 = join7(config2.stateDir, "claude-rpc.sqlite");
     for (const path of [file2, file2 + "-wal", file2 + "-shm"]) {
       try {
-        const stat2 = lstatSync5(path);
+        const stat2 = lstatSync6(path);
         if (!stat2.isFile() || stat2.isSymbolicLink() || stat2.nlink !== 1)
           throw new RpcError("protocol");
       } catch (error61) {
@@ -61004,7 +61083,7 @@ class ClaudeRpc {
         content.push({ type: "text", text: part.text });
       else if (part.type === "localImage" && typeof part.path === "string") {
         const path = resolve5(part.path);
-        if (!path.startsWith(this.config.cwd + "/") || realpathSync2(path) !== path)
+        if (!path.startsWith(this.config.cwd + "/") || realpathSync3(path) !== path)
           throw new RpcError("request_failed");
         const file2 = await open5(path, "r");
         try {
@@ -62972,7 +63051,7 @@ class RuntimeStore {
 
 // src/codex-runtime/conversation.ts
 import { randomUUID as randomUUID5 } from "crypto";
-import { lstatSync as lstatSync6 } from "fs";
+import { lstatSync as lstatSync7 } from "fs";
 import { join as join13 } from "path";
 
 // src/codex-runtime/corporate.ts
@@ -64572,8 +64651,8 @@ function corporateIdentity(message) {
     ...message.is_topic_message === true && Number.isSafeInteger(message.message_thread_id) && message.message_thread_id > 0 ? { isTopicMessage: true, threadId: message.message_thread_id } : {}
   };
 }
-function corporateConversationKey(identity) {
-  return identity.chatType === "private" ? "user:" + identity.userId : identity.isTopicMessage ? `topic:${identity.chatId}:${identity.threadId}` : "group:" + identity.chatId;
+function corporateConversationKey(identity2) {
+  return identity2.chatType === "private" ? "user:" + identity2.userId : identity2.isTopicMessage ? `topic:${identity2.chatId}:${identity2.threadId}` : "group:" + identity2.chatId;
 }
 var CORPORATE_TOOLS = [
   { type: "function", name: "company_access_list", description: "Owner-only list of admitted Telegram IDs, current permissions and actual registered company resources. Never guesses resource IDs.", inputSchema: { type: "object", properties: { subject: { type: "string" } }, additionalProperties: false } },
@@ -64609,19 +64688,19 @@ class CorporateGateway {
     return { ...value, admins: value.admins.map(String), allowFrom: value.allowFrom.map(String) };
   }
   isAdmitted(message) {
-    const identity = corporateIdentity(message);
-    if (!identity)
+    const identity2 = corporateIdentity(message);
+    if (!identity2)
       return false;
-    if (identity.chatType === "private" && identity.userId === this.options.ownerChatId)
+    if (identity2.chatType === "private" && identity2.userId === this.options.ownerChatId)
       return false;
-    return this.admittedIdentity(identity);
+    return this.admittedIdentity(identity2);
   }
-  admittedIdentity(identity) {
-    if (identity.chatType === "private" && identity.userId === this.options.ownerChatId)
+  admittedIdentity(identity2) {
+    if (identity2.chatType === "private" && identity2.userId === this.options.ownerChatId)
       return true;
     try {
       const access2 = this.access();
-      return access2.allowFrom.includes(identity.userId) && !this.options.store.getMeta("corporate-admission-uncertain:user:" + identity.userId) && (identity.chatType === "private" || !this.options.store.getMeta("corporate-admission-uncertain:group:" + identity.chatId)) && (identity.chatType === "private" || Object.hasOwn(access2.groups ?? {}, identity.chatId));
+      return access2.allowFrom.includes(identity2.userId) && !this.options.store.getMeta("corporate-admission-uncertain:user:" + identity2.userId) && (identity2.chatType === "private" || !this.options.store.getMeta("corporate-admission-uncertain:group:" + identity2.chatId)) && (identity2.chatType === "private" || Object.hasOwn(access2.groups ?? {}, identity2.chatId));
     } catch {
       return false;
     }
@@ -64629,7 +64708,7 @@ class CorporateGateway {
   canDeliver(chatId, threadId, delivery) {
     if (!delivery)
       return chatId === this.options.ownerChatId && threadId == null;
-    const identity = (actor, conversation, chat2, thread) => {
+    const identity2 = (actor, conversation, chat2, thread) => {
       const value = corporateIdentity({
         message_id: 1,
         from: { id: Number(actor) },
@@ -64638,10 +64717,10 @@ class CorporateGateway {
       });
       return value && corporateConversationKey(value) === conversation && this.admittedIdentity(value);
     };
-    if (!USER.test(delivery.actorUserId) || !identity(delivery.actorUserId, delivery.conversationKey, chatId, threadId))
+    if (!USER.test(delivery.actorUserId) || !identity2(delivery.actorUserId, delivery.conversationKey, chatId, threadId))
       return false;
     const origin = delivery.origin;
-    return !origin || origin.actorUserId === delivery.actorUserId && origin.conversationKey.startsWith(origin.threadId == null ? "group:" : "topic:") && !!identity(origin.actorUserId, origin.conversationKey, origin.chatId, origin.threadId);
+    return !origin || origin.actorUserId === delivery.actorUserId && origin.conversationKey.startsWith(origin.threadId == null ? "group:" : "topic:") && !!identity2(origin.actorUserId, origin.conversationKey, origin.chatId, origin.threadId);
   }
   async process(message, deliveryId) {
     if (!this.isAdmitted(message) || this.stopped)
@@ -64649,7 +64728,7 @@ class CorporateGateway {
     const match = /^telegram-update:(0|[1-9]\d*)$/.exec(deliveryId);
     if (!match || !Number.isSafeInteger(Number(match[1])))
       throw new Error("Invalid corporate delivery");
-    const identity = corporateIdentity(message);
+    const identity2 = corporateIdentity(message);
     const safe = { ...message, text: this.options.redact(message.text ?? ""), caption: this.options.redact(message.caption ?? "") };
     const input2 = {
       message_id: safe.message_id,
@@ -64662,33 +64741,33 @@ class CorporateGateway {
       voice: safe.voice,
       audio: safe.audio,
       document: safe.document,
-      is_topic_message: identity.isTopicMessage,
-      message_thread_id: identity.threadId
+      is_topic_message: identity2.isTopicMessage,
+      message_thread_id: identity2.threadId
     };
     const command = (message.text ?? "").split(/\s/, 1)[0].split("@", 1)[0].toLowerCase();
-    const conversation = corporateConversationKey(identity);
-    const accepted = this.options.store.acceptCorporate(Number(match[1]), { message: input2, deliveryId }, this.incomingArchive(input2, identity), { actorUserId: identity.userId, conversationKey: conversation, command });
-    if (accepted === "accepted" && command === "/stop" && this.preparation && this.preparation.id < Number(match[1]) && this.preparation.actor === identity.userId && this.preparation.conversation === conversation)
+    const conversation = corporateConversationKey(identity2);
+    const accepted = this.options.store.acceptCorporate(Number(match[1]), { message: input2, deliveryId }, this.incomingArchive(input2, identity2), { actorUserId: identity2.userId, conversationKey: conversation, command });
+    if (accepted === "accepted" && command === "/stop" && this.preparation && this.preparation.id < Number(match[1]) && this.preparation.actor === identity2.userId && this.preparation.conversation === conversation)
       this.preparation.abort.abort();
     if (accepted === "accepted") {
-      this.options.telegram.setMessageReaction(identity.chatId, identity.messageId).catch(() => this.options.log("corporate_reaction_failed"));
+      this.options.telegram.setMessageReaction(identity2.chatId, identity2.messageId).catch(() => this.options.log("corporate_reaction_failed"));
     }
     this.drain().catch(() => this.options.log("corporate_intake_unavailable"));
   }
-  incomingArchive(message, identity) {
+  incomingArchive(message, identity2) {
     const file2 = message.voice ?? message.audio ?? message.photo?.at(-1) ?? message.document;
     return { type: "message", message: {
-      chat_id: identity.chatId,
-      user_id: identity.userId,
+      chat_id: identity2.chatId,
+      user_id: identity2.userId,
       username: message.from?.username ?? null,
       direction: "in",
       text: this.options.redact(message.text || message.caption || ""),
       ts: this.timestamp(message),
-      message_id: identity.messageId,
+      message_id: identity2.messageId,
       attachment_kind: message.voice ? "voice" : message.audio ? "audio" : message.photo?.length ? "photo" : message.document ? "document" : null,
       attachment_file_id: file2?.file_id ?? null,
-      thread_id: identity.threadId ?? null,
-      conversation_key: corporateConversationKey(identity)
+      thread_id: identity2.threadId ?? null,
+      conversation_key: corporateConversationKey(identity2)
     } };
   }
   timestamp(message) {
@@ -64708,16 +64787,16 @@ class CorporateGateway {
           this.options.store.finishCorporate(item.id);
           continue;
         }
-        const identity = corporateIdentity(message);
+        const identity2 = corporateIdentity(message);
         const command = (message.text ?? "").split(/\s/, 1)[0].split("@", 1)[0].toLowerCase();
         try {
           if (item.state === "notice" || ["/sessions", "/status", "/stop", "/unstick"].includes(command)) {
             if (!this.options.store.claimCorporateSend(item.id))
               continue;
             try {
-              const key = corporateConversationKey(identity);
-              const text = item.state === "notice" ? "The company queue is full. Check /status and send your task again after it has room." : command === "/stop" || command === "/unstick" ? "Task: " + await this.options.runtime.unstick(key, identity.userId) : JSON.stringify(this.options.runtime.health(key).conversation ?? { admissionState: this.options.runtime.health().admissionState });
-              await this.options.telegram.sendText(identity.chatId, text, undefined, undefined, { threadId: identity.threadId, replyTo: identity.messageId });
+              const key = corporateConversationKey(identity2);
+              const text = item.state === "notice" ? "The company queue is full. Check /status and send your task again after it has room." : command === "/stop" || command === "/unstick" ? "Task: " + await this.options.runtime.unstick(key, identity2.userId) : JSON.stringify(this.options.runtime.health(key).conversation ?? { admissionState: this.options.runtime.health().admissionState });
+              await this.options.telegram.sendText(identity2.chatId, text, undefined, undefined, { threadId: identity2.threadId, replyTo: identity2.messageId });
               this.options.store.finishCorporate(item.id);
             } catch {
               this.options.store.finishCorporate(item.id, "unknown");
@@ -64727,9 +64806,9 @@ class CorporateGateway {
           }
           let input2;
           const abort = new AbortController;
-          this.preparation = { id: item.id, actor: identity.userId, conversation: corporateConversationKey(identity), abort };
+          this.preparation = { id: item.id, actor: identity2.userId, conversation: corporateConversationKey(identity2), abort };
           try {
-            input2 = item.state === "prepared" ? item.payload.prepared : await this.prepare(item, identity, AbortSignal.any([this.options.signal, abort.signal]));
+            input2 = item.state === "prepared" ? item.payload.prepared : await this.prepare(item, identity2, AbortSignal.any([this.options.signal, abort.signal]));
           } finally {
             this.preparation = undefined;
           }
@@ -64744,7 +64823,7 @@ class CorporateGateway {
         } catch {
           if (item.state === "pending" && item.attempts >= 2 && this.options.store.claimCorporateSend(item.id)) {
             try {
-              await this.options.telegram.sendText(identity.chatId, "The attachment could not be prepared. Send text, an image up to 3 MB, or a PDF, Office or text document up to 20 MB. Voice also requires the owner\u2019s transcription connection.", undefined, undefined, { threadId: identity.threadId, replyTo: identity.messageId });
+              await this.options.telegram.sendText(identity2.chatId, "The attachment could not be prepared. Send text, an image up to 3 MB, or a PDF, Office or text document up to 20 MB. Voice also requires the owner\u2019s transcription connection.", undefined, undefined, { threadId: identity2.threadId, replyTo: identity2.messageId });
               this.options.store.finishCorporate(item.id);
             } catch {
               this.options.store.finishCorporate(item.id, "unknown");
@@ -64759,13 +64838,13 @@ class CorporateGateway {
     });
     return this.draining;
   }
-  async prepare(item, identity, signal) {
+  async prepare(item, identity2, signal) {
     const message = item.payload.message;
     let text = message.text || message.caption || "";
     let images, documents;
     const file2 = message.voice ?? message.audio ?? message.photo?.at(-1) ?? message.document;
     if (file2) {
-      const stopTyping = startCorporateTyping(this.options.telegram, identity.chatId, identity.threadId, signal);
+      const stopTyping = startCorporateTyping(this.options.telegram, identity2.chatId, identity2.threadId, signal);
       const root = join12(this.options.home, ".local/state/novsky-codex/corporate-inbox");
       const { mkdir: mkdir4 } = await import("fs/promises");
       await mkdir4(root, { recursive: true, mode: 448 });
@@ -64812,7 +64891,7 @@ class CorporateGateway {
     signal.throwIfAborted();
     text = this.options.redact(text);
     const input2 = {
-      ...identity,
+      ...identity2,
       deliveryId: item.payload.deliveryId,
       username: message.from?.username ?? "",
       text,
@@ -64820,7 +64899,7 @@ class CorporateGateway {
       ...documents?.length ? { documents } : {},
       createdAt: this.timestamp(message)
     };
-    this.options.store.prepareCorporate(item.id, { ...item.payload, prepared: input2 }, message.voice || message.audio ? { type: "transcript", chatId: identity.chatId, messageId: identity.messageId, text } : undefined);
+    this.options.store.prepareCorporate(item.id, { ...item.payload, prepared: input2 }, message.voice || message.audio ? { type: "transcript", chatId: identity2.chatId, messageId: identity2.messageId, text } : undefined);
     return input2;
   }
   dispatchControls() {
@@ -64846,23 +64925,23 @@ class CorporateGateway {
   async executeControl(item) {
     try {
       if (item.state === "callback_result") {
-        const { identity, pending, type } = item.payload;
-        if (type === "action" && !this.canDeliver(identity.chatId, null, pending.delivery)) {
+        const { identity: identity2, pending, type } = item.payload;
+        if (type === "action" && !this.canDeliver(identity2.chatId, null, pending.delivery)) {
           this.options.store.finishCorporate(item.id);
           return;
         }
-        await this.options.telegram.sendText(identity.chatId, item.payload.result, undefined, undefined, { replyTo: identity.messageId });
+        await this.options.telegram.sendText(identity2.chatId, item.payload.result, undefined, undefined, { replyTo: identity2.messageId });
       } else {
         const message = item.payload.message;
         if (!this.isAdmitted(message)) {
           this.options.store.finishCorporate(item.id);
           return;
         }
-        const identity = corporateIdentity(message), key = corporateConversationKey(identity);
+        const identity2 = corporateIdentity(message), key = corporateConversationKey(identity2);
         const command = (message.text ?? "").split(/\s/, 1)[0].split("@", 1)[0].toLowerCase();
-        const text = command === "/stop" || command === "/unstick" ? "Task: " + await this.options.runtime.unstick(key, identity.userId) : JSON.stringify(this.options.runtime.health(key).conversation ?? { admissionState: this.options.runtime.health().admissionState });
+        const text = command === "/stop" || command === "/unstick" ? "Task: " + await this.options.runtime.unstick(key, identity2.userId) : JSON.stringify(this.options.runtime.health(key).conversation ?? { admissionState: this.options.runtime.health().admissionState });
         if (this.isAdmitted(message))
-          await this.options.telegram.sendText(identity.chatId, text, undefined, undefined, { threadId: identity.threadId, replyTo: identity.messageId });
+          await this.options.telegram.sendText(identity2.chatId, text, undefined, undefined, { threadId: identity2.threadId, replyTo: identity2.messageId });
       }
       this.options.store.finishCorporate(item.id);
     } catch {
@@ -64876,20 +64955,20 @@ class CorporateGateway {
       return false;
     let answer = "This confirmation has expired or belongs to another message.";
     try {
-      const identity = callback.message ? corporateIdentity({ ...callback.message, from: callback.from }) : null;
-      if (!identity || identity.chatType !== "private")
+      const identity2 = callback.message ? corporateIdentity({ ...callback.message, from: callback.from }) : null;
+      if (!identity2 || identity2.chatType !== "private")
         return true;
       const type = match[1], decision = match[2], token = match[3];
-      if (type !== "action" ? identity.userId !== this.options.ownerChatId : identity.userId !== this.options.ownerChatId && !this.isAdmitted({ ...callback.message, from: callback.from }))
+      if (type !== "action" ? identity2.userId !== this.options.ownerChatId : identity2.userId !== this.options.ownerChatId && !this.isAdmitted({ ...callback.message, from: callback.from }))
         return true;
       const key = type === "policy" ? "corporate-membership:" + token : type === "resource" ? "corporate-resource:" + token : "corporate-callback:action:" + token;
       const raw = this.options.store.getMeta(key);
       const pending = raw ? JSON.parse(raw) : null;
-      if (!pending || pending.consumed || pending.messageId !== identity.messageId || pending.chatId && pending.chatId !== identity.chatId || pending.expiresAt && pending.expiresAt <= Date.now())
+      if (!pending || pending.consumed || pending.messageId !== identity2.messageId || pending.chatId && pending.chatId !== identity2.chatId || pending.expiresAt && pending.expiresAt <= Date.now())
         return true;
-      if (type === "action" && (!pending.delivery || pending.delivery.actorUserId !== identity.userId || !this.canDeliver(identity.chatId, null, pending.delivery)))
+      if (type === "action" && (!pending.delivery || pending.delivery.actorUserId !== identity2.userId || !this.canDeliver(identity2.chatId, null, pending.delivery)))
         return true;
-      if (this.options.store.acceptCorporateCallback(update.update_id, { identity, type, decision, token, pending }, key, raw)) {
+      if (this.options.store.acceptCorporateCallback(update.update_id, { identity: identity2, type, decision, token, pending }, key, raw)) {
         answer = "Confirmation received. I will send its result here.";
         this.dispatchControls();
       }
@@ -64902,18 +64981,18 @@ class CorporateGateway {
     return true;
   }
   async executeCallback(item) {
-    const { identity, type, decision, token, pending } = item.payload;
+    const { identity: identity2, type, decision, token, pending } = item.payload;
     let answer;
     const uncertainAdmission = () => {
       if (type === "policy" && decision === "approve" && pending.admitted === false)
         this.options.store.setMeta("corporate-admission-uncertain:" + pending.subject, JSON.stringify({ token }));
     };
     try {
-      if (type === "action" && !this.canDeliver(identity.chatId, null, pending.delivery)) {
+      if (type === "action" && !this.canDeliver(identity2.chatId, null, pending.delivery)) {
         this.options.store.finishCorporate(item.id);
         return;
       }
-      const result = await (type === "policy" ? decision === "approve" ? this.options.runtime.approvePolicyPreview(token, identity) : this.options.runtime.cancelPolicyPreview(token, identity) : type === "resource" ? decision === "approve" ? this.options.runtime.approveResourcePreview(token, identity) : this.options.runtime.cancelResourcePreview(token, identity) : decision === "approve" ? this.options.runtime.confirmAction(token, identity) : this.options.runtime.cancelAction(token, identity));
+      const result = await (type === "policy" ? decision === "approve" ? this.options.runtime.approvePolicyPreview(token, identity2) : this.options.runtime.cancelPolicyPreview(token, identity2) : type === "resource" ? decision === "approve" ? this.options.runtime.approveResourcePreview(token, identity2) : this.options.runtime.cancelResourcePreview(token, identity2) : decision === "approve" ? this.options.runtime.confirmAction(token, identity2) : this.options.runtime.cancelAction(token, identity2));
       if (type === "policy" && result.ok === true && decision === "approve" && typeof pending.admitted === "boolean") {
         this.changeAdmission(pending.subject, pending.admitted);
         this.options.store.setMeta("corporate-admission-uncertain:" + pending.subject, null);
@@ -65071,7 +65150,7 @@ function administratorAdmitted(home, engine, owner, chatId) {
     let path = home;
     for (const part of ["", engine === "claude" ? ".claude" : ".codex", "channels", "telegram"]) {
       path = join13(path, part);
-      const directory2 = lstatSync6(path);
+      const directory2 = lstatSync7(path);
       if (!directory2.isDirectory() || directory2.isSymbolicLink())
         return false;
     }
@@ -65177,7 +65256,7 @@ function toolResult(text, success2) {
 }
 
 // src/codex-runtime/lifecycle.ts
-import { constants as constants7, existsSync as existsSync4, lstatSync as lstatSync7, mkdirSync as mkdirSync5, openSync as openSync4, closeSync as closeSync4, fsyncSync as fsyncSync2, writeFileSync as writeFileSync2, unlinkSync as unlinkSync3 } from "fs";
+import { constants as constants7, existsSync as existsSync4, lstatSync as lstatSync8, mkdirSync as mkdirSync5, openSync as openSync4, closeSync as closeSync4, fsyncSync as fsyncSync2, writeFileSync as writeFileSync2, unlinkSync as unlinkSync3 } from "fs";
 import { join as join14 } from "path";
 import { randomBytes } from "crypto";
 var TASK = /^[a-z0-9][a-z0-9._-]{0,63}$/;
@@ -65207,7 +65286,7 @@ class NativeLifecycle {
     this.now = options.now ?? Date.now;
     let enabled = false;
     try {
-      const bin = lstatSync7(join14(options.home, "bin")), helper = lstatSync7(join14(options.home, "bin/native-lifecycle"));
+      const bin = lstatSync8(join14(options.home, "bin")), helper = lstatSync8(join14(options.home, "bin/native-lifecycle"));
       enabled = bin.isDirectory() && !bin.isSymbolicLink() && helper.isFile() && !helper.isSymbolicLink() && helper.nlink === 1;
     } catch {}
     this.enabled = enabled;
@@ -65218,7 +65297,7 @@ class NativeLifecycle {
         path = join14(path, part);
         if (!existsSync4(path))
           mkdirSync5(path, { mode: 448 });
-        const stat2 = lstatSync7(path);
+        const stat2 = lstatSync8(path);
         if (!stat2.isDirectory() || stat2.isSymbolicLink())
           throw new Error("Unsafe lifecycle directory");
       }
@@ -65685,7 +65764,7 @@ async function chatWorkRequest(op, payload) {
 }
 
 // src/codex-runtime/corporate-loader.ts
-import { lstatSync as lstatSync8, readFileSync as readFileSync4, realpathSync as realpathSync3 } from "fs";
+import { lstatSync as lstatSync9, readFileSync as readFileSync4, realpathSync as realpathSync4 } from "fs";
 import { isAbsolute as isAbsolute7, join as join16, resolve as resolve7 } from "path";
 import { pathToFileURL as pathToFileURL2 } from "url";
 function createHostTokenSource(home, rpc) {
@@ -65723,9 +65802,9 @@ function createHostTokenSource(home, rpc) {
   };
 }
 function installedPath(path, directory2) {
-  if (!isAbsolute7(path) || resolve7(path) !== path || realpathSync3(path) !== path)
+  if (!isAbsolute7(path) || resolve7(path) !== path || realpathSync4(path) !== path)
     throw new Error("Corporate installation unavailable");
-  const stat2 = lstatSync8(path);
+  const stat2 = lstatSync9(path);
   if (stat2.isSymbolicLink() || (directory2 ? !stat2.isDirectory() : !stat2.isFile()) || stat2.mode & 18)
     throw new Error("Corporate installation unavailable");
   return path;
@@ -65778,7 +65857,7 @@ async function loadCorporateHost(options, dependencies = {}) {
     if (moduleDir !== join16(kitRoot, "resources/modules/telegram-corporate"))
       throw new Error("Corporate module does not belong to the installed kit");
     const manifestPath = installedPath(join16(kitRoot, "manifest.json"), false);
-    if (lstatSync8(manifestPath).size > 2097152)
+    if (lstatSync9(manifestPath).size > 2097152)
       throw new Error("Invalid native manifest");
     const manifest = JSON.parse(readFileSync4(manifestPath, "utf8"));
     if (manifest?.engine !== "codex" || typeof manifest.productId !== "string" || !Array.isArray(manifest.features) || !manifest.features.every((feature) => typeof feature === "string") || !manifest.files || typeof manifest.files !== "object" || Array.isArray(manifest.files))
@@ -65969,6 +66048,7 @@ class CodexTelegramRuntime {
   typingIntervalMs;
   log;
   transcribe;
+  usedOpenAIKeys = new Set;
   active;
   prompts = new Set;
   initialized = false;
@@ -66116,7 +66196,12 @@ class CodexTelegramRuntime {
         },
         redact: (text) => this.redact(text),
         log: this.log,
-        transcribe: (path, signal) => this.transcribe(path, this.config.openaiApiKey ?? "", undefined, signal)
+        transcribe: async (path, signal) => {
+          const key = this.openAIKey();
+          if (!key)
+            throw new Error("OpenAI connection required");
+          return this.transcribe(path, key, undefined, signal);
+        }
       });
     }
     this.initialized = true;
@@ -66179,8 +66264,8 @@ class CodexTelegramRuntime {
     return chatId === this.config.ownerChatId || administratorAdmitted(this.config.kit?.home, this.config.engine, this.config.ownerChatId, chatId);
   }
   isRuntimeActor(message) {
-    const identity = corporateIdentity(message);
-    return !!identity && identity.chatType === "private" && this.isAuthorizedChat(identity.chatId);
+    const identity2 = corporateIdentity(message);
+    return !!identity2 && identity2.chatType === "private" && this.isAuthorizedChat(identity2.chatId);
   }
   conversation(chatId) {
     let conversation = this.conversations.get(chatId);
@@ -66314,8 +66399,19 @@ Lifecycle: ` + this.lifecycle.status.tick + " (details: /reminders)" : ""));
       this.log("control_failed");
     }
   }
+  openAIKey() {
+    const key = runtimeOpenAIKey(this.config);
+    if (key)
+      this.usedOpenAIKeys.add(key);
+    return key;
+  }
   redact(text) {
-    return redactSecrets(text, [this.config.botToken, this.config.openaiApiKey ?? ""]);
+    try {
+      this.openAIKey();
+    } catch {
+      return "[redacted: connection store unavailable]";
+    }
+    return redactSecrets(text, [this.config.botToken, this.config.openaiApiKey ?? "", ...this.usedOpenAIKeys]);
   }
   incomingArchive(message) {
     if (!this.memory)
@@ -66357,7 +66453,7 @@ Lifecycle: ` + this.lifecycle.status.tick + " (details: /reminders)" : ""));
     }
   }
   textReplies(text, modelReply = false) {
-    const redacted = redactSecrets(text, [this.config.botToken, this.config.openaiApiKey ?? ""]);
+    const redacted = this.redact(text);
     const safe = redacted.slice(0, 256000).replace(/[\uD800-\uDBFF]$/, "");
     if (modelReply)
       return renderTelegramMarkdown(safe).map((part) => ({ type: "text", ...part, modelReply: true }));
@@ -66499,8 +66595,8 @@ This separate conversation is with the authenticated installer administrator` + 
       const photo = message.photo?.at(-1);
       const audio = message.voice ?? message.audio;
       const file2 = audio ? { ...audio, file_name: message.voice ? "voice.ogg" : audio.file_name ?? "audio.mp3" } : photo ? { ...photo, isImage: true } : message.document;
-      if (audio && !this.config.openaiApiKey) {
-        answer = "\u0414\u043B\u044F \u0440\u0430\u0441\u043F\u043E\u0437\u043D\u0430\u0432\u0430\u043D\u0438\u044F \u0433\u043E\u043B\u043E\u0441\u043E\u0432\u044B\u0445 \u0434\u043E\u0431\u0430\u0432\u044C OpenAI API key \u0434\u043B\u044F Whisper \u043F\u0440\u0438 \u0443\u0441\u0442\u0430\u043D\u043E\u0432\u043A\u0435 \u0430\u0433\u0435\u043D\u0442\u0430 \u0432 Novsky. \u0422\u0435\u043A\u0441\u0442\u043E\u0432\u044B\u0435 \u0441\u043E\u043E\u0431\u0449\u0435\u043D\u0438\u044F \u0443\u0436\u0435 \u0440\u0430\u0431\u043E\u0442\u0430\u044E\u0442.";
+      if (audio && !this.openAIKey()) {
+        answer = "\u0414\u043B\u044F \u0440\u0430\u0441\u043F\u043E\u0437\u043D\u0430\u0432\u0430\u043D\u0438\u044F \u0433\u043E\u043B\u043E\u0441\u043E\u0432\u044B\u0445 \u0434\u043E\u0431\u0430\u0432\u044C OpenAI API key \u0432\u043E \u0432\u043A\u043B\u0430\u0434\u043A\u0435 \xAB\u041F\u043E\u0434\u043A\u043B\u044E\u0447\u0435\u043D\u0438\u044F\xBB \u0430\u0433\u0435\u043D\u0442\u0430 \u0432 Novsky. \u0422\u0435\u043A\u0441\u0442\u043E\u0432\u044B\u0435 \u0441\u043E\u043E\u0431\u0449\u0435\u043D\u0438\u044F \u0443\u0436\u0435 \u0440\u0430\u0431\u043E\u0442\u0430\u044E\u0442.";
         return;
       }
       if (!teamResult && !input2.length && !file2) {
@@ -66518,7 +66614,10 @@ This separate conversation is with the authenticated installer administrator` + 
           let transcript;
           this.store.activityPhase(job.updateId, "transcribing");
           try {
-            transcript = await this.transcribe(saved.path, this.config.openaiApiKey, audio.mime_type ?? "audio/ogg", active.abort.signal);
+            const key = this.openAIKey();
+            if (!key)
+              throw new Error("OpenAI connection required");
+            transcript = await this.transcribe(saved.path, key, audio.mime_type ?? "audio/ogg", active.abort.signal);
           } catch {
             answer = "\u041D\u0435 \u0443\u0434\u0430\u043B\u043E\u0441\u044C \u0440\u0430\u0441\u043F\u043E\u0437\u043D\u0430\u0442\u044C \u0433\u043E\u043B\u043E\u0441\u043E\u0432\u043E\u0435 \u0447\u0435\u0440\u0435\u0437 Whisper. \u041F\u0440\u043E\u0432\u0435\u0440\u044C OpenAI API key \u0438 \u0431\u0430\u043B\u0430\u043D\u0441 \u0430\u043A\u043A\u0430\u0443\u043D\u0442\u0430 OpenAI \u0438\u043B\u0438 \u043F\u0440\u0438\u0448\u043B\u0438 \u0441\u043E\u043E\u0431\u0449\u0435\u043D\u0438\u0435 \u0442\u0435\u043A\u0441\u0442\u043E\u043C.";
             return;
@@ -66917,7 +67016,7 @@ Approve this request once? Expires in 5 minutes.`;
       text = "Installer administrator Telegram ID " + active.conversation.chatId + ` requested this work. Only the primary owner can approve.
 
 ` + text;
-    text = redactSecrets(text, [this.config.botToken, this.config.openaiApiKey ?? ""]);
+    text = this.redact(text);
     if (text.length > 12000) {
       reject();
       this.notice("An approval was declined because the operation is too large to review in Telegram.");
@@ -66927,7 +67026,7 @@ Approve this request once? Expires in 5 minutes.`;
     const keyboard = choices.map((choice) => {
       const token = randomBytes2(24).toString("base64url");
       prompt.buttons.set(token, choice.result);
-      return [{ text: redactSecrets(choice.label, [this.config.botToken, this.config.openaiApiKey ?? ""]), callback_data: token }];
+      return [{ text: this.redact(choice.label), callback_data: token }];
     });
     this.prompts.add(prompt);
     this.store.activityPhase(active.job.updateId, "processing", true);
@@ -67268,6 +67367,7 @@ Approve this request once? Expires in 5 minutes.`;
       timestamp: new Date(this.now()).toISOString(),
       service_active: this.initialized && !this.stopping && !this.transportDead,
       pid: process.pid,
+      connectionStoreVersion: 1,
       [this.config.engine === "claude" ? "claude_authenticated" : "codex_authenticated"]: this.authenticated,
       gateway: { poller: this.pollerOk ? "ok" : "down" },
       owner: { queue: this.store.queuedCount, stuck: Boolean(this.active && this.now() - this.active.startedAt > this.turnTimeoutMs) },
@@ -67355,7 +67455,7 @@ if (import.meta.main) {
           throw new Error("Task is too large");
         chunks.push(Buffer.from(chunk));
       }
-      const result = await runTeamTask(config2, JSON.parse(Buffer.concat(chunks).toString()), { signal: abort.signal, redact: (value) => redactSecrets(value, [config2.botToken, config2.openaiApiKey ?? ""]) });
+      const result = await runTeamTask(config2, JSON.parse(Buffer.concat(chunks).toString()), { signal: abort.signal, redact: (value) => redactSecrets(value, [config2.botToken]) });
       console.log(JSON.stringify({ result }));
     } else {
       if (config2.powerPreferencePath) {

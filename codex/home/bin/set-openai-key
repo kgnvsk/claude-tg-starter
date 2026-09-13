@@ -9,7 +9,7 @@ from pathlib import Path
 import sys
 
 HOME = Path.home()
-STATE = HOME / ".claude/onboarding-state.json"
+STATE = HOME / ".codex/onboarding-state.json"
 
 args = sys.argv[1:]
 if args == ["--stdin"]:

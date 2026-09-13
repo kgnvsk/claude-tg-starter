@@ -1,0 +1,414 @@
+#!/usr/bin/env python3
+"""Per-agent credential store. JSON stdin API exposes metadata only, never values.
+
+Standalone stdlib source also embedded verbatim by Novsky. The caller obtains
+home from its authorized runtime profile; this helper never authenticates a UI
+user. Internal Python readers can load_value; there is deliberately no get CLI.
+"""
+from __future__ import annotations
+
+from datetime import datetime, timezone
+import json
+import os
+from pathlib import Path
+import re
+import secrets
+import shlex
+import stat
+import sys
+from urllib import request, error
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
+
+SCHEMA = 1
+MAX_BYTES = 1024 * 1024
+PROVIDERS = {
+    'github': ('GITHUB_TOKEN', 'https://api.github.com/user', 'https://github.com/settings/personal-access-tokens'),
+    'vercel': ('VERCEL_TOKEN', 'https://api.vercel.com/v2/user', 'https://vercel.com/account/tokens'),
+    'apify': ('APIFY_TOKEN', 'https://api.apify.com/v2/users/me', 'https://console.apify.com/settings/integrations'),
+    'openai': ('OPENAI_API_KEY', 'https://api.openai.com/v1/models', 'https://platform.openai.com/api-keys'),
+}
+NATIVE = {
+    'github': ('GITHUB_OAUTH', ('.config/gh/hosts.yml',), 'https://cli.github.com/manual/gh_auth_login', 'Run gh auth login.'),
+    'claude': ('CLAUDE_OAUTH', ('.claude/.credentials.json',), 'https://claude.ai/login', 'Run claude auth login.'),
+    'codex': ('CODEX_OAUTH', ('.codex/auth.json',), 'https://chatgpt.com/', 'Run codex login.'),
+}
+ENV_NAME = re.compile(r'^[A-Z][A-Z0-9_]{0,63}$')
+RESERVED = {'HOME','PATH','PWD','OLDPWD','SHELL','USER','LOGNAME','IFS','ENV','BASH_ENV','ZDOTDIR',
+            'CDPATH','SHELLOPTS','BASHOPTS','PS4','PROMPT_COMMAND','TERM','TMP','TEMP','TMPDIR',
+            'SSL_CERT_FILE','SSL_CERT_DIR','CURL_CA_BUNDLE','REQUESTS_CA_BUNDLE','ALL_PROXY',
+            'HTTP_PROXY','HTTPS_PROXY','NO_PROXY','GITHUB_TOKEN','GH_TOKEN','VERCEL_TOKEN','APIFY_TOKEN',
+            'OPENAI_API_KEY','TELEGRAM_BOT_TOKEN','ANTHROPIC_API_KEY','GOG_KEYRING_PASSWORD',
+            'LANG','LANGUAGE','RUBYOPT','RUBYLIB','PERL5OPT','PERL5LIB','JAVA_TOOL_OPTIONS',
+            'JDK_JAVA_OPTIONS','CLASSPATH','AWKPATH','KUBECONFIG','DOCKER_CONFIG'}
+RESERVED_PREFIXES = ('LD_','DYLD_','NODE_','PYTHON','BASH_','GIT_','GH_','GITHUB_','NPM_','BUN_',
+                     'XDG_','CODEX_','CLAUDE_','NOVSKY_','SUDO_','SSH_','LC_','OPENAI_','TELEGRAM_')
+STATUSES = {'configured','connected','invalid','unavailable','missing'}
+
+
+class ConnectionError(ValueError):
+    pass
+
+
+def strict_json(raw):
+    def pairs(items):
+        result = {}
+        for key, value in items:
+            if key in result: raise ConnectionError('invalid_request')
+            result[key] = value
+        return result
+    return json.loads(raw, object_pairs_hook=pairs,
+                      parse_constant=lambda _: (_ for _ in ()).throw(ConnectionError('invalid_request')))
+
+
+def identity(provider, name):
+    if not isinstance(provider, str) or provider not in {*PROVIDERS, 'custom', *NATIVE}:
+        raise ConnectionError('invalid_provider')
+    if provider in NATIVE and name == NATIVE[provider][0]: raise ConnectionError('native_managed')
+    if provider in PROVIDERS:
+        if name != PROVIDERS[provider][0]: raise ConnectionError('invalid_name')
+    elif provider != 'custom': raise ConnectionError('native_managed')
+    elif (not isinstance(name, str) or not ENV_NAME.fullmatch(name) or name in RESERVED
+          or name.startswith(RESERVED_PREFIXES)):
+        raise ConnectionError('invalid_name')
+    return provider + ':' + name
+
+
+def validate_value(value):
+    if (not isinstance(value, str) or not 8 <= len(value) <= 16384
+            or any(ord(char) < 33 or ord(char) > 126 for char in value)):
+        raise ConnectionError('invalid_value')
+    return value
+
+
+def now():
+    return datetime.now(timezone.utc).isoformat(timespec='seconds')
+
+
+def _date(value):
+    if value is None: return None
+    if not isinstance(value, str) or not re.fullmatch(r'\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\+00:00', value): return None
+    try: datetime.fromisoformat(value)
+    except ValueError: return None
+    return value
+
+
+def metadata(provider, name, value=None, previous=None):
+    previous = previous if isinstance(previous, dict) else {}
+    status = previous.get('status')
+    return {'provider': provider, 'name': name, 'authType': 'api_key',
+            'status': (status if status in STATUSES - {'missing'} else 'configured') if value else 'missing',
+            'updatedAt': _date(previous.get('updatedAt')), 'checkedAt': _date(previous.get('checkedAt')),
+            'setupUrl': PROVIDERS[provider][2] if provider in PROVIDERS else None,
+            'reconnectHint': 'Add an API key in Connections.',
+            'migrationConflict': previous.get('migrationConflict') is True}
+
+
+class Store:
+    """Pin ancestry with no-follow dirfds; check regular files and ownership."""
+    def __init__(self, home):
+        if fcntl is None or os.name != 'posix': raise ConnectionError('unavailable')
+        if (not isinstance(home, str) or not home.startswith('/') or home == '/'
+                or any(part in {'', '.', '..'} for part in home.split('/')[1:]) or '\\' in home or '\x00' in home):
+            raise ConnectionError('invalid_home')
+        self.home = Path(home)
+        self.fds = []; self.links = []; self.lock = None
+        try:
+            self.fd = os.open('/', os.O_RDONLY | os.O_DIRECTORY)
+            self.fds.append(self.fd)
+            for part in self.home.parts[1:]: self._push(part)
+            self.homefd = self.fd
+            info = os.fstat(self.homefd)
+            self.uid, self.gid = info.st_uid, info.st_gid
+            if info.st_mode & 0o022 or os.geteuid() not in {0, self.uid}: raise ConnectionError('unsafe_path')
+            for part in ('.config', 'novsky'):
+                try: os.mkdir(part, 0o700, dir_fd=self.fd)
+                except FileExistsError: pass
+                else:
+                    if os.geteuid() == 0: os.chown(part, self.uid, self.gid, dir_fd=self.fd, follow_symlinks=False)
+                self._push(part)
+                info = os.fstat(self.fd)
+                if info.st_uid != self.uid or info.st_mode & 0o022: raise ConnectionError('unsafe_path')
+                if part == 'novsky': os.fchmod(self.fd, 0o700)
+            self.lock = self._open('.connections.lock', create=True)
+            fcntl.flock(self.lock, fcntl.LOCK_EX)
+            self.verify()
+            self.values = self._document('secrets.json', 'values')
+            self.records = self._document('connections.json', 'connections')
+            for key, value in self.values.items():
+                if not isinstance(key, str) or ':' not in key: raise ConnectionError('store_invalid')
+                provider, name = key.split(':', 1)
+                try: identity(provider, name)
+                except ConnectionError: raise ConnectionError('store_invalid') from None
+                if value is not None:
+                    try: validate_value(value)
+                    except ConnectionError: raise ConnectionError('store_invalid') from None
+            self.dirty_values = False; self.dirty_records = False
+        except BaseException:
+            self.close()
+            raise
+
+    def _push(self, name):
+        parent = self.fd
+        child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+        self.fds.append(child)
+        self.links.append((parent, name, child))
+        self.fd = child
+
+    def verify(self):
+        if self.lock is not None:
+            current = os.stat('.connections.lock', dir_fd=self.fd, follow_symlinks=False)
+            pinned = self._check(self.lock)
+            if (current.st_dev,current.st_ino) != (pinned.st_dev,pinned.st_ino):
+                raise ConnectionError('unsafe_path')
+        for parent, name, descriptor in self.links:
+            current = os.stat(name, dir_fd=parent, follow_symlinks=False)
+            pinned = os.fstat(descriptor)
+            if not stat.S_ISDIR(current.st_mode) or (current.st_dev,current.st_ino) != (pinned.st_dev,pinned.st_ino):
+                raise ConnectionError('unsafe_path')
+
+    def _check(self, descriptor, *, private=True):
+        info = os.fstat(descriptor)
+        if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid != self.uid
+                or (private and info.st_mode & 0o077) or info.st_size > MAX_BYTES):
+            raise ConnectionError('unsafe_path')
+        return info
+
+    def _open(self, name, *, create=False):
+        flags = os.O_NOFOLLOW | os.O_NONBLOCK | (os.O_RDWR if create else os.O_RDONLY)
+        made = False
+        if create:
+            try:
+                descriptor = os.open(name, flags | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=self.fd)
+                made = True
+            except FileExistsError: descriptor = os.open(name, flags, dir_fd=self.fd)
+        else: descriptor = os.open(name, flags, dir_fd=self.fd)
+        try:
+            if made and os.geteuid() == 0: os.fchown(descriptor, self.uid, self.gid)
+            self._check(descriptor)
+        except BaseException:
+            os.close(descriptor); raise
+        return descriptor
+
+    def _document(self, name, field):
+        try: descriptor = self._open(name)
+        except FileNotFoundError: return {}
+        with os.fdopen(descriptor, 'rb') as source: raw = source.read(MAX_BYTES + 1)
+        try:
+            value = strict_json(raw)
+            if (not isinstance(value, dict) or value.get('schemaVersion') != SCHEMA
+                    or not isinstance(value.get(field), dict) or len(value[field]) > 256):
+                raise ValueError()
+        except (ValueError, UnicodeError, RecursionError): raise ConnectionError('store_invalid') from None
+        return value[field]
+
+    def write(self, name, value):
+        self.verify()
+        try: descriptor = self._open(name)
+        except FileNotFoundError: pass
+        else: os.close(descriptor)
+        temporary = '.connections-' + secrets.token_hex(16) + '.tmp'
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=self.fd)
+        try:
+            if os.geteuid() == 0: os.fchown(descriptor, self.uid, self.gid)
+            with os.fdopen(descriptor, 'w', encoding='utf-8') as target:
+                json.dump(value, target, ensure_ascii=True, separators=(',', ':')); target.write('\n')
+                target.flush(); os.fsync(target.fileno())
+            self.verify()
+            os.replace(temporary, name, src_dir_fd=self.fd, dst_dir_fd=self.fd)
+            os.fsync(self.fd)
+        finally:
+            try: os.unlink(temporary, dir_fd=self.fd)
+            except FileNotFoundError: pass
+
+    def save(self):
+        if (len(self.values) > 256 or len(self.records) > 256
+                or len(json.dumps(self.values, ensure_ascii=True)) > MAX_BYTES - 128
+                or len(json.dumps(self.records, ensure_ascii=True)) > MAX_BYTES - 128):
+            raise ConnectionError('store_unavailable')
+        if self.dirty_values: self.write('secrets.json', {'schemaVersion': SCHEMA, 'values': self.values})
+        if self.dirty_records: self.write('connections.json', {'schemaVersion': SCHEMA, 'connections': self.records})
+        self.dirty_values = self.dirty_records = False
+
+    def legacy_read(self, relative):
+        """Read an explicit legacy file under pinned home; no following links."""
+        descriptor = os.dup(self.homefd)
+        try:
+            parts = relative.split('/')
+            for part in parts[:-1]:
+                child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=descriptor)
+                os.close(descriptor); descriptor = child
+                if os.fstat(descriptor).st_uid not in {0, self.uid}: raise ConnectionError('unsafe_path')
+            source = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=descriptor)
+            with os.fdopen(source, 'rb') as stream:
+                self._check(stream.fileno(), private=False)
+                return stream.read(MAX_BYTES + 1).decode('utf-8')
+        except FileNotFoundError: return ''
+        finally: os.close(descriptor)
+
+    def migrate(self):
+        candidates = {}
+        for provider, path in (('apify','.config/apify-token'),('vercel','.config/vercel-token')):
+            value = self.legacy_read(path).strip()
+            if value: candidates.setdefault(provider, []).append(value)
+        # Native OAuth and the narrowly scoped backup token are deliberately absent.
+        for relative in ('.claude/channels/telegram/.env', '.codex/channels/telegram/.env', '.agent-profile.env'):
+            raw = self.legacy_read(relative)
+            for line in raw.splitlines():
+                name, sep, value = line.removeprefix('export ').partition('=')
+                provider = next((p for p, spec in PROVIDERS.items() if spec[0] == name or p == 'github' and name == 'GH_TOKEN'), None)
+                if not sep or not provider: continue
+                try: words = shlex.split(value, comments=True)
+                except ValueError: continue
+                if len(words) == 1: candidates.setdefault(provider, []).append(words[0])
+        for provider, values in candidates.items():
+            name = PROVIDERS[provider][0]; key = identity(provider, name)
+            valid = []
+            for value in values:
+                try: valid.append(validate_value(value))
+                except ConnectionError: continue
+            if not valid: continue
+            if key not in self.values:
+                if len(set(valid)) > 1:
+                    # No account choice can safely represent conflicting engine
+                    # credentials. Existing readers keep their own legacy source
+                    # until an explicit save creates the canonical value.
+                    record = metadata(provider, name, previous=self.records.get(key))
+                    if not record['migrationConflict']:
+                        record['migrationConflict'] = True
+                        self.records[key] = record; self.dirty_records = True
+                    continue
+                self.values[key] = valid[0]; self.dirty_values = True
+                self.records[key] = metadata(provider, name, valid[0], {'updatedAt': now()}); self.dirty_records = True
+        self.save()
+
+    def legacy_provider_value(self, provider):
+        # These two adapters historically used a dedicated file. Never select
+        # another engine's environment, and never call this past a tombstone.
+        path = {'apify': '.config/apify-token', 'vercel': '.config/vercel-token'}.get(provider)
+        if not path: return ''
+        value = self.legacy_read(path).strip()
+        if not value: return ''
+        try: return validate_value(value)
+        except ConnectionError: return ''
+
+    def row(self, provider, name):
+        key = identity(provider, name)
+        return metadata(provider, name, self.values.get(key), self.records.get(key))
+
+    def rows(self):
+        rows = [self.row(provider, spec[0]) for provider, spec in PROVIDERS.items()]
+        rows.extend(self.row('custom', key.split(':',1)[1]) for key in sorted(self.values)
+                    if key.startswith('custom:') and self.values[key] is not None)
+        for provider, (name, paths, url, hint) in NATIVE.items():
+            # Presence is explicitly not a network validation of native OAuth.
+            present = any(bool(self.legacy_read(path)) for path in paths)
+            rows.append({'provider': provider, 'name': name, 'authType': 'native',
+                         'status': 'native' if present else 'missing', 'updatedAt': None, 'checkedAt': None,
+                         'setupUrl': url, 'reconnectHint': hint, 'migrationConflict': False})
+        return rows
+
+    def close(self):
+        if self.lock is not None: os.close(self.lock); self.lock = None
+        for descriptor in reversed(self.fds): os.close(descriptor)
+        self.fds.clear()
+
+    def __enter__(self): return self
+    def __exit__(self, *_): self.close()
+
+
+class NoRedirect(request.HTTPRedirectHandler):
+    def redirect_request(self, *_args, **_kwargs): return None
+
+
+def check_provider(provider, value):
+    if provider == 'custom': return 'configured'
+    endpoint = PROVIDERS[provider][1]
+    headers = {'Authorization': 'Bearer ' + value, 'Accept': 'application/json', 'User-Agent': 'Novsky-Agent-Connections/1'}
+    opener = request.build_opener(request.ProxyHandler({}), NoRedirect())
+    try:
+        with opener.open(request.Request(endpoint, headers=headers), timeout=12) as response:
+            return 'connected' if response.status == 200 else 'unavailable'
+    except error.HTTPError as exc:
+        return 'invalid' if exc.code in {401, 403} else 'unavailable'
+    except (OSError, error.URLError, ValueError): return 'unavailable'
+
+
+def _handle(document):
+    if not isinstance(document, dict): raise ConnectionError('invalid_request')
+    operation = document.get('operation')
+    allowed = {'operation', 'home'} | ({'provider','name','value'} if operation == 'put' else {'provider','name'} if operation in {'check','delete'} else set())
+    if operation not in {'list','put','check','delete'} or set(document) - allowed: raise ConnectionError('invalid_request')
+    if operation != 'list':
+        provider, name = document.get('provider'), document.get('name')
+        key = identity(provider, name)
+        if operation == 'put': validate_value(document.get('value'))
+    with Store(document.get('home')) as store:
+        store.migrate()
+        if operation == 'list': return {'schemaVersion': SCHEMA, 'connections': store.rows()}
+        if operation == 'put':
+            value = document['value']; status = check_provider(provider, value)
+            if status not in {'connected','configured'}:
+                return {'schemaVersion': SCHEMA, 'ok': False, 'error': 'invalid_key' if status == 'invalid' else 'unavailable', 'connection': store.row(provider, name)}
+            if key not in store.values and len(store.values) >= 256: raise ConnectionError('store_unavailable')
+            store.values[key] = value
+            store.records[key] = metadata(provider, name, value, {'status':status,'updatedAt':now(), 'checkedAt':now() if provider != 'custom' else None})
+            store.dirty_values = store.dirty_records = True
+        elif operation == 'delete':
+            store.values[key] = None  # Tombstone blocks stale legacy re-import.
+            store.records[key] = metadata(provider, name, previous={'updatedAt':now()})
+            store.dirty_values = store.dirty_records = True
+        else:
+            value = store.values.get(key)
+            if value:
+                record = store.row(provider, name)
+                record.update(status=check_provider(provider, value), checkedAt=now() if provider != 'custom' else None)
+                store.records[key] = record; store.dirty_records = True
+        store.save()
+        return {'schemaVersion': SCHEMA, 'ok': True, 'connection': store.row(provider, name)}
+
+
+def handle(document):
+    try: return _handle(document)
+    except ConnectionError as exc: code = str(exc)
+    except (NotADirectoryError, FileExistsError): code = 'unsafe_path'
+    except OSError as exc: code = 'unsafe_path' if exc.errno in {20, 40, 62} else 'store_unavailable'
+    except (ValueError, TypeError, UnicodeError, RecursionError): code = 'store_invalid'
+    return {'schemaVersion': SCHEMA, 'ok': False, 'error': code}
+
+
+def load_value(home, provider, name=None):
+    """Internal provider adapter; always reload, including after a deletion."""
+    name = name if provider == 'custom' else PROVIDERS.get(provider, (None,))[0]
+    key = identity(provider, name)
+    with Store(str(home)) as store:
+        store.migrate()
+        if key in store.values: return store.values[key] or ''
+        return store.legacy_provider_value(provider)
+
+
+def configure_local(home, provider, value):
+    """Hidden-prompt legacy setters keep their offline setup behavior."""
+    validate_value(value)
+    name = PROVIDERS[provider][0]; key = identity(provider, name)
+    with Store(str(home)) as store:
+        store.migrate(); store.values[key] = value
+        store.records[key] = metadata(provider,name,value,{'updatedAt':now()})
+        store.dirty_values = store.dirty_records = True; store.save()
+
+
+def main():
+    try:
+        if len(sys.argv) != 1: raise ConnectionError('invalid_request')
+        raw = sys.stdin.buffer.read(MAX_BYTES + 1)
+        if len(raw) > MAX_BYTES: raise ConnectionError('invalid_request')
+        result = handle(strict_json(raw))
+    except (ValueError, UnicodeError, RecursionError):
+        result = {'schemaVersion': SCHEMA, 'ok': False, 'error': 'invalid_request'}
+    print(json.dumps(result, separators=(',', ':')))
+    return 0 if result.get('ok', True) else 1
+
+
+if __name__ == '__main__': raise SystemExit(main())

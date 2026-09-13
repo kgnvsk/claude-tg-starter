@@ -183,8 +183,16 @@ def _verify_reconnect_inventory(temporary, manifest, observed, *, system_context
         if not isinstance(provider, str) or provider not in RECONNECT_CATALOG:
             raise ValueError("invalid reconnect inventory integration")
         location, setup_url = RECONNECT_CATALOG[provider]
-        if row != {"provider": provider, "configLocation": location, "scopes": [],
-                   "setupUrl": setup_url, "action": "reauthorize"}:
+        expected = {"provider": provider, "configLocation": location, "scopes": [],
+                    "setupUrl": setup_url, "action": "reauthorize"}
+        if "canonicalName" in row:
+            canonical = {"github":"GITHUB_TOKEN", "vercel":"VERCEL_TOKEN", "apify":"APIFY_TOKEN", "openai-api":"OPENAI_API_KEY"}
+            name = row["canonicalName"]
+            if (not isinstance(name, str) or not re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", name)
+                    or provider != "other-integration" and canonical.get(provider) != name):
+                raise ValueError("invalid reconnect inventory integration")
+            expected.update(canonicalName=name, reconnectHint="Add an API key in Connections.")
+        if row != expected:
             raise ValueError("invalid reconnect inventory integration")
 
 

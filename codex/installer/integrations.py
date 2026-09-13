@@ -285,6 +285,17 @@ class Redactor:
                         self.add(words[0])
                 except ValueError:
                     self.add(match[2].strip().strip("\"'"))
+        canonical = self.read(home / ".config/novsky/secrets.json")
+        if canonical:
+            try:
+                document = strict_json(canonical)
+                if not isinstance(document, dict) or document.get("schemaVersion") != 1 or not isinstance(document.get("values"), dict):
+                    raise ValueError()
+                for value in document["values"].values():
+                    if value is not None and not isinstance(value, str): raise ValueError()
+                    self.add(value)
+            except (ValueError, TypeError, RecursionError):
+                raise Denied("A configured credential file needs repair before integrations can run.") from None
         for name in ("apify-token", "asana-token", "hubspot-token", "vercel-token"):
             self.add(self.read(home / ".config" / name).strip())
         for name in ("meta-ads.json", "gogcli/credentials.json", "gog/credentials.json", "gcloud/application_default_credentials.json"):

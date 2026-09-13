@@ -23,7 +23,7 @@ import zlib
 PRODUCT_ID = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 REVISION = re.compile(r"^[0-9a-f]{40}$")
 DIGEST = re.compile(r"^[0-9a-f]{64}$")
-MANAGED_PATH = re.compile(r"^bin/[a-z0-9][a-z0-9.-]*$")
+MANAGED_PATH = re.compile(r"^bin/[a-z0-9][a-z0-9_.-]*$")
 RENDER_PLACEHOLDERS = (
     "AGENT_NAME",
     "OWNER_NAME",

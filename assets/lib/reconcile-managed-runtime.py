@@ -10,7 +10,7 @@ import sys
 import tempfile
 
 
-TOOL_NAME = re.compile(r"^[a-z0-9][a-z0-9.-]*$")
+TOOL_NAME = re.compile(r"^[a-z0-9][a-z0-9_.-]*$")
 MANAGED_BIN_NAMES = frozenset(
     {
         "access-update",
@@ -23,6 +23,10 @@ MANAGED_BIN_NAMES = frozenset(
         "agent-full-restore",
         "agent-backup-github-store",
         "agent-backup-sanitize",
+        "agent-connections",
+        "agent_connections.py",
+        "agent-provider-run",
+        "gh",
         "agent-goal",
         "allow-chat",
         "apify-social",

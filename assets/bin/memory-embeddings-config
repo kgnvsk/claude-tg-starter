@@ -127,6 +127,11 @@ def main() -> int:
     try:
         lines = ENV.read_text(encoding="utf-8").splitlines() if ENV.exists() else []
         values = parse_values(lines)
+        try:
+            from agent_connections import provider_environment
+        except ModuleNotFoundError:
+            from assets.bin.agent_connections import provider_environment
+        values = provider_environment(HOME.resolve(), "openai", values)
         primary_key = values.get("OPENAI_API_KEY", "")
         fallback_key = values.get("OPENAI_API_KEY_FALLBACK", "")
         key_present = bool(primary_key or fallback_key)

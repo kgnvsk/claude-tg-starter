@@ -1,8 +1,8 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-09-13.fbe9016f409f`
+- Реліз: `2026-09-13.23b78d03e2b9`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `fbe9016f409f87e841255713ce059fa28d786658`
+- Ревізія вихідного комплекту: `23b78d03e2b97012bd37a33d521033dbfb5280e3`
 - Дата релізу: `2026-09-13`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
@@ -19,8 +19,14 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    fix: allow managed backup chat helpers during installation
-    feat: connect private backups through owner Telegram conversation
+    fix(ci): keep managed runtime defaults in sorted order
+    fix(ci): admit the connection reader in safe update baselines
+    Sync canonical connection-aware runtime from immutable Novsky source
+    Pin connection consumer readiness to verified Claude and Codex payloads
+    Preserve conflicting legacy credentials until an explicit connection choice
+    Scrub canonical connection keys from encrypted system context
+    Preserve isolated GitHub OAuth accounts when a general PAT is configured
+    Add private per-agent connections with live credential readers and safe backups
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не

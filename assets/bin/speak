@@ -4,16 +4,22 @@
 # Usage: speak <chat_id> "text"   [env: OPENAI_TTS_VOICE=onyx OPENAI_TTS_SPEED=1.1 OPENAI_TTS_STYLE="..."]
 set -e
 
+# Re-enter once with the current store value; the parent bot need not restart.
+if [ "${1:-}" = "--novsky-provider-ready" ]; then
+  shift
+else
+  if [ -f "$HOME/.claude/channels/telegram/.env" ]; then
+    set -a
+    . "$HOME/.claude/channels/telegram/.env"
+    set +a
+  fi
+  exec python3 "$(dirname "$0")/agent-provider-run" openai /bin/bash "$0" --novsky-provider-ready "$@"
+fi
+
 CHAT_ID="$1"
 TEXT="$2"
 [ -z "$CHAT_ID" ] || [ -z "$TEXT" ] && { echo "Usage: speak <chat_id> \"text\"" >&2; exit 1; }
 
-# Load env (same source as transcribe)
-if [ -f "$HOME/.claude/channels/telegram/.env" ]; then
-  set -a
-  . "$HOME/.claude/channels/telegram/.env"
-  set +a
-fi
 [ -z "$OPENAI_API_KEY" ] && { echo "No OPENAI_API_KEY" >&2; exit 1; }
 [ -z "$TELEGRAM_BOT_TOKEN" ] && { echo "No TELEGRAM_BOT_TOKEN" >&2; exit 1; }
 
@@ -31,12 +37,11 @@ OGG="/tmp/speak-$$.ogg"
 trap 'rm -f "$OGG"' EXIT
 
 # 1. TTS → ogg/opus (Telegram's native voice format)
-HTTP=$(curl -sS -o "$OGG" -w "%{http_code}" -X POST "https://api.openai.com/v1/audio/speech" \
-  -H "Authorization: Bearer $OPENAI_API_KEY" \
+HTTP=$(printf 'Authorization: Bearer %s\n' "$OPENAI_API_KEY" | curl -H @- -sS -o "$OGG" -w "%{http_code}" -X POST "https://api.openai.com/v1/audio/speech" \
   -H "Content-Type: application/json" \
   -d "$(jq -n --arg t "$TEXT" --arg v "$VOICE" --argjson s "$SPEED" --arg i "$STYLE" '{model:"gpt-4o-mini-tts", input:$t, voice:$v, speed:$s, instructions:$i, response_format:"opus"}')")
 if [ "$HTTP" != "200" ]; then
-  echo "TTS failed (HTTP $HTTP): $(head -c 300 "$OGG")" >&2
+  echo "TTS failed (HTTP $HTTP)" >&2
   exit 1
 fi
 

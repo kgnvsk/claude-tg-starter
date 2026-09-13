@@ -356,6 +356,11 @@ def openai_keys() -> list[str]:
         lines = EMBED_ENV.read_text(encoding="utf-8").splitlines()
         values = embedding_env(lines)
         consent = values.get("MEMORY_EMBEDDINGS_OPENAI", "")
+        try:
+            from agent_connections import provider_environment
+        except ModuleNotFoundError:
+            from assets.bin.agent_connections import provider_environment
+        values = provider_environment(HOME.resolve(), "openai", values)
         primary = values.get("OPENAI_API_KEY", "")
         fallback = values.get("OPENAI_API_KEY_FALLBACK", "")
     except (OSError, UnicodeError, ValueError):
