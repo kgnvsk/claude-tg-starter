@@ -73,6 +73,7 @@ PATTERNS = (
     re.compile(r'(?<![A-Za-z0-9+/=_-])[A-Za-z0-9+/=_-]{80,}(?![A-Za-z0-9+/=_-])'),
 )
 RECONNECT_CATALOG = {
+    'whatsapp': ('WhatsApp linked-device session','https://web.whatsapp.com/'),
     'telegram': ('Telegram connection configuration','https://t.me/BotFather'),
     'openai-codex': ('Codex authentication configuration','https://chatgpt.com/'),
     'openai-api': ('OpenAI API configuration','https://platform.openai.com/api-keys'),
@@ -196,16 +197,21 @@ def classify_path(path, *, is_source=False):
         return 'browser-profile-cannot-be-sanitized'
     if base in {'.env','.npmrc','.netrc','.pypirc','.git-credentials','hosts.yml','auth.json','oauth.json','cookies.txt','cookies.sqlite','credentials','credentials.json','.credentials.json','recovery-key.txt','github-token','secret.key','secrets.json'} or base.startswith(('.env.','id_rsa','id_ed25519','id_ecdsa')):
         return 'credential-file'
+    if base in {'session.db','session.db-wal','session.db-shm'} and 'wa-bridge' in parts:
+        return 'credential-or-session-store'
     source_code=is_source or source_code_path(base)
     documentation=Path(base).suffix in {'.md','.mdx','.rst','.html'}
-    if Path(base).suffix in {'.key','.pem','.p12','.pfx','.jks','.keystore'} or not (source_code or documentation) and re.search(r'(?:^|[-_.])(?:credentials?|oauth|tokens?|secrets?|cookies?|passwords?)(?:[-_.]|$)',base):
+    media_title=(Path(base).suffix in ATTACHMENT_SUFFIXES and not re.fullmatch(
+        r'credentials?|oauth|tokens?|secrets?|cookies?|passwords?',Path(base).stem))
+    credential_name=re.search(r'(?:^|[-_.])(?:credentials?|oauth|tokens?|secrets?|cookies?|passwords?)(?:[-_.](?:backup|old|orig|copy|saved|json|env|ya?ml|toml|txt|db|sqlite3?|cfg|conf|ini|bak))*$',Path(base).stem)
+    if Path(base).suffix in {'.key','.pem','.p12','.pfx','.jks','.keystore'} or not (source_code or documentation or media_title) and credential_name:
         return 'credential-file'
     return None
 
 def reconnect_for(path,data=b''):
     lower = str(path).lower()
     provider = next((name for terms,name in (
-        (('telegram',),'telegram'), (('.codex','novsky/codex'),'openai-codex'),
+        (('telegram',),'telegram'), (('wa-bridge','whatsapp'),'whatsapp'), (('.codex','novsky/codex'),'openai-codex'),
         (('.claude','claude-tg'),'anthropic-claude'), (('github','/.config/gh/'),'github'),
         (('gogcli','gcal','google'),'google'), (('slack',),'slack'), (('.aws','aws'),'aws'),
         (('clickup',),'clickup'), (('vercel',),'vercel'), (('apify',),'apify'),
@@ -980,6 +986,19 @@ def sanitize_sqlite(source,destination,*,path,known_secrets=(),timeout_seconds=3
                         if secret_key(column[1]) or secret_row and str(column[1]).lower() in {'value','data','content'}:known.add(value.encode())
         output.execute('PRAGMA trusted_schema=OFF')
         known=_prepare_known(known)
+        # Preassign opaque aliases for redacted keys before copying any rows.
+        # Applying the same map to references preserves joins and uniqueness;
+        # replacing every primary key with one marker would lose whole tables.
+        for name,columns,_sql in table_defs:
+            key_columns={column[1] for column in columns if column[5]}
+            for index in original.execute('PRAGMA index_list('+quote_name(name)+')').fetchall():
+                if index[2]:
+                    key_columns.update(row[2] for row in original.execute('PRAGMA index_info('+quote_name(index[1])+')') if row[2])
+            for column in columns:
+                if column[1] not in key_columns:continue
+                for (value,) in original.execute('SELECT '+quote_name(column[1])+' FROM '+quote_name(name)):
+                    if isinstance(value,bytes) or isinstance(value,str) and (secret_key(column[1]) or _text(value,known)[1]):
+                        placeholder(value)
         for name,columns,sql in table_defs:
             clean_schema,count=_plain(sql,known)
             redactions+=count
@@ -999,6 +1018,8 @@ def sanitize_sqlite(source,destination,*,path,known_secrets=(),timeout_seconds=3
                         pass
                     elif invalidate and column[1]=='state' and value in inactive_states[name]:
                         value='expired';invalidated+=1
+                    elif isinstance(value,(str,bytes)) and value in replacements:
+                        value=placeholder(value).encode() if isinstance(value,bytes) else placeholder(value);redactions+=1
                     elif isinstance(value,bytes):value=b'' if column[3] else None;redactions+=1
                     elif secret_key(column[1]) or secret_row and str(column[1]).lower() in {'value','data','content'}:
                         value=placeholder(value) if isinstance(value,str) else None;redactions+=1

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import hashlib
+import gzip
 import importlib.machinery
 import importlib.util
 import io
@@ -301,7 +302,8 @@ def create_snapshot(home: Path, output: Path, recipient: str, *, age_binary: str
             temporary_output = Path(temporary_name).resolve()
             with os.fdopen(descriptor, "wb") as ciphertext:
                 process = subprocess.Popen([str(age_binary), "-r", recipient], stdin=subprocess.PIPE, stdout=ciphertext, stderr=subprocess.DEVNULL)
-                with tarfile.open(fileobj=process.stdin, mode="w|gz", format=tarfile.PAX_FORMAT) as archive:
+                with gzip.GzipFile(fileobj=process.stdin, mode="wb", compresslevel=3, mtime=0) as compressed, \
+                        tarfile.open(fileobj=compressed, mode="w|", format=tarfile.PAX_FORMAT) as archive:
 
                     def add_directory(name, source_stat=None):
                         if name in entries:
@@ -434,6 +436,10 @@ def create_snapshot(home: Path, output: Path, recipient: str, *, age_binary: str
                                 failed(name, "symlink-resolution-failed")
                                 return
                             if not _inside(resolved, home):
+                                if (relative.startswith('.config/pulse/') and source.name.endswith('-runtime')
+                                        and resolved.parent == Path('/tmp') and resolved.name.startswith('pulse-')):
+                                    excluded(name, 'regenerable-audio-runtime-link')
+                                    return
                                 roots = [Path(root).resolve() for root in ("/usr/bin", "/bin", "/usr/local/bin")]
                                 try:
                                     info = resolved.stat()
@@ -496,10 +502,12 @@ def create_snapshot(home: Path, output: Path, recipient: str, *, age_binary: str
                             if str(parent) != ".":
                                 add_directory(str(parent))
                         add_regular(source, name, source.stat())
+                    excluded_labels = {item['path'] for item in coverage['exclusions']}
                     for name, (target, data) in safe_links.items():
                         target_name = "home" if target == home else "home/" + target.relative_to(home).as_posix()
-                        intentionally_excluded = any(target_name == item["path"] or target_name.startswith(item["path"] + "/")
-                                                     for item in coverage["exclusions"])
+                        target_parts = PurePosixPath(target_name).parts
+                        intentionally_excluded = any(safe_label('/'.join(target_parts[:length])) in excluded_labels
+                                                     for length in range(1, len(target_parts) + 1))
                         if intentionally_excluded:
                             excluded(name, "link-target-intentionally-excluded")
                         elif target.exists() and target_name not in entries:
