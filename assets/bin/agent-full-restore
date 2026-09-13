@@ -30,6 +30,7 @@ SHA256 = re.compile(r"[0-9a-f]{64}")
 # This helper travels alone with release assets. Keep this schema aligned with
 # agent-backup-sanitize; only exact catalog values are accepted from an archive.
 RECONNECT_CATALOG = {
+    "whatsapp": ("WhatsApp linked-device session", "https://web.whatsapp.com/"),
     "telegram": ("Telegram connection configuration", "https://t.me/BotFather"),
     "openai-codex": ("Codex authentication configuration", "https://chatgpt.com/"),
     "openai-api": ("OpenAI API configuration", "https://platform.openai.com/api-keys"),

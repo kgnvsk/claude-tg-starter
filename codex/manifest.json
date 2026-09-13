@@ -9,7 +9,7 @@
     "standalone-server-v1"
   ],
   "source": "codex/starter/product.json",
-  "sourceRevision": "074a96b4ced5bbb80bf3122ac2061e9993791c42",
+  "sourceRevision": "4abd5b2e07214f4a5dfceb6df25305b2f056cfd0",
   "sourceDirty": false,
   "features": [
     "browser"
@@ -90,7 +90,7 @@
     "assets/agents/researcher.md": "520cb8590e94a81923f5663cedf92976f50f0dcf705045b34496efc897859395",
     "assets/bin/agent-backup": "126b15a172ac3f1584ba7d0951c286faca9e8dd545e863d1b3d4935258664373",
     "assets/bin/agent-backup-github-store": "318b484508262693e021844aa7df45d5b125ee965a24c18b9ca9b1ba64418ec1",
-    "assets/bin/agent-full-restore": "956419902b572e6116bae5686aee5c19a30c1318cf7b9b67fc00f553f376401c",
+    "assets/bin/agent-full-restore": "3896f7141198791bf7430fcd509fa250e491671be746a7ebfc49c48c8aa1e7ac",
     "assets/bin/agent-full-snapshot": "27ac65b14f26e051c1faa266f659cd720fda868c02ee5c6b63f18a5ef2c09555",
     "assets/bin/agent-github-backup": "aecb12222f61453c9bff3aa162b3533a4455415ffa6993a522593cb7d8dd2cb7",
     "assets/bin/agent-goal": "5a6b434b195f9eda4790635e563091d7623ae341baf6f60e033e022d820f1bbb",
@@ -133,7 +133,7 @@
     "home/bin/agent-backup-github-store": "318b484508262693e021844aa7df45d5b125ee965a24c18b9ca9b1ba64418ec1",
     "home/bin/agent-backup-sanitize": "b743ec0d11e58aa2a933e109d2389200581fea5b5b35742d140566607bd58b0b",
     "home/bin/agent-full-backup": "12c8f25803538475e6e06cccc092cc9a83c5b9c593d15e77c3beabd20cf94a60",
-    "home/bin/agent-full-restore": "956419902b572e6116bae5686aee5c19a30c1318cf7b9b67fc00f553f376401c",
+    "home/bin/agent-full-restore": "3896f7141198791bf7430fcd509fa250e491671be746a7ebfc49c48c8aa1e7ac",
     "home/bin/agent-full-snapshot": "27ac65b14f26e051c1faa266f659cd720fda868c02ee5c6b63f18a5ef2c09555",
     "home/bin/agent-github-backup": "aecb12222f61453c9bff3aa162b3533a4455415ffa6993a522593cb7d8dd2cb7",
     "home/bin/agent-goal": "6c24a8a26c78d6e43b66040088153679dc0860fe49335ed75d2a15387a218391",
