@@ -14,7 +14,7 @@ export DEBIAN_FRONTEND=noninteractive
 # jq, sqlite3 and screen are load-bearing for self-healing and the service unit,
 # not conveniences: without them the watchdogs go quiet and the unit cannot start.
 PACKAGES=(
-  git curl ca-certificates gnupg screen jq ffmpeg sqlite3
+  git gh curl ca-certificates gnupg screen jq ffmpeg sqlite3
   python3 python3-pip python3-venv python3-numpy pipx unzip sudo cron
 )
 
@@ -52,7 +52,7 @@ SOURCES
   apt-get install -y nodejs
 fi
 
-for command in git curl screen jq ffmpeg sqlite3 python3 node npm pipx setpriv; do
+for command in git gh curl screen jq ffmpeg sqlite3 python3 node npm pipx setpriv; do
   command -v "$command" >/dev/null 2>&1 || {
     echo "FATAL: $command досі відсутній після базового налаштування" >&2
     exit 1

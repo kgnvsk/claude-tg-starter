@@ -1,0 +1,155 @@
+#!/usr/bin/env python3
+"""Deterministic owner onboarding. Input is a pipe; output never contains a token."""
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import os
+from pathlib import Path
+import re
+import sys
+import time
+from urllib.parse import urlencode
+
+loader = importlib.machinery.SourceFileLoader('full_backup_chat_backend', str(Path(__file__).with_name('agent-full-backup')))
+spec = importlib.util.spec_from_loader(loader.name, loader)
+backend = importlib.util.module_from_spec(spec)
+loader.exec_module(backend)
+
+TOKEN = re.compile(r'(?:github_pat_|gh[pousr]_)[A-Za-z0-9_]+')
+INTENT = re.compile(r'(?i)(?:б[еэ]к[аі]п|backup|резервн.{0,12}коп)')
+CANCEL = re.compile(r'(?i)^(?:скасуй|скасувати|відміна|отмена|отмени|cancel|стоп|stop)[.!\s]*$')
+SAVED = re.compile(r'(?i)(?:збер[іе]г|збережено|сохранил|сохранено|saved)')
+TTL = 24 * 3600
+
+
+def reply(text, **extra):
+    return {'ok': True, 'text': text, **extra}
+
+
+def handle(backup, value, now=None):
+    now = int(time.time()) if now is None else now
+    owner = value.get('owner', '')
+    if not re.fullmatch(r'[1-9][0-9]{0,18}', owner):
+        raise backend.BackupError('owner-required')
+    state_path = backup.directory / 'chat.json'
+    state = backup.load(state_path)
+    text = str(value.get('text', ''))
+    if len(text) > 8192:
+        return reply('Надішли посилання або токен окремим коротким повідомленням.')
+    # Transport supplies exact verified owner, never a model-selected account.
+    if state and (state.get('owner') != owner or now > state.get('expires', 0)):
+        state = {}
+    if value.get('operation') == 'wait-context':
+        # The root collector runs every minute after the recovery recipient exists.
+        # Wait outside the model instead of failing a fast first-time setup.
+        deadline = time.monotonic() + 150
+        while True:
+            try:
+                backup.context()
+                return {'ok': True}
+            except backend.BackupError as exc:
+                if str(exc) != 'system-context-not-ready' or time.monotonic() >= deadline:
+                    raise
+                time.sleep(5)
+    if value.get('operation') == 'finished':
+        backup.save(state_path, {})
+        return {'ok': True}
+    if value.get('operation') == 'key-delivered':
+        if state.get('phase') == 'key':
+            state['keyDelivered'] = True
+            backup.save(state_path, state)
+        return {'ok': True}
+    if CANCEL.fullmatch(text.strip()):
+        backup.save(state_path, {})
+        return reply('Діалог налаштування закрито. Уже ввімкнений автоматичний бекап продовжує працювати.')
+    status = backup.status()
+    tokens = TOKEN.findall(text)
+    if tokens:
+        if value.get('deleted') is not True:
+            return reply('Не вдалося видалити повідомлення з токеном. Видали його та відклич цей токен у GitHub. Новий надішли після повторного підключення.')
+        if state.get('phase') != 'token' or len(tokens) != 1:
+            return reply('Токен не використано, повідомлення видалено. Спочатку напиши «хочу підключити бекап» і надішли адресу приватного репозиторію.')
+        prepared = backup.prepare()
+        backup.connect(state['repository'], tokens[0])
+        if prepared.get('keySaved'):
+            state['phase'] = 'ready'
+            backup.save(state_path, state)
+            return reply('Доступ перевірено. Напиши «увімкни бекап», щоб запустити першу копію та розклад.')
+        state.update(phase='key', keyDelivered=False)
+        backup.save(state_path, state)
+        return reply('Доступ до приватного репозиторію перевірено. Збережи цей файл ключа на своєму комп’ютері або в менеджері паролів. Він потрібен для відновлення після втрати сервера. Потім напиши «ключ збережено».', recoveryKey=True)
+    if state.get('phase') == 'github':
+        return reply('Очікую підтвердження входу на сторінці GitHub. Щоб закрити налаштування, напиши «скасуй».', githubLogin=True, nonce=state['nonce'])
+    if state.get('phase') == 'key':
+        if SAVED.search(text) and state.get('keyDelivered'):
+            backup.confirm_key_saved()
+            state['phase'] = 'ready'
+            backup.save(state_path, state)
+            return reply('Ключ збережено. Запускаю першу копію та автоматичний бекап. Повідомлю результат після перевірки завантаження.', enable=True)
+        return reply('Збережи файл ключа окремо від сервера та напиши «ключ збережено». Повторно надсилаю файл.', recoveryKey=True)
+    if state.get('phase') == 'ready':
+        if INTENT.search(text) or SAVED.search(text):
+            return reply('Запускаю копію та автоматичний бекап. Повідомлю результат після перевірки завантаження.', enable=True)
+        return reply('Напиши «увімкни бекап» або «скасуй».')
+    if state.get('phase') in ('repository', 'token'):
+        match = re.fullmatch(r'(?:https://github\.com/)?([A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9][A-Za-z0-9_.-]{0,99})/?', text.strip())
+        if match:
+            state.update(phase='token', repository=match[1])
+            backup.save(state_path, state)
+            return reply(token_guide(match[1]))
+        if state.get('phase') == 'token':
+            return reply(token_guide(state['repository']))
+    if status.get('configured') and not state and not status.get('enabled'):
+        return reply('Доступ і ключ збережено, але автобекап ще не ввімкнений. Напиши «повтори бекап», щоб запустити копію та розклад.', enable=bool(re.search(r'(?i)(?:повтор|retry|увімк|включ)', text)))
+    if status.get('configured') and status.get('enabled'):
+        if re.search(r'(?i)(?:повтор|retry)', text):
+            return reply('Повторюю створення й перевірку копії.', enable=True)
+        when = status.get('lastSuccessAt')
+        if when:
+            date = time.strftime('%d.%m.%Y %H:%M UTC', time.gmtime(when))
+            tail = ' Остання спроба завершилася помилкою; попередню копію збережено.' if status.get('lastError') else ''
+            if not re.search(r'(?i)(?:онов|обнов|зам[іе]н|токен|token)', text):
+                return reply('Автобекап увімкнений. Остання успішна копія: ' + date + '.' + tail)
+        elif not re.search(r'(?i)(?:онов|обнов|зам[іе]н|токен|token)', text):
+            return reply('Автобекап увімкнений, але успішну першу копію ще не підтверджено. Напиши «повтори бекап», щоб повторити перевірку.', enable=bool(re.search(r'(?i)(?:повтор|retry)', text)))
+    if not re.search(r'(?i)(?:вручн|manual|через токен)', text):
+        state = {'owner': owner, 'phase': 'github', 'expires': now + TTL, 'nonce': backend.secrets.token_hex(12)}
+        backup.save(state_path, state)
+        return reply('Підключимо GitHub. Зараз надішлю посилання й одноразовий код для входу. Якщо акаунта ще немає, спочатку зареєструйся на https://github.com/signup. Далі я сам створю приватний репозиторій і налаштую копії.', githubLogin=True, nonce=state['nonce'])
+    state = {'owner': owner, 'phase': 'repository', 'expires': now + TTL}
+    backup.save(state_path, state)
+    return reply('Підключимо автоматичний бекап. Якщо ще немає GitHub — зареєструйся: https://github.com/signup\n\nВідкрий https://github.com/new, назви репозиторій my-agent-backup, обери Private та додай README. Створи його й надішли сюди посилання. Далі підкажу, як дати доступ лише до цього репозиторію. Термінал не потрібен. Щоб перервати діалог, напиши «скасуй».')
+
+
+def token_guide(repo):
+    url = 'https://github.com/settings/personal-access-tokens/new?' + urlencode({'name': 'Agent backup', 'target_name': repo.split('/')[0], 'expires_in': 90, 'contents': 'write'})
+    return ('Тепер створи токен доступу: ' + url + '\n\nRepository access → Only select repositories → обери лише ' + repo.split('/')[1] + '.\nPermissions → Contents: Read and write. Інші права не потрібні. Натисни Generate token, скопіюй його та надішли сюди окремим текстовим повідомленням.\n\nОбробник видалить це повідомлення та збереже токен окремо від переписки й бекапу. Не надсилай пароль GitHub. Токен діятиме 90 днів; після завершення строку його потрібно оновити.')
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--home', type=Path, required=True)
+    args = parser.parse_args()
+    descriptor = None
+    try:
+        raw = sys.stdin.buffer.read(16385)
+        if len(raw) > 16384:
+            raise backend.BackupError('input-too-large')
+        value = json.loads(raw)
+        backup = backend.Backup(args.home)
+        descriptor = backup.lock()
+        result = handle(backup, value)
+    except Exception as exc:
+        code = str(exc) if isinstance(exc, backend.BackupError) else str(getattr(exc, 'code', ''))
+        if not backend.ERROR_CODE.fullmatch(code):
+            code = 'setup-failed'
+        result = {'ok': False, 'error': code}
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    print(json.dumps(result, ensure_ascii=False))
+
+
+if __name__ == '__main__':
+    main()

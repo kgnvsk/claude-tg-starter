@@ -1,0 +1,142 @@
+#!/usr/bin/env python3
+"""GitHub CLI browser login and private repository setup; JSON events only."""
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import os
+from pathlib import Path
+import re
+import selectors
+import shutil
+import subprocess
+import sys
+import time
+
+loader = importlib.machinery.SourceFileLoader('backup_chat_login', str(Path(__file__).with_name('agent-backup-chat')))
+spec = importlib.util.spec_from_loader(loader.name, loader)
+chat = importlib.util.module_from_spec(spec)
+loader.exec_module(chat)
+backend = chat.backend
+
+
+def emit(value):
+    print(json.dumps(value, ensure_ascii=False), flush=True)
+
+
+def login(backup, owner, nonce):
+    def current():
+        state = backup.load(backup.directory / 'chat.json')
+        if state.get('owner') != owner or state.get('nonce') != nonce or state.get('phase') != 'github':
+            raise backend.BackupError('setup-cancelled')
+        return state
+    current()
+    prepared = backup.prepare()
+    config = backup.load(backup.config_path)
+    gh = shutil.which('gh')
+    if not gh:
+        raise backend.BackupError('github-cli-missing')
+    directory = backup.home
+    for part in ('.config', 'gh', 'novsky-backup-' + config['installationId']):
+        directory /= part
+        if directory.is_symlink() or (directory.exists() and not directory.is_dir()):
+            raise backend.BackupError('github-config-unsafe')
+        directory.mkdir(mode=0o700, exist_ok=True)
+    os.chmod(directory, 0o700)
+    env = {'HOME': str(backup.home), 'GH_CONFIG_DIR': str(directory),
+           'PATH': '/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin', 'LANG': 'C.UTF-8', 'LC_ALL': 'C',
+           'GH_BROWSER': '/usr/bin/true', 'GH_PROMPT_DISABLED': '1', 'GH_NO_UPDATE_NOTIFIER': '1'}
+    def command(args):
+        result = subprocess.run([gh, *args], env=env, cwd=backup.home, stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=120)
+        if result.returncode or len(result.stdout) > 131072:
+            raise backend.BackupError('github-operation-failed')
+        return result.stdout.decode().strip()
+    help_text = command(['auth', 'login', '--help'])
+    storage = ['--insecure-storage'] if '--insecure-storage' in help_text else []
+    protocol = ['--git-protocol', 'https'] if '--git-protocol' in help_text else []
+    process = subprocess.Popen([gh, 'auth', 'login', '--hostname', 'github.com', '--web', *protocol, *storage],
+                               env=env, cwd=backup.home, stdin=subprocess.PIPE,
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    process.stdin.write(b'\n'); process.stdin.close()
+    selector = selectors.DefaultSelector()
+    selector.register(process.stdout, selectors.EVENT_READ)
+    end = time.monotonic() + 600
+    output = ''
+    sent = False
+    try:
+        while process.poll() is None:
+            current()
+            if time.monotonic() > end:
+                raise backend.BackupError('github-login-expired')
+            for key, _ in selector.select(timeout=1):
+                chunk = os.read(key.fd, 4096).decode(errors='replace')
+                output = (output + chunk)[-8192:]
+                match = re.search(r'one-time code:\s*([A-Z0-9]{4}-[A-Z0-9]{4})', output)
+                if match and not sent:
+                    emit({'progress': True, 'text': 'Відкрий https://github.com/login/device і введи код ' + match[1] + '. Увійди у свій GitHub та підтвердь доступ GitHub CLI. Пароль або токен сюди надсилати не потрібно. Після входу я сам створю приватний репозиторій.'})
+                    sent = True
+        if process.returncode:
+            raise backend.BackupError('github-login-failed')
+    finally:
+        selector.close()
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill(); process.wait()
+    state = current()
+    for path in directory.iterdir():
+        if path.is_symlink() or not path.is_file():
+            raise backend.BackupError('github-config-unsafe')
+        os.chmod(path, 0o600)
+    account = command(['api', 'user', '--jq', '.login'])
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9-]{0,38}', account):
+        raise backend.BackupError('github-account-invalid')
+    repository = config.get('repository') or account + '/agent-backup-' + config['installationId'][:12]
+    if repository.split('/')[0].lower() != account.lower():
+        raise backend.BackupError('github-owner-mismatch')
+    # The owner approved this CLI login. Use only the agent's isolated GH_CONFIG_DIR.
+    # No token is returned to the caller, placed in argv, or inherited by a shell.
+    # Older Ubuntu CLI versions lack `gh auth token`. Both old gh (plaintext
+    # by default) and modern gh (--insecure-storage above) write this isolated
+    # private credential file; do not touch the user's global gh account.
+    hosts = backend.protected_read(directory / 'hosts.yml').decode()
+    found = re.findall(r'^\s+oauth_token:\s*[\"\']?([A-Za-z0-9_]{20,255})[\"\']?\s*$', hosts, re.M)
+    if len(found) != 1:
+        raise backend.BackupError('github-token-unavailable')
+    token = found[0]
+    store = backend.helper('agent-backup-github-store')
+    try:
+        store.check_repository(repository, token)
+    except Exception as exc:
+        if getattr(exc, 'code', '') != 'github-not-found':
+            raise
+        current()
+        command(['api', '--method', 'POST', 'user/repos', '-f', 'name=' + repository.split('/')[1], '-F', 'private=true', '-F', 'auto_init=true', '-f', 'description=Private encrypted agent recovery backups'])
+    current()
+    backup.connect(repository, token)
+    state.update(phase='ready' if prepared.get('keySaved') else 'key', keyDelivered=False)
+    state.pop('nonce', None)
+    backup.save(backup.directory / 'chat.json', state)
+    if prepared.get('keySaved'):
+        return chat.reply('GitHub підключено. Приватний репозиторій: https://github.com/' + repository + '. Запускаю автоматичний бекап.', enable=True)
+    return chat.reply('GitHub підключено. Приватний репозиторій: https://github.com/' + repository + '. Збережи файл ключа відновлення окремо від сервера й напиши «ключ збережено».', recoveryKey=True)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--home', type=Path, required=True)
+    args = parser.parse_args()
+    try:
+        value = json.loads(sys.stdin.buffer.read(16384))
+        result = login(backend.Backup(args.home), value['owner'], value['nonce'])
+    except Exception as exc:
+        code = str(exc) if isinstance(exc, backend.BackupError) else str(getattr(exc, 'code', ''))
+        result = {'ok': False, 'error': code if backend.ERROR_CODE.fullmatch(code) else 'github-setup-failed'}
+    emit(result)
+
+
+if __name__ == '__main__':
+    main()

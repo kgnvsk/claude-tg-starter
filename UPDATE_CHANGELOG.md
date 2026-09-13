@@ -1,8 +1,8 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-09-13.4abd5b2e0721`
+- Реліз: `2026-09-13.fbe9016f409f`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `4abd5b2e07214f4a5dfceb6df25305b2f056cfd0`
+- Ревізія вихідного комплекту: `fbe9016f409f87e841255713ce059fa28d786658`
 - Дата релізу: `2026-09-13`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
@@ -19,7 +19,8 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    fix(backup): restore WhatsApp reconnect inventories
+    fix: allow managed backup chat helpers during installation
+    feat: connect private backups through owner Telegram conversation
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не

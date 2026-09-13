@@ -15,6 +15,8 @@ MANAGED_BIN_NAMES = frozenset(
     {
         "access-update",
         "agent-backup",
+        "agent-backup-chat",
+        "agent-backup-github-login",
         "agent-github-backup",
         "agent-full-backup",
         "agent-full-snapshot",
@@ -87,6 +89,7 @@ MANAGED_BIN_NAMES = frozenset(
         "speak",
         "subagent-result-nudge",
         "sql-readonly",
+        "telegram-backup-chat.ts",
         "telegram-inbox-prune",
         "tender-watch",
         "tg-context-inject",

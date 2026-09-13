@@ -521,6 +521,26 @@ async function updateAccess(args: string[]): Promise<void> {
 const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
 
 const bot = new Bot(TOKEN)
+// Consume GitHub credentials before every command, archive and model route.
+const backupChatPath = join(homedir(), 'bin', 'telegram-backup-chat.ts')
+bot.use(async (ctx, next) => {
+  const message = ctx.message ?? ctx.editedMessage
+  if (message) {
+    const text = ('text' in message ? message.text : '') || ('caption' in message ? message.caption : '') || ''
+    try {
+      const { handleBackupMessage } = await import(pathToFileURL(backupChatPath).href)
+      if (await handleBackupMessage({ home: homedir(), ownerChatId: OWNER_CHAT_ID, botToken: TOKEN, message })) return
+    } catch {
+      // A missing helper must never send a pasted token to the model.
+      if (/(?:github_pat_|gh[pousr]_)[A-Za-z0-9_]*/.test(text)) {
+        await ctx.deleteMessage().catch(() => {})
+        return
+      }
+    }
+  }
+  await next()
+})
+
 let botUsername = ''
 
 type PendingEntry = {

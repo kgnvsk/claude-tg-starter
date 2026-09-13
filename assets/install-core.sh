@@ -198,6 +198,11 @@ validate_starter_foundation
 # silently inert without it. onboard.sh installs no system packages, so a bare
 # check would dead-end a customer install; take the package ourselves (we are
 # root here) and only fail when it is still unavailable afterwards.
+if ! command -v gh >/dev/null 2>&1; then
+  DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 update -qq
+  DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 install -y -q gh
+fi
+
 if ! command -v sqlite3 >/dev/null 2>&1; then
   DEBIAN_FRONTEND=noninteractive apt-get install -y -q sqlite3 >/dev/null 2>&1 || true
   command -v sqlite3 >/dev/null 2>&1 || {

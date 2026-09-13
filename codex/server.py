@@ -216,7 +216,7 @@ def install(config, root=ROOT):
                 input=json.dumps({**native, "action": "plan"}), timeout=120)
         progress("server-packages")
         run(["apt-get", "-o", "DPkg::Lock::Timeout=120", "update", "-qq"], timeout=600)
-        run(["apt-get", "-o", "DPkg::Lock::Timeout=120", "install", "-y", "-qq", "ca-certificates", "python3", "xz-utils"], timeout=600)
+        run(["apt-get", "-o", "DPkg::Lock::Timeout=120", "install", "-y", "-qq", "ca-certificates", "python3", "xz-utils", "gh"], timeout=600)
         progress("backup-and-agent-account")
         runtime = {key: value for key, value in config.items() if key not in ("user", "timezone", "licenseKey")}
         runtime.update(workspace=str(home / "obsidian-vault"), stateDir=str(home / ".local/state/novsky-codex"),
