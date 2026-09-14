@@ -468,11 +468,10 @@ def main() -> int:
             head_unchanged = (
                 started_head is not None and started_fifo_head() == started_head
             )
-            if head_unchanged and origin_chat is not None and send(
-                    origin_chat,
-                    "Незавершений попередній запит не повторюю автоматично, щоб "
-                    "випадково не виконати його двічі. Після відновлення надішли його ще раз.",
-            ):
+            # The interrupted request is still dropped rather than replayed. The
+            # owner asked for no chat notice about it, so the abort no longer
+            # waits on a message going out; the notes below remain the record.
+            if head_unchanged and origin_chat is not None:
                 if abort_started_fifo_head(delivery_id, started_head[1]):
                     if not remove_matching_cleanup_proof(delivery_id):
                         note(f"{command_name}: exact cleanup proof retained for Stop retry")

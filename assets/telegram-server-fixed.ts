@@ -296,7 +296,6 @@ const MAX_PENDING_INBOUND_DELIVERIES = 1000
 const INBOUND_OFFER_RETRY_MS = 120000
 const MAX_INBOUND_DELIVERY_ATTEMPTS = 2
 const INBOUND_RETRY_NOTICE = '⚠️ Повідомлення не вдалося передати в обробку після повторних спроб. Будь ласка, надішли його ще раз.'
-const INBOUND_STARTED_RECOVERY_NOTICE = 'Незавершений попередній запит не повторюю автоматично, щоб випадково не виконати його двічі. Після відновлення надішли його ще раз.'
 
 type InboundNotification = {
   method: 'notifications/claude/channel'
@@ -831,6 +830,7 @@ async function loadCorporateRuntime(): Promise<CorporateGatewayRuntime | null> {
       dbPath: string
       home: string
       ownerChatId: string
+      isPrivilegedActor?: (userId: string) => boolean
       sendText: typeof sendCorporateText
     }) => CorporateGatewayRuntime
   }
@@ -842,6 +842,8 @@ async function loadCorporateRuntime(): Promise<CorporateGatewayRuntime | null> {
     dbPath: join(STATE_DIR, 'messages.db'),
     home: homedir(),
     ownerChatId: OWNER_CHAT_ID,
+    // Re-read per call: revoking an admin must take effect on the next request.
+    isPrivilegedActor: (userId: string) => userId === OWNER_CHAT_ID || loadAccess().admins.includes(userId),
     sendText: sendCorporateText,
   })
 }
@@ -1415,31 +1417,17 @@ async function recoverStartedInboundHeadOnStartup(): Promise<void> {
       return
     }
 
-    let sentMessageId: number
+    // The interrupted request is still dropped rather than replayed, but the
+    // owner asked for no chat notice about it: a restart is routine here, and
+    // the message arrived in every chat that happened to have a turn in flight.
+    // The stderr trace below is the record. The routing identity is still
+    // resolved before the row goes: a delivery whose topic cannot be placed is
+    // one this process does not understand, and it stays queued rather than
+    // disappearing without either a notice or a trace of what it was.
     try {
-      const threadId = pendingInboundThreadId(row, chatId)
-      const sent = await bot.api.sendMessage(chatId, INBOUND_STARTED_RECOVERY_NOTICE, {
-        ...(threadId != null ? { message_thread_id: threadId } : {}),
-      })
-      sentMessageId = sent.message_id
+      pendingInboundThreadId(row, chatId)
     } catch {
-      process.stderr.write('telegram channel: pending inbound started notice failed; retained\n')
-      return
-    }
-    try {
-      logMsgStrict({
-        chat_id: chatId,
-        user_id: '',
-        username: botUsername || 'bot',
-        direction: 'out',
-        text: INBOUND_STARTED_RECOVERY_NOTICE,
-        ts: Date.now(),
-        message_id: sentMessageId,
-        thread_id: pendingInboundThreadId(row, chatId),
-        conversation_key: pendingInboundConversationKey(row, chatId),
-      })
-    } catch {
-      process.stderr.write('telegram channel: pending inbound started log failed; retained\n')
+      process.stderr.write('telegram channel: pending inbound started identity invalid; retained\n')
       return
     }
 

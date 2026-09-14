@@ -1,9 +1,9 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-09-13.23b78d03e2b9`
+- Реліз: `2026-09-14.782db45f006b`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `23b78d03e2b97012bd37a33d521033dbfb5280e3`
-- Дата релізу: `2026-09-13`
+- Ревізія вихідного комплекту: `782db45f006bf01329a92626436c3e25ce6c777b`
+- Дата релізу: `2026-09-14`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
 
@@ -19,14 +19,8 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    fix(ci): keep managed runtime defaults in sorted order
-    fix(ci): admit the connection reader in safe update baselines
-    Sync canonical connection-aware runtime from immutable Novsky source
-    Pin connection consumer readiness to verified Claude and Codex payloads
-    Preserve conflicting legacy credentials until an explicit connection choice
-    Scrub canonical connection keys from encrypted system context
-    Preserve isolated GitHub OAuth accounts when a general PAT is configured
-    Add private per-agent connections with live credential readers and safe backups
+    telegram: stop announcing an interrupted request in the chat (#50)
+    fix(persona): stop agents reporting the scheduler as a missing feature (#49)
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не

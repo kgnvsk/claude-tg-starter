@@ -28,7 +28,7 @@ UPSTREAM_SERVER_SHA256 = (
 )
 UPSTREAM_PACKAGE_START = "bun install --no-summary 1>&2 && bun server.ts"
 GOLDEN_SERVER_SHA256 = (
-    "9e380a859af3141d6862a9d091c6ada36a542072f917fdf7d0bf8c97993048ca"
+    "f25f46419073f59814186540eef1a8df5f7e756df9a08fce2325b746872a397e"
 )
 PREVIOUS_GOLDEN_SERVER_SHA256S = frozenset(
     {
@@ -62,6 +62,10 @@ PREVIOUS_GOLDEN_SERVER_SHA256S = frozenset(
         # The 10 August golden (kit d82194757310): still live on boxes installed
         # from that kit, and "unknown origin" there aborted the whole update.
         "b4485d15e7f9458f65d6a22274eeff8b44defe239b012505aca0881e73a98f01",
+        # The golden before the corporate reminder tool.
+        "9e380a859af3141d6862a9d091c6ada36a542072f917fdf7d0bf8c97993048ca",
+        # The golden that still sent a restart notice into the chat.
+        "1843912ee6ded2eff86de3cd5c25d58d1a64d9394bfc0a318a56c71684b56116",
     }
 )
 UPSTREAM_FILE_SHA256 = {
