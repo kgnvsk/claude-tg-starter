@@ -1,8 +1,8 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-09-14.782db45f006b`
+- Реліз: `2026-09-14.d279ed561df8`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `782db45f006bf01329a92626436c3e25ce6c777b`
+- Ревізія вихідного комплекту: `d279ed561df8feca49ce5c2e675ab1ba28ff2ca1`
 - Дата релізу: `2026-09-14`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
@@ -19,8 +19,7 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    telegram: stop announcing an interrupted request in the chat (#50)
-    fix(persona): stop agents reporting the scheduler as a missing feature (#49)
+    install: the owner's Telegram username is optional (#51)
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не

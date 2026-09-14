@@ -267,7 +267,7 @@ INTRO
 
 ask_required AGENT_NAME "Ім’я асистента" "Це ім’я, яким асистент представлятиметься. Наприклад: Atlas або Mego."
 ask_required OWNER_NAME "Як звертатися до власника" "Ім’я використовується лише в персональних відповідях асистента."
-ask_required OWNER_TG_USERNAME "Ім’я користувача власника в Telegram" "Можна ввести з @. Воно потрібне для підпису власника, але права визначаються числовим ID."
+ask_optional OWNER_TG_USERNAME "Ім’я користувача власника в Telegram" "Необовʼязково: не в кожного власника воно є. Можна ввести з @. Права визначаються числовим ID."
 OWNER_TG_USERNAME="$(normalize_username "$OWNER_TG_USERNAME")"
 ask_required OWNER_CHAT_ID "Числовий ID користувача Telegram" "Відкрий @userinfobot, натисни Start і скопіюй поле Id. Цей ID стане головним адміністратором." validate_chat_id
 ask_optional_clearable ADDITIONAL_ADMIN_CHAT_IDS "ID додаткових адміністраторів через кому" "Адміністратори можуть змінювати доступи й налаштування. Залиш порожнім, якщо головний адміністратор один." validate_admin_ids
@@ -441,7 +441,7 @@ fi
 VAULT_LOCALE="${VAULT_LOCALE:-en-US}"
 
 printf '\nПеревір без секретів:\n'
-printf '  Асистент: %s\n  Власник: %s (@%s, id %s)\n' "$AGENT_NAME" "$OWNER_NAME" "$OWNER_TG_USERNAME" "$OWNER_CHAT_ID"
+printf '  Асистент: %s\n  Власник: %s (%sid %s)\n' "$AGENT_NAME" "$OWNER_NAME" "${OWNER_TG_USERNAME:+@$OWNER_TG_USERNAME, }" "$OWNER_CHAT_ID"
 printf '  Бот: @%s\n  Часовий пояс: %s\n' "$BOT_USERNAME" "$TIMEZONE"
 if product_check_declared voice_transcription; then
   printf '  Голосові: %s\n' "$(status_label "$VOICE_SETUP_STATUS")"

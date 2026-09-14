@@ -48,7 +48,9 @@ else
   SUDOERS_FILE=/etc/sudoers.d/claude-telegram-heal-$AGENT_USER
 fi
 
-for name in AGENT_NAME OWNER_NAME OWNER_TG_USERNAME OWNER_CHAT_ID BOT_USERNAME TIMEZONE TELEGRAM_BOT_TOKEN; do
+# The owner's Telegram username is informational only: rights come from the numeric
+# ID, and not every owner has a username at all. It may be empty.
+for name in AGENT_NAME OWNER_NAME OWNER_CHAT_ID BOT_USERNAME TIMEZONE TELEGRAM_BOT_TOKEN; do
   [ -n "${!name:-}" ] || { echo "FATAL: обов’язкову змінну середовища $name не задано" >&2; exit 1; }
 done
 
