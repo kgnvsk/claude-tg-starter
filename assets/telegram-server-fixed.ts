@@ -1202,7 +1202,7 @@ const mcp = new Server(
     instructions: [
       'The sender reads Telegram, not this session. Anything you want them to see must go through the reply tool — your transcript output never reaches their chat.',
       '',
-      'Messages from Telegram arrive as <channel source="telegram" chat_id="..." message_id="..." user="..." ts="...">. If the tag has an image_path attribute, Read that file — it is a photo the sender attached. If the tag has attachment_file_id, call download_attachment with that file_id to fetch the file, then Read the returned path. Reply with the reply tool — pass chat_id back. For a forum topic, also pass the inbound thread_id as an integer independently of reply_to, even for the latest message and every follow-up. thread_id selects the topic; reply_to only adds a quote. Use reply_to (set to a message_id) only when quoting an earlier message; omit reply_to for normal responses, never omit an inbound thread_id. Do not guess a topic from the latest activity in another conversation.',
+      'Messages from Telegram arrive as <channel source="telegram" chat_id="..." message_id="..." user="..." ts="...">. If the tag has an image_path attribute, Read that file — it is a photo the sender attached. If the tag has image_paths, they are photos posted in this chat shortly before the message without mentioning you (newest first) — Read the ones the message refers to. If the tag has attachment_file_id, call download_attachment with that file_id to fetch the file, then Read the returned path. Reply with the reply tool — pass chat_id back. For a forum topic, also pass the inbound thread_id as an integer independently of reply_to, even for the latest message and every follow-up. thread_id selects the topic; reply_to only adds a quote. Use reply_to (set to a message_id) only when quoting an earlier message; omit reply_to for normal responses, never omit an inbound thread_id. Do not guess a topic from the latest activity in another conversation.',
       '',
       `reply accepts files staged inside ${ATTACHMENT_OUTBOX} for attachments. Pass an absolute path, not ~. Use react to add emoji reactions, and edit_message for interim progress updates. Edits don\'t trigger push notifications — when a long task completes, send a new reply so the user\'s device pings.`,
       '',
@@ -1819,23 +1819,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         return { content: [{ type: 'text', text: 'reacted' }] }
       }
       case 'download_attachment': {
-        const file_id = args.file_id as string
-        const file = await bot.api.getFile(file_id, AbortSignal.timeout(TELEGRAM_FETCH_TIMEOUT_MS))
-        if (!file.file_path) throw new Error('Telegram returned no file_path — file may have expired')
-        const url = `https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`
-        const res = await fetch(url, {
-          signal: AbortSignal.timeout(TELEGRAM_FETCH_TIMEOUT_MS),
-        })
-        if (!res.ok) throw new Error(`download failed: HTTP ${res.status}`)
-        const buf = await readTelegramFileResponse(res, file.file_size)
-        // file_path is from Telegram (trusted), but strip to safe chars anyway
-        // so nothing downstream can be tricked by an unexpected extension.
-        const rawExt = file.file_path.includes('.') ? file.file_path.split('.').pop()! : 'bin'
-        const ext = rawExt.replace(/[^a-zA-Z0-9]/g, '') || 'bin'
-        const uniqueId = (file.file_unique_id ?? '').replace(/[^a-zA-Z0-9_-]/g, '') || 'dl'
-        const path = join(INBOX_DIR, `${Date.now()}-${uniqueId}.${ext}`)
-        mkdirSync(INBOX_DIR, { recursive: true })
-        writeFileSync(path, buf)
+        const path = await downloadAttachmentById(args.file_id as string)
         return { content: [{ type: 'text', text: path }] }
       }
       case 'edit_message': {
@@ -2281,16 +2265,93 @@ async function readTelegramFileResponse(response: Response, expectedSize?: numbe
     return Buffer.concat(chunks, total)
   } finally { await reader.cancel().catch(() => {}); reader.releaseLock() }
 }
+// One downloader for every file the model asks for by id — the
+// download_attachment tool and the late binding of group photos share it.
+async function downloadAttachmentById(file_id: string): Promise<string> {
+  const file = await bot.api.getFile(file_id, AbortSignal.timeout(TELEGRAM_FETCH_TIMEOUT_MS))
+  if (!file.file_path) throw new Error('Telegram returned no file_path — file may have expired')
+  const url = `https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`
+  const res = await fetch(url, {
+    signal: AbortSignal.timeout(TELEGRAM_FETCH_TIMEOUT_MS),
+  })
+  if (!res.ok) throw new Error(`download failed: HTTP ${res.status}`)
+  const buf = await readTelegramFileResponse(res, file.file_size)
+  // file_path is from Telegram (trusted), but strip to safe chars anyway
+  // so nothing downstream can be tricked by an unexpected extension.
+  const rawExt = file.file_path.includes('.') ? file.file_path.split('.').pop()! : 'bin'
+  const ext = rawExt.replace(/[^a-zA-Z0-9]/g, '') || 'bin'
+  const uniqueId = (file.file_unique_id ?? '').replace(/[^a-zA-Z0-9_-]/g, '') || 'dl'
+  const path = join(INBOX_DIR, `${Date.now()}-${uniqueId}.${ext}`)
+  mkdirSync(INBOX_DIR, { recursive: true })
+  writeFileSync(path, buf)
+  return path
+}
 // End bounded Telegram download
 
+// A photo posted in a group without a mention is observed, not delivered, and
+// the download waits for the gate. The mention that follows ("rephrase the
+// text in the photo above") then arrives without the file. So the mention
+// binds late: the last few observed photos of the same conversation are
+// fetched now and handed over as image_path(s).
+const LATE_BIND_PHOTO_WINDOW_MS = 10 * 60 * 1000
+const LATE_BIND_PHOTO_LIMIT = 3
+const recentObservedPhotosQuery = MSG_DB.prepare(
+  `SELECT attachment_file_id AS file_id FROM messages
+   WHERE chat_id=? AND conversation_key=? AND direction='in'
+     AND attachment_kind='photo' AND attachment_file_id IS NOT NULL AND ts>=?
+   ORDER BY ts DESC LIMIT ${LATE_BIND_PHOTO_LIMIT}`,
+)
+// file_id → inbox path: a second mention of the same photo does not fetch it again.
+const lateBoundPhotoPaths = new Map<string, string>()
+async function lateBoundPhotos(chat_id: string, conversationKey: string): Promise<string[]> {
+  const rows = recentObservedPhotosQuery.all(
+    chat_id, conversationKey, Date.now() - LATE_BIND_PHOTO_WINDOW_MS,
+  ) as { file_id: string }[]
+  const paths: string[] = []
+  for (const { file_id } of rows) {
+    const cached = lateBoundPhotoPaths.get(file_id)
+    if (cached && existsSync(cached)) { paths.push(cached); continue }
+    try {
+      const path = await downloadAttachmentById(file_id)
+      lateBoundPhotoPaths.set(file_id, path)
+      paths.push(path)
+    } catch (err) {
+      process.stderr.write(`telegram channel: late-bound photo download failed: ${err}\n`)
+    }
+  }
+  return paths
+}
+// What the <channel> tag says about pictures: an own photo that downloaded is
+// the whole story; a failed download keeps the file_id as the fallback; with
+// no own image, earlier photos of the conversation stand in.
+function inboundImageMeta(
+  imagePath: string | undefined,
+  attachment: AttachmentMeta | undefined,
+  latePaths: string[],
+): Record<string, string> {
+  if (imagePath) return { image_path: imagePath }
+  return {
+    ...(latePaths.length ? { image_path: latePaths[0]!, image_paths: latePaths.join(';') } : {}),
+    ...(attachment ? {
+      attachment_kind: attachment.kind,
+      attachment_file_id: attachment.file_id,
+      ...(attachment.size != null ? { attachment_size: String(attachment.size) } : {}),
+      ...(attachment.mime ? { attachment_mime: attachment.mime } : {}),
+      ...(attachment.name ? { attachment_name: attachment.name } : {}),
+    } : {}),
+  }
+}
 bot.on('message:photo', async ctx => {
   const caption = ctx.message.caption ?? '(photo)'
+  // Largest size is last in the array.
+  const photos = ctx.message.photo
+  const best = photos[photos.length - 1]
   // Defer download until after the gate approves — any user can send photos,
   // and we don't want to burn API quota or fill the inbox for dropped messages.
+  // The file_id still reaches the journal: a photo posted without a mention is
+  // observed, not downloaded, and the mention that follows binds to it late
+  // (lateBoundPhotos).
   await handleInbound(ctx, caption, async () => {
-    // Largest size is last in the array.
-    const photos = ctx.message.photo
-    const best = photos[photos.length - 1]
     try {
       const file = await ctx.api.getFile(best.file_id, AbortSignal.timeout(TELEGRAM_FETCH_TIMEOUT_MS))
       if (!file.file_path) return undefined
@@ -2308,7 +2369,7 @@ bot.on('message:photo', async ctx => {
       process.stderr.write(`telegram channel: photo download failed: ${err}\n`)
       return undefined
     }
-  })
+  }, { kind: 'photo', file_id: best.file_id, size: best.file_size })
 })
 
 bot.on('message:document', async ctx => {
@@ -2530,9 +2591,12 @@ async function routeInbound(
   ctx: Context,
   text: string,
   downloadImage: (() => Promise<string | undefined>) | undefined,
-  attachment: AttachmentMeta | undefined,
+  inboundAttachment: AttachmentMeta | undefined,
   legacyInbound: (deliveryId: string) => Promise<void>,
 ): Promise<void> {
+  // Photo meta exists for the journal and the legacy late binding only; the
+  // corporate route keeps treating a photo as the update's own image.
+  const attachment = inboundAttachment?.kind === 'photo' ? undefined : inboundAttachment
   const from = ctx.from!
   const chat_id = String(ctx.chat!.id)
   const msgId = ctx.message?.message_id
@@ -2749,6 +2813,9 @@ async function handleInbound(
       const transcript = saved?.text && saved.text !== text ? saved.text : await transcribeObservedAttachment(ctx, chat_id, msgId, attachment)
       if (transcript) inboundText = ctx.message?.caption ? `${text}\n${transcript}` : transcript
     }
+    const latePaths = imagePath == null && downloadImage == null && ctx.chat?.type !== 'private'
+      ? await lateBoundPhotos(chat_id, conversationKey)
+      : []
     const notification: InboundNotification = {
       method: 'notifications/claude/channel',
       params: {
@@ -2775,14 +2842,7 @@ async function handleInbound(
               ...(rt ? { reply_to_text: rt } : {}),
             }
           })() : {}),
-          ...(imagePath ? { image_path: imagePath } : {}),
-          ...(attachment ? {
-            attachment_kind: attachment.kind,
-            attachment_file_id: attachment.file_id,
-            ...(attachment.size != null ? { attachment_size: String(attachment.size) } : {}),
-            ...(attachment.mime ? { attachment_mime: attachment.mime } : {}),
-            ...(attachment.name ? { attachment_name: attachment.name } : {}),
-          } : {}),
+          ...inboundImageMeta(imagePath, attachment, latePaths),
         },
       },
     }
