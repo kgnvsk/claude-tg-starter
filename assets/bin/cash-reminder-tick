@@ -216,7 +216,11 @@ settle_reminder() {
     log_message "fired $(basename "$f") → chat=$chat"
     return 0
   fi
-  local next_epoch=$((now + repeat))
+  # The next slot stays on the reminder's own grid (EPOCH + n*REPEAT): advancing
+  # from the send time drifted a daily 09:30 reminder to 09:37 over 58 runs.
+  # Skipping every slot that is already past keeps an overdue repeat to one send.
+  local missed=$(( (now - epoch) / repeat ))
+  local next_epoch=$(( epoch + (missed + 1) * repeat ))
   local next_count=$((count + 1))
   if [ -n "$until" ] && [ "$next_epoch" -gt "$until" ]; then
     if ! rm -f "$f"; then
