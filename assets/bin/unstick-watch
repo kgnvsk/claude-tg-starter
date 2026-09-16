@@ -127,7 +127,9 @@ def recent_restarts() -> int:
         out = subprocess.run(
             ["journalctl", "-u", SERVICE, "--since", "10 min ago", "--no-pager"],
             capture_output=True, text=True, timeout=20).stdout
-        return out.count("Started Claude Code")
+        # systemd 249 (22.04): "Started Claude Code Telegram Bot…";
+        # 255+ (24.04, 26.04): "Started claude-telegram.service - Claude Code Telegram Bot…".
+        return len(re.findall(r"Started (?:\S+\.service - )?Claude Code", out))
     except Exception:
         return -1
 

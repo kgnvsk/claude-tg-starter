@@ -1,0 +1,279 @@
+#!/usr/bin/env python3
+"""Give the Stop guard a second chance at a queue head it never got to judge.
+
+The Stop hook fires the moment a turn ends, but the transcript's final record
+lands a little later. The guard reads an unfinished turn, exits silently
+(rc=0, no stdout, no stderr) — and nobody calls it again. The head stays
+'started' for good, every later message piles up behind it, and a restart
+picks a different old message instead (Kirill's box, 2026-09-15). Running the
+installed guard by hand over the same wedged session settles the head at
+once, so the guard is right and only its timing was wrong.
+
+This decides nothing about delivery: when a head has been sitting longer than
+QUEUE_SETTLE_AFTER_SECONDS it calls the same guard again over the finished
+transcript and lets it apply all of its own proofs. Only when the guard
+refuses does this script act, and then the most it does is put the message
+back in the queue so the person gets an answer instead of silence.
+"""
+import fcntl
+import json
+import os
+import pathlib
+import re
+import sqlite3
+import subprocess
+import sys
+import time
+import uuid
+
+AGENT_ROOT = pathlib.Path(os.environ.get("AGENT_ROOT") or os.environ.get("HOME") or "/home/claude")
+STATE_DIR = pathlib.Path(os.environ.get("TELEGRAM_STATE_DIR") or AGENT_ROOT / ".claude/channels/telegram")
+CONFIG_DIR = pathlib.Path(os.environ.get("CLAUDE_CONFIG_DIR") or AGENT_ROOT / ".claude")
+GUARD = AGENT_ROOT / "bin/tg-reply-stop-guard"
+LOG = AGENT_ROOT / "logs/queue-settle-sweep.log"
+# Shared with cash-healthcheck, unstick-watch, claude-limit-recovery and
+# claude-auth-rescue: whoever holds it is mid-way through the transport, and a
+# head it is about to abort must not be requeued from under it.
+LIFECYCLE_LOCK = AGENT_ROOT / "logs/transport-lifecycle.lock"
+STUCK_SECONDS = int(os.environ.get("QUEUE_SETTLE_AFTER_SECONDS", "180"))
+# The carrier envelope naming the head sits at the start of its turn, so the
+# tail of a recent transcript is where a wedged head is found. Bounded: these
+# files grow to megabytes and this runs every minute.
+TRANSCRIPT_TAIL_BYTES = 4 * 1024 * 1024
+TRANSCRIPT_CANDIDATES = 12
+
+
+def log(message: str) -> None:
+    LOG.parent.mkdir(parents=True, exist_ok=True)
+    with LOG.open("a", encoding="utf-8") as handle:
+        handle.write(f"[{time.strftime('%FT%TZ', time.gmtime())}] {message}\n")
+
+
+def queue_head() -> tuple[str, int] | None:
+    """The oldest started head and its age in seconds."""
+    database = STATE_DIR / "messages.db"
+    try:
+        connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True, timeout=5)
+        columns = {item[1] for item in connection.execute("PRAGMA table_info(pending_inbound_deliveries)")}
+        if not columns:
+            connection.close()
+            return None
+        # The schema differs between kit generations: started_at is not everywhere.
+        stamp = "started_at" if "started_at" in columns else "created_at"
+        # The same order every other actor walks the queue in; judging by rowid
+        # could pick a newer row and requeue the wrong message.
+        row = connection.execute(
+            f"SELECT delivery_id, {stamp} FROM pending_inbound_deliveries "
+            "WHERE state='started' ORDER BY created_at ASC, rowid ASC LIMIT 1"
+        ).fetchone()
+        connection.close()
+    except sqlite3.Error as error:
+        log(f"queue not read: {error}")
+        return None
+    if row is None:
+        return None
+    delivery_id, marked = row
+    marked = marked or 0
+    age = int(time.time() - (marked / 1000 if marked > 10 ** 11 else marked))
+    return str(delivery_id), age
+
+
+def transcript_for(delivery_id: str) -> pathlib.Path | None:
+    """The transcript that carries this head, and only that one.
+
+    An agent runs several sessions at once, so the newest transcript is often
+    somebody else's turn. The guard would read it, find no proof for this head
+    and refuse — a refusal about a different conversation, on which this script
+    would then put a message back in the queue. A head no transcript carries is
+    left alone instead.
+    """
+    files = sorted((CONFIG_DIR / "projects").glob("*/*.jsonl"), key=lambda path: path.stat().st_mtime, reverse=True)
+    needle = delivery_id.encode()
+    for path in files[:TRANSCRIPT_CANDIDATES]:
+        try:
+            with path.open("rb") as handle:
+                handle.seek(max(0, path.stat().st_size - TRANSCRIPT_TAIL_BYTES))
+                if needle in handle.read():
+                    return path
+        except OSError:
+            continue
+    return None
+
+
+def session_of(transcript: pathlib.Path) -> str | None:
+    """Claude Code names a transcript after its session; fall back to its records."""
+    stem = transcript.stem
+    try:
+        return str(uuid.UUID(stem))
+    except ValueError:
+        pass
+    try:
+        with transcript.open("r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                try:
+                    recorded = json.loads(line).get("sessionId")
+                except (json.JSONDecodeError, AttributeError):
+                    continue
+                if isinstance(recorded, str):
+                    try:
+                        return str(uuid.UUID(recorded))
+                    except ValueError:
+                        return None
+    except OSError:
+        return None
+    return None
+
+
+def still_started(delivery_id: str) -> bool:
+    try:
+        connection = sqlite3.connect(f"file:{STATE_DIR / 'messages.db'}?mode=ro", uri=True, timeout=5)
+        row = connection.execute(
+            "SELECT 1 FROM pending_inbound_deliveries WHERE delivery_id=? AND state='started'",
+            (delivery_id,),
+        ).fetchone()
+        connection.close()
+    except sqlite3.Error:
+        return False
+    return row is not None
+
+
+# The model never ran: the account is out of its session, weekly or usage
+# allowance, the seat is out of credits, the subscription or organisation is
+# gone, or the request itself is refused (a 4xx: a model this CLI does not
+# know, a revoked key). Same wording the limit watcher classifies, kept here
+# because a sweep that cannot see this replays a dead agent (Kirill's box,
+# 2026-09-15: a weekly limit, every turn dying at once). A 5xx is not listed:
+# an overloaded provider is exactly what a later replay fixes.
+TURN_NEVER_RAN = re.compile(
+    r"You've hit your (?:session|weekly|usage) limit"
+    r"|You're out of usage credits"
+    r"|Invalid API key|OAuth token has expired|Please run /login"
+    r"|Failed to authenticate"
+    r"|subscription (?:has |is )?(?:expired|ended|inactive)|no active subscription"
+    r"|credit balance is too low|payment (?:required|failed)|overdue invoice"
+    r"|organization has been disabled"
+    r"|API Error: 4[0-9]{2}\b"
+)
+
+
+def turn_never_ran(transcript: pathlib.Path) -> str | None:
+    """The reason the model produced nothing at all, if it is written down."""
+    try:
+        with transcript.open("rb") as handle:
+            handle.seek(max(0, transcript.stat().st_size - TRANSCRIPT_TAIL_BYTES))
+            tail = handle.read().decode("utf-8", "replace")
+    except OSError:
+        return None
+    found = TURN_NEVER_RAN.search(tail)
+    return found.group(0) if found else None
+
+
+def drop_unanswered_group_head(delivery_id: str, age: int, note: str) -> None:
+    """A group turn the guard refuses owes nobody an answer, so it just goes.
+
+    In a group the agent watches people talk to each other and answers only when it
+    is addressed; a turn that ends without publishing anything is the ordinary
+    case, and the guard's block is coaching aimed at a model that has already
+    stopped. Returning such a head to the queue re-reads the same group message
+    and earns the same refusal, so the person watched "the message did not
+    reach processing twice" arrive once a minute (Kirill's box, 2026-09-15).
+    Nothing was owed, so the head is cleared and the queue moves on.
+    """
+    try:
+        writable = sqlite3.connect(f"file:{STATE_DIR / 'messages.db'}?mode=rw", uri=True, timeout=5)
+        writable.execute(
+            "DELETE FROM pending_inbound_deliveries WHERE delivery_id=? AND state='started'",
+            (delivery_id,),
+        )
+        writable.commit()
+        writable.close()
+        log(f"{delivery_id} sat {age}s in a group with nothing to publish — head cleared: {note or 'no output'}")
+    except sqlite3.Error as error:
+        log(f"{delivery_id} sat {age}s and the group head could not be cleared: {error}")
+
+
+def requeue(delivery_id: str, age: int, note: str) -> None:
+    """The guard refused in a one-to-one chat: somebody is waiting for an answer.
+
+    There is nobody left to ask — the model has stopped — so the message goes
+    back in the queue and the poller hands it to the model again. The attempts
+    column stays as it is: the receiver already counted the offer that handed
+    the head to the session, and it stops re-offering at two. Counting the
+    replay here as well reached that limit at once, and the next drain tick
+    told the person "не вдалося передати" instead of retrying (Lera's box,
+    2026-09-15). Left alone, the receiver's own exhausted path tells the person
+    to send it once more after the replay fails, so one message can never hold
+    the queue for ever and no second counter is needed.
+    """
+    try:
+        writable = sqlite3.connect(f"file:{STATE_DIR / 'messages.db'}?mode=rw", uri=True, timeout=5)
+        writable.execute(
+            "UPDATE pending_inbound_deliveries SET state='queued' WHERE delivery_id=? AND state='started'",
+            (delivery_id,),
+        )
+        writable.commit()
+        writable.close()
+        log(f"{delivery_id} sat {age}s with no delivery — returned to the queue for one more delivery: "
+            f"{note or 'no output'}")
+    except sqlite3.Error as error:
+        log(f"{delivery_id} sat {age}s and could not be returned to the queue: {error}")
+
+
+def main() -> int:
+    if not GUARD.is_file() or not (STATE_DIR / "messages.db").exists():
+        return 0
+    head = queue_head()
+    if head is None:
+        return 0
+    delivery_id, age = head
+    if age < STUCK_SECONDS:
+        return 0
+    try:
+        LIFECYCLE_LOCK.parent.mkdir(parents=True, exist_ok=True)
+        lock = LIFECYCLE_LOCK.open("a")
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (OSError, BlockingIOError):
+        log(f"{delivery_id} sat {age}s but the transport lifecycle lock is busy — left for its holder")
+        return 0
+    transcript = transcript_for(delivery_id)
+    if transcript is None:
+        log(f"{delivery_id} sat {age}s and no recent transcript carries it — left untouched")
+        return 0
+    session = session_of(transcript)
+    if session is None:
+        log(f"{delivery_id} sat {age}s but {transcript.name} names no session")
+        return 0
+    # The guard needs the session to ask the team broker about delegated work;
+    # without it every turn that used a shell looks unconfirmed and it refuses.
+    payload = json.dumps({
+        "transcript_path": str(transcript),
+        "session_id": session,
+        "stop_hook_active": False,
+    })
+    try:
+        verdict = subprocess.run([str(GUARD)], input=payload, text=True, capture_output=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as error:
+        log(f"{delivery_id} sat {age}s and the guard did not run: {error}")
+        return 0
+    if not still_started(delivery_id):
+        log(f"{delivery_id} sat {age}s — settled by running the guard again")
+        return 0
+    note = (verdict.stdout or verdict.stderr or "").strip().replace("\n", " ")[:160]
+    # Nothing the queue does helps an agent that never got to think: handing the
+    # message over again buys another dead turn and, two attempts later, tells
+    # the person their message did not reach processing. The limit watcher is
+    # what owes the owner an explanation here; this only stays out of the way.
+    external = turn_never_ran(transcript)
+    if external:
+        log(f"{delivery_id} sat {age}s and the turn never ran ({external}) — left for the limit watcher")
+        return 0
+    # A group head owes nobody a reply; a one-to-one head has somebody waiting.
+    if delivery_id.startswith("-"):
+        drop_unanswered_group_head(delivery_id, age, note)
+    else:
+        requeue(delivery_id, age, note)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

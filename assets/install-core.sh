@@ -743,7 +743,7 @@ install_managed_crontab() {
   # unmanaged line that invokes a job this block owns.
   unmanaged_crontab="$(printf '%s\n' "$existing_crontab" | awk \
     -v legacy_health="$H/bin/cash-health-evening" \
-    -v owned="$H/bin/cash-reminder-tick $H/bin/cash-healthcheck $H/bin/claude-limit-recovery $H/bin/relogin-watch $H/bin/unstick-watch $H/bin/telegram-inbox-prune $H/bin/vault-sync $H/bin/memory-index $H/bin/learning-review $H/bin/onboarding-reminder $H/bin/skill-brief $H/bin/agent-github-backup" '
+    -v owned="$H/bin/cash-reminder-tick $H/bin/cash-healthcheck $H/bin/claude-limit-recovery $H/bin/relogin-watch $H/bin/unstick-watch $H/bin/queue-settle-sweep $H/bin/telegram-inbox-prune $H/bin/vault-sync $H/bin/memory-index $H/bin/learning-review $H/bin/onboarding-reminder $H/bin/skill-brief $H/bin/agent-github-backup" '
     BEGIN { split(owned, jobs, " ") }
     $0 == "# BEGIN claude-tg-starter" { managed=1; next }
     $0 == "# END claude-tg-starter" { managed=0; next }
@@ -755,6 +755,12 @@ install_managed_crontab() {
   ')"
 {
   printf '%s\n' "$unmanaged_crontab"
+  managed_crontab_block
+} | sed '/^[[:space:]]*$/N;/^\n$/D' | crontab -u "$AGENT_USER" -
+}
+
+# The lines this kit schedules, without the owner's own entries around them.
+managed_crontab_block() {
   echo "# BEGIN claude-tg-starter"
   echo "CRON_TZ=$TIMEZONE"
   echo "TZ=$TIMEZONE"
@@ -768,6 +774,10 @@ install_managed_crontab() {
   echo "* * * * * /usr/bin/timeout 55 $H/bin/claude-limit-recovery --notify"
   echo "* * * * * /usr/bin/timeout 55 $H/bin/relogin-watch"
   echo "* * * * * /usr/bin/timeout 180 $H/bin/unstick-watch"
+  # The Stop hook can fire before the transcript's last record lands, and then
+  # nothing calls the guard again. This gives it a second chance over the
+  # finished transcript; it decides nothing about delivery itself.
+  echo "* * * * * /usr/bin/timeout 90 $H/bin/queue-settle-sweep"
   echo "17 4 * * * /usr/bin/timeout 30 $H/bin/telegram-inbox-prune"
   echo "23 4 * * * find $H/telegram-outbox -xdev -type f -mtime +7 -delete"
   echo "*/5 * * * * /usr/bin/timeout 60 $H/bin/vault-sync"
@@ -780,14 +790,50 @@ install_managed_crontab() {
   # Daily tick; the helper spaces the nudges itself (a day after install, then weekly).
   echo "13 11 * * * /usr/bin/timeout 30 $H/bin/onboarding-reminder"
   echo "# END claude-tg-starter"
-} | sed '/^[[:space:]]*$/N;/^\n$/D' | crontab -u "$AGENT_USER" -
+}
+
+# A maintenance run must not rewrite a quiesced crontab, but update.sh always
+# runs this installer in maintenance mode — so a job a newer kit schedules would
+# otherwise only ever reach a fresh install, and every agent already in the field
+# would keep running yesterday's set. That is how the queue sweep missed the
+# whole fleet. Add the missing lines to the block that is already there, remove
+# nothing, and leave the file completely alone when the block itself is gone:
+# that is an UPGRADING window deliberately holding every schedule.
+add_missing_managed_jobs() {
+  local existing missing
+  existing="$(crontab -u "$AGENT_USER" -l 2>/dev/null || true)"
+  if ! printf '%s\n' "$existing" | grep -Fxq '# BEGIN claude-tg-starter'; then
+    echo "      керований блок знято на час обслуговування — crontab не змінюю"
+    return 0
+  fi
+  # Match on the command, not on the whole line: a box where somebody scheduled
+  # the same helper by hand outside the block would otherwise end up running it
+  # twice a minute, and two copies racing for one queue head burn its retries at
+  # double speed.
+  missing="$(managed_crontab_block | awk '/^[*0-9]/' | while IFS= read -r line; do
+    # The helper and its first option, without the schedule, the timeout cap or
+    # a redirect: those differ between a hand-written line and this block, while
+    # "--active" and "--notify" still count as two different jobs.
+    key="$(printf '%s\n' "$line" | sed -E 's#^([^ ]+ +){5}##; s#^/usr/bin/timeout +[0-9]+ +##; s# *>+ *[^ ]+( +2>&1)? *$##')"
+    printf '%s\n' "$existing" | grep -Fq "$key" || printf '%s\n' "$line"
+  done)"
+  if [ -z "$missing" ]; then
+    echo "      керований crontab уже містить усі завдання комплекту"
+    return 0
+  fi
+  printf '%s\n' "$existing" | awk -v add="$missing" '
+    $0 == "# END claude-tg-starter" { print add }
+    { print }
+  ' | crontab -u "$AGENT_USER" -
+  echo "      додано керованих завдань: $(printf '%s\n' "$missing" | grep -c .)"
 }
 
 echo "[5/7] зберігаю наявний crontab; замінюю лише керований блок"
 python3 "$KIT/assets/lib/install-backup-context.py" \
   --home "$H" --user "$AGENT_USER" --unit "$AGENT_SERVICE" --engine claude
 if [ "$CLAUDE_UPDATE_MAINTENANCE" = 1 ]; then
-  echo "      режим обслуговування: залишаю зупинений crontab без змін"
+  echo "      режим обслуговування: наявний crontab зберігаю, лише додаю нові керовані завдання"
+  add_missing_managed_jobs
 else
   install_managed_crontab
 fi

@@ -16,6 +16,12 @@ import tempfile
 import uuid
 
 
+HOME = Path(os.environ.get("HOME", "/home/claude"))
+# Кілька агентів під одним юзером ділять HOME, а власні bin/ і logs/ мають у
+# своєму корені. Решта кітових сторожів уже читає AGENT_ROOT саме так, і
+# queue-settle-sweep шукає цей файл як AGENT_ROOT/bin/tg-reply-stop-guard —
+# тож і шляхи всередині мають рахуватися від того самого кореня.
+AGENT_ROOT = Path(os.environ.get("AGENT_ROOT", str(HOME)))
 MALFORMED_WINDOW_SECONDS = 10 * 60
 MAX_ANCESTRY_EVENTS = 20_000
 OUTBOUND_SUFFIXES = (
@@ -38,6 +44,8 @@ UNSAFE_FALLBACK_TEXT = re.compile(
 )
 TRANSCRIPT_TAIL_BYTES = 16 * 1024 * 1024
 TEAM_CLIENT = Path('/usr/local/lib/novsky-team/client.py')
+# The broker's own words for a uid that belongs to no org chart.
+UNREGISTERED_TEAM_AGENT = 'This user is not a Novsky agent'
 CONTINUATION_ATTACHMENT_TYPES = frozenset(
     {
         "task_reminder",
@@ -81,6 +89,24 @@ CONTINUATION_ATTACHMENT_TYPES = frozenset(
         "deferred_tools_record",
     }
 )
+# Позначки рантайму, які Claude Code пише окремими записами ВЕРХНЬОГО рівня,
+# а не вкладеннями. Кожна невідома тут обриває обхід ланцюга ходу: хід стає
+# невидимим, відповідь не доставляється, голова черги лишається «started»
+# (Кнопа Кирила, 15.09 — last-prompt/mode/permission-mode/queue-operation).
+# Це продовження ходу, а не носій нового запиту, і доказом доставки не є.
+CONTINUATION_EVENT_TYPES = frozenset(
+    {
+        "last-prompt",
+        "mode",
+        "permission-mode",
+        "queue-operation",
+        "atis-latch",
+        "ai-title",
+        "bridge-session",
+    }
+)
+
+
 CHANNEL_ENVELOPE = re.compile(
     r"\A\s*<channel\b(?P<attributes>[^>]*)>.*</channel>\s*\Z",
     re.DOTALL,
@@ -185,7 +211,7 @@ def telegram_delivery_id(prompt: object, origin: object) -> str | None:
 
 
 def telegram_state_dir() -> Path:
-    config_root = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
+    config_root = Path(os.environ.get("CLAUDE_CONFIG_DIR") or AGENT_ROOT / ".claude")
     return Path(
         os.environ.get("TELEGRAM_STATE_DIR")
         or config_root / "channels" / "telegram"
@@ -562,6 +588,8 @@ def event_disposition(event: dict) -> tuple[str, object, object]:
         if attachment_type in CONTINUATION_ATTACHMENT_TYPES:
             return "continuation", None, None
         return "ambiguous", None, None
+    if event_type in CONTINUATION_EVENT_TYPES:
+        return "continuation", None, None
     if event_type != "user":
         return "ambiguous", None, None
 
@@ -708,7 +736,7 @@ def request_clean_restart(events: list[object], chat_id: str) -> None:
     malformed = malformed_tool_calls(events)
     if len(malformed) < 2:
         return
-    marker = Path.home() / "logs" / "malformed-tool-restart.json"
+    marker = AGENT_ROOT / "logs" / "malformed-tool-restart.json"
     marker.parent.mkdir(parents=True, exist_ok=True)
     temporary = marker.with_suffix(".tmp")
     payload = {
@@ -866,6 +894,10 @@ def final_answer_text(turn_events: list[object]) -> str:
     for event in reversed(turn_events):
         if not isinstance(event, dict) or event.get("type") != "assistant":
             continue
+        # Claude Code records the provider's refusal as an assistant record; the
+        # fallback once sent that raw "API Error: 400 {...}" to the person.
+        if event.get("isApiErrorMessage") is True:
+            continue
         for block in reversed(list(content_blocks(event))):
             if isinstance(block, dict) and block.get("type") == "text":
                 text = str(block.get("text", "")).strip()
@@ -886,7 +918,7 @@ def deliver_pending_answer(turn_events: list[object], chat_id: str) -> bool:
     text = final_answer_text(turn_events)
     if chat_id.startswith("-") or text == "NO_REPLY" or not text or UNSAFE_FALLBACK_TEXT.search(text):
         return False
-    sender = Path.home() / "bin/tg-send"
+    sender = AGENT_ROOT / "bin/tg-send"
     if not os.access(sender, os.X_OK):
         return False
     try:
@@ -916,10 +948,31 @@ def deliver_pending_answer(turn_events: list[object], chat_id: str) -> bool:
 
 
 def observation_only(turn_events: list[dict]) -> bool:
-    """Silence cannot replace a tool result, failed send or unfinished task."""
-    return not any(
-        isinstance(block, dict) and block.get("type") == "tool_use"
+    """Silence cannot replace an unfinished tool call or a failed send.
+
+    A call that already returned is not unfinished work: an agent that looked
+    something up and then had nothing worth saying is still only observing.
+    Requiring zero calls jammed the FIFO instead — a group turn with 22
+    completed calls ended in NO_REPLY, the head stayed «started», and every
+    later message queued behind it (Кнопа Кирила, 15.09).
+    """
+    finished: set[str] = set()
+    failed = False
+    for event in turn_events:
+        for block in content_blocks(event):
+            if not isinstance(block, dict) or block.get("type") != "tool_result":
+                continue
+            identifier = block.get("tool_use_id")
+            if isinstance(identifier, str):
+                finished.add(identifier)
+            if block.get("is_error") is True:
+                failed = True
+    if failed:
+        return False
+    return all(
+        block.get("id") in finished
         for event in turn_events for block in content_blocks(event)
+        if isinstance(block, dict) and block.get("type") == "tool_use"
     )
 
 
@@ -999,8 +1052,19 @@ def delegated_turn_work(hook: dict, events: list[dict], turn_events: list[dict])
     after = event_timestamp(carrier)
     if after is None:
         raise ValueError('Native turn timestamp unavailable')
-    result = subprocess.run([sys.executable, str(TEAM_CLIENT), 'turn-work', scope, str(after)],
-                            capture_output=True, text=True, timeout=15, check=True)
+    try:
+        result = subprocess.run([sys.executable, str(TEAM_CLIENT), 'turn-work', scope, str(after)],
+                                capture_output=True, text=True, timeout=15, check=True)
+    except subprocess.CalledProcessError as error:
+        # A uid the broker does not know belongs to no org chart, so it cannot
+        # have delegated anything: the honest answer is "no work", not an
+        # outage. The team module is installed on boxes that never received an
+        # org chart, and failing closed there blocked every turn that touched a
+        # shell — the Telegram request stayed at the head of the queue until
+        # somebody restarted the bot. Any other broker failure still blocks.
+        if UNREGISTERED_TEAM_AGENT in (error.stderr or ''):
+            return {'pending': [], 'reportedAt': None}
+        raise
     work = json.loads(result.stdout)
     if (not isinstance(work, dict) or set(work) != {'pending', 'reportedAt'}
             or not isinstance(work['pending'], list) or len(work['pending']) > 20):

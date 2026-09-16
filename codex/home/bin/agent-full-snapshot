@@ -39,6 +39,20 @@ EXCLUDED_ROOTS = {
     ".cache/ms-playwright": "disposable-download-cache",
     ".bun/install/cache": "disposable-package-cache",
     ".local/share/pnpm/store": "disposable-package-cache",
+    # Runtimes the kit installs and reinstalls from a lockfile on every update.
+    # Copying them bought nothing and sank whole snapshots: a 127 MB webpack cache
+    # outlived the per-file sanitizer deadline, and third-party sources were run
+    # through the credential sanitizer. Only the reinstallable part: the video
+    # editor's public/jobs next to node_modules can hold the owner's media.
+    ".local/share/claude-video-edit/node_modules": "kit-managed-runtime",
+    ".local/share/pipx/venvs/yt-dlp": "kit-managed-runtime",
+    ".local/lib/node_modules/deno": "kit-managed-runtime",
+    ".npm-global/lib/node_modules/vercel": "kit-managed-runtime",
+    ".venvs/bigquery": "kit-managed-runtime",
+    ".venvs/finance": "kit-managed-runtime",
+    ".venvs/heif": "kit-managed-runtime",
+    ".venvs/spreadsheets": "kit-managed-runtime",
+    ".codex/cache": "disposable-download-cache",
 }
 SYSTEM_ROOTS = ("/etc/systemd/system", "/usr/lib/systemd/system", "/lib/systemd/system", "/etc/cron.d", "/var/spool/cron")
 AGE_IDENTITY = re.compile(rb"AGE-SECRET-KEY-1[023456789ACDEFGHJKLMNPQRSTUVWXYZ]{58}")
@@ -374,10 +388,22 @@ def create_snapshot(home: Path, output: Path, recipient: str, *, age_binary: str
                                     if expected.get("sha256") != staged_digest or expected.get("size") != staged.stat().st_size:
                                         raise ValueError("sanitized system context receipt mismatch")
                                 else:
-                                    report = sanitizer.sanitize_file(staged, cleaned, path=name,
-                                                                     known_secrets=known_secrets,
-                                                                     prepared_known=prepared_secrets,
-                                                                     timeout_seconds=file_timeout)
+                                    # Both still abort the whole snapshot: a conversation record
+                                    # that could not be cleaned in time must not quietly vanish from
+                                    # a backup, and a secret that collides with code makes every
+                                    # redaction suspect. They only stop hiding behind a bare
+                                    # "backup-failed" — the owner's status names which one it was.
+                                    try:
+                                        report = sanitizer.sanitize_file(staged, cleaned, path=name,
+                                                                         known_secrets=known_secrets,
+                                                                         prepared_known=prepared_secrets,
+                                                                         timeout_seconds=file_timeout)
+                                    except TimeoutError as error:
+                                        error.code = "sanitizer-timeout"
+                                        raise
+                                    except ValueError as error:
+                                        error.code = "sanitizer-rejected-source"
+                                        raise
                                     sanitized(name, report)
                                     if report["disposition"] == "excluded":
                                         return
@@ -547,7 +573,11 @@ def create_snapshot(home: Path, output: Path, recipient: str, *, age_binary: str
             temporary_output.unlink()
             return {"path": str(output), "sha256": digest, "size": size, "files": sum(data["type"] == "file" for data in entries.values()), "createdAt": created, "coverage": coverage, "privacyPolicy": sanitizer.POLICY}
     except (OSError, tarfile.TarError, subprocess.SubprocessError) as error:
-        raise ValueError("snapshot capture or encryption failed") from error
+        wrapped = ValueError("snapshot capture or encryption failed")
+        # A sanitizer timeout is an OSError and lands here; keep its code visible.
+        if isinstance(getattr(error, "code", None), str):
+            wrapped.code = error.code
+        raise wrapped from error
     finally:
         if process is not None:
             if process.stdin is not None and not process.stdin.closed:

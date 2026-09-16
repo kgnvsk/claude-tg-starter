@@ -28,10 +28,12 @@ UPSTREAM_SERVER_SHA256 = (
 )
 UPSTREAM_PACKAGE_START = "bun install --no-summary 1>&2 && bun server.ts"
 GOLDEN_SERVER_SHA256 = (
-    "f25f46419073f59814186540eef1a8df5f7e756df9a08fce2325b746872a397e"
+    "7dfbdea2af27d52acb8362960e1685ad0e4dc9a52e5ece2398386dcbbdef19b3"
 )
 PREVIOUS_GOLDEN_SERVER_SHA256S = frozenset(
     {
+        # The golden before a burst of messages became one turn.
+        "03115d23a64bbd0fd09caf282be35740b5416892e76667a8167a06f065183b58",
         "8ed378e93fcc314f3005631bd5398c13caa3051de653f20b6f8c4168214c0b87",
         "1e07d16dad23343b1cc48a354b128fdbde7da4be3fa7fe765a6a72e10a327b89",
         "a72d5260131d8640fbfc2464d1c16182f166c89aa265765024449e1921a04fd8",
@@ -66,6 +68,8 @@ PREVIOUS_GOLDEN_SERVER_SHA256S = frozenset(
         "9e380a859af3141d6862a9d091c6ada36a542072f917fdf7d0bf8c97993048ca",
         # The golden that still sent a restart notice into the chat.
         "1843912ee6ded2eff86de3cd5c25d58d1a64d9394bfc0a318a56c71684b56116",
+        # The golden before employee sessions took documents.
+        "f25f46419073f59814186540eef1a8df5f7e756df9a08fce2325b746872a397e",
     }
 )
 UPSTREAM_FILE_SHA256 = {

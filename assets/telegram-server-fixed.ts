@@ -61,7 +61,7 @@ const CORPORATE_ACTIVATED_MARKER = join(
 const CORPORATE_TEMPORARILY_UNAVAILABLE =
   '⚠️ Корпоративний режим тимчасово недоступний. Спробуй трохи пізніше.'
 const CORPORATE_FILE_INSPECTION_DISABLED =
-  '⚠️ Підтримуються фото та файли JPEG/PNG/GIF/WebP до 3 МБ, голосові й аудіо. Інші файли поки надішли як текст.'
+  '⚠️ Підтримуються фото та зображення JPEG/PNG/GIF/WebP до 3 МБ, голосові й аудіо, а також документи PDF, DOCX, XLSX, PPTX, TXT, MD, CSV і TSV до 20 МБ. Інші файли надішли як текст.'
 
 function isOwnerServiceControlInput(
   chatId: string, senderId: string, chatType: string, text: string, now = Date.now(),
@@ -286,6 +286,14 @@ const pendingInboundStartedHeadDelete = MSG_DB.prepare(
      AND rowid=(SELECT rowid FROM pending_inbound_deliveries
        ORDER BY created_at ASC, rowid ASC LIMIT 1)`,
 )
+const pendingInboundMergeHead = MSG_DB.prepare(
+  `UPDATE pending_inbound_deliveries SET payload=?
+   WHERE rowid=? AND delivery_id=? AND state='queued' AND payload=?`,
+)
+const pendingInboundFoldedDelete = MSG_DB.prepare(
+  `DELETE FROM pending_inbound_deliveries
+   WHERE rowid=? AND delivery_id=? AND state='queued' AND payload=?`,
+)
 const pendingInboundExists = MSG_DB.prepare(
   `SELECT 1 FROM pending_inbound_deliveries WHERE delivery_id=?`,
 )
@@ -295,6 +303,16 @@ const pendingInboundCount = MSG_DB.prepare(
 const MAX_PENDING_INBOUND_DELIVERIES = 1000
 const INBOUND_OFFER_RETRY_MS = 120000
 const MAX_INBOUND_DELIVERY_ATTEMPTS = 2
+// Telegram delivers a caption and its file, an album, or a person typing three
+// thoughts in a row, as separate updates, and each one started its own turn:
+// the agent answered "I don't see a file" nine seconds before it summarised
+// that very file, and sixteen photos came back commented one by one while their
+// sender waited — "she can't stop, she doesn't see my later messages" (client
+// box, 2026-09-15). Everything one person wrote before getting an answer is
+// handed over as a single turn, which is how the generation before the durable
+// delivery queue behaved by accident and what people still expect.
+const MAX_COALESCED_INBOUND_MESSAGES = 10
+const MAX_COALESCED_INBOUND_BYTES = 8000
 const INBOUND_RETRY_NOTICE = '⚠️ Повідомлення не вдалося передати в обробку після повторних спроб. Будь ласка, надішли його ще раз.'
 
 type InboundNotification = {
@@ -414,6 +432,89 @@ function pendingInboundHead(): PendingInboundRow | null {
      FROM pending_inbound_deliveries
      ORDER BY created_at ASC, rowid ASC LIMIT 1`,
   ).get() as PendingInboundRow | null
+}
+
+// An album arrives as one message per photo, so the files of a burst travel
+// together: the first keeps the single-attachment attributes every existing
+// agent already reads, and the whole set is listed in image_paths and
+// attachment_file_ids. The head keeps its own delivery id, so the completion
+// proof, the retry ladder and the exhausted notice are unchanged. The head is
+// rewritten before the folded rows are dropped: a crash in between leaves a
+// message queued twice at worst, which is exactly today's behaviour, and never
+// loses one.
+function coalesceInboundBurst(row: PendingInboundRow): PendingInboundRow {
+  if (row.state !== 'queued') return row
+  let head: InboundNotification
+  try { head = JSON.parse(row.payload) as InboundNotification }
+  catch { return row }
+  if (head.method !== 'notifications/claude/channel') return row
+  const meta = head.params?.meta
+  if (!meta || meta.delivery_id !== row.delivery_id) return row
+  const attachmentKeys = ['image_path', 'attachment_kind', 'attachment_file_id', 'attachment_size', 'attachment_mime', 'attachment_name']
+  const images: string[] = meta.image_path !== undefined ? [meta.image_path] : []
+  const fileIds: string[] = meta.attachment_file_id !== undefined ? [meta.attachment_file_id] : []
+  const fileNames: string[] = meta.attachment_name !== undefined ? [meta.attachment_name] : []
+  let content = head.params.content ?? ''
+  const folded: { row: PendingInboundRow, meta: Record<string, string> }[] = []
+  const followers = MSG_DB.query(
+    `SELECT rowid, delivery_id, payload, created_at, state, attempts, next_attempt_at
+     FROM pending_inbound_deliveries
+     WHERE created_at > ? OR (created_at = ? AND rowid > ?)
+     ORDER BY created_at ASC, rowid ASC LIMIT ?`,
+  ).all(row.created_at, row.created_at, row.rowid, MAX_COALESCED_INBOUND_MESSAGES) as PendingInboundRow[]
+  for (const next of followers) {
+    // Anything still queued behind the head is a message its sender wrote
+    // BEFORE getting an answer — either in one burst, or while the agent was
+    // busy for two minutes with the photo before it. Both are the same request
+    // to a person, so the gap between them is not a reason to split the turn;
+    // only the caps below are. An answered message never sits here: completion
+    // removes it, so a new message after a reply becomes a head of its own.
+    if (next.state !== 'queued') break
+    let notification: InboundNotification
+    try { notification = JSON.parse(next.payload) as InboundNotification }
+    catch { break }
+    if (notification.method !== 'notifications/claude/channel') break
+    const nextMeta = notification.params?.meta
+    if (!nextMeta || nextMeta.delivery_id !== next.delivery_id) break
+    // One person, one chat, one topic: a group must never merge two people, and
+    // a reply that names a different message keeps its own turn.
+    if (nextMeta.chat_id !== meta.chat_id || nextMeta.thread_id !== meta.thread_id
+      || nextMeta.user_id !== meta.user_id || nextMeta.conversation_key !== meta.conversation_key) break
+    if (nextMeta.reply_to_message_id !== undefined) break
+    // Every file of the burst travels with it, and the same cap applies to the
+    // files as to the messages: an album of forty photos is not one prompt.
+    if (images.length + fileIds.length >= MAX_COALESCED_INBOUND_MESSAGES) break
+    const merged = `${content}\n${notification.params.content ?? ''}`
+    if (Buffer.byteLength(merged, 'utf8') > MAX_COALESCED_INBOUND_BYTES) break
+    content = merged
+    if (nextMeta.image_path !== undefined) images.push(nextMeta.image_path)
+    if (nextMeta.attachment_file_id !== undefined) fileIds.push(nextMeta.attachment_file_id)
+    if (nextMeta.attachment_name !== undefined) fileNames.push(nextMeta.attachment_name)
+    folded.push({ row: next, meta: nextMeta })
+  }
+  if (!folded.length) return row
+  const mergedMeta: Record<string, string> = { ...meta }
+  for (const item of folded) {
+    for (const key of attachmentKeys) {
+      if (item.meta[key] !== undefined && mergedMeta[key] === undefined) mergedMeta[key] = item.meta[key]
+    }
+  }
+  // The single-file attributes keep naming the first file, so an agent that was
+  // never told about a set still behaves exactly as before; the set is listed
+  // separately and only when there is more than one.
+  if (images.length > 1) mergedMeta.image_paths = images.join(',')
+  if (fileIds.length > 1) mergedMeta.attachment_file_ids = fileIds.join(',')
+  if (fileNames.length > 1) mergedMeta.attachment_names = fileNames.join(', ')
+  mergedMeta.coalesced_messages = String(folded.length + 1)
+  const payload = JSON.stringify({ ...head, params: { content, meta: mergedMeta } })
+  if (pendingInboundMergeHead.run(payload, row.rowid, row.delivery_id, row.payload).changes !== 1) return row
+  for (const item of folded) {
+    if (pendingInboundFoldedDelete.run(item.row.rowid, item.row.delivery_id, item.row.payload).changes !== 1) {
+      process.stderr.write('telegram channel: coalesced message left queued; it will be offered on its own\n')
+    }
+  }
+  process.stderr.write(`telegram channel: coalesced ${folded.length + 1} inbound messages into one turn\n`)
+  return { ...row, payload }
 }
 
 function queueInboundDelivery(
@@ -1202,7 +1303,7 @@ const mcp = new Server(
     instructions: [
       'The sender reads Telegram, not this session. Anything you want them to see must go through the reply tool — your transcript output never reaches their chat.',
       '',
-      'Messages from Telegram arrive as <channel source="telegram" chat_id="..." message_id="..." user="..." ts="...">. If the tag has an image_path attribute, Read that file — it is a photo the sender attached. If the tag has attachment_file_id, call download_attachment with that file_id to fetch the file, then Read the returned path. Reply with the reply tool — pass chat_id back. For a forum topic, also pass the inbound thread_id as an integer independently of reply_to, even for the latest message and every follow-up. thread_id selects the topic; reply_to only adds a quote. Use reply_to (set to a message_id) only when quoting an earlier message; omit reply_to for normal responses, never omit an inbound thread_id. Do not guess a topic from the latest activity in another conversation.',
+      'Messages from Telegram arrive as <channel source="telegram" chat_id="..." message_id="..." user="..." ts="...">. If the tag has an image_path attribute, Read that file — it is a photo the sender attached. If the tag has attachment_file_id, call download_attachment with that file_id to fetch the file, then Read the returned path. One tag can carry a whole burst: image_paths lists every photo of it, comma-separated, and attachment_file_ids every file — Read or download all of them, and answer the burst once instead of replying per message. Reply with the reply tool — pass chat_id back. For a forum topic, also pass the inbound thread_id as an integer independently of reply_to, even for the latest message and every follow-up. thread_id selects the topic; reply_to only adds a quote. Use reply_to (set to a message_id) only when quoting an earlier message; omit reply_to for normal responses, never omit an inbound thread_id. Do not guess a topic from the latest activity in another conversation.',
       '',
       `reply accepts files staged inside ${ATTACHMENT_OUTBOX} for attachments. Pass an absolute path, not ~. Use react to add emoji reactions, and edit_message for interim progress updates. Edits don\'t trigger push notifications — when a long task completes, send a new reply so the user\'s device pings.`,
       '',
@@ -1347,16 +1448,20 @@ async function drainPendingInboundDeliveries(): Promise<void> {
       return
     }
 
+    // A burst is folded into the head before it is offered: the same person's
+    // caption and file reach the model as one turn instead of two.
+    const ready = coalesceInboundBurst(row)
+
     const nextAttemptAt = now + INBOUND_OFFER_RETRY_MS
-    const offered = row.state === 'queued'
-      ? pendingInboundQueuedOffer.run(nextAttemptAt, row.delivery_id, now)
-      : row.state === 'offered'
-        ? pendingInboundSecondOffer.run(nextAttemptAt, row.delivery_id, MAX_INBOUND_DELIVERY_ATTEMPTS, now)
+    const offered = ready.state === 'queued'
+      ? pendingInboundQueuedOffer.run(nextAttemptAt, ready.delivery_id, now)
+      : ready.state === 'offered'
+        ? pendingInboundSecondOffer.run(nextAttemptAt, ready.delivery_id, MAX_INBOUND_DELIVERY_ATTEMPTS, now)
         : null
     if (!offered || offered.changes !== 1) return
 
     try {
-      const notification = JSON.parse(row.payload) as InboundNotification
+      const notification = JSON.parse(ready.payload) as InboundNotification
       await deliverInboundNotification(notification)
     } catch {
       process.stderr.write('telegram channel: pending inbound offer failed\n')
@@ -2526,6 +2631,36 @@ async function downloadCorporateImage(ctx: Context, attachment?: AttachmentMeta)
   return media.readImageResponse(response, photo ? 'image/jpeg' : document?.mime_type, file.file_size ?? incoming.file_size)
 }
 
+async function downloadCorporateDocument(ctx: Context, attachment: AttachmentMeta) {
+  // Same trust rule as images: only this update's document, bounded before the
+  // download, then validated by the corporate module before a worker sees it.
+  const document = ctx.message?.document
+  if (!document || attachment.kind !== 'document' || attachment.file_id !== document.file_id) {
+    throw new Error('current document missing')
+  }
+  const media = await import(new URL('./media.ts', pathToFileURL(CORPORATE_MODULE)).href)
+  const name = corporateDocumentName(attachment.name)
+  const mediaType = media.corporateDocumentType(name)
+  if (!mediaType) throw new Error('document type unsupported')
+  if (document.file_size != null && document.file_size > media.MAX_DOCUMENT_BYTES) throw new Error('document too large')
+  const file = await ctx.api.getFile(document.file_id, AbortSignal.timeout(TELEGRAM_FETCH_TIMEOUT_MS))
+  if (!file.file_path || file.file_path.includes('..') || !/^[A-Za-z0-9_./-]+$/.test(file.file_path)) {
+    throw new Error('invalid Telegram file path')
+  }
+  if (file.file_size != null && file.file_size > media.MAX_DOCUMENT_BYTES) throw new Error('document too large')
+  const response = await fetch(`https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`, {
+    signal: AbortSignal.timeout(TELEGRAM_FETCH_TIMEOUT_MS), redirect: 'error',
+  })
+  const bytes = await readTelegramFileResponse(response, file.file_size ?? document.file_size)
+  return media.validateCorporateDocuments([{ name, mediaType, data: bytes.toString('base64') }])[0]
+}
+
+// The uploader picks the name; the module refuses separators, control
+// characters and dot names, and a name it cannot type is refused before download.
+function corporateDocumentName(name: string | undefined): string {
+  return (name ?? '').replace(/[\x00-\x1f\x7f/\\]/g, '_').trim().slice(0, 200)
+}
+
 async function routeInbound(
   ctx: Context,
   text: string,
@@ -2573,9 +2708,19 @@ async function routeInbound(
   try {
     let corporateText = text
     let images
+    let documents
     if (downloadImage != null || attachment?.kind === 'document') {
-      try { images = [await downloadCorporateImage(ctx, attachment)] }
-      catch {
+      // A photo, or a document that is an image, stays an image; a document of
+      // a kind the corporate module takes (PDF, Office, plain text) becomes a
+      // file in the worker's workspace; anything else is refused before download.
+      const incomingDocument = ctx.message?.document
+      const imageDocument = attachment?.kind === 'document'
+        && (/^image\//.test(incomingDocument?.mime_type ?? attachment.mime ?? '')
+          || /\.(jpe?g|png|gif|webp)$/i.test(incomingDocument?.file_name ?? attachment.name ?? ''))
+      try {
+        if (attachment?.kind === 'document' && !imageDocument) documents = [await downloadCorporateDocument(ctx, attachment)]
+        else images = [await downloadCorporateImage(ctx, attachment)]
+      } catch {
         await replyCorporate(CORPORATE_FILE_INSPECTION_DISABLED)
         return
       }
@@ -2610,6 +2755,7 @@ async function routeInbound(
       messageId: msgId,
       text: corporateText,
       ...(images ? { images } : {}),
+      ...(documents ? { documents } : {}),
       createdAt: Date.now(),
     })
     if (corporate.health().admissionState !== 'active') {

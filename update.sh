@@ -77,6 +77,37 @@ require_valid_restart_hold() {
   fi
 }
 
+# Сторонні супервізори клієнта не знають про restart-hold і піднімають службу
+# посеред вікна: у Лери це робив власний bots-supervisor кожні 5 хвилин, і
+# оновлення падало на перевірці зупиненої служби. Умова в drop-in вимикає
+# СТАРТ для всіх однаково, не питаючи нікого: чужий `systemctl start` тихо
+# нічого не робить (rc=0), юніт не падає в failed, тож чужий сторож не здіймає
+# тривогу. Вже запущену службу drop-in не зупиняє — він забороняє лише підйом.
+#
+# Умова навмисно прив'язана до того самого restart-hold, а не до власного
+# прапорця: забутий drop-in тоді не лишає бота лежати. Коли hold протухає,
+# cash-healthcheck прибирає його (service_mutation_allowed), умова знову
+# виконується, і служба стартує. Максимальний час — 24 години, стільки ж
+# дозволяє require_valid_restart_hold.
+# Каталог перекривається лише тестом; на живому боксі це завжди systemd.
+MAINTENANCE_DROPIN_DIR="${MAINTENANCE_DROPIN_DIR:-/etc/systemd/system/claude-telegram.service.d}"
+MAINTENANCE_DROPIN="$MAINTENANCE_DROPIN_DIR/zz-maintenance-hold.conf"
+
+install_maintenance_dropin() {
+  mkdir -p "$MAINTENANCE_DROPIN_DIR"
+  printf '[Unit]\nConditionPathExists=!%s\n' "$RESTART_HOLD" > "$MAINTENANCE_DROPIN"
+  chmod 644 "$MAINTENANCE_DROPIN"
+  systemctl daemon-reload
+}
+
+# Знімається безумовно, а не наприкінці вдалого шляху: аварія посеред оновлення
+# не має лишати по собі правило, якого ніхто не чекає.
+remove_maintenance_dropin() {
+  rm -f "$MAINTENANCE_DROPIN"
+  rmdir "$MAINTENANCE_DROPIN_DIR" 2>/dev/null || true
+  systemctl daemon-reload
+}
+
 require_corporate_stopped_preflight() {
   local receipt_digest
   receipt_digest="$(python3 - "$CORPORATE_STOPPED_PREFLIGHT" <<'PY'
@@ -218,6 +249,13 @@ if [ "$CLAUDE_UPDATE_MAINTENANCE" != 1 ]; then
   exit 1
 fi
 require_valid_restart_hold
+install_maintenance_dropin
+# Обробник сигналу сам по собі не зупиняє скрипт: без явного виходу ми б зняли
+# drop-in і поїхали оновлювати далі вже без захисту. Тому INT і TERM виходять,
+# а прибирання висить на EXIT, який спрацює в обох випадках.
+trap remove_maintenance_dropin EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 require_primary_service_stopped
 
 # Corporate routing is irreversible once activated. The outer transaction must
@@ -414,7 +452,7 @@ SAVED_EXPORTS="$(mktemp)"
 cleanup_exports() {
   rm -f "$SAVED_EXPORTS"
 }
-trap cleanup_exports EXIT
+trap 'cleanup_exports; remove_maintenance_dropin' EXIT
 python3 "$KIT/assets/bin/saved-env-export" "$ENV_SAVED" > "$SAVED_EXPORTS"
 # Novsky can supply a new key privately when migrating an older saved config.
 _requested_license_key="${NOVSKY_LICENSE_KEY:-}"

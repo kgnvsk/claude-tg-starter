@@ -645,7 +645,24 @@ def _python(text,known):
         # preserves statements, indentation and all expressions around literals.
         changed.append(token._replace(string=value))
     if not count:return text,0
-    clean=tokenize.untokenize(changed)
+    # Splice changed spellings into the original by coordinates, not untokenize:
+    # on Python 3.12 (Ubuntu 24.04) untokenize turns an untouched escaped brace in
+    # an f-string into a space ("\d{{6}}" came back as "\d{ 6}}"), so any file that
+    # held a secret next to such a regex failed the whole backup. The duplicate
+    # brace of each escape sits between FSTRING_MIDDLE tokens, so a changed middle
+    # takes the gap up to the next token with it and is escaped again.
+    offsets=[0]
+    for line in io.StringIO(text).readlines():offsets.append(offsets[-1]+len(line))
+    def at(point):return offsets[point[0]-1]+point[1]
+    pieces=[];cursor=0
+    for index,(old,new) in enumerate(zip(tokens,changed)):
+        if old.string==new.string:continue
+        if old.type==getattr(tokenize,'FSTRING_MIDDLE',-1):
+            end=at(tokens[index+1].start);spelling=new.string.replace('{','{{').replace('}','}}')
+        else:
+            end=at(old.end);spelling=new.string
+        pieces+=[text[cursor:at(old.start)],spelling];cursor=end
+    clean=''.join(pieces)+text[cursor:]
     ast.parse(clean)
     return clean,count
 

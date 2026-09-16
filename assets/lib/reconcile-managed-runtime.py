@@ -70,6 +70,7 @@ MANAGED_BIN_NAMES = frozenset(
         "onboarding-reminder",
         "onboarding-status",
         "plugin-doctor",
+        "queue-settle-sweep",
         "reconcile-telegram-plugin",
         "report-build",
         "report-shell.html",

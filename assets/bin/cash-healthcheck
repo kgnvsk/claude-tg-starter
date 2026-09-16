@@ -112,12 +112,22 @@ chmod 0600 "$LOG" 2>/dev/null || exit 0
 # lock. A concurrent recovery tick makes this status unknown; unknown fails closed
 # for the destructive stuck-turn restart, then the next health tick tries again.
 LIMIT_RECOVERY_STATUS=unknown
+# A dead detector looks exactly like one busy tick, only forever: two boxes lived
+# for weeks with --status failing silently (a stale checkpoint on one, state that
+# was never initialized on the other), and every tick quietly retried. Remember
+# since when the answer has been unknown, so a later check can tell the two apart.
+LIMIT_SILENT_STAMP="$STAMP/limit-detector-unknown-since.ts"
 if [ -x "$H/bin/claude-limit-recovery" ]; then
     LIMIT_STATUS_JSON=$(timeout 30 env HOME="$H" "$H/bin/claude-limit-recovery" --status 2>/dev/null || true)
     case "$LIMIT_STATUS_JSON" in
         '{"active":true,"schemaVersion":1}') LIMIT_RECOVERY_STATUS=active ;;
         '{"active":false,"schemaVersion":1}') LIMIT_RECOVERY_STATUS=clear ;;
     esac
+    if [ "$LIMIT_RECOVERY_STATUS" = unknown ]; then
+        [ -s "$LIMIT_SILENT_STAMP" ] || date +%s > "$LIMIT_SILENT_STAMP" 2>/dev/null || true
+    else
+        rm -f "$LIMIT_SILENT_STAMP"
+    fi
 fi
 LIFECYCLE_LOCK=$H/logs/transport-lifecycle.lock
 touch "$LIFECYCLE_LOCK" 2>/dev/null || exit 0
@@ -260,7 +270,13 @@ alert() {
     # failed starts, which is a dead assistant and worth saying out loud.
     # corporate-paused / corporate-unavailable: employees are unanswered while
     # the owner's own chat works, so nothing else would ever tell him.
-    case "$key" in browser-down|crash-loop|low-disk|service-down|stuck-escalate|corporate-paused|corporate-unavailable) ;; *) return 0 ;; esac
+    # limit-detector-silent: the limit watchdog is the thing that would tell the
+    # owner a Claude limit ran out; once it stops answering, a spent limit turns
+    # into an assistant that silently stops replying, and nothing self-heals it.
+    # api-error-turns: the service is up, the login is valid and every turn ends
+    # in a second — with a provider refusal instead of an answer (a model this
+    # CLI does not know, a revoked key). No restart fixes it; only the owner can.
+    case "$key" in browser-down|crash-loop|low-disk|service-down|stuck-escalate|corporate-paused|corporate-unavailable|limit-detector-silent|api-error-turns) ;; *) return 0 ;; esac
     local last_file="$STAMP/cash-alert-${key}.ts"
     local now=$(date +%s)
     local last=$(cat "$last_file" 2>/dev/null || echo 0)
@@ -316,7 +332,11 @@ fi
 # Stop recovery before handling any restart request when the service is already
 # crash-looping. Keeping this guard below an early-exit recovery branch let one
 # poisoned FIFO item restart the agent forever without ever reaching the guard.
-RESTARTS=$(journalctl -u "$SVC" --since "10 min ago" --no-pager 2>/dev/null | grep -c "Started Claude Code")
+# systemd 249 (Ubuntu 22.04) logs "Started Claude Code Telegram Bot…"; 255+ (24.04,
+# 26.04) logs "Started claude-telegram.service - Claude Code Telegram Bot…". A grep
+# for the bare description counted 0 on every 24.04 box, so this guard, the
+# restarts_10min field and /unstick's count were all silently dead there.
+RESTARTS=$(journalctl -u "$SVC" --since "10 min ago" --no-pager 2>/dev/null | grep -c -E "Started ([^ ]+\.service - )?Claude Code")
 if [ "$RESTARTS" -gt 4 ]; then
     if service_mutation_allowed; then
         if sudo systemctl stop "$SVC" 2>/dev/null; then
@@ -596,6 +616,23 @@ if systemctl list-unit-files streampost.service --no-legend 2>/dev/null | grep -
     if ! systemctl is-active streampost.service >/dev/null 2>&1; then
         sudo systemctl start streampost.service 2>/dev/null
     fi
+fi
+
+# A limit watchdog that has not answered for half an hour is dead, not busy: a
+# concurrent recovery tick holds the answer for seconds, and half an hour is
+# fifteen health ticks in a row. Say it once a day until it answers again.
+if [ -s "$LIMIT_SILENT_STAMP" ]; then
+    LIMIT_SILENT_SINCE=$(cat "$LIMIT_SILENT_STAMP" 2>/dev/null || true)
+    case "$LIMIT_SILENT_SINCE" in
+        ''|*[!0-9]*) rm -f "$LIMIT_SILENT_STAMP" ;;
+        *)
+            LIMIT_SILENT_MIN=$(( ($(date +%s) - LIMIT_SILENT_SINCE) / 60 ))
+            if [ "$LIMIT_SILENT_MIN" -ge 30 ]; then
+                echo "[$(date -u +%FT%TZ)] limit watchdog has not answered for ${LIMIT_SILENT_MIN} min" >> "$LOG"
+                alert "limit-detector-silent" "Сторож лімітів Claude не відповідає вже ${LIMIT_SILENT_MIN} хв. Якщо ліміт закінчиться, бот просто замовкне і ніхто не дізнається чому. Напиши нам." 86400
+            fi
+            ;;
+    esac
 fi
 
 # 8. Disk space (< 5% free = critical)
@@ -1243,6 +1280,81 @@ PRIVATE_CHAT_ACTIVITY_EOF
             done
         fi
     fi
+fi
+
+# 8b. Turns that end in an API error nobody else owns. Limits (429) and overload
+# (529) belong to claude-limit-recovery; an expired login to the auth rescue. What
+# is left is a request the provider refuses outright — a model the installed CLI
+# does not know, a revoked key — and it looks healthy to every other detector:
+# service active, authenticated, no stuck turn, because each turn ends in a
+# second. A customer watched 16 minutes of "API Error 400" replies with
+# health-state.json all green (2026-09-15). Two such turns in 15 minutes are an
+# incident; the owner is told once an hour with the provider's own words.
+API_ERROR_SCAN=$(python3 - "$SESS_DIR" <<'PY' 2>/dev/null
+import json
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+WINDOW_SECONDS = 900
+TAIL_BYTES = 4 * 1024 * 1024
+root = Path(sys.argv[1])
+now = time.time()
+count = 0
+latest = ("", "")
+try:
+    paths = [
+        path for path in root.rglob("*.jsonl")
+        if "corporate-workers" not in path.parent.name and now - path.stat().st_mtime < WINDOW_SECONDS
+    ]
+except OSError:
+    paths = []
+for path in paths:
+    try:
+        with path.open("rb") as handle:
+            handle.seek(max(0, path.stat().st_size - TAIL_BYTES))
+            data = handle.read()
+    except OSError:
+        continue
+    for raw in data.splitlines():
+        if b'"isApiErrorMessage"' not in raw:
+            continue
+        try:
+            event = json.loads(raw)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if not isinstance(event, dict) or event.get("isApiErrorMessage") is not True:
+            continue
+        if event.get("type") != "assistant" or event.get("isSidechain") is not False:
+            continue
+        if event.get("apiErrorStatus") in (429, 529):
+            continue
+        stamp = str(event.get("timestamp") or "")
+        try:
+            age = now - datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            continue
+        if age > WINDOW_SECONDS:
+            continue
+        count += 1
+        content = (event.get("message") or {}).get("content")
+        text = ""
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            text = next((block.get("text", "") for block in content if isinstance(block, dict) and block.get("type") == "text"), "")
+        if stamp >= latest[0]:
+            latest = (stamp, " ".join(str(text).split())[:160])
+print(f"{count}|{latest[1]}")
+PY
+)
+API_ERROR_COUNT=$(printf '%s' "$API_ERROR_SCAN" | cut -d'|' -f1)
+case "$API_ERROR_COUNT" in ''|*[!0-9]*) API_ERROR_COUNT=0 ;; esac
+if [ "$API_ERROR_COUNT" -ge 2 ]; then
+    API_ERROR_TEXT=$(printf '%s' "$API_ERROR_SCAN" | cut -d'|' -f2-)
+    echo "[$(date -u +%FT%TZ)] api-error turns in 15 min: ${API_ERROR_COUNT} — ${API_ERROR_TEXT}" >> "$LOG"
+    alert "api-error-turns" "Я відповідаю помилкою API замість відповіді (${API_ERROR_COUNT} за 15 хв): ${API_ERROR_TEXT}. Перезапуск не допоможе: перевір модель у settings.json або виконай /relogin." 3600
 fi
 
 # 9. Write one machine-readable snapshot after both owner and corporate queues
