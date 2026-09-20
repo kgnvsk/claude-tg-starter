@@ -96,6 +96,15 @@
             "timeout": 5
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "{{AGENT_HOME}}/bin/tg-turn-end",
+            "timeout": 5
+          }
+        ]
       }
     ],
     "PostToolUse": [
@@ -133,6 +142,26 @@
             "type": "command",
             "command": "{{AGENT_HOME}}/bin/tg-reply-stop-guard",
             "timeout": 35
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "{{AGENT_HOME}}/bin/tg-turn-end",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "StopFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "{{AGENT_HOME}}/bin/tg-turn-end",
+            "timeout": 5
           }
         ]
       }

@@ -2,7 +2,9 @@
 """Block one Stop event when a Telegram turn was never delivered to Telegram."""
 
 from datetime import datetime, timezone
+from contextlib import redirect_stdout
 import fcntl
+import io
 import json
 import subprocess
 import os
@@ -13,6 +15,7 @@ import sqlite3
 import stat
 import sys
 import tempfile
+import time
 import uuid
 
 
@@ -42,6 +45,13 @@ UNSAFE_FALLBACK_TEXT = re.compile(
     r"\bmcp__[A-Za-z0-9_]+\b|\bstop_hook\b|/home/|\.jsonl\b|<channel\b|\*\*|```)",
     re.IGNORECASE,
 )
+# The model's old text marker for silence, alone or under its reasoning.
+# Forwarding such text reverses the intent: the person got the reasoning and
+# the marker itself, five times in three minutes (Кнопа Кирила, 17.09). Since
+# 19.09 silence is the no_reply tool; the marker is recognised only as a model
+# error that gets one hint, and as silence on the retried Stop.
+DECLARED_SILENCE = re.compile(r"^\s*NO_REPLY\s*$", re.MULTILINE)
+NO_REPLY_TOOL_SUFFIX = "__no_reply"
 TRANSCRIPT_TAIL_BYTES = 16 * 1024 * 1024
 TEAM_CLIENT = Path('/usr/local/lib/novsky-team/client.py')
 # The broker's own words for a uid that belongs to no org chart.
@@ -218,8 +228,154 @@ def telegram_state_dir() -> Path:
     )
 
 
+AUTHORITY_VALUES = ("guard", "shadow", "receiver")
+
+
+def delivery_authority() -> str:
+    """Who removes a delivered message from the queue (KTD8).
+
+    The launcher exports the channel file into the CLI environment, so a hook
+    of the bot's session carries the value the receiver started with; a run
+    without it (the sweep from cron, an operator by hand) reads the value the
+    poller recorded. Absent or unknown means guard.
+    """
+    value = os.environ.get("TG_DELIVERY_AUTHORITY", "")
+    if value in AUTHORITY_VALUES:
+        return value
+    database = telegram_state_dir() / "messages.db"
+    if not database.exists():
+        return "guard"
+    try:
+        connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True, timeout=1.0)
+        try:
+            row = connection.execute(
+                "SELECT value FROM delivery_runtime WHERE key='authority'"
+            ).fetchone()
+        finally:
+            connection.close()
+    except sqlite3.Error:
+        return "guard"
+    return row[0] if row and row[0] in AUTHORITY_VALUES else "guard"
+
+
+def mark_turn_message(
+    connection: sqlite3.Connection, delivery_id: str, closed_by: str
+) -> None:
+    """Tell the receiver's turn ledger why this guard closed the head (KTD9).
+
+    guard_delivered — an answer reached the chat; guard_silence — declared
+    silence (tool or text marker); guard_forwarded — this guard's own resend of
+    terminal text. A row the receiver already closed (a receipt, no_reply) is
+    left alone: the shadow classifier compares its closer with the fact that
+    the head is gone. Missing ledger tables are an older receiver; a failed
+    mark is observability lost, never a reason to hold the Stop.
+    """
+    try:
+        table = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='delivery_turn_messages'"
+        ).fetchone()
+        if table is None:
+            return
+        connection.execute(
+            "UPDATE delivery_turn_messages SET closed_by=?, closed_at=? "
+            "WHERE delivery_id=? AND closed_at IS NULL",
+            (closed_by, int(datetime.now(timezone.utc).timestamp() * 1000), delivery_id),
+        )
+    except sqlite3.Error:
+        pass
+
+
+def mark_guard_settlement(
+    connection: sqlite3.Connection, delivery_id: str, binding: tuple[int, str] | None,
+) -> None:
+    """Record an actual guard deletion without replacing the receipt's kind."""
+    if binding is None:
+        return
+    columns = {row[1] for row in connection.execute('PRAGMA table_info(delivery_turn_messages)')}
+    if 'guard_settled_at' not in columns:
+        return
+    connection.execute(
+        'UPDATE delivery_turn_messages SET guard_settled_at=coalesce(guard_settled_at,?) '
+        'WHERE delivery_id=? AND turn_id=? AND EXISTS '
+        '(SELECT 1 FROM delivery_turns t WHERE t.turn_id=delivery_turn_messages.turn_id AND t.session_id=?)',
+        (int(datetime.now(timezone.utc).timestamp() * 1000), delivery_id, *binding),
+    )
+
+
+def retain_request(
+    connection: sqlite3.Connection, delivery_id: str, session_id: str | None,
+    closed_by: str,
+) -> tuple[int, str] | None | bool:
+    """Preserve the original input and require the guard's exact ledger binding.
+
+    False means unsafe to release; None is an older receiver without durable
+    requests. A binding is returned for an atomic result update after release.
+    """
+    columns = {row[1] for row in connection.execute('PRAGMA table_info(delivery_results)')}
+    if 'request_payload' not in columns:
+        return None
+    acknowledged = 'r.acknowledged_at' if 'acknowledged_at' in columns else 'NULL'
+    task = 'r.task_id' if 'task_id' in columns else 'NULL'
+    row = connection.execute(
+        'SELECT r.turn_id,r.session_id,r.state,r.request_payload,r.chat_id,r.thread_id,r.stamp, '
+        f'{acknowledged}, {task} '
+        'FROM delivery_results r JOIN delivery_turns t ON t.turn_id=r.turn_id '
+        'JOIN delivery_turn_messages m ON m.turn_id=t.turn_id AND m.delivery_id=r.delivery_id '
+        'WHERE r.delivery_id=? AND t.session_id=r.session_id AND m.chat_id=r.chat_id '
+        'AND m.thread_id IS r.thread_id', (delivery_id,),
+    ).fetchone()
+    if row is None or (session_id is not None and session_id != row[1]):
+        return False
+    if row[2] == 'blocked':
+        return False  # A quarantined request needs recovery evidence, not ordinary turn settlement.
+    if not row[6] or row[6] != os.environ.get('TG_DELIVERY_STAMP'):
+        return False
+    if closed_by in {'guard_forwarded', 'guard_silence'} and not session_id:
+        return False
+    if closed_by == 'guard_silence' and (row[2] == 'deferred' or row[7] is not None or row[8]):
+        return False  # A promised result cannot be settled as an observation.
+    payload = row[3]
+    if not payload:
+        pending = connection.execute(
+            'SELECT payload FROM pending_inbound_deliveries WHERE delivery_id=?', (delivery_id,),
+        ).fetchone()
+        if pending is None:
+            return False
+        payload = pending[0]
+    try:
+        meta = json.loads(payload)['params']['meta']
+        if (str(meta.get('delivery_id', '')) != delivery_id
+                or str(meta.get('chat_id', '')) != row[4]
+                or (str(meta['thread_id']) if meta.get('thread_id') is not None else None) != row[5]):
+            return False
+    except (ValueError, KeyError, TypeError, AttributeError):
+        return False
+    connection.execute(
+        'UPDATE delivery_results SET request_payload=coalesce(request_payload,?) '
+        'WHERE delivery_id=? AND turn_id=? AND session_id=?', (payload, delivery_id, row[0], row[1]),
+    )
+    return row[0], row[1]
+
+
+def settle_result(
+    connection: sqlite3.Connection, delivery_id: str, binding: tuple[int, str] | None,
+    closed_by: str,
+) -> None:
+    if binding is None or closed_by not in {'guard_forwarded', 'guard_silence'}:
+        return
+    now = int(datetime.now(timezone.utc).timestamp() * 1000)
+    connection.execute(
+        'UPDATE delivery_results SET state=?,updated_at=?,finished_at=? '
+        'WHERE delivery_id=? AND turn_id=? AND session_id=? '
+        "AND state IN ('queued','pending','deferred','paused','resume_pending')",
+        ('no_reply' if closed_by == 'guard_silence' else 'complete', now, now,
+         delivery_id, *binding),
+    )
+
+
 def complete_started_delivery(
-    delivery_id: str | None, *, allow_offered: bool = False, silent: bool = False
+    delivery_id: str | None, *, allow_offered: bool = False, silent: bool = False,
+    closed_by: str = "guard_delivered", session_id: str | None = None,
 ) -> bool:
     """Remove the exact completed row; queued carriers may still be offered."""
     if delivery_id is None:
@@ -238,6 +394,10 @@ def complete_started_delivery(
         ).fetchone()
         if table is None:
             return False
+        connection.execute('BEGIN IMMEDIATE')
+        binding = retain_request(connection, delivery_id, session_id, closed_by)
+        if binding is False:
+            return False
         if silent:
             # Observation is not proof of delivery. Do not release a row already
             # reserved by recovery, or any other item in the FIFO.
@@ -252,6 +412,7 @@ def complete_started_delivery(
                 "delivery_id TEXT PRIMARY KEY, completed_at INTEGER NOT NULL)"
             )
             if deleted.rowcount == 1:
+                mark_guard_settlement(connection, delivery_id, binding)
                 connection.execute(
                     "INSERT OR REPLACE INTO telegram_silent_deliveries VALUES (?,?)",
                     (delivery_id, int(datetime.now(timezone.utc).timestamp())),
@@ -261,14 +422,18 @@ def complete_started_delivery(
                     "(SELECT delivery_id FROM telegram_silent_deliveries "
                     "ORDER BY completed_at DESC, rowid DESC LIMIT 1000)"
                 )
-            connection.commit()
             remaining = connection.execute(
                 "SELECT 1 FROM pending_inbound_deliveries WHERE delivery_id=?", (delivery_id,)
             ).fetchone()
             receipt = connection.execute(
                 "SELECT 1 FROM telegram_silent_deliveries WHERE delivery_id=?", (delivery_id,)
             ).fetchone()
-            return remaining is None and receipt is not None
+            settled = remaining is None and receipt is not None
+            if settled:
+                mark_turn_message(connection, delivery_id, closed_by)
+                settle_result(connection, delivery_id, binding, closed_by)
+            connection.commit()
+            return settled
         if allow_offered:
             deleted = connection.execute(
                 "DELETE FROM pending_inbound_deliveries "
@@ -281,14 +446,17 @@ def complete_started_delivery(
                 "WHERE delivery_id=? AND state IN ('started','recovering')",
                 (delivery_id,),
             )
-        connection.commit()
-        if deleted.rowcount == 1:
-            return True
-        remaining = connection.execute(
+        completed = deleted.rowcount == 1 or connection.execute(
             "SELECT state FROM pending_inbound_deliveries WHERE delivery_id=?",
             (delivery_id,),
-        ).fetchone()
-        return remaining is None
+        ).fetchone() is None
+        if completed:
+            if deleted.rowcount == 1:
+                mark_guard_settlement(connection, delivery_id, binding)
+            mark_turn_message(connection, delivery_id, closed_by)
+            settle_result(connection, delivery_id, binding, closed_by)
+        connection.commit()
+        return completed
     except sqlite3.Error:
         return False
     finally:
@@ -916,15 +1084,21 @@ def deliver_pending_answer(turn_events: list[object], chat_id: str) -> bool:
     тож сторож стану бачить чат відповіданим, і мовчить у підавлених сесіях.
     """
     text = final_answer_text(turn_events)
-    if chat_id.startswith("-") or text == "NO_REPLY" or not text or UNSAFE_FALLBACK_TEXT.search(text):
+    if chat_id.startswith("-") or not text or DECLARED_SILENCE.search(text) or UNSAFE_FALLBACK_TEXT.search(text):
         return False
     sender = AGENT_ROOT / "bin/tg-send"
     if not os.access(sender, os.X_OK):
         return False
+    # The resend is the person's answer, not the model's: the outbound row is
+    # marked stop-guard and carries no service stamp, so the receiver never
+    # counts it as a receipt of a delivered reply and the model's failure stays
+    # visible in the shadow report.
+    environment = {key: value for key, value in os.environ.items() if key != "TG_DELIVERY_STAMP"}
+    environment["TG_SEND_ORIGIN"] = "stop-guard"
     try:
         done = subprocess.run(
             [str(sender), chat_id, text],
-            capture_output=True, text=True, timeout=30,
+            capture_output=True, text=True, timeout=30, env=environment,
         )
     except (OSError, subprocess.SubprocessError):
         return False
@@ -947,25 +1121,39 @@ def deliver_pending_answer(turn_events: list[object], chat_id: str) -> bool:
     return False
 
 
-def observation_only(turn_events: list[dict]) -> bool:
+def observation_only(turn_events: list[dict], result_events: list[object] | None = None) -> bool:
     """Silence cannot replace an unfinished tool call or a failed send.
 
     A call that already returned is not unfinished work: an agent that looked
     something up and then had nothing worth saying is still only observing.
     Requiring zero calls jammed the FIFO instead — a group turn with 22
     completed calls ended in NO_REPLY, the head stayed «started», and every
-    later message queued behind it (Кнопа Кирила, 15.09).
+    later message queued behind it (Кнопа Кирила, 15.09). Results are looked
+    for in `result_events` (the whole transcript) when given: a turn that ends
+    on the no_reply call itself keeps its result outside the ancestry.
     """
     finished: set[str] = set()
+    sends: set[str] = set()
     failed = False
     for event in turn_events:
         for block in content_blocks(event):
-            if not isinstance(block, dict) or block.get("type") != "tool_result":
+            if isinstance(block, dict) and delivery_attempt_chat_ids(block):
+                sends.add(block.get("id"))
+    for event in result_events if result_events is not None else turn_events:
+        for block in content_blocks(event):
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") != "tool_result":
                 continue
             identifier = block.get("tool_use_id")
             if isinstance(identifier, str):
                 finished.add(identifier)
-            if block.get("is_error") is True:
+            # Only a lost answer forbids silence. A lookup the secrets guard
+            # refused or a command the format enforcer rejected is still
+            # observation; counting every error as a failed send blocked NO_REPLY
+            # nine times in a row until the CLI cut the turn, and the head stayed
+            # «started» (Кнопа Кирила, 17.09).
+            if block.get("is_error") is True and identifier in sends:
                 failed = True
     if failed:
         return False
@@ -983,6 +1171,33 @@ def explicit_no_reply(turn_events: list[dict]) -> bool:
                      if isinstance(block, dict) and block.get("type") == "text"]
             return (all(isinstance(text, str) for text in texts)
                     and "\n".join(texts).strip() == "NO_REPLY")
+    return False
+
+
+def successful_no_reply(turn_events: list[dict], events: list[object]) -> bool:
+    """A no_reply tool call of this turn that came back without an error.
+
+    The result is a child of the assistant event that made the call, so when
+    the turn ends on the call itself it is missing from the ancestry: results
+    are looked for in the whole transcript, as for a delivery.
+    """
+    calls: set[str] = set()
+    for event in turn_events:
+        if not isinstance(event, dict) or event.get("type") != "assistant":
+            continue
+        for block in content_blocks(event):
+            if not isinstance(block, dict) or block.get("type") != "tool_use":
+                continue
+            name = str(block.get("name", ""))
+            if "telegram" in name and name.endswith(NO_REPLY_TOOL_SUFFIX) and block.get("id"):
+                calls.add(str(block["id"]))
+    if not calls:
+        return False
+    for event in events:
+        for block in content_blocks(event):
+            if (isinstance(block, dict) and block.get("type") == "tool_result"
+                    and str(block.get("tool_use_id", "")) in calls and block.get("is_error") is not True):
+                return True
     return False
 
 
@@ -1013,10 +1228,14 @@ def silence_covers_latest_incoming(
 
 def finish_group_observation(
     turn_events: list[dict], delivery_id: str | None, queued_carrier: bool,
-    *, reported_work: bool = False,
+    *, reported_work: bool = False, silent: bool = False, result_events: list[object] | None = None,
+    session_id: str | None = None,
 ) -> None:
-    if explicit_no_reply(turn_events) and observation_only(turn_events) and not reported_work:
-        if not complete_started_delivery(delivery_id, allow_offered=queued_carrier, silent=True):
+    if silent and observation_only(turn_events, result_events) and not reported_work:
+        if not complete_started_delivery(
+            delivery_id, allow_offered=queued_carrier, silent=True, closed_by="guard_silence",
+            session_id=session_id,
+        ):
             reason = ("The group observation could not be settled in the queue. No Telegram "
                       "response was sent. Keep this request pending and retry Stop; do not "
                       "send a silence explanation or claim delivery.")
@@ -1026,12 +1245,180 @@ def finish_group_observation(
         "Group terminal text is NOT automatically published. If a real response is required, "
         "send it explicitly with mcp__plugin_telegram_telegram__reply to this turn's chat_id/topic "
         "(or the documented sender if that tool failed). If this is only observation of "
-        "people talking to each other and no tool/action/task needs a result, finish with "
-        "exactly NO_REPLY as terminal text. Never send NO_REPLY or an explanation of why "
-        "you are staying silent to Telegram. Do not use silence to abandon requested work, "
-        "a refusal that needs delivery, a failed send or a delegated result."
+        "people talking to each other and no tool/action/task needs a result, call "
+        "mcp__plugin_telegram_telegram__no_reply with this turn's chat_id (and thread_id for a topic). "
+        "Never send an explanation of why you are staying silent to Telegram. Do not use "
+        "silence to abandon requested work, a refusal that needs delivery, a failed send or "
+        "a delegated result."
     )
     print(json.dumps({"decision": "block", "reason": reason, "systemMessage": reason}))
+
+
+def native_request_events(events: list[dict], turn_events: list[dict], delivery_id: str | None) -> list[dict]:
+    """A recovery carrier continues the same request's native work, not a new launch."""
+    scope = list(turn_events)
+    by_uuid = transcript_uuid_map(events) or {}
+    carrier = by_uuid.get(ancestry_parent_uuid(scope[0])) if scope else None
+    visited: set[str] = set()
+    while carrier and len(visited) < MAX_ANCESTRY_EVENTS:
+        _, prompt, origin = event_disposition(carrier)
+        if (not delivery_id or telegram_delivery_id(prompt, origin) != delivery_id
+                or not (channel_attributes(prompt) or {}).get('recovery_attempt')):
+            break
+        current = by_uuid.get(ancestry_parent_uuid(carrier))
+        previous = []
+        while current and len(visited) < MAX_ANCESTRY_EVENTS:
+            identifier = current.get('uuid')
+            if identifier in visited or current.get('isSidechain') is True:
+                return scope
+            visited.add(identifier)
+            disposition, prompt, origin = event_disposition(current)
+            if disposition == 'carrier':
+                if telegram_delivery_id(prompt, origin) != delivery_id:
+                    return scope
+                scope = list(reversed(previous)) + scope
+                carrier = current
+                break
+            if disposition != 'continuation':
+                return scope
+            previous.append(current)
+            current = by_uuid.get(ancestry_parent_uuid(current))
+        else:
+            break
+    return scope
+
+
+def native_background_work(events: list[dict], turn_events: list[dict], delivery_id: str | None) -> dict:
+    """Only native launch receipts and read callbacks describe background work.
+
+    A successful Monitor/async tool_result confirms a launch, not its result.
+    Ordinary command output, task status snapshots, other branches and copied
+    task-notification text cannot finish that work.
+    """
+    scope = native_request_events(events, turn_events, delivery_id)
+    tasks: dict[str, tuple[str, str, int]] = {}
+    unknown: list[str] = []
+    lost: list[str] = []
+    read_uuid = None
+
+    def text_of(content):
+        if isinstance(content, str):
+            return content
+        return '\n'.join(block.get('text', '') for block in (content if isinstance(content, list) else [])
+                         if isinstance(block, dict) and isinstance(block.get('text'), str))
+
+    def call_result(event, call):
+        # Only the result the active native branch actually read is evidence.
+        # Sibling children of the same tool-call event may describe another
+        # execution; a buffered result outside this ancestry is not read yet.
+        for row in scope:
+            if (row.get('type') != 'user' or row.get('isSidechain') is True
+                    or row.get('parentUuid') != event.get('uuid')):
+                continue
+            for block in content_blocks(row):
+                if (isinstance(block, dict) and block.get('type') == 'tool_result'
+                        and block.get('tool_use_id') == call.get('id')):
+                    native = row.get('toolUseResult')
+                    return block, native if isinstance(native, dict) else {}
+        return None, {}
+
+    for index, event in enumerate(scope):
+        for call in content_blocks(event):
+            if not isinstance(call, dict) or call.get('type') != 'tool_use':
+                continue
+            name, identifier = call.get('name'), call.get('id')
+            if name not in {'Monitor', 'Bash', 'Agent', 'Task'} or not isinstance(identifier, str):
+                continue
+            result, native = call_result(event, call)
+            parameters = call.get('input') if isinstance(call.get('input'), dict) else {}
+            background = (name == 'Monitor' or parameters.get('run_in_background') is True
+                          or native.get('isAsync') is True or bool(native.get('backgroundTaskId')))
+            if not background or (result and result.get('is_error') is True):
+                continue
+            task_id = native.get('backgroundTaskId') or (native.get('agentId') if native.get('isAsync') is True else None)
+            if task_id is None and result:
+                text = text_of(result.get('content'))
+                pattern = (r'^Monitor started \(task ([A-Za-z0-9_-]{1,128}),' if name == 'Monitor'
+                           else r'^Command running in background with ID: ([A-Za-z0-9_-]{1,128})(?:[.\s]|$)' if name == 'Bash'
+                           else r'^Async agent launched successfully\..*?\bagentId:\s*([A-Za-z0-9_-]{1,128})(?:[.\s]|$)')
+                match = re.search(pattern, text, re.DOTALL)
+                task_id = match.group(1) if match else None
+            if (not isinstance(task_id, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', task_id)
+                    or (task_id in tasks and tasks[task_id][0] != identifier)):
+                unknown.append(identifier)
+            else:
+                tasks[task_id] = (identifier, name, index)
+
+    for index, event in enumerate(scope):
+        text = None
+        if event.get('type') == 'user' and event.get('origin') == {'kind': 'task-notification'}:
+            text = (event.get('message') or {}).get('content')
+        elif event.get('type') == 'attachment':
+            attachment = event.get('attachment') or {}
+            if (attachment.get('type') == 'queued_command' and attachment.get('commandMode') == 'task-notification'
+                    and attachment.get('origin') in (None, {'kind': 'task-notification'})):
+                text = attachment.get('prompt')
+        if (isinstance(text, str) and re.fullmatch(r'\s*<task-notification>.*</task-notification>\s*', text, re.DOTALL)
+                and text.count('<task-id>') == 1 and text.count('</task-notification>') == 1):
+            task = re.search(r'<task-id>([A-Za-z0-9_-]{1,128})</task-id>', text)
+            bound = tasks.get(task.group(1)) if task else None
+            tool = re.search(r'<tool-use-id>([^<]+)</tool-use-id>', text)
+            terminal = re.search(r'<status>(completed|failed|killed|stopped|cancelled)</status>', text)
+            # A native Monitor event is already read input; the model can send
+            # its meaningful result or explicitly keep the same watch deferred.
+            streamed = re.search(r'<event>.+</event>', text, re.DOTALL)
+            if (bound and index > bound[2] and (not tool or tool.group(1) == bound[0])
+                    and (terminal or (bound[1] == 'Monitor' and streamed))):
+                del tasks[task.group(1)]
+                read_uuid = event.get('uuid')
+        for call in content_blocks(event):
+            if not isinstance(call, dict) or call.get('type') != 'tool_use' or call.get('name') != 'TaskOutput':
+                continue
+            parameters = call.get('input') if isinstance(call.get('input'), dict) else {}
+            task_id = parameters.get('task_id')
+            bound = tasks.get(task_id)
+            result, native = call_result(event, call)
+            if not bound or index <= bound[2] or not result:
+                continue
+            if result.get('is_error') is True:
+                # A service restart may have killed its child. Native absence
+                # ends waiting, but proves nothing about that child's effects.
+                if re.match(r'^No task found with ID: ' + re.escape(task_id) + r'(?:$|[.\n])',
+                            text_of(result.get('content'))):
+                    del tasks[task_id]
+                    lost.append(task_id)
+                    read_uuid = event.get('uuid')
+                continue
+            if not native:
+                try:
+                    native = json.loads(text_of(result.get('content')))
+                except (ValueError, TypeError):
+                    native = {}
+            task = native.get('task') if isinstance(native, dict) else None
+            if (isinstance(task, dict) and task.get('task_id', task.get('id')) == task_id
+                    and task.get('status') in {'completed', 'failed', 'killed', 'stopped', 'cancelled'}):
+                del tasks[task_id]
+                read_uuid = event.get('uuid')
+    return {'pending': list(tasks), 'unknown': unknown, 'lost': lost, 'read_uuid': read_uuid}
+
+
+def native_task_deferred(hook: dict, delivery_id: str | None, task_ids: list[str]) -> bool:
+    """A confirmed progress receipt may defer only this exact native obligation."""
+    if not delivery_id or len(task_ids) != 1 or not hook.get('session_id') or not os.environ.get('TG_DELIVERY_STAMP'):
+        return False
+    try:
+        with sqlite3.connect(f"file:{telegram_state_dir() / 'messages.db'}?mode=ro", uri=True, timeout=0.2) as conn:
+            return conn.execute(
+                'SELECT 1 FROM delivery_results r JOIN delivery_sessions s ON s.session_id=r.session_id '
+                'JOIN delivery_turns t ON t.turn_id=coalesce(r.response_turn_id,r.turn_id) '
+                "WHERE r.delivery_id=? AND r.session_id=? AND r.stamp=? AND r.state='deferred' AND r.task_id=? "
+                'AND r.acknowledged_at IS NOT NULL AND r.request_payload IS NOT NULL '
+                'AND s.stamp=r.stamp AND t.session_id=r.session_id '
+                'AND t.turn_id=(SELECT max(turn_id) FROM delivery_turns WHERE session_id=r.session_id)',
+                (delivery_id, hook['session_id'], os.environ['TG_DELIVERY_STAMP'], task_ids[0]),
+            ).fetchone() is not None
+    except sqlite3.Error:
+        return False
 
 
 def delegated_turn_work(hook: dict, events: list[dict], turn_events: list[dict]) -> dict:
@@ -1082,25 +1469,132 @@ def block_delegation(reason: str) -> None:
     print(json.dumps({'decision': 'block', 'reason': reason, 'systemMessage': reason}))
 
 
-def main() -> None:
+def current_stop_target(hook: dict) -> tuple[str, str, str | None, bool] | None:
+    """A unique real input claimed by this bot session, never a guessed chat."""
+    session = hook.get('session_id')
+    stamp = os.environ.get('TG_DELIVERY_STAMP')
+    if not isinstance(session, str) or not session or not stamp:
+        return None
+    connection = None
     try:
-        hook = json.load(sys.stdin)
-        stop_hook_active = hook.get("stop_hook_active") is True
-        transcript_path = Path(str(hook["transcript_path"]))
-        events = read_recent_events(transcript_path)
-        if events is None:
-            return
-    except Exception:
-        return
+        connection = sqlite3.connect(f"file:{telegram_state_dir() / 'messages.db'}?mode=ro", uri=True, timeout=0.2)
+        rows = connection.execute(
+            'SELECT DISTINCT m.delivery_id,m.chat_id,m.thread_id,p.payload '
+            'FROM delivery_turns t JOIN delivery_sessions s ON s.session_id=t.session_id '
+            'JOIN delivery_turn_messages m ON m.turn_id=t.turn_id '
+            'JOIN pending_inbound_deliveries p ON p.delivery_id=m.delivery_id '
+            "WHERE t.session_id=? AND s.stamp=? AND p.state='started' "
+            'AND t.turn_id=(SELECT max(turn_id) FROM delivery_turns WHERE session_id=?) LIMIT 2',
+            (session, stamp, session),
+        ).fetchall()
+        if len(rows) != 1:
+            return None
+        delivery_id, chat_id, thread_id, payload = rows[0]
+        if not isinstance(delivery_id, str) or not re.fullmatch(r'-?[0-9]+:[0-9]+', delivery_id):
+            return None
+        meta = json.loads(payload)['params']['meta']
+        if (meta.get('delivery_id') != delivery_id or str(meta.get('chat_id')) != chat_id
+                or delivery_id != f"{chat_id}:{meta.get('message_id')}"
+                or (str(meta['thread_id']) if meta.get('thread_id') is not None else None) != thread_id):
+            return None
+        terminal = False
+        if connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='delivery_results'").fetchone():
+            terminal = connection.execute(
+                'SELECT 1 FROM delivery_results WHERE delivery_id=? AND session_id=? AND stamp=? '
+                'AND chat_id=? AND thread_id IS ? '
+                "AND state IN ('complete','no_reply','cancelled','failed') "
+                'AND turn_id=(SELECT max(turn_id) FROM delivery_turns WHERE session_id=?)',
+                (delivery_id, session, stamp, chat_id, thread_id, session),
+            ).fetchone() is not None
+        return delivery_id, chat_id, thread_id, terminal
+    except (sqlite3.Error, ValueError, KeyError, TypeError):
+        return None
+    finally:
+        if connection is not None:
+            connection.close()
 
-    turn = active_turn(events)
-    if turn is None:
+
+def read_stop_turn(hook: dict, transcript_path: Path):
+    """The CLI can call Stop before its last transcript append reaches disk."""
+    expected = hook.get('last_assistant_message')
+    expected = expected.strip() if isinstance(expected, str) else ''
+    target = current_stop_target(hook)
+    for delay in (0, 0.05, 0.1, 0.2):
+        if delay:
+            time.sleep(delay)
+        try:
+            events = read_recent_events(transcript_path)
+        except (OSError, UnicodeError):
+            events = None
+        turn = active_turn(events) if events is not None else None
+        if turn is not None:
+            turn_events, prompt, origin, _ = turn
+            if telegram_chat_id(prompt, origin) is None:
+                return events, turn  # A local/untrusted carrier stays untrusted.
+            current_input = target is None or telegram_delivery_id(prompt, origin) == target[0]
+            current_text = not expected or final_answer_text(turn_events).strip() == expected
+            if current_input and current_text:
+                return events, turn
+        if not expected and target is None:
+            return None
+    return None
+
+
+def evaluate_stop(hook: dict) -> None:
+    stop_hook_active = hook.get("stop_hook_active") is True
+    transcript_path = Path(str(hook["transcript_path"]))
+    current = read_stop_turn(hook, transcript_path)
+    target = current_stop_target(hook)
+    if target is not None and target[3]:
+        # A native tool's terminal ledger result remains proof even while its
+        # transcript result is buffered. Release only that exact transport row;
+        # never coach another send or republish older terminal text.
+        complete_started_delivery(target[0])
         return
+    if current is None:
+        # Some CLI writes finish only after hooks return. Ask for one native
+        # correction, without fabricating a transcript or publishing hook text.
+        if target is not None and not stop_hook_active:
+            _, chat_id, thread_id, _ = target
+            topic = f', thread_id={thread_id}' if thread_id is not None else ''
+            block_delegation(
+                'The current Telegram turn is not yet confirmed in the transcript. '
+                f'Finish this exact input with the Telegram reply tool using chat_id={chat_id}{topic}; '
+                'terminal text alone is invisible to the person. Do not repeat completed work. '
+                'For a group observation that accepted no work, use the no_reply tool instead. '
+                'Do not claim delivery without a successful tool result.')
+        return
+    events, turn = current
     turn_events, prompt, origin, queued_carrier = turn
     chat_id = telegram_chat_id(prompt, origin)
     if chat_id is None:
         return
     delivery_id = telegram_delivery_id(prompt, origin)
+
+    native_work = native_background_work(events, turn_events, delivery_id)
+    if native_work['pending'] or native_work['unknown']:
+        if not native_work['unknown'] and native_task_deferred(hook, delivery_id, native_work['pending']):
+            # Release transport acceptance, while the result and original input
+            # stay deferred. Never forward a terminal promise or mark complete.
+            if not complete_started_delivery(delivery_id, allow_offered=queued_carrier,
+                    closed_by='guard_delivered', session_id=hook.get('session_id')):
+                block_cleanup()
+            return
+        task_ids = ', '.join(native_work['pending']) or 'launch result not yet confirmed'
+        block_delegation(
+            f'This Telegram request still has unread native background work: {task_ids}. '
+            f'Keep the original delivery_id={delivery_id}; inspect the existing task before any continuation and do not repeat completed actions. '
+            'A launch acknowledgement or promise is not the final result. Read the existing task result, '
+            'or use the Telegram reply tool with phase=progress, this exact delivery_id and the existing task_id '
+            'to durably defer this request until its native callback. Do not use phase=final or no_reply before reading the result.')
+        return
+    if native_work['read_uuid']:
+        read_index = next((index for index, event in enumerate(turn_events)
+                           if event.get('uuid') == native_work['read_uuid']), None)
+        if read_index is not None:
+            # A send or promise made before reading the background result is
+            # only progress. Require a new response after that native evidence.
+            turn_events = turn_events[read_index + 1:]
 
     # This marker is added by the admitted Telegram transport, never inferred
     # from a private answer. Publication is explicit; missing bookkeeping leaves
@@ -1142,7 +1636,9 @@ def main() -> None:
     fallback_delivery = stop_hook_active and proof_status == "delivered"
     if native_delivery or fallback_delivery:
         if not complete_started_delivery(
-            delivery_id, allow_offered=queued_carrier
+            delivery_id, allow_offered=queued_carrier,
+            closed_by="guard_delivered" if native_delivery else "guard_forwarded",
+            session_id=hook.get('session_id'),
         ):
             block_cleanup()
         elif proof_status is not None and not remove_cleanup_proof(
@@ -1156,14 +1652,35 @@ def main() -> None:
     except OSError:
         pass
 
+    if native_work['lost']:
+        block_delegation(
+            'The native runtime confirms that this request\'s previous task no longer exists: '
+            + ', '.join(native_work['lost']) + '. Do not keep waiting for its callback. '
+            f'Preserve delivery_id={delivery_id} and reconcile the saved work/history first. '
+            'Continue only the remaining read-only or idempotent steps without repeating confirmed effects. '
+            'If an external effect is uncertain, ask a precise clarification with reply phase=final. '
+            'Otherwise deliver the reconciled result with reply phase=final and this original delivery_id. '
+            'A missing task is not proof of successful work; terminal text alone will not complete it.')
+        return
+
     if chat_id.startswith("-"):
         # Only explicit sends are publishable in groups. Plain model text may
         # explain why it should stay silent; forwarding it reverses that intent.
-        if explicit_no_reply(turn_events) and not silence_covers_latest_incoming(events, chat_id, delivery_id):
-            block_delegation('A newer Telegram input has no current disposition in the transcript yet. Retry Stop after its current turn is recorded; do not reuse an older NO_REPLY or send a silence explanation.')
+        silent_tool = successful_no_reply(turn_events, events)
+        silent_text = explicit_no_reply(turn_events)
+        if (silent_tool or silent_text) and not silence_covers_latest_incoming(events, chat_id, delivery_id):
+            block_delegation('A newer Telegram input has no current disposition in the transcript yet. Retry Stop after its current turn is recorded; do not reuse an older silence or send a silence explanation.')
+            return
+        if silent_text and not silent_tool and not stop_hook_active:
+            # The text marker is a model error: one hint towards the tool,
+            # nothing reaches the person. A retried Stop still carrying the
+            # marker is settled as silence, as before — no loop.
+            block_delegation('Silence in a group is declared with the mcp__plugin_telegram_telegram__no_reply tool, not with terminal text: call it with this turn\'s chat_id (and thread_id for a topic). Nothing was sent to Telegram.')
             return
         finish_group_observation(turn_events, delivery_id, queued_carrier,
-                                 reported_work=work['reportedAt'] is not None)
+                                 reported_work=work['reportedAt'] is not None or native_work['read_uuid'] is not None,
+                                 silent=silent_tool or silent_text, result_events=events,
+                                 session_id=hook.get('session_id'))
         return
 
     if stop_hook_active and os.path.lexists(cleanup_proof_path()):
@@ -1178,7 +1695,8 @@ def main() -> None:
                 block_cleanup()
                 return
             if not complete_started_delivery(
-                delivery_id, allow_offered=queued_carrier
+                delivery_id, allow_offered=queued_carrier, closed_by="guard_forwarded",
+                session_id=hook.get('session_id'),
             ):
                 block_cleanup()
             elif delivery_id is not None and not remove_cleanup_proof(
@@ -1201,6 +1719,33 @@ def main() -> None:
         "<channel> tag now. Do not merely repeat the answer as terminal text."
     )
     print(json.dumps({"decision": "block", "reason": reason, "systemMessage": reason}))
+
+
+def main() -> None:
+    # Under the receiver this guard neither blocks nor settles a turn (R13).
+    if delivery_authority() == "receiver":
+        return
+    try:
+        hook = json.load(sys.stdin)
+        if not isinstance(hook, dict) or "transcript_path" not in hook:
+            return
+    except Exception:
+        return
+    verdict = io.StringIO()
+    with redirect_stdout(verdict):
+        evaluate_stop(hook)
+    output = verdict.getvalue()
+    sys.stdout.write(output)
+    if output.strip() or hook.get("hook_event_name") != "Stop":
+        return
+    # A block is a continuation of the same native turn. Its parallel Stop
+    # action must never close that turn and schedule recovery under the model.
+    # Only this accepted path commits Stop; sweep invocations are not Stop.
+    try:
+        subprocess.run([str(Path(__file__).resolve().with_name("tg-turn-end")), "--guard-accepted"],
+                       input=json.dumps(hook), text=True, capture_output=True, timeout=5, check=False)
+    except (OSError, subprocess.SubprocessError):
+        pass  # The end helper has always been best-effort ledger observation.
 
 
 if __name__ == "__main__":

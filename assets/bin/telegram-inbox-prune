@@ -13,6 +13,20 @@ import time
 
 
 RETENTION_SECONDS = 2 * 24 * 60 * 60
+LEDGER_RETENTION_SECONDS = 14 * 24 * 60 * 60
+UNRESOLVED = ('queued', 'pending', 'deferred', 'paused', 'resume_pending', 'blocked')
+
+
+def unresolved_requests(connection: sqlite3.Connection) -> list[dict]:
+    columns = {row[1] for row in connection.execute('PRAGMA table_info(delivery_results)')}
+    if not columns:
+        return []
+    cursor = connection.execute(
+        "SELECT * FROM delivery_results WHERE state IN (" + ','.join('?' for _ in UNRESOLVED) + ")",
+        UNRESOLVED,
+    )
+    names = [column[0] for column in cursor.description]
+    return [dict(zip(names, row)) for row in cursor]
 
 
 def fail() -> int:
@@ -20,11 +34,93 @@ def fail() -> int:
     return 1
 
 
+def prune_turn_ledger(database: Path) -> None:
+    """Closed turns older than 14 days go with their messages, and so do sessions
+    of that age that own no turn. Best-effort and silent without the ledger (an
+    older receiver has none); the inbox cleanup below never depends on it."""
+    try:
+        metadata = database.lstat()
+    except OSError:
+        return
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        return
+    cutoff = int((time.time() - LEDGER_RETENTION_SECONDS) * 1000)
+    connection = None
+    try:
+        connection = sqlite3.connect(
+            f"file:{database}?mode=rw", uri=True, timeout=3.0, isolation_level=None
+        )
+        connection.execute("BEGIN IMMEDIATE")
+        unresolved = unresolved_requests(connection)
+        protected_ids = {row['delivery_id'] for row in unresolved}
+        protected_turns = {row.get(key) for row in unresolved
+                           for key in ('turn_id', 'response_turn_id', 'recovery_from_turn')}
+        protected_turns.discard(None)
+        connection.execute('CREATE TEMP TABLE retained_turns (turn_id INTEGER PRIMARY KEY)')
+        connection.execute('CREATE TEMP TABLE retained_sessions (session_id TEXT PRIMARY KEY)')
+        connection.executemany('INSERT OR IGNORE INTO retained_sessions VALUES (?)',
+                               ((row['session_id'],) for row in unresolved if row.get('session_id')))
+        (present,) = connection.execute(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' "
+            "AND name IN ('delivery_sessions', 'delivery_turns', 'delivery_turn_messages')"
+        ).fetchone()
+        if present == 3:
+            # A resumed request has several historical turns; all their receipts
+            # and session pointers remain recovery evidence until it is terminal.
+            for delivery_id in protected_ids:
+                protected_turns.update(row[0] for row in connection.execute(
+                    'SELECT turn_id FROM delivery_turn_messages WHERE delivery_id=?', (delivery_id,)))
+            connection.executemany('INSERT OR IGNORE INTO retained_turns VALUES (?)',
+                                   ((turn_id,) for turn_id in protected_turns))
+            connection.execute(
+                "DELETE FROM delivery_turn_messages WHERE turn_id IN "
+                "(SELECT turn_id FROM delivery_turns WHERE closed_at < ? "
+                "AND turn_id NOT IN (SELECT turn_id FROM retained_turns))",
+                (cutoff,),
+            )
+            connection.execute("DELETE FROM delivery_turns WHERE closed_at < ? "
+                               "AND turn_id NOT IN (SELECT turn_id FROM retained_turns)", (cutoff,))
+            connection.execute(
+                "DELETE FROM delivery_sessions WHERE started_at < ? "
+                "AND session_id NOT IN (SELECT session_id FROM delivery_turns) "
+                "AND session_id NOT IN (SELECT session_id FROM retained_sessions)",
+                (cutoff,),
+            )
+        (receipts,) = connection.execute(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='delivery_receipts'"
+        ).fetchone()
+        if receipts:
+            connection.executemany('INSERT OR IGNORE INTO retained_turns VALUES (?)',
+                                   ((turn_id,) for turn_id in protected_turns))
+            connection.execute('CREATE TEMP TABLE retained_deliveries (delivery_id TEXT PRIMARY KEY)')
+            connection.executemany('INSERT INTO retained_deliveries VALUES (?)',
+                                   ((delivery_id,) for delivery_id in protected_ids))
+            receipt_columns = {row[1] for row in connection.execute('PRAGMA table_info(delivery_receipts)')}
+            guards = []
+            if 'delivery_id' in receipt_columns:
+                guards.append('(delivery_id IS NULL OR delivery_id NOT IN (SELECT delivery_id FROM retained_deliveries))')
+            if 'turn_id' in receipt_columns:
+                guards.append('(turn_id IS NULL OR turn_id NOT IN (SELECT turn_id FROM retained_turns))')
+            if guards:
+                connection.execute('DELETE FROM delivery_receipts WHERE created_at < ? AND ' + ' AND '.join(guards), (cutoff,))
+            elif not unresolved:
+                connection.execute("DELETE FROM delivery_receipts WHERE created_at < ?", (cutoff,))
+        connection.execute("COMMIT")
+    except sqlite3.Error as error:
+        if connection is not None and connection.in_transaction:
+            connection.execute("ROLLBACK")
+        print(f"telegram-inbox-prune: turn ledger not pruned: {error}", file=sys.stderr)
+    finally:
+        if connection is not None:
+            connection.close()
+
+
 def main() -> int:
     state = Path(
         os.environ.get("TELEGRAM_STATE_DIR")
         or Path.home() / ".claude/channels/telegram"
     )
+    prune_turn_ledger(state / "messages.db")
     inbox = state / "inbox"
     try:
         inbox_metadata = inbox.lstat()
@@ -53,10 +149,17 @@ def main() -> int:
             database_metadata.st_mode
         ):
             return fail()
-        with sqlite3.connect(f"file:{database}?mode=ro", uri=True) as connection:
+        connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
+        try:
             rows = connection.execute(
                 "SELECT payload FROM pending_inbound_deliveries"
             ).fetchall()
+            for request in unresolved_requests(connection):
+                raw_payload = request.get('request_payload')
+                if raw_payload:
+                    rows.append((raw_payload,))
+        finally:
+            connection.close()
     except (OSError, sqlite3.Error):
         return fail()
 
@@ -64,9 +167,16 @@ def main() -> int:
     try:
         for (raw_payload,) in rows:
             payload = json.loads(raw_payload)
-            image_path = payload.get("params", {}).get("meta", {}).get("image_path")
-            if isinstance(image_path, str):
-                referenced.add(os.path.abspath(image_path))
+            meta = payload.get("params", {}).get("meta", {})
+            paths = [meta.get('image_path')]
+            album = meta.get('image_paths')
+            if isinstance(album, str):
+                paths.extend(album.split(','))
+            elif isinstance(album, list):
+                paths.extend(album)
+            for image_path in paths:
+                if isinstance(image_path, str) and image_path:
+                    referenced.add(os.path.abspath(image_path))
     except (AttributeError, TypeError, json.JSONDecodeError):
         return fail()
 

@@ -60,6 +60,8 @@ MEMORY_EMBEDDINGS_OPENAI="${MEMORY_EMBEDDINGS_OPENAI:-disabled}"
 RECALL_API_KEY="${RECALL_API_KEY:-}"
 RECALL_REGION_INPUT="${RECALL_REGION:-}"   # explicit operator value this run, if any
 RECALL_REGION="${RECALL_REGION:-eu-central-1}"
+TG_DELIVERY_AUTHORITY_INPUT="${TG_DELIVERY_AUTHORITY:-}"   # explicit operator value this run, if any
+TG_DELIVERY_AUTHORITY="${TG_DELIVERY_AUTHORITY:-guard}"
 CALENDAR_EMAIL="${CALENDAR_EMAIL:-}"
 OWNER_EMAIL="${OWNER_EMAIL:-}"
 VAULT_LOCALE="${VAULT_LOCALE:-en-US}"
@@ -638,6 +640,23 @@ if [ -z "$RECALL_REGION_INPUT" ] && [ -r "$CHANNEL_ENV" ]; then
   _existing_region="$(read_channel_value "$CHANNEL_ENV" RECALL_REGION)"
   [ -n "$_existing_region" ] && RECALL_REGION="$_existing_region"
 fi
+# Who removes a delivered message from the queue (KTD8): keep the value the box
+# runs with unless the operator passed one explicitly this run, and refuse a
+# value the receiver would not understand. It lives in the channel file only —
+# the poller records what it started with, the cron block never carries it, and
+# the saved installer config does not either, so an update cannot roll a
+# hand-switched box back to the value of its first install.
+if [ -z "$TG_DELIVERY_AUTHORITY_INPUT" ] && [ -r "$CHANNEL_ENV" ]; then
+  _existing_authority="$(read_channel_value "$CHANNEL_ENV" TG_DELIVERY_AUTHORITY)"
+  [ -n "$_existing_authority" ] && TG_DELIVERY_AUTHORITY="$_existing_authority"
+fi
+case "$TG_DELIVERY_AUTHORITY" in
+  guard|shadow|receiver) ;;
+  *)
+    echo "FATAL: TG_DELIVERY_AUTHORITY містить недопустиме значення «$TG_DELIVERY_AUTHORITY» (очікується guard, shadow або receiver)" >&2
+    exit 2
+    ;;
+esac
 
 # Restore it once the secrets are written. Left set, this umask follows the
 # installer into everything that runs after — apt keyrings written under it come
@@ -648,7 +667,7 @@ umask 077
 MANAGED_CHANNEL_ENV="$(mktemp)"
 : > "$MANAGED_CHANNEL_ENV"
 for name in TELEGRAM_BOT_TOKEN OPENAI_API_KEY MEMORY_EMBEDDINGS_OPENAI RECALL_API_KEY RECALL_REGION TG_DROP_PENDING_ON_BOOT \
-  OWNER_CHAT_ID TG_CORPORATE_SESSIONS GOG_KEYRING_BACKEND GOG_KEYRING_PASSWORD; do
+  TG_DELIVERY_AUTHORITY OWNER_CHAT_ID TG_CORPORATE_SESSIONS GOG_KEYRING_BACKEND GOG_KEYRING_PASSWORD; do
   write_shell_value "$MANAGED_CHANNEL_ENV" "$name"
 done
 if ! python3 "$KIT/assets/lib/merge-env.py" \
@@ -741,7 +760,9 @@ install_managed_crontab() {
   # and every job runs twice — Cash was firing reminders, the watchdog, vault-sync,
   # relogin-watch and the memory index twice over (found 2026-07-28). Drop any
   # unmanaged line that invokes a job this block owns.
-  unmanaged_crontab="$(printf '%s\n' "$existing_crontab" | awk \
+  # A retired helper leaves the owned list, so its copy outside the block goes
+  # through the same filter the maintenance run uses.
+  unmanaged_crontab="$(printf '%s\n' "$existing_crontab" | drop_retired_managed_jobs | awk \
     -v legacy_health="$H/bin/cash-health-evening" \
     -v owned="$H/bin/cash-reminder-tick $H/bin/cash-healthcheck $H/bin/claude-limit-recovery $H/bin/relogin-watch $H/bin/unstick-watch $H/bin/queue-settle-sweep $H/bin/telegram-inbox-prune $H/bin/vault-sync $H/bin/memory-index $H/bin/learning-review $H/bin/onboarding-reminder $H/bin/skill-brief $H/bin/agent-github-backup" '
     BEGIN { split(owned, jobs, " ") }
@@ -828,12 +849,54 @@ add_missing_managed_jobs() {
   echo "      додано керованих завдань: $(printf '%s\n' "$missing" | grep -c .)"
 }
 
+# The cron lines this kit has retired, in the same normalized form
+# add_missing_managed_jobs derives: the helper and its first option, without
+# the schedule, the timeout cap or a redirect — e.g. "$H/bin/<helper> --option".
+# An empty list changes nothing; a line the block still writes never belongs here.
+retired_managed_jobs() {
+  :
+}
+
+# Prints the crontab on stdin without retired lines. Inside the managed block
+# any retired key drops the line; outside it only a key naming the kit's own
+# path ($H/bin/…) does, because a maintenance run never calls
+# install_managed_crontab and an unmanaged copy has no other way out. Every
+# other line outside the block is the owner's.
+drop_retired_managed_jobs() {
+  # Tab-joined: BSD awk refuses a newline inside a -v value, and no key holds a tab.
+  awk -v retired="$(retired_managed_jobs | tr '\n' '\t')" -v own="$H/bin/" '
+    BEGIN { n = split(retired, keys, "\t") }
+    $0 == "# BEGIN claude-tg-starter" { managed=1 }
+    $0 == "# END claude-tg-starter" { managed=0 }
+    {
+      for (i = 1; i <= n; i++)
+        if (keys[i] != "" && index($0, keys[i]) && (managed || index(keys[i], own) == 1)) next
+      print
+    }
+  '
+}
+
+# Maintenance used to only add, so a line the kit retired kept running on every
+# installed box (R15). No block means an UPGRADING window that stopped every
+# schedule on purpose: leave it alone.
+remove_retired_managed_jobs() {
+  local existing pruned
+  existing="$(crontab -u "$AGENT_USER" -l 2>/dev/null || true)"
+  printf '%s\n' "$existing" | grep -Fxq '# BEGIN claude-tg-starter' || return 0
+  pruned="$(printf '%s\n' "$existing" | drop_retired_managed_jobs)"
+  [ "$pruned" != "$existing" ] || return 0
+  printf '%s\n' "$pruned" | crontab -u "$AGENT_USER" -
+  echo "      знято керованих завдань: $(( $(printf '%s\n' "$existing" | wc -l) - $(printf '%s\n' "$pruned" | wc -l) ))"
+}
+
 echo "[5/7] зберігаю наявний crontab; замінюю лише керований блок"
 python3 "$KIT/assets/lib/install-backup-context.py" \
   --home "$H" --user "$AGENT_USER" --unit "$AGENT_SERVICE" --engine claude
+# Add first, then retire: if a retired line is still in the block, retirement wins.
 if [ "$CLAUDE_UPDATE_MAINTENANCE" = 1 ]; then
-  echo "      режим обслуговування: наявний crontab зберігаю, лише додаю нові керовані завдання"
+  echo "      режим обслуговування: наявний crontab зберігаю — додаю нові керовані завдання, прибираю зняті комплектом"
   add_missing_managed_jobs
+  remove_retired_managed_jobs
 else
   install_managed_crontab
 fi
@@ -847,6 +910,17 @@ echo "[6/7] необов’язкові інструменти"
 
 if product_has_feature google-workspace && ! command -v gog >/dev/null 2>&1; then
   bash "$KIT/scripts/install-gog.sh"
+fi
+
+# The kit ships the shared Novsky OAuth client, so "підключи Google" needs only the
+# owner's consent click — no per-client Google Cloud project. An agent that already
+# configured its own client keeps it: seeding only fills an empty config.
+GOOGLE_OAUTH_CLIENT="$KIT/assets/product/google-oauth-client.json"
+if product_has_feature google-workspace && command -v gog >/dev/null 2>&1 && \
+   [ -s "$GOOGLE_OAUTH_CLIENT" ] && [ ! -s "$H/.local/share/gogcli/credentials.json" ]; then
+  runuser -u "$AGENT_USER" -- env HOME="$H" \
+    "$H/bin/gog" auth credentials set "$GOOGLE_OAUTH_CLIENT" >/dev/null || \
+    echo "      WARN: не вдалося записати спільний OAuth-клієнт Google (повтор: ~/bin/gog auth credentials set /opt/claude-tg-starter/assets/product/google-oauth-client.json)"
 fi
 
 EXTERNAL_SKILLS="$KIT/assets/external-skills"

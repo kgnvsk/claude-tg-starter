@@ -70,11 +70,14 @@ def owner() -> str:
     return str(ids[0]) if ids else ""
 
 
-def send(chat: str, text: str) -> bool:
+def send(chat: str, text: str, thread_id: str | None = None) -> bool:
     token = env_val("TELEGRAM_BOT_TOKEN")
     if not token or not chat:
         return False
-    body = urllib.parse.urlencode({"chat_id": chat, "text": text}).encode()
+    body = urllib.parse.urlencode({
+        "chat_id": chat, "text": text,
+        **({"message_thread_id": thread_id} if thread_id else {}),
+    }).encode()
     try:
         with urllib.request.urlopen(urllib.request.Request(
                 f"https://api.telegram.org/bot{token}/sendMessage", data=body),
@@ -234,128 +237,6 @@ def atomic_write_checkpoint(timestamp: int) -> None:
     atomic_write_private(STATE_FILE, payload)
 
 
-def started_fifo_head() -> tuple[str, str] | None:
-    """Return the exact reserved FIFO head and observed state, payload-free."""
-    connection = None
-    try:
-        connection = sqlite3.connect(
-            f"file:{MESSAGES_DB}?mode=ro", uri=True, timeout=2
-        )
-        row = connection.execute(
-            "SELECT delivery_id,state FROM pending_inbound_deliveries "
-            "ORDER BY created_at ASC, rowid ASC LIMIT 1"
-        ).fetchone()
-        if (
-            row is not None
-            and row[1] in {"started", "recovering"}
-            and isinstance(row[0], str)
-        ):
-            return row[0], row[1]
-    except sqlite3.Error:
-        pass
-    finally:
-        if connection is not None:
-            connection.close()
-    return None
-
-
-def delivery_origin_chat(delivery_id: str) -> str | None:
-    """Extract the exact numeric origin chat from a canonical delivery id."""
-    identity = re.fullmatch(r"(-?[0-9]+):[0-9]+", delivery_id)
-    return identity.group(1) if identity is not None else None
-
-
-def abort_started_fifo_head(delivery_id: str, observed_state: str) -> bool:
-    """CAS-delete only the exact reserved delivery whose origin was notified."""
-    if observed_state not in {"started", "recovering"}:
-        return False
-    connection = None
-    try:
-        connection = sqlite3.connect(
-            f"file:{MESSAGES_DB}?mode=rw", uri=True, timeout=2
-        )
-        deleted = connection.execute(
-            "DELETE FROM pending_inbound_deliveries "
-            "WHERE delivery_id=? AND state=? "
-            "AND rowid=(SELECT rowid FROM pending_inbound_deliveries "
-            "ORDER BY created_at ASC, rowid ASC LIMIT 1)",
-            (delivery_id, observed_state),
-        )
-        connection.commit()
-        return deleted.rowcount == 1
-    except sqlite3.Error:
-        return False
-    finally:
-        if connection is not None:
-            connection.close()
-
-
-def remove_matching_cleanup_proof(delivery_id: str) -> bool:
-    """Remove only a private proof for this exact delivery."""
-    try:
-        chat_id, message_id = delivery_id.rsplit(":", 1)
-    except ValueError:
-        return False
-    if (
-        re.fullmatch(r"-?\d+", chat_id) is None
-        or re.fullmatch(r"\d+", message_id) is None
-    ):
-        return False
-    proof_path = STATE_DIR / "fallback-cleanup-proof.json"
-    lock = open_lifecycle_lock(STATE_DIR / "fallback-cleanup-proof.lock")
-    if lock is None:
-        return False
-    descriptor = -1
-    try:
-        if not os.path.lexists(proof_path):
-            return True
-        flags = os.O_RDONLY
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        descriptor = os.open(proof_path, flags)
-        opened = os.fstat(descriptor)
-        if (
-            not stat.S_ISREG(opened.st_mode)
-            or opened.st_uid != os.geteuid()
-            or opened.st_mode & 0o077
-            or opened.st_size <= 0
-            or opened.st_size > 512
-        ):
-            return False
-        with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
-            descriptor = -1
-            proof = json.load(handle)
-        status_value = proof.get("status") if isinstance(proof, dict) else None
-        if status_value not in {"prepared", "delivered"}:
-            return False
-        if proof != {
-            "delivery_id": delivery_id,
-            "chat_id": chat_id,
-            "message_id": message_id,
-            "status": status_value,
-        }:
-            return True
-        proof_path.unlink()
-        directory_flags = os.O_RDONLY
-        if hasattr(os, "O_DIRECTORY"):
-            directory_flags |= os.O_DIRECTORY
-        directory_descriptor = os.open(proof_path.parent, directory_flags)
-        try:
-            os.fsync(directory_descriptor)
-        finally:
-            os.close(directory_descriptor)
-        return True
-    except (OSError, UnicodeError, json.JSONDecodeError):
-        return False
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
-        try:
-            fcntl.flock(lock, fcntl.LOCK_UN)
-        finally:
-            os.close(lock)
-
-
 def main() -> int:
     if not MESSAGES_DB.exists():
         return 0
@@ -441,7 +322,7 @@ def main() -> int:
             send(chat, "🔄 Прийнято. Перезапускаю службу один раз.")
         else:
             send(chat, f"🛠 Прийнято. {verdict} Перезапускаюся один раз — "
-                       "напиши мені за хвилину.")
+                       "збережені запити залишаються в черзі.")
 
         command_name = '/restart' if explicit_restart else '/unstick'
         try:
@@ -459,34 +340,13 @@ def main() -> int:
                 note(f"{command_name}: stop failed; queue retained")
                 return 0
 
-            # An input may start while the acknowledgement is being sent. Inspect
-            # the real interrupted head only after the old consumer has stopped.
-            started_head = started_fifo_head()
-            delivery_id = started_head[0] if started_head is not None else None
-            origin_chat = (
-                delivery_origin_chat(delivery_id) if delivery_id is not None else None
-            )
-
-            head_unchanged = (
-                started_head is not None and started_fifo_head() == started_head
-            )
-            # The interrupted request is still dropped rather than replayed. The
-            # owner asked for no chat notice about it, so the abort no longer
-            # waits on a message going out; the notes below remain the record.
-            if head_unchanged and origin_chat is not None:
-                if abort_started_fifo_head(delivery_id, started_head[1]):
-                    if not remove_matching_cleanup_proof(delivery_id):
-                        note(f"{command_name}: exact cleanup proof retained for Stop retry")
-                    note(f"{command_name}: aborted unfinished started delivery")
-                else:
-                    note(f"{command_name}: started delivery changed before cleanup")
-            elif head_unchanged and origin_chat is None:
-                note(f"{command_name}: invalid started delivery identity retained")
-            elif delivery_id is not None:
-                note(f"{command_name}: started delivery changed before resend notice")
+            # Restart changes the process, not the person's intent. Keep the
+            # request, turn and send proofs intact, including on older schemas.
+            # Only the receiver decides whether and how to resume them on boot.
+            note(f"{command_name}: requests and delivery evidence retained for receiver recovery")
         finally:
             # A failed/timed-out stop can already have stopped the service. Never
-            # leave it down, including when notification or exact cleanup fails.
+            # leave it down even when the stop client reports a failure.
             try:
                 started = subprocess.run(
                     ["sudo", "systemctl", "start", SERVICE],

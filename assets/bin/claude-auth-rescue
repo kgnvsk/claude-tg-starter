@@ -24,6 +24,11 @@ credentials and 401 the bot).
 The human tap is unavoidable by OAuth design (and desirable: no password is
 ever stored). Everything else is automatic. Debounced via a state file so the
 2-minute healthcheck can call this unconditionally. Never logs tokens/codes.
+
+Account switch (2026-09-19, Yasha on a burnt weekly limit): `--force` while the
+login is still alive means the owner wants ANOTHER account. The old login keeps
+working until the new one lands, so `loggedIn` proves nothing here — only a
+different account (or the login process finishing successfully) does.
 """
 
 import json
@@ -121,7 +126,8 @@ def looks_like_code(text: str) -> bool:
     return bool(re.fullmatch(r"[A-Za-z0-9_#\-\.]{15,}", text))
 
 
-def logged_in() -> bool | None:
+def _auth_status() -> dict | None:
+    """`claude auth status` as JSON; None when blocked, malformed or timed out."""
     try:
         probe = subprocess.run(
             [str(CLAUDE_BIN), "auth", "status"],
@@ -142,10 +148,22 @@ def logged_in() -> bool | None:
             log("auth probe blocked by hook — не вважаю це втратою логіну")
             return None
         status = json.loads(probe.stdout or "")
-        authenticated = status.get("loggedIn") if isinstance(status, dict) else None
-        return authenticated if type(authenticated) is bool else None
+        return status if isinstance(status, dict) else None
     except Exception:
         return None
+
+
+def logged_in() -> bool | None:
+    status = _auth_status()
+    authenticated = status.get("loggedIn") if status else None
+    return authenticated if type(authenticated) is bool else None
+
+
+def auth_email() -> str:
+    """Account of the live login; "" when logged out or unknown."""
+    status = _auth_status()
+    email = status.get("email") if status else ""
+    return email if isinstance(email, str) else ""
 
 
 def listener_port(pid: int) -> str:
@@ -459,13 +477,19 @@ def acquire_lock() -> int | None:
     return descriptor
 
 
-def wait_code_from_owner(chat: str, since_ms: int, state: str = "") -> str | None:
+def wait_code_from_owner(chat: str, since_ms: int, state: str = "",
+                         switching_from: str = "") -> str | None:
     deadline = time.time() + CODE_TIMEOUT_S
     while time.time() < deadline:
         # A desktop operator may complete a separate login while this rescue is
         # waiting on its own OAuth code. Stop immediately instead of sending a
         # false "still logged out / link expired" alert ten minutes later.
-        if logged_in():
+        # During an account switch the old login is alive by definition: only
+        # a different account means someone else completed a login meanwhile.
+        if switching_from:
+            if auth_email() not in ("", switching_from):
+                return None
+        elif logged_in():
             return None
         try:
             conn = sqlite3.connect(f"file:{MESSAGES_DB}?mode=ro", uri=True, timeout=2)
@@ -536,7 +560,12 @@ def main(force: bool = False) -> int:
         log("no bot token or owner chat — cannot assist")
         return 1
 
-    log("auth dead — starting rescue flow")
+    # /relogin while the login is alive = the owner switches accounts (a burnt
+    # weekly limit, a shared login). Nothing below may read `loggedIn` as
+    # "done": the old account answers `loggedIn: true` until the new one lands.
+    switching_from = auth_email() if force else ""
+    log("account switch requested — starting login flow" if switching_from
+        else "auth dead — starting rescue flow")
     pid, fd = pty.fork()
     if pid == 0:
         os.environ["HOME"] = str(HOME)
@@ -573,17 +602,28 @@ def main(force: bool = False) -> int:
 
     since_ms = int(time.time() * 1000)
     publish_auth_input(chat, state, since_ms)
-    send(token, chat,
-         "🔐 Термін дії моєї авторизації Claude завершився. Віднови її за хвилину, без SSH:\n"
-         "1) Відкрий посилання нижче та увійди до свого облікового запису Claude.\n"
-         "2) Скопіюй код зі сторінки.\n"
-         "3) Надішли мені сюди код ОДНИМ повідомленням (лише код, без слів).\n\n"
-         f"{url}\n\n"
-         "⏳ Чекаю код 10 хвилин. Якщо не встигнеш або посилання втратить чинність — просто напиши мені "
-         "/relogin, і я відразу надішлю свіже (скільки завгодно разів).")
+    if switching_from:
+        send(token, chat,
+             f"🔐 Перемикаю обліковий запис Claude за твоєю командою. Поточний вхід ({switching_from}) "
+             "працює, доки не завершиш новий:\n"
+             "1) Відкрий посилання нижче та увійди до ПОТРІБНОГО облікового запису Claude.\n"
+             "2) Скопіюй код зі сторінки.\n"
+             "3) Надішли мені сюди код ОДНИМ повідомленням (лише код, без слів).\n\n"
+             f"{url}\n\n"
+             "⏳ Чекаю код 10 хвилин. Передумав — нічого не надсилай, усе залишиться як є. "
+             "Свіже посилання — командою /relogin.")
+    else:
+        send(token, chat,
+             "🔐 Термін дії моєї авторизації Claude завершився. Віднови її за хвилину, без SSH:\n"
+             "1) Відкрий посилання нижче та увійди до свого облікового запису Claude.\n"
+             "2) Скопіюй код зі сторінки.\n"
+             "3) Надішли мені сюди код ОДНИМ повідомленням (лише код, без слів).\n\n"
+             f"{url}\n\n"
+             "⏳ Чекаю код 10 хвилин. Якщо не встигнеш або посилання втратить чинність — просто напиши мені "
+             "/relogin, і я відразу надішлю свіже (скільки завгодно разів).")
     log("oauth url sent to owner; waiting for code")
 
-    code = wait_code_from_owner(chat, since_ms, state)
+    code = wait_code_from_owner(chat, since_ms, state, switching_from)
     if code is None:
         try:
             os.kill(pid, signal.SIGKILL)
@@ -593,6 +633,9 @@ def main(force: bool = False) -> int:
             token,
             chat,
             success_message=(
+                f"✅ Обліковий запис Claude вже змінено іншим способом: тепер {auth_email() or 'новий вхід'}. "
+                "Службу перезапущено, збережені запити залишаються в черзі."
+                if switching_from else
                 "✅ Вхід у Claude вже відновлено іншим способом. "
                 "Службу перезапущено, збережені запити залишаються в черзі."
             ),
@@ -606,9 +649,14 @@ def main(force: bool = False) -> int:
     os.write(fd, code.encode() + b"\n")
     log("code pasted into cli")
 
+    # The login process exiting cleanly is the one CLI-independent proof that
+    # the pasted code was accepted; an account switch cannot rely on `loggedIn`.
+    landed = False
     end = time.time() + 45
     while time.time() < end:
-        if os.waitpid(pid, os.WNOHANG)[0] == pid:
+        done, status = os.waitpid(pid, os.WNOHANG)
+        if done == pid:
+            landed = os.waitstatus_to_exitcode(status) == 0
             break
         ready, _, _ = select.select([fd], [], [], 1)
         if ready:
@@ -636,7 +684,12 @@ def main(force: bool = False) -> int:
                     break
                 time.sleep(5)
 
-    if logged_in():
+    switched_to = auth_email() if switching_from else ""
+    if switching_from:
+        succeeded = landed or switched_to not in ("", switching_from)
+    else:
+        succeeded = bool(logged_in())
+    if succeeded:
         zombies = env_token_zombies()
         warn = (f"\n⚠️ У {ENV_FILE} залишився {zombies} — старий токен перекриває "
                 "нову авторизацію (бот отримає 401). Видали цей рядок і перезапусти мене."
@@ -645,14 +698,25 @@ def main(force: bool = False) -> int:
             token,
             chat,
             success_message=(
+                f"✅ Обліковий запис Claude змінено: тепер {switched_to or 'новий вхід'}. "
+                "Службу перезапущено, збережені запити залишаються в черзі." + warn
+                if switching_from else
                 "✅ Вхід у Claude відновлено. Службу перезапущено, "
                 "збережені запити залишаються в черзі." + warn
             ),
-            success_log="rescue OK, transport verified",
+            success_log=("account switched, transport verified" if switching_from
+                         else "rescue OK, transport verified"),
             auth_code=code,
             since_ms=since_ms,
         )
 
+    if switching_from:
+        send(token, chat,
+             "❌ Код не підійшов (або надісланий із зайвим текстом). "
+             f"Залишаюся на {switching_from}. "
+             "Напиши /relogin — надішлю свіже посилання, спробуємо ще раз.")
+        log("code rejected — account unchanged")
+        return 1
     send(token, chat,
          "❌ Код не підійшов (або надісланий із зайвим текстом). "
          "Напиши /relogin — надішлю свіже посилання, спробуємо ще раз.")

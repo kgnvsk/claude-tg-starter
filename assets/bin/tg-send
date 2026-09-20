@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""tg-send [--no-watchdog-credit] <chat_id> "text" — deliver a plain message straight through the
+"""tg-send [--no-watchdog-credit] <chat_id> "text" [--thread-id <positive_id>]
+Deliver a plain message straight through the
 Telegram Bot API, bypassing the MCP reply-tool.
 
 The FALLBACK path: when the telegram plugin's MCP reply-tool is momentarily gone
@@ -9,6 +10,16 @@ the user gets the actual content, silently. The healthcheck restores the native
 tool within ~60s; the owner never needs to know it blipped.
 
 Portable token resolution (env or TELEGRAM_STATE_DIR); prints ok:true/false.
+TG_DELIVERY_PHASE=progress|final distinguishes an acknowledgement from a result
+(default final). TG_DELIVERY_ID selects the original request for an async result;
+TG_DELIVERY_TASK_ID registers a native background task on a progress send.
+
+The recorded outbound row carries its provenance for the receiver's receipts:
+the service stamp from TG_DELIVERY_STAMP (the launcher's environment — a cron
+send has none), the origin from TG_SEND_ORIGIN (default "shell"; the Stop guard
+marks its own resend "stop-guard") and watchdog_credit=1. A --no-watchdog-credit
+send (limit notices) records no row at all, as before: every watchdog reads any
+outbound row as "the chat was answered".
 """
 import sys, os, re, json, sqlite3, subprocess, time, urllib.parse, urllib.request
 
@@ -28,7 +39,140 @@ def token():
     sys.exit("tg-send: TELEGRAM_BOT_TOKEN not found")
 
 
-def record_outbound(chat_id, text, receipt, task_id="", occurrence=""):
+def parse_thread_id(chat_id, value):
+    if not re.fullmatch(r"[1-9][0-9]{0,9}", value) or int(value) > 2_147_483_647:
+        raise ValueError("invalid topic id")
+    if not str(chat_id).startswith("-"):
+        raise ValueError("topics require a group chat")
+    return int(value)
+
+
+def capture_delivery(chat_id, thread_id=None):
+    """Bind before sending; an empty snapshot must stay empty on later retries."""
+    phase = os.environ.get("TG_DELIVERY_PHASE", "final")
+    task_id = os.environ.get("TG_DELIVERY_TASK_ID") or None
+    if os.environ.get("TG_SEND_ORIGIN") == "stop-guard":
+        task_id = None
+    delivery_id = os.environ.get("TG_DELIVERY_ID") or None
+    stamp = os.environ.get("TG_DELIVERY_STAMP") or None
+    if phase not in ("progress", "final"):
+        raise ValueError("TG_DELIVERY_PHASE must be progress or final")
+    if task_id and (phase != "progress" or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", task_id)):
+        raise ValueError("TG_DELIVERY_TASK_ID requires progress and the exact native background task ID")
+    context = {"chat_id": str(chat_id), "thread_id": thread_id, "targets": [],
+               "stamp": stamp, "phase": phase, "task_id": task_id}
+    if not stamp:
+        if delivery_id or task_id:
+            raise ValueError("explicit delivery binding requires the current service stamp")
+        return context
+    state = os.environ.get("TELEGRAM_STATE_DIR") or os.path.expanduser("~/.claude/channels/telegram")
+    try:
+        mode = "rw" if task_id else "ro"
+        connection = sqlite3.connect(f"file:{state}/messages.db?mode={mode}", uri=True, timeout=3)
+        try:
+            if task_id:
+                connection.execute("BEGIN IMMEDIATE")
+            scope = (str(chat_id), str(thread_id) if thread_id is not None else None, stamp)
+            results_present = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='delivery_results'"
+            ).fetchone()
+            if delivery_id:
+                targets = connection.execute(
+                    "SELECT r.turn_id,r.delivery_id FROM delivery_results r "
+                    "JOIN delivery_sessions s ON s.session_id=r.session_id AND s.stamp IS r.stamp "
+                    "WHERE r.delivery_id=? AND r.chat_id=? AND r.thread_id IS ? AND r.stamp=?",
+                    (delivery_id, *scope),
+                ).fetchall() if results_present else []
+                if not targets:
+                    raise ValueError("TG_DELIVERY_ID does not belong to this chat, topic and service session")
+            else:
+                targets = connection.execute(
+                    "SELECT m.turn_id,m.delivery_id FROM delivery_turn_messages m "
+                    "JOIN delivery_turns t ON t.turn_id=m.turn_id "
+                    "JOIN delivery_sessions s ON s.session_id=t.session_id "
+                    "WHERE t.closed_at IS NULL AND m.chat_id=? AND m.thread_id IS ? AND s.stamp=? "
+                    "ORDER BY m.taken_at,m.turn_id", scope,
+                ).fetchall()
+                continuations = connection.execute(
+                    "SELECT r.turn_id,r.delivery_id FROM delivery_results r "
+                    "JOIN delivery_turns t ON t.turn_id=r.response_turn_id "
+                    "WHERE t.closed_at IS NULL AND r.chat_id=? AND r.thread_id IS ? AND r.stamp=?",
+                    scope,
+                ).fetchall() if results_present else []
+                if continuations and (targets or len(continuations) > 1):
+                    raise ValueError("several requests share this turn; pass the original TG_DELIVERY_ID")
+                targets = continuations or targets
+                if not targets and results_present and connection.execute(
+                    "SELECT 1 FROM delivery_results WHERE chat_id=? AND thread_id IS ? "
+                    "AND state='resume_pending' AND request_payload IS NOT NULL LIMIT 1", scope[:2],
+                ).fetchone():
+                    raise ValueError("this chat has a retained request awaiting recovery; use its original "
+                                     "TG_DELIVERY_ID after the native callback or recovery input claims it")
+            if task_id:
+                if not targets or not results_present:
+                    raise ValueError("TG_DELIVERY_TASK_ID requires a progress send bound to an inbound request")
+                previous = connection.execute(
+                    "SELECT delivery_id FROM delivery_results WHERE task_id=? AND stamp=?", (task_id, stamp),
+                ).fetchall()
+                if any(row[0] not in {target[1] for target in targets} for row in previous):
+                    raise ValueError("TG_DELIVERY_TASK_ID belongs to another request; start a fresh background task")
+                for turn, delivery in targets:
+                    returned = connection.execute(
+                        "SELECT 1 FROM delivery_unbound_task_returns u "
+                        "JOIN delivery_results r ON r.session_id=u.session_id AND r.stamp=u.stamp "
+                        "WHERE u.task_id=? AND r.delivery_id=? AND r.turn_id=? AND r.stamp=?",
+                        (task_id, delivery, turn, stamp),
+                    ).fetchone()
+                    if returned:
+                        raise ValueError("task already returned before registration; send its final result with "
+                                         "the original TG_DELIVERY_ID, or start a fresh background task")
+                    changed = connection.execute(
+                        "UPDATE delivery_results SET state='deferred', task_id=?, response_turn_id=NULL, updated_at=? "
+                        "WHERE delivery_id=? AND turn_id=? AND chat_id=? AND thread_id IS ? AND stamp=? "
+                        "AND state IN ('pending','deferred')",
+                        (task_id, int(time.time()*1000), delivery, turn, *scope),
+                    ).rowcount
+                    if changed != 1:
+                        raise ValueError("background task registration failed; no acknowledgement was sent")
+                connection.commit()
+            context["targets"] = [{"turn_id": turn, "delivery_id": delivery} for turn, delivery in targets]
+        finally:
+            connection.close()
+    except sqlite3.Error:
+        if delivery_id or task_id:
+            raise ValueError("delivery origin unavailable; explicit binding cannot be verified") from None
+        # The transport can still send, but cannot claim a request it did not identify.
+        print("tg-send: delivery origin unavailable; send will not settle a request", file=sys.stderr)
+    return context
+
+
+def record_completion(connection, chat_id, thread_id, context, now):
+    """Settle work atomically with its outbound row, before a Stop hook can run."""
+    stamp = os.environ.get("TG_DELIVERY_STAMP") or None
+    if (not isinstance(context, dict) or not stamp or context.get("stamp") != stamp
+            or os.environ.get("TG_SEND_ORIGIN") == "stop-guard"
+            or context.get("chat_id") != str(chat_id)
+            or str(context.get("thread_id")) != str(thread_id)
+            or context.get("phase") not in ("progress", "final")):
+        return
+    if not connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='delivery_results'"
+    ).fetchone():
+        return
+    phase = context["phase"]
+    for target in context.get("targets", []):
+        connection.execute(
+            "UPDATE delivery_results SET acknowledged_at=coalesce(acknowledged_at,?), "
+            "updated_at=?, state=coalesce(?,state), finished_at=? "
+            "WHERE delivery_id=? AND turn_id=? AND chat_id=? AND thread_id IS ? AND stamp=? "
+            "AND state IN ('pending','deferred')",
+            (now, now, "complete" if phase == "final" else None,
+             now if phase == "final" else None, target["delivery_id"], target["turn_id"],
+             str(chat_id), str(thread_id) if thread_id is not None else None, stamp),
+        )
+
+
+def record_outbound(chat_id, text, receipt, task_id="", occurrence="", context=None):
     """Record only a matching Telegram acknowledgement; never resend on failure."""
     if not isinstance(receipt, dict) or receipt.get("ok") is not True:
         return False
@@ -68,16 +212,24 @@ def record_outbound(chat_id, text, receipt, task_id="", occurrence=""):
                 "direction": "out", "text": text, "ts": int(time.time() * 1000),
                 "message_id": message_id,
             }
-            for name, value in (("conversation_key", conversation_key), ("thread_id", thread_id)):
+            for name, value in (
+                ("conversation_key", conversation_key), ("thread_id", thread_id),
+                ("delivery_stamp", os.environ.get("TG_DELIVERY_STAMP") or None),
+                ("send_origin", os.environ.get("TG_SEND_ORIGIN") or "shell"),
+                ("watchdog_credit", 1),
+                ("delivery_context", json.dumps(context) if context is not None else None),
+            ):
                 if name in columns:
                     values[name] = value
             names = ", ".join(values)
             placeholders = ", ".join("?" for _ in values)
-            connection.execute(
+            inserted = connection.execute(
                 f"INSERT OR IGNORE INTO messages ({names}) SELECT {placeholders} "
                 "WHERE NOT EXISTS (SELECT 1 FROM messages WHERE chat_id=? AND message_id=?)",
                 (*values.values(), chat_id, message_id),
             )
+            if inserted.rowcount:
+                record_completion(connection, chat_id, thread_id, context, values["ts"])
             connection.commit()
             return True
         finally:
@@ -104,12 +256,13 @@ def main(argv):
         sys.exit(0)
     arguments = argv[1:]
     if arguments[:1] == ["--record-confirmed-outbound"]:
-        if len(arguments) != 4:
+        if len(arguments) not in (4, 5):
             sys.exit(2)
         try:
             raw_receipt, text = sys.stdin.buffer.read().decode("utf-8").split("\0", 1)
             recorded = record_outbound(arguments[1], text, json.loads(raw_receipt),
-                                       arguments[2], arguments[3])
+                                       arguments[2], arguments[3],
+                                       json.loads(arguments[4]) if len(arguments) == 5 else None)
         except (ValueError, UnicodeError):
             recorded = False
         sys.exit(0 if recorded else 1)
@@ -117,31 +270,54 @@ def main(argv):
     if arguments[:1] == ["--no-watchdog-credit"]:
         watchdog_credit = False
         arguments = arguments[1:]
+    thread_id = None
+    if len(arguments) >= 4 and arguments[-2] == "--thread-id":
+        try:
+            thread_id = parse_thread_id(arguments[0], arguments[-1])
+        except ValueError as error:
+            sys.exit(f"tg-send: {error}")
+        arguments = arguments[:-2]
     if len(arguments) != 2:
-        sys.exit('usage: tg-send [--no-watchdog-credit] <chat_id> "text"')
+        sys.exit('usage: tg-send [--no-watchdog-credit] <chat_id> "text" [--thread-id <positive_id>]')
     chat_id, text = arguments
-    for chunk_start in range(0, len(text), 4000) or [0]:
+    try:
+        context = capture_delivery(chat_id, thread_id) if watchdog_credit else None
+    except ValueError as error:
+        sys.exit(f"tg-send: {error}")
+    starts = list(range(0, len(text), 4000)) or [0]
+    for index, chunk_start in enumerate(starts):
         chunk = text[chunk_start:chunk_start + 4000]
-        body = urllib.parse.urlencode({"chat_id": chat_id, "text": chunk}).encode()
+        fields = {"chat_id": chat_id, "text": chunk}
+        if thread_id is not None:
+            fields["message_thread_id"] = thread_id
+        body = urllib.parse.urlencode(fields).encode()
         req = urllib.request.Request(
             f"https://api.telegram.org/bot{token()}/sendMessage", data=body)
         try:
             out = urllib.request.urlopen(req, timeout=15).read().decode()
             payload = json.loads(out)
             ok = payload.get("ok") is True
+            if not ok:
+                print("ok: False")
+                sys.exit(1)
             if ok and watchdog_credit:
-                if not record_outbound(chat_id, chunk, payload):
+                part_context = (context if index == len(starts) - 1 else
+                                {**context, "phase": "progress", "task_id": None})
+                if not record_outbound(chat_id, chunk, payload, context=part_context):
                     print("tg-send: history_write_failed; message will not be resent", file=sys.stderr)
         except Exception as e:
             print("tg-send error:", type(e).__name__)
             sys.exit(1)
     if watchdog_credit:
-        subprocess.run(
-            [os.path.expanduser("~/bin/tg-fallback-outbound"), chat_id],
-            check=False,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        try:
+            subprocess.run(
+                [os.path.expanduser("~/bin/tg-fallback-outbound"), chat_id],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except OSError:
+            pass  # A legacy watchdog marker cannot invalidate Telegram acceptance.
     print("ok:", ok)
     sys.exit(0 if ok else 1)
 

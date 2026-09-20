@@ -34,6 +34,85 @@ telegram_poller_alive() {
   return 1
 }
 
+# Cheap facts shared by the early snapshot and the checks below.
+recent_restarts() {
+  journalctl -u "$SVC" --since "10 min ago" --no-pager 2>/dev/null | grep -c -E "Started ([^ ]+\.service - )?Claude Code"
+}
+disk_free_pct() {
+  df /home | awk 'NR==2 {gsub("%",""); print 100-$5}'
+}
+
+# API-error turns of the main chain within the last $1 seconds, printed as one
+# "count|auth|status|text" line: how many, how many of them are login errors,
+# and the status and text of the newest. Mode "unowned" skips 429/529, which
+# claude-limit-recovery owns; "any" keeps them. The transcripts are the same
+# evidence the limit watcher reads — the watchdog never asks the model itself:
+# a probe turn burns tokens, drags context and took 90 of the tick's 110 seconds.
+api_error_scan() {
+  python3 - "$SESS_DIR" "$1" "$2" <<'PY' 2>/dev/null
+import json
+import re
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+root, window, mode = Path(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
+TAIL_BYTES = 4 * 1024 * 1024
+now = time.time()
+count = 0
+auth = 0
+latest = ("", "", "")
+try:
+    paths = [
+        path for path in root.rglob("*.jsonl")
+        if "corporate-workers" not in path.parent.name and now - path.stat().st_mtime < window
+    ]
+except OSError:
+    paths = []
+for path in paths:
+    try:
+        with path.open("rb") as handle:
+            handle.seek(max(0, path.stat().st_size - TAIL_BYTES))
+            data = handle.read()
+    except OSError:
+        continue
+    for raw in data.splitlines():
+        if b'"isApiErrorMessage"' not in raw:
+            continue
+        try:
+            event = json.loads(raw)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if not isinstance(event, dict) or event.get("isApiErrorMessage") is not True:
+            continue
+        if event.get("type") != "assistant" or event.get("isSidechain") is not False:
+            continue
+        status = event.get("apiErrorStatus")
+        if mode == "unowned" and status in (429, 529):
+            continue
+        stamp = str(event.get("timestamp") or "")
+        try:
+            age = now - datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            continue
+        if age > window:
+            continue
+        count += 1
+        content = (event.get("message") or {}).get("content")
+        text = ""
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            text = next((block.get("text", "") for block in content if isinstance(block, dict) and block.get("type") == "text"), "")
+        if re.search(r"401|oauth|log ?in|authenticat|refresh", str(text), re.I):
+            auth += 1
+        if stamp >= latest[0]:
+            latest = (stamp, "" if status is None else str(status), " ".join(str(text).split())[:160])
+print(f"{count}|{auth}|{latest[1]}|{latest[2]}")
+PY
+}
+
 # The owner can park automatic service recovery with /fix when the watchdog itself
 # is what keeps killing the bot. Valid expired holds are cleared; a current hold
 # that cannot be validated fails closed until it can be inspected safely.
@@ -108,6 +187,23 @@ chmod 0700 "$H/logs" 2>/dev/null || exit 0
 [ ! -L "$LOG" ] || exit 0
 : >> "$LOG" 2>/dev/null || exit 0
 chmod 0600 "$LOG" 2>/dev/null || exit 0
+# The first thing every tick leaves behind is a fresh snapshot of the cheap
+# facts. Novsky and /health read this file, and a tick that dies on the budget
+# or loses the lifecycle-lock race below must not leave a stale one behind: 214
+# sat 14 minutes stale on 2026-09-19 with a one-second tick. Login and queue
+# verdicts are deliberately absent — a reader treats a missing field as "not
+# checked yet", while a guessed false would paint a healthy agent orange.
+cat > "$STATE.tmp" <<STATE_EOF
+{
+  "timestamp": "$(date -u +%FT%TZ)",
+  "service_active": $(sudo systemctl is-active "$SVC" >/dev/null 2>&1 && echo true || echo false),
+  "restarts_10min": $(recent_restarts),
+  "disk_free_pct": $(disk_free_pct),
+  "gateway": {"poller": "$(telegram_poller_alive && echo ok || echo down)"},
+  "partial": true
+}
+STATE_EOF
+mv -f "$STATE.tmp" "$STATE"
 # Refresh the transcript-backed limit evidence before taking the shared lifecycle
 # lock. A concurrent recovery tick makes this status unknown; unknown fails closed
 # for the destructive stuck-turn restart, then the next health tick tries again.
@@ -118,11 +214,19 @@ LIMIT_RECOVERY_STATUS=unknown
 # since when the answer has been unknown, so a later check can tell the two apart.
 LIMIT_SILENT_STAMP="$STAMP/limit-detector-unknown-since.ts"
 if [ -x "$H/bin/claude-limit-recovery" ]; then
-    LIMIT_STATUS_JSON=$(timeout 30 env HOME="$H" "$H/bin/claude-limit-recovery" --status 2>/dev/null || true)
-    case "$LIMIT_STATUS_JSON" in
-        '{"active":true,"schemaVersion":1}') LIMIT_RECOVERY_STATUS=active ;;
-        '{"active":false,"schemaVersion":1}') LIMIT_RECOVERY_STATUS=clear ;;
-    esac
+    # --status takes the lifecycle lock without waiting, and the minute-crons
+    # (limit watcher, unstick-watch) hold it for a moment in the same second.
+    # One lost race must not read as a dead detector: the early snapshot above
+    # shifted this probe by half a second and 214 lost every tick from then on
+    # (2026-09-19). Ask again after a pause before calling the answer unknown.
+    for _status_try in 1 2 3; do
+        LIMIT_STATUS_JSON=$(timeout 30 env HOME="$H" "$H/bin/claude-limit-recovery" --status 2>/dev/null || true)
+        case "$LIMIT_STATUS_JSON" in
+            '{"active":true,"schemaVersion":1}') LIMIT_RECOVERY_STATUS=active; break ;;
+            '{"active":false,"schemaVersion":1}') LIMIT_RECOVERY_STATUS=clear; break ;;
+        esac
+        [ "$_status_try" -lt 3 ] && sleep 2
+    done
     if [ "$LIMIT_RECOVERY_STATUS" = unknown ]; then
         [ -s "$LIMIT_SILENT_STAMP" ] || date +%s > "$LIMIT_SILENT_STAMP" 2>/dev/null || true
     else
@@ -134,7 +238,13 @@ touch "$LIFECYCLE_LOCK" 2>/dev/null || exit 0
 chmod 0600 "$LIFECYCLE_LOCK" 2>/dev/null || exit 0
 command -v flock >/dev/null 2>&1 || exit 0
 exec 9>"$LIFECYCLE_LOCK"
-flock -n -x 9 || exit 0
+# Wait for the holder instead of vanishing: the minute-crons (limit watcher,
+# unstick-watch) start in the same second and hold the lock for a moment, and
+# a silent exit here is exactly how the snapshot went stale for whole hours.
+if ! flock -w 25 -x 9; then
+    echo "[$(date -u +%FT%TZ)] tick skipped: transport lifecycle lock busy for 25s" >> "$LOG"
+    exit 0
+fi
 # Expiry is housekeeping, independent of plugin provenance or a recovery trigger.
 service_mutation_allowed || true
 
@@ -233,23 +343,27 @@ PY
 # Alert function (with cooldown per alert-key)
 real_auth_verdict() {
     # Поле "loggedIn" лишається true при простроченому токені, а справжній виклик
-    # уже віддає 401. Один обмежений виклик коштує менше, ніж клієнт, який добу
-    # думає, що бот працює.
-    local out
+    # уже віддає 401. Доказ — останній хід самої сесії за вікно застряглого
+    # повідомлення ($1 хвилин), а не пробний виклик моделі зі сторожа.
+    local window_min="${1:-30}" scan status text
     if [ "$LIMIT_RECOVERY_STATUS" = active ]; then
         printf 'Уперся в ліміт акаунта. Він сам відпустить; напиши /health, щоб побачити коли.'
         return
     fi
-    out=$(ATARAX_SUPPRESS_TELEGRAM=1 timeout 90 "$H/.local/bin/claude" -p "ok" 2>&1 | head -3)
-    case "$out" in
+    if [ "${CLAUDE_AUTHENTICATED:-true}" = false ]; then
+        printf 'Мене розлогінило — потрібен новий вхід. Напиши /relogin, і я надішлю посилання.'
+        return
+    fi
+    scan=$(api_error_scan $((window_min * 60)) any)
+    status=$(printf '%s' "$scan" | cut -d'|' -f3)
+    text=$(printf '%s' "$scan" | cut -d'|' -f4-)
+    case "$status $text" in
+        *401*|*"OAuth"*|*"Re-authenticate"*|*"Not logged in"*|*"/login"*)
+            printf 'Мене розлогінило — потрібен новий вхід. Напиши /relogin, і я надішлю посилання.' ;;
+        *429*|*"session limit"*|*"usage limit"*|*"weekly limit"*|*"rate limit"*)
+            printf 'Уперся в ліміт акаунта. Він сам відпустить; напиши /health, щоб побачити коли.' ;;
         *529*|*503*|*500*|*Overloaded*|*overloaded*)
             printf 'Це збій на боці Anthropic, не в мене: моделі відповідають помилкою. Я повернусь сам, коли їх полагодять — статус на status.anthropic.com.' ;;
-        *401*|*"OAuth"*|*"Re-authenticate"*)
-            printf 'Мене розлогінило — потрібен новий вхід. Напиши /relogin, і я надішлю посилання.' ;;
-        *"session limit"*|*"usage limit"*|*"weekly limit"*|*"rate"*|*429*)
-            printf 'Уперся в ліміт акаунта. Він сам відпустить; напиши /health, щоб побачити коли.' ;;
-        "")
-            printf 'Перешли останнє повідомлення ще раз або напиши /unstick.' ;;
         *)
             printf 'Логін і ліміт живі — схоже, загубився хід. Перешли повідомлення ще раз або напиши /unstick.' ;;
     esac
@@ -336,7 +450,7 @@ fi
 # 26.04) logs "Started claude-telegram.service - Claude Code Telegram Bot…". A grep
 # for the bare description counted 0 on every 24.04 box, so this guard, the
 # restarts_10min field and /unstick's count were all silently dead there.
-RESTARTS=$(journalctl -u "$SVC" --since "10 min ago" --no-pager 2>/dev/null | grep -c -E "Started ([^ ]+\.service - )?Claude Code")
+RESTARTS=$(recent_restarts)
 if [ "$RESTARTS" -gt 4 ]; then
     if service_mutation_allowed; then
         if sudo systemctl stop "$SVC" 2>/dev/null; then
@@ -570,7 +684,14 @@ else
     # Self-service re-login: владельцу уходит OAuth-ссылка в TG, код он присылает
     # обратно боту сообщением, скрипт вставляет его в CLI и рестартит сервис.
     # Скрипт сам дебаунсится (20 мин) — безопасно звать каждые 2 минуты.
-    nohup "$H/bin/claude-auth-rescue" 9>&- >/dev/null 2>&1 &
+    # An operator re-login (Novsky «Повторити вхід», /fix hold) logs the CLI
+    # out on purpose under a restart hold; a rescue link on top of it would
+    # start a second login flow in the owner's chat.
+    if service_mutation_allowed; then
+        nohup "$H/bin/claude-auth-rescue" 9>&- >/dev/null 2>&1 &
+    else
+        echo "[$(date -u +%FT%TZ)] auth rescue suppressed: restart hold" >> "$LOG"
+    fi
 fi
 
 # 3. Bun telegram MCP alive? Grace-period 4 min before restart — restarting claude-telegram
@@ -636,7 +757,7 @@ if [ -s "$LIMIT_SILENT_STAMP" ]; then
 fi
 
 # 8. Disk space (< 5% free = critical)
-DISK_PCT=$(df /home | awk 'NR==2 {gsub("%",""); print 100-$5}')
+DISK_PCT=$(disk_free_pct)
 if [ "$DISK_PCT" -lt 10 ]; then
     alert "low-disk" "Мало місця на диску: на /home вільно ${DISK_PCT}%. Перевір /opt/streampost/data та файли браузера."
 fi
@@ -645,6 +766,23 @@ fi
 # from one employee conversation: the gateway reports that queue separately and
 # scoped /unstick handles it without restarting the owner session.
 DB=$H/.claude/channels/telegram/messages.db
+# Who removes a delivered message from the queue (KTD8): the value the poller
+# started with, read from the database on every tick, never from the channel
+# file. Under the receiver the rules that judge the queue — started-head
+# recovery, the stuck-turn restart and its escalation — are inert; every other
+# rule is unchanged. Absent or unknown reads as guard.
+DELIVERY_AUTHORITY=guard
+if [ -f "$DB" ] && command -v sqlite3 >/dev/null 2>&1; then
+    DELIVERY_AUTHORITY=$(sqlite3 "$DB" "SELECT value FROM delivery_runtime WHERE key='authority';" 2>/dev/null || true)
+    case "$DELIVERY_AUTHORITY" in guard|shadow|receiver) ;; *) DELIVERY_AUTHORITY=guard ;; esac
+fi
+# Contract 3 retains requests and resumes them in the receiver even in shadow.
+# The healthcheck still owns dead processes; queue age is not a restart reason.
+DURABLE_REQUEST_RECOVERY=0
+if [ -f "$DB" ] && command -v sqlite3 >/dev/null 2>&1; then
+    RECEIPT_CONTRACT=$(sqlite3 "$DB" "SELECT value FROM delivery_runtime WHERE key='receipt_contract';" 2>/dev/null || true)
+    case "$RECEIPT_CONTRACT" in ''|*[!0-9]*) ;; *) [ "$RECEIPT_CONTRACT" -lt 3 ] || DURABLE_REQUEST_RECOVERY=1 ;; esac
+fi
 STARTED_RECOVERY_STAMP=$STAMP/runtime-started-head-restart.json
 
 write_started_recovery_checkpoint() {
@@ -789,6 +927,8 @@ rollback_started_recovery() {
 # absent after a bounded lease. `started_at` avoids mistaking old queue wait time
 # for a stale claim after a legitimate long turn.
 if [ "$SERVICE_RESTARTED" -eq 0 ] \
+   && [ "$DELIVERY_AUTHORITY" != receiver ] \
+   && [ "$DURABLE_REQUEST_RECOVERY" -eq 0 ] \
    && [ -f "$DB" ] && command -v sqlite3 >/dev/null 2>&1 \
    && [ "$CLAUDE_AUTHENTICATED" = true ] \
    && [ "$LIMIT_RECOVERY_STATUS" = clear ] \
@@ -979,41 +1119,9 @@ if [ "$RESTARTS" -gt 1 ] || [ "$DISK_PCT" -lt 20 ]; then
     echo "[$(date -u +%FT%TZ)] HB restarts=${RESTARTS} disk=${DISK_PCT}%" >> "$LOG"
 fi
 
-# 10. Claude OAuth token freshness + auto-recovery (added 2026-06-09; restart-on-expiry 2026-06-12).
-# OAuth refresh can rotate the token while the long-lived bot keeps stale in-memory state.
-# A restart forces the bot to reread the current credentials file and
-# взять валидный токен. Кулдаун 15м, чтобы не словить crash-loop guard (#4).
-# Same silent-failure class as the sqlite3 watchdog: without jq the expiry reads
-# as 0, the whole token-recovery block below is skipped and nothing says so.
-if ! command -v jq >/dev/null 2>&1; then
-    echo "[$(date -u +%FT%TZ)] WARN: jq missing — OAuth token auto-recovery disabled; apt-get install -y jq" >> "$LOG"
-fi
-EXP=$(jq -r ".claudeAiOauth.expiresAt // 0" "$H/.claude/.credentials.json" 2>/dev/null)
-NOW_MS=$(( $(date +%s) * 1000 ))
-if [ "${EXP:-0}" -gt 0 ]; then
-    LEFT_MIN=$(( (EXP - NOW_MS) / 60000 ))
-    if [ "$LEFT_MIN" -le 0 ]; then
-        RESTART_TS=$STAMP/cash-token-restart.ts
-        NOW_S2=$(date +%s); LAST_R=$(cat "$RESTART_TS" 2>/dev/null || echo 0)
-        # Restart PROMPTLY on an expired token — do NOT idle-gate this. An expired
-        # in-memory token means every model call 401s ("Please run /login"), so the
-        # session writes error lines and *looks busy*; gating on that busyness (tried
-        # 2026-07-22) deferred the very restart that fixes it and wedged the bot for
-        # ~20 min. A dead token has no useful work to protect. (Message-in-window
-        # drops belong to the transport's on-disk retention, not here.)
-        if [ $(( NOW_S2 - LAST_R )) -ge 900 ]; then
-            # Silent by design: the refreshed token is already on disk and the
-            # restart makes the bot read it. Almost every one of these ended in
-            # a working bot, so the message only said "something was wrong"
-            # after it no longer was. If the restart does not help, the auth
-            # check above catches it on the next tick and sends a login link —
-            # the one thing the owner can actually do.
-            if restart_service token_expired; then
-                echo "$NOW_S2" > "$RESTART_TS"
-            fi
-        fi
-    fi
-fi
+# 10. (retired) Restarting on an expired expiresAt in .credentials.json hit idle
+# sessions, which refresh by themselves on their next call. Stale in-memory
+# credentials are detected in 8b from the transcript's auth errors instead.
 
 # 11. Codex auth (картинки gpt-image-2) — проверка раз в 30 мин, лёгкая.
 CODEX_STAMP=$STAMP/cash-codex-check.ts
@@ -1037,7 +1145,7 @@ fi
 if [ -f "$DB" ] && ! command -v sqlite3 >/dev/null 2>&1; then
     echo "[$(date -u +%FT%TZ)] WARN: sqlite3 missing — stuck-turn watchdog disabled; apt-get install -y sqlite3" >> "$LOG"
 fi
-if [ -f "$DB" ] && command -v sqlite3 >/dev/null 2>&1; then
+if [ -f "$DB" ] && command -v sqlite3 >/dev/null 2>&1 && [ "$DELIVERY_AUTHORITY" != receiver ] && [ "$DURABLE_REQUEST_RECOVERY" -eq 0 ]; then
     # Before corporate isolation is activated, every private chat still shares
     # the legacy owner process and needs the old watchdog. Afterwards employee
     # DMs have independent workers, so only the exact owner may trigger a global
@@ -1062,6 +1170,12 @@ if [ -f "$DB" ] && command -v sqlite3 >/dev/null 2>&1; then
         # bounded recovery path by classifying those rows as unknown.
         MESSAGE_ID_EXPR="''"
     fi
+    NOW_MS3=$(( $(date +%s) * 1000 ))
+    # A private message nobody answered for more than a day is history, not a
+    # wedged queue: a stranger's "Привет" from two months ago kept Кеша and Сири
+    # flagged "stuck" forever (2026-09-18), orange in Novsky with an empty queue.
+    # Escalation stops at 24 h anyway; the flag now follows the same bound.
+    STUCK_RECENT_MS=$(( NOW_MS3 - 86400000 ))
     PRIVATE_CHAT_ACTIVITY=$(sqlite3 "$DB" "
         WITH activity AS (
             SELECT chat_id,
@@ -1070,7 +1184,7 @@ if [ -f "$DB" ] && command -v sqlite3 >/dev/null 2>&1; then
             FROM messages
             WHERE $PRIVATE_CHATS
             GROUP BY chat_id
-            HAVING last_in > last_out
+            HAVING last_in > last_out AND last_in > $STUCK_RECENT_MS
         )
         SELECT m.chat_id,
                activity.last_in,
@@ -1083,7 +1197,6 @@ if [ -f "$DB" ] && command -v sqlite3 >/dev/null 2>&1; then
           AND m.ts > activity.last_out
         ORDER BY m.chat_id, m.ts, m.rowid
     " 2>/dev/null || true)
-    NOW_MS3=$(( $(date +%s) * 1000 ))
     # 1200s, not 180s: a long tool call (codex/video render, 5-15 min) writes
     # nothing to the session jsonl while working — a few quiet minutes is a BUSY
     # turn, not a hang. A 180s window false-fired mid-render on Mani (2026-07-16)
@@ -1211,7 +1324,6 @@ PY
             CHAT_INCIDENT_SELECTED=1
             continue
         fi
-        OWNER_STUCK=true
 
         # Only exact, main-chain transcript evidence may suppress recovery.
         # Missing legacy message IDs stay unknown; a broken helper fails closed
@@ -1235,6 +1347,9 @@ PY
                 continue
                 ;;
         esac
+        # A handled or interrupted turn is answered work, not a stuck queue: the
+        # flag is raised only for a turn the transcript cannot vouch for.
+        OWNER_STUCK=true
 
         # Від ПЕРШОГО повідомлення без відповіді: інакше кожне нове питання
         # власника скидає лічильник, і сторож мовчить, поки той пише.
@@ -1267,7 +1382,7 @@ PY
         # сторож почав скаржитись на повідомлення тритижневої давнини.
         if [ "$AGE_MIN" -ge 30 ] && [ "$AGE_MIN" -le 1440 ] && [ "$LAST_ESC_IN" != "$FIRST_UNANSWERED" ]; then
             echo "$FIRST_UNANSWERED" > "$ESCALATE_TS"
-            AUTH_VERDICT="$(real_auth_verdict)"
+            AUTH_VERDICT="$(real_auth_verdict "$AGE_MIN")"
             alert "stuck-escalate" "Не відповідаю вже ${AGE_MIN} хв: вхідне повідомлення не отримало підтвердженої відповіді. ${AUTH_VERDICT}" 10800
         fi
     done <<PRIVATE_CHAT_ACTIVITY_EOF
@@ -1290,69 +1405,30 @@ fi
 # second. A customer watched 16 minutes of "API Error 400" replies with
 # health-state.json all green (2026-09-15). Two such turns in 15 minutes are an
 # incident; the owner is told once an hour with the provider's own words.
-API_ERROR_SCAN=$(python3 - "$SESS_DIR" <<'PY' 2>/dev/null
-import json
-import sys
-import time
-from datetime import datetime
-from pathlib import Path
-
-WINDOW_SECONDS = 900
-TAIL_BYTES = 4 * 1024 * 1024
-root = Path(sys.argv[1])
-now = time.time()
-count = 0
-latest = ("", "")
-try:
-    paths = [
-        path for path in root.rglob("*.jsonl")
-        if "corporate-workers" not in path.parent.name and now - path.stat().st_mtime < WINDOW_SECONDS
-    ]
-except OSError:
-    paths = []
-for path in paths:
-    try:
-        with path.open("rb") as handle:
-            handle.seek(max(0, path.stat().st_size - TAIL_BYTES))
-            data = handle.read()
-    except OSError:
-        continue
-    for raw in data.splitlines():
-        if b'"isApiErrorMessage"' not in raw:
-            continue
-        try:
-            event = json.loads(raw)
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            continue
-        if not isinstance(event, dict) or event.get("isApiErrorMessage") is not True:
-            continue
-        if event.get("type") != "assistant" or event.get("isSidechain") is not False:
-            continue
-        if event.get("apiErrorStatus") in (429, 529):
-            continue
-        stamp = str(event.get("timestamp") or "")
-        try:
-            age = now - datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp()
-        except ValueError:
-            continue
-        if age > WINDOW_SECONDS:
-            continue
-        count += 1
-        content = (event.get("message") or {}).get("content")
-        text = ""
-        if isinstance(content, str):
-            text = content
-        elif isinstance(content, list):
-            text = next((block.get("text", "") for block in content if isinstance(block, dict) and block.get("type") == "text"), "")
-        if stamp >= latest[0]:
-            latest = (stamp, " ".join(str(text).split())[:160])
-print(f"{count}|{latest[1]}")
-PY
-)
+API_ERROR_SCAN=$(api_error_scan 900 unowned)
 API_ERROR_COUNT=$(printf '%s' "$API_ERROR_SCAN" | cut -d'|' -f1)
+API_AUTH_COUNT=$(printf '%s' "$API_ERROR_SCAN" | cut -d'|' -f2)
 case "$API_ERROR_COUNT" in ''|*[!0-9]*) API_ERROR_COUNT=0 ;; esac
-if [ "$API_ERROR_COUNT" -ge 2 ]; then
-    API_ERROR_TEXT=$(printf '%s' "$API_ERROR_SCAN" | cut -d'|' -f2-)
+case "$API_AUTH_COUNT" in ''|*[!0-9]*) API_AUTH_COUNT=0 ;; esac
+API_ERROR_TEXT=$(printf '%s' "$API_ERROR_SCAN" | cut -d'|' -f4-)
+if [ "$API_AUTH_COUNT" -ge 2 ] && [ "$CLAUDE_AUTHENTICATED" = true ]; then
+    # The session 401s while the on-disk login is valid: another process rotated
+    # the refresh token (cron `claude -p`, a corporate worker) and the long-lived
+    # CLI still holds the old one. One restart re-reads the file. Only the
+    # transcript proves this state — an expired expiresAt on disk does not,
+    # because an idle session refreshes on its next call by itself.
+    RESTART_TS=$STAMP/cash-token-restart.ts
+    NOW_S2=$(date +%s); LAST_R=$(cat "$RESTART_TS" 2>/dev/null || echo 0)
+    if [ $(( NOW_S2 - LAST_R )) -ge 900 ]; then
+        echo "[$(date -u +%FT%TZ)] auth errors in 15 min: ${API_AUTH_COUNT} while the on-disk login is valid — restarting ${SVC} to re-read credentials" >> "$LOG"
+        if restart_service creds_stale; then
+            echo "$NOW_S2" > "$RESTART_TS"
+        fi
+    else
+        echo "[$(date -u +%FT%TZ)] auth errors in 15 min: ${API_AUTH_COUNT} after a credentials restart — ${API_ERROR_TEXT}" >> "$LOG"
+        alert "api-error-turns" "Я відповідаю помилкою входу замість відповіді (${API_AUTH_COUNT} за 15 хв): ${API_ERROR_TEXT}. Перезапуск не допоміг — виконай /relogin." 3600
+    fi
+elif [ "$API_ERROR_COUNT" -ge 2 ]; then
     echo "[$(date -u +%FT%TZ)] api-error turns in 15 min: ${API_ERROR_COUNT} — ${API_ERROR_TEXT}" >> "$LOG"
     alert "api-error-turns" "Я відповідаю помилкою API замість відповіді (${API_ERROR_COUNT} за 15 хв): ${API_ERROR_TEXT}. Перезапуск не допоможе: перевір модель у settings.json або виконай /relogin." 3600
 fi
@@ -1363,9 +1439,11 @@ GATEWAY_POLLER=down
 telegram_poller_alive && GATEWAY_POLLER=ok
 CORPORATE_ENABLED=false
 [ "$CORPORATE_ACTIVATED" -eq 1 ] && CORPORATE_ENABLED=true
-cat > "$STATE" <<STATE_EOF
+cat > "$STATE.tmp" <<STATE_EOF
 {
   "timestamp": "$(date -u +%FT%TZ)",
+  "partial": false,
+  "tick_seconds": ${SECONDS},
   "service_active": $(sudo systemctl is-active "$SVC" >/dev/null 2>&1 && echo true || echo false),
   "telegram_plugin_compatible": $([ "$TELEGRAM_PLUGIN_COMPATIBLE" -eq 1 ] && echo true || echo false),
   "claude_authenticated": ${CLAUDE_AUTHENTICATED},
@@ -1373,9 +1451,11 @@ cat > "$STATE" <<STATE_EOF
   "disk_free_pct": ${DISK_PCT},
   "streampost_active": $(systemctl is-active streampost.service >/dev/null 2>&1 && echo true || echo false),
   "gateway": {"poller": "${GATEWAY_POLLER}"},
+  "delivery_authority": "${DELIVERY_AUTHORITY}",
   "owner": {"queue": ${OWNER_QUEUE}, "stuck": ${OWNER_STUCK}},
   "corporate": {"enabled": ${CORPORATE_ENABLED}, "admissionState": "${CORPORATE_ADMISSION}", "active": ${CORPORATE_ACTIVE}, "queued": ${CORPORATE_QUEUED}, "blocked": ${CORPORATE_BLOCKED}, "maxWorkers": 3}
 }
 STATE_EOF
+mv -f "$STATE.tmp" "$STATE"
 
 exit 0

@@ -46,24 +46,22 @@ INITIALIZE_LOCK_BUSY_EXIT = 75
 TRANSPORT_PATTERN = "bun.*plugins-official.*telegram"
 NOTICE_TEXT = (
     "Процес агента перезапущено після підтвердженого ліміту Claude. "
-    "Будь ласка, надішли останнє повідомлення ще раз — автоматично воно не відтворюється."
+    "Збережений запит очікує відновлення з попереднього контексту."
 )
 OVERLOAD_NOTICE_TEXT = (
-    "⚠️ Anthropic зараз перевантажений. Я не зміг завершити це повідомлення — "
-    "запит не виконано. Надішли його ще раз за кілька хвилин."
+    "⚠️ Anthropic зараз перевантажений. Запит збережено; продовжу його після відновлення доступу."
 )
 LIMIT_NOTICE_TEXT = (
-    "⏳ Я вперся в ліміт Claude. Це повідомлення не виконане. "
-    "Напиши /health, щоб побачити стан, і повтори запит після скидання ліміту."
+    "⏳ Я вперся в ліміт Claude. Запит збережено; після скидання ліміту продовжу з попереднього місця. "
+    "Стан доступний через /health."
 )
 OWNER_OVERLOAD_NOTICE_TEXT = (
     "⚠️ Один із дозволених чатів не отримав відповідь: Anthropic перевантажений. "
-    "Користувачу вже надіслано прохання повторити запит пізніше."
+    "Запит збережено для продовження після відновлення доступу."
 )
 OWNER_LIMIT_NOTICE_TEXT = (
     "⏳ Один із дозволених чатів не отримав відповідь через ліміт Claude. "
-    "Користувачу вже надіслано інструкцію перевірити /health і повторити запит "
-    "після скидання."
+    "Запит збережено для продовження після скидання ліміту."
 )
 NOTICE_STATE_NAME = "claude-interruption-notices.json"
 NOTICE_LOCK_NAME = "claude-interruption-notices.lock"
@@ -145,6 +143,7 @@ UNIX_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 class ChannelRef:
     chat_id: str
     message_id: str | None
+    thread_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -218,7 +217,15 @@ def parse_channel(text: object) -> ChannelRef | None:
         and NUMERIC_MESSAGE_ID.fullmatch(message_id) is None
     ):
         return None
-    return ChannelRef(chat_id=chat_id, message_id=message_id)
+    thread_id = attributes.get("thread_id")
+    if thread_id is not None and (not re.fullmatch(r"[1-9][0-9]*", thread_id)
+                                  or not chat_id.startswith("-")):
+        return None
+    if attributes.get("conversation_key", "").startswith("topic:") and (
+        thread_id is None or attributes["conversation_key"] != f"topic:{chat_id}:{thread_id}"
+    ):
+        return None
+    return ChannelRef(chat_id=chat_id, message_id=message_id, thread_id=thread_id)
 
 
 def rendered_assistant_text(event: dict) -> str | None:
@@ -618,6 +625,7 @@ def classify_interruption(
         "chat_id": channel.chat_id,
         "message_id": channel.message_id,
         "kind": kind,
+        **({"thread_id": channel.thread_id} if channel.thread_id is not None else {}),
     }
 
 
@@ -650,7 +658,7 @@ def classify_turn_status(
     message = event.get("message")
     content = message.get("content") if isinstance(message, dict) else None
     if (
-        channel != ChannelRef(chat_id, message_id)
+        (channel is None or channel.chat_id != chat_id or channel.message_id != message_id)
         or event.get("type") != "assistant"
         or event.get("isSidechain") is not False
         or event.get("userType") != "external"
@@ -1852,7 +1860,7 @@ def _apply_batch_in_place(
         if (
             incident is not None
             and not incident["resolved"]
-            and now_ms >= incident["event_epoch_ms"] + INCIDENT_TTL_MS
+            and now_ms >= incident_expires_at(incident)
         ):
             incident["expired"] = True
         if incident is not None and (incident["resolved"] or incident["expired"]):
@@ -2004,6 +2012,14 @@ def recovery_confirmed(state: dict, db: Path) -> bool:
     return False
 
 
+def incident_expires_at(incident: dict) -> int:
+    expiry = incident["event_epoch_ms"] + INCIDENT_TTL_MS
+    reset = incident.get("reset_epoch_ms")
+    if type(reset) is int and incident["event_epoch_ms"] <= reset <= incident["event_epoch_ms"] + 8 * INCIDENT_TTL_MS:
+        expiry = max(expiry, reset + RESET_MARGIN_MS)
+    return expiry
+
+
 def decide_attempt(state: dict, now_ms: int) -> Decision:
     """Choose one bounded retry identity without performing side effects."""
     try:
@@ -2018,7 +2034,7 @@ def decide_attempt(state: dict, now_ms: int) -> Decision:
         return Decision(False, None, "incident_resolved")
     if (
         incident["expired"]
-        or now_ms >= incident["event_epoch_ms"] + INCIDENT_TTL_MS
+        or now_ms >= incident_expires_at(incident)
     ):
         return Decision(False, None, "incident_expired")
     if incident["unknown_queue_operation"]:
@@ -2034,6 +2050,10 @@ def decide_attempt(state: dict, now_ms: int) -> Decision:
         last_attempt_ms = max(attempt["attempted_at_ms"] for attempt in attempts)
         if now_ms - last_attempt_ms < COOLDOWN_MS:
             return Decision(False, None, "cooldown")
+
+    reset_epoch_ms = incident["reset_epoch_ms"]
+    if reset_epoch_ms is not None and now_ms < reset_epoch_ms + RESET_MARGIN_MS:
+        return Decision(False, None, "provider_reset_pending")
 
     pending_entries = [
         entry
@@ -2276,13 +2296,28 @@ def preflight(agent_root: Path, service: str, runner) -> str | None:
 
 
 def _agent_root() -> Path:
-    home = os.environ.get("HOME")
+    home = os.environ.get("AGENT_ROOT") or os.environ.get("HOME")
     if not home:
         return Path.home()
     path = Path(home)
     if not path.is_absolute():
         raise StateError("HOME must be absolute")
     return path
+
+
+def durable_scheduler_owns_recovery(db: Path) -> bool:
+    connection = None
+    try:
+        connection = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=1)
+        row = connection.execute(
+            "SELECT value FROM delivery_runtime WHERE key='receipt_contract'"
+        ).fetchone()
+        return row is not None and int(row[0]) >= 3
+    except (sqlite3.Error, ValueError):
+        return False
+    finally:
+        if connection is not None:
+            connection.close()
 
 
 def _projects_dir(agent_root: Path) -> Path:
@@ -2637,6 +2672,7 @@ def notification_tick(mode: str) -> int:
                         _notice_copy(interruption["kind"], owner=(
                             interruption["kind"] in ACCOUNT_NOTICE_KINDS and affected_chat == owner_chat
                         )),
+                        *(["--thread-id", interruption["thread_id"]] if interruption.get("thread_id") else []),
                     ],
                     timeout=COMMAND_TIMEOUT_SECONDS,
                 ):
@@ -2726,6 +2762,13 @@ def tick(mode: str) -> int:
             _record_suppression(agent_root, "observe_mode")
             return 0
 
+        if durable_scheduler_owns_recovery(messages_db):
+            # The receiver wakes saved work after reset without replacing its
+            # native session. Process health remains the healthcheck's job.
+            atomic_write_state(state_path, state)
+            _record_suppression(agent_root, "durable_scheduler_owns_recovery")
+            return 0
+
         decision = decide_attempt(state, now_ms)
         if not decision.eligible:
             if decision.suppression == "incident_expired" and incident is not None:
@@ -2798,7 +2841,7 @@ def limit_status() -> int:
         if (
             incident is not None
             and not incident["resolved"]
-            and now_ms >= incident["event_epoch_ms"] + INCIDENT_TTL_MS
+            and now_ms >= incident_expires_at(incident)
         ):
             incident["expired"] = True
         active = bool(

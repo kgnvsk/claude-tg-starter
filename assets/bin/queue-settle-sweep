@@ -11,9 +11,9 @@ once, so the guard is right and only its timing was wrong.
 
 This decides nothing about delivery: when a head has been sitting longer than
 QUEUE_SETTLE_AFTER_SECONDS it calls the same guard again over the finished
-transcript and lets it apply all of its own proofs. Only when the guard
-refuses does this script act, and then the most it does is put the message
-back in the queue so the person gets an answer instead of silence.
+transcript and lets it apply all of its own proofs. A refusal leaves the input
+untouched. With a durable request ledger this entire legacy sweep is inert:
+the receiver owns recovery and any decision to resume unfinished work.
 """
 import fcntl
 import json
@@ -33,7 +33,7 @@ GUARD = AGENT_ROOT / "bin/tg-reply-stop-guard"
 LOG = AGENT_ROOT / "logs/queue-settle-sweep.log"
 # Shared with cash-healthcheck, unstick-watch, claude-limit-recovery and
 # claude-auth-rescue: whoever holds it is mid-way through the transport, and a
-# head it is about to abort must not be requeued from under it.
+# lifecycle transition must not race another guard check.
 LIFECYCLE_LOCK = AGENT_ROOT / "logs/transport-lifecycle.lock"
 STUCK_SECONDS = int(os.environ.get("QUEUE_SETTLE_AFTER_SECONDS", "180"))
 # The carrier envelope naming the head sits at the start of its turn, so the
@@ -47,6 +47,27 @@ def log(message: str) -> None:
     LOG.parent.mkdir(parents=True, exist_ok=True)
     with LOG.open("a", encoding="utf-8") as handle:
         handle.write(f"[{time.strftime('%FT%TZ', time.gmtime())}] {message}\n")
+
+
+AUTHORITY_VALUES = ("guard", "shadow", "receiver")
+
+
+def delivery_authority() -> str:
+    """Who removes a delivered message from the queue (KTD8).
+
+    The value the poller started with, read from the database on every run —
+    never from the channel file, which may already say something the running
+    service has not started with. Absent or unknown means guard.
+    """
+    try:
+        connection = sqlite3.connect(f"file:{STATE_DIR / 'messages.db'}?mode=ro", uri=True, timeout=5)
+        try:
+            row = connection.execute("SELECT value FROM delivery_runtime WHERE key='authority'").fetchone()
+        finally:
+            connection.close()
+    except sqlite3.Error:
+        return "guard"
+    return row[0] if row and row[0] in AUTHORITY_VALUES else "guard"
 
 
 def queue_head() -> tuple[str, int] | None:
@@ -156,71 +177,99 @@ TURN_NEVER_RAN = re.compile(
 )
 
 
-def turn_never_ran(transcript: pathlib.Path) -> str | None:
-    """The reason the model produced nothing at all, if it is written down."""
+def turn_records(transcript: pathlib.Path, delivery_id: str) -> list[dict] | None:
+    """This delivery's turn: every record from its envelope to the end of the tail.
+
+    None when the tail no longer carries the envelope: the turn began more than
+    TRANSCRIPT_TAIL_BYTES ago, so the model has long since run.
+    """
     try:
         with transcript.open("rb") as handle:
             handle.seek(max(0, transcript.stat().st_size - TRANSCRIPT_TAIL_BYTES))
-            tail = handle.read().decode("utf-8", "replace")
+            lines = handle.read().decode("utf-8", "replace").splitlines()
     except OSError:
         return None
-    found = TURN_NEVER_RAN.search(tail)
-    return found.group(0) if found else None
+    needle = f'delivery_id="{delivery_id}"'
+    start = next((index for index, line in enumerate(lines) if needle in line.replace('\\"', '"')), None)
+    if start is None:
+        return None
+    records = []
+    for line in lines[start:]:
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(record, dict):
+            records.append(record)
+    return records
 
 
-def drop_unanswered_group_head(delivery_id: str, age: int, note: str) -> None:
-    """A group turn the guard refuses owes nobody an answer, so it just goes.
+def turn_closed(records: list[dict] | None) -> bool:
+    """Claude Code ends every turn, a refused one included, with a turn_duration record.
 
-    In a group the agent watches people talk to each other and answers only when it
-    is addressed; a turn that ends without publishing anything is the ordinary
-    case, and the guard's block is coaching aimed at a model that has already
-    stopped. Returning such a head to the queue re-reads the same group message
-    and earns the same refusal, so the person watched "the message did not
-    reach processing twice" arrive once a minute (Kirill's box, 2026-09-15).
-    Nothing was owed, so the head is cleared and the queue moves on.
+    Until it lands the model is still working, and the transcript is written
+    with a lag and out of order: judged in the middle of a long turn, the guard
+    found no delivery yet and forwarded the model's last progress note to the
+    person as its answer, minutes before the real reply (Кнопа Кирила and Кеш,
+    17.09). A turn without its closing record is not the guard's to judge.
     """
-    try:
-        writable = sqlite3.connect(f"file:{STATE_DIR / 'messages.db'}?mode=rw", uri=True, timeout=5)
-        writable.execute(
-            "DELETE FROM pending_inbound_deliveries WHERE delivery_id=? AND state='started'",
-            (delivery_id,),
-        )
-        writable.commit()
-        writable.close()
-        log(f"{delivery_id} sat {age}s in a group with nothing to publish — head cleared: {note or 'no output'}")
-    except sqlite3.Error as error:
-        log(f"{delivery_id} sat {age}s and the group head could not be cleared: {error}")
+    if records is None:
+        return True
+    return any(record.get("type") == "system" and record.get("subtype") == "turn_duration"
+               for record in records)
 
 
-def requeue(delivery_id: str, age: int, note: str) -> None:
-    """The guard refused in a one-to-one chat: somebody is waiting for an answer.
+def turn_never_ran(records: list[dict] | None) -> str | None:
+    """The reason the model produced nothing at all, if Claude Code wrote it down.
 
-    There is nobody left to ask — the model has stopped — so the message goes
-    back in the queue and the poller hands it to the model again. The attempts
-    column stays as it is: the receiver already counted the offer that handed
-    the head to the session, and it stops re-offering at two. Counting the
-    replay here as well reached that limit at once, and the next drain tick
-    told the person "не вдалося передати" instead of retrying (Lera's box,
-    2026-09-15). Left alone, the receiver's own exhausted path tells the person
-    to send it once more after the replay fails, so one message can never hold
-    the queue for ever and no second counter is needed.
+    Only a record the CLI itself flags isApiErrorMessage counts, and only from
+    this delivery's own turn on. The same words sit in the documentation of a
+    tool loaded on demand (SendMessage: "the subscription expired", written
+    into the transcript since CLI 2.1.274) and in a limit record from a turn
+    that ended hours earlier; read from the raw tail, both parked a live head
+    until the healthcheck restarted a healthy agent (Kirill's box, 16–17.09).
     """
+    for record in records or []:
+        if not record.get("isApiErrorMessage"):
+            continue
+        message = record.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        texts = [content] if isinstance(content, str) else [
+            block.get("text", "") for block in (content or []) if isinstance(block, dict)]
+        found = TURN_NEVER_RAN.search("\n".join(str(text) for text in texts))
+        if found:
+            return found.group(0)
+    return None
+
+
+def durable_recovery(connection: sqlite3.Connection | None = None) -> bool:
+    """A durable request ledger makes the receiver the sole rescheduler."""
+    own_connection = connection is None
     try:
-        writable = sqlite3.connect(f"file:{STATE_DIR / 'messages.db'}?mode=rw", uri=True, timeout=5)
-        writable.execute(
-            "UPDATE pending_inbound_deliveries SET state='queued' WHERE delivery_id=? AND state='started'",
-            (delivery_id,),
-        )
-        writable.commit()
-        writable.close()
-        log(f"{delivery_id} sat {age}s with no delivery — returned to the queue for one more delivery: "
-            f"{note or 'no output'}")
-    except sqlite3.Error as error:
-        log(f"{delivery_id} sat {age}s and could not be returned to the queue: {error}")
+        if connection is None:
+            connection = sqlite3.connect(f"file:{STATE_DIR / 'messages.db'}?mode=ro", uri=True, timeout=2)
+        return any(row[1] == 'request_payload' for row in connection.execute('PRAGMA table_info(delivery_results)'))
+    except sqlite3.Error:
+        # Unknown ownership is not permission to mutate a queue.
+        return True
+    finally:
+        if own_connection and connection is not None:
+            connection.close()
+
+
+def log_retained_delivery(delivery_id: str, age: int, note: str) -> None:
+    """The receiver alone schedules a new attempt of the saved request."""
+    log(f"{delivery_id} sat {age}s — retained for receiver recovery: {note or 'no confirmed output'}")
 
 
 def main() -> int:
     if not GUARD.is_file() or not (STATE_DIR / "messages.db").exists():
+        return 0
+    if durable_recovery():
+        log("durable requests: receiver owns recovery — sweep inert")
+        return 0
+    if delivery_authority() == "receiver":
+        log("delivery authority is receiver: the receiver settles its own queue — sweep inert")
         return 0
     head = queue_head()
     if head is None:
@@ -228,51 +277,55 @@ def main() -> int:
     delivery_id, age = head
     if age < STUCK_SECONDS:
         return 0
+    lock = None
     try:
         LIFECYCLE_LOCK.parent.mkdir(parents=True, exist_ok=True)
         lock = LIFECYCLE_LOCK.open("a")
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except (OSError, BlockingIOError):
+        if lock is not None:
+            lock.close()
         log(f"{delivery_id} sat {age}s but the transport lifecycle lock is busy — left for its holder")
         return 0
-    transcript = transcript_for(delivery_id)
-    if transcript is None:
-        log(f"{delivery_id} sat {age}s and no recent transcript carries it — left untouched")
-        return 0
-    session = session_of(transcript)
-    if session is None:
-        log(f"{delivery_id} sat {age}s but {transcript.name} names no session")
-        return 0
-    # The guard needs the session to ask the team broker about delegated work;
-    # without it every turn that used a shell looks unconfirmed and it refuses.
-    payload = json.dumps({
-        "transcript_path": str(transcript),
-        "session_id": session,
-        "stop_hook_active": False,
-    })
     try:
-        verdict = subprocess.run([str(GUARD)], input=payload, text=True, capture_output=True, timeout=60)
-    except (OSError, subprocess.SubprocessError) as error:
-        log(f"{delivery_id} sat {age}s and the guard did not run: {error}")
+        transcript = transcript_for(delivery_id)
+        if transcript is None:
+            log(f"{delivery_id} sat {age}s and no recent transcript carries it — left untouched")
+            return 0
+        session = session_of(transcript)
+        if session is None:
+            log(f"{delivery_id} sat {age}s but {transcript.name} names no session")
+            return 0
+        records = turn_records(transcript, delivery_id)
+        if not turn_closed(records):
+            log(f"{delivery_id} sat {age}s but its turn is still running — left alone")
+            return 0
+        # The guard needs the session to ask the team broker about delegated work;
+        # without it every turn that used a shell looks unconfirmed and it refuses.
+        payload = json.dumps({
+            "transcript_path": str(transcript),
+            "session_id": session,
+            "stop_hook_active": False,
+        })
+        try:
+            verdict = subprocess.run([str(GUARD)], input=payload, text=True, capture_output=True, timeout=60)
+        except (OSError, subprocess.SubprocessError) as error:
+            log(f"{delivery_id} sat {age}s and the guard did not run: {error}")
+            return 0
+        if not still_started(delivery_id):
+            log(f"{delivery_id} sat {age}s — settled by running the guard again")
+            return 0
+        note = (verdict.stdout or verdict.stderr or "").strip().replace("\n", " ")[:160]
+        # A provider limit needs receiver recovery, not another blind execution.
+        external = turn_never_ran(records)
+        if external:
+            log(f"{delivery_id} sat {age}s and the turn never ran ({external}) — left for the limit watcher")
+            return 0
+        # A missing response alone proves neither completion nor deliberate silence.
+        log_retained_delivery(delivery_id, age, note)
         return 0
-    if not still_started(delivery_id):
-        log(f"{delivery_id} sat {age}s — settled by running the guard again")
-        return 0
-    note = (verdict.stdout or verdict.stderr or "").strip().replace("\n", " ")[:160]
-    # Nothing the queue does helps an agent that never got to think: handing the
-    # message over again buys another dead turn and, two attempts later, tells
-    # the person their message did not reach processing. The limit watcher is
-    # what owes the owner an explanation here; this only stays out of the way.
-    external = turn_never_ran(transcript)
-    if external:
-        log(f"{delivery_id} sat {age}s and the turn never ran ({external}) — left for the limit watcher")
-        return 0
-    # A group head owes nobody a reply; a one-to-one head has somebody waiting.
-    if delivery_id.startswith("-"):
-        drop_unanswered_group_head(delivery_id, age, note)
-    else:
-        requeue(delivery_id, age, note)
-    return 0
+    finally:
+        lock.close()
 
 
 if __name__ == "__main__":

@@ -27,6 +27,9 @@ MANAGED_HOOKS = (
     ("PreToolUse", "Bash|Edit|Write|MultiEdit", "{H}/bin/memory-budget-guard", 5),
     ("PostToolUse", "Write|Edit|MultiEdit", "jq -r '.tool_input.file_path // .tool_response.filePath // \"\"' | grep -q \"^{H}/obsidian-vault/\" && {H}/bin/vault-sync &", 5),
     ("Stop", None, "{H}/bin/tg-reply-stop-guard", 35),
+    ("Stop", None, "{H}/bin/tg-turn-end", 5),
+    ("StopFailure", None, "{H}/bin/tg-turn-end", 5),
+    ("SessionStart", None, "{H}/bin/tg-turn-end", 5),
 )
 
 PROTECTED_DENY_RULES = (

@@ -1,0 +1,74 @@
+#!/usr/bin/env python3
+"""Select only a ledger-bound Telegram session with a verified local transcript."""
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+import re
+import sqlite3
+import sys
+
+
+def select_session(config: Path, state: Path, workspace: Path) -> str | None:
+    connection = sqlite3.connect(f'file:{state / "messages.db"}?mode=ro', uri=True, timeout=3)
+    try:
+        row = connection.execute(
+            "SELECT t.session_id, coalesce(t.transcript_path,s.transcript_path) "
+            "FROM delivery_turns t JOIN delivery_sessions s ON s.session_id=t.session_id "
+            "WHERE s.stamp IS NOT NULL AND EXISTS "
+            "(SELECT 1 FROM delivery_turn_messages m WHERE m.turn_id=t.turn_id) "
+            "ORDER BY t.opened_at DESC,t.turn_id DESC LIMIT 1"
+        ).fetchone()
+    finally:
+        connection.close()
+    if not row or not isinstance(row[0], str) or not re.fullmatch(
+        r'[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}', row[0]
+    ) or not row[1]:
+        return None
+    session, raw_path = row
+    projects = (config / 'projects').resolve(strict=True)
+    transcript = Path(raw_path).resolve(strict=True)
+    transcript.relative_to(projects)
+    if not transcript.is_file() or transcript.name != session + '.jsonl':
+        return None
+    expected_cwd = workspace.resolve(strict=True)
+    # No transcript text leaves this process. Metadata may follow an initial
+    # snapshot, but an unbounded read must never delay the service launch.
+    with transcript.open('r', encoding='utf-8') as handle:
+        budget = 1024 * 1024
+        for _ in range(256):
+            line = handle.readline(min(budget + 1, 128 * 1024))
+            if not line:
+                break
+            budget -= len(line.encode('utf-8'))
+            if budget < 0 or not line.endswith('\n'):
+                return None
+            try:
+                record = json.loads(line)
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(record, dict) or record.get('sessionId') != session:
+                continue
+            cwd = record.get('cwd')
+            if isinstance(cwd, str) and Path(cwd).is_absolute() and Path(cwd).resolve() == expected_cwd:
+                return session
+    return None
+
+
+def main() -> None:
+    config = Path(os.environ.get('CLAUDE_CONFIG_DIR') or Path.home() / '.claude')
+    state = Path(os.environ.get('TELEGRAM_STATE_DIR') or config / 'channels/telegram')
+    try:
+        session = select_session(config, state, Path.cwd())
+    except (OSError, ValueError, sqlite3.Error):
+        session = None
+    if session:
+        print(session)
+    else:
+        # Exactly one bounded diagnostic; never include paths, content or SQL.
+        print('telegram launcher: no verified bot session; starting fresh with durable recovery', file=sys.stderr)
+
+
+if __name__ == '__main__':
+    main()

@@ -322,7 +322,15 @@ def reconcile_entries(
             action = "install" if live is None else "conflict"
         elif live == previous:
             action = "update"
+        elif live is None and name == "manifest.json":
+            # The skill inventory belongs to the kit, not to the owner: a missing
+            # manifest.json is reinstalled whatever release the baseline remembers
+            # (skill-doctor refuses to finish without it; Chuck and Christoph,
+            # 19.09.2026, stayed on an old kit because their baseline named a
+            # third revision and the absence read as a conflict).
+            action = "install"
         elif desired == previous:
+            # A missing skill stays the owner's removal.
             action = "preserve-absence" if live is None else "preserve"
         else:
             action = "conflict"

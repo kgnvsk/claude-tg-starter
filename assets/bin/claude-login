@@ -6,15 +6,28 @@
 # поэтому URL ловится чисто (интерактивный промпт не рендерится в сырой SSH-канал → SSH виснет).
 #
 # Два шага, чтобы владелец сделал минимум — открыл один URL и вставил один код:
-#   claude-login          → стартует логин, печатает OAuth-URL (отдать владельцу)
-#   claude-login <код>    → скармливает вставленный владельцем код, завершает + верифицирует
+#   claude-login            → стартует логин, печатает OAuth-URL (отдать владельцу)
+#   claude-login <код>      → скармливает вставленный владельцем код, завершает + верифицирует
+#   claude-login --switch   → те саме при ЖИВОМУ вході: перевести бота на інший обліковий запис
+#                             (вичерпаний тижневий ліміт, спільний вхід); успіх = інший email
 #
 # Запускать ОТ ИМЕНИ юзера бота:  runuser -l claude -c 'claude-login'
 set -uo pipefail
 SES="clogin-$(id -u)"
-LOG="/tmp/claude-login.$(id -u).log"
+LOG="${TMPDIR:-/tmp}/claude-login.$(id -u).log"
+# Обліковий запис до перемикання; порожній файл = зараховується будь-який вхід.
+BEFORE="${TMPDIR:-/tmp}/claude-login.$(id -u).before"
+SWITCH=""
+if [ "${1:-}" = "--switch" ]; then SWITCH=1; shift; fi
 
 authed() { claude auth status 2>/dev/null | grep -q '"loggedIn": *true'; }
+account() { claude auth status 2>/dev/null | grep -oE '"email": *"[^"]*"' | head -1 | sed -E 's/.*: *"([^"]*)"/\1/'; }
+landed() {
+  authed || return 1
+  local before
+  before=$(cat "$BEFORE" 2>/dev/null || true)
+  [ -z "$before" ] || [ "$(account)" != "$before" ]
+}
 AUTH_ESTABLISHED="${AGENT_ROOT:-$HOME}/.claude/auth-established"
 mark_auth_established() {
   mkdir -p "$(dirname "$AUTH_ESTABLISHED")"
@@ -23,7 +36,7 @@ mark_auth_established() {
 }
 
 
-if authed; then
+if [ -z "$SWITCH" ] && [ -z "$(cat "$BEFORE" 2>/dev/null)" ] && authed; then
   mark_auth_established
   echo "✅ Вже авторизовано:"; claude auth status 2>/dev/null | grep -E '"(email|subscriptionType|authMethod)"'
   exit 0
@@ -33,6 +46,7 @@ if [ $# -eq 0 ]; then
   # ШАГ 1 — старт логина, поймать URL
   screen -S "$SES" -X quit 2>/dev/null || true
   : > "$LOG"
+  if [ -n "$SWITCH" ]; then account > "$BEFORE"; else : > "$BEFORE"; fi
   screen -dmS "$SES" bash -c "claude auth login --claudeai > '$LOG' 2>&1"
   URL=""
   for _ in $(seq 1 40); do
@@ -45,7 +59,11 @@ if [ $# -eq 0 ]; then
     screen -S "$SES" -X quit 2>/dev/null || true
     exit 1
   fi
-  echo "1) Передай власнику цей URL — нехай відкриє його у браузері та увійде зі СВОЄЮ підпискою Max:"
+  if [ -n "$SWITCH" ]; then
+    echo "1) Передай власнику цей URL — нехай відкриє його у браузері та увійде до ІНШОГО облікового запису (поточний: $(cat "$BEFORE")). Поточний вхід працює, доки не завершиться новий:"
+  else
+    echo "1) Передай власнику цей URL — нехай відкриє його у браузері та увійде зі СВОЄЮ підпискою Max:"
+  fi
   echo
   echo "   $URL"
   echo
@@ -57,10 +75,16 @@ fi
 if ! screen -S "$SES" -X stuff "$1"$'\n' 2>/dev/null; then
   echo "⚠ Сесію входу не знайдено — спочатку запусти: claude-login"; exit 1
 fi
-for _ in $(seq 1 20); do authed && break; sleep 1; done
-if authed; then
+for _ in $(seq 1 20); do landed && break; sleep 1; done
+if landed; then
   mark_auth_established
-  echo "✅ Авторизовано через підписку:"; claude auth status 2>/dev/null | grep -E '"(email|subscriptionType|authMethod)"'
+  if [ -n "$(cat "$BEFORE" 2>/dev/null)" ]; then
+    echo "✅ Обліковий запис змінено:"; claude auth status 2>/dev/null | grep -E '"(email|subscriptionType|authMethod)"'
+    echo "Перезапусти службу бота, щоб вона підхопила новий вхід — запущений процес тримає старий токен у пам’яті."
+  else
+    echo "✅ Авторизовано через підписку:"; claude auth status 2>/dev/null | grep -E '"(email|subscriptionType|authMethod)"'
+  fi
+  : > "$BEFORE"
   screen -S "$SES" -X quit 2>/dev/null || true
 else
   echo "⚠ Підтвердження ще не отримано. Кінець журналу:"; tail -10 "$LOG"

@@ -1,0 +1,249 @@
+#!/usr/bin/env python3
+"""Зведення тіньового періоду доставки (KTD9): класи, чати, вікно, вердикт.
+
+Читає messages.db приймача (TELEGRAM_STATE_DIR або AGENT_ROOT/.claude/channels/telegram):
+тіньові записи delivery_shadow, чинне значення прапорця з delivery_runtime — те, з яким
+стартував поллер, — і значення з .env каналу, яке набуде сили лише після перезапуску.
+Вердикт для цього боксу за KTD9 враховує лише поточний період shadow: вікно не коротше
+48 годин, нуль receiver_blind, no_end_signal, no_turn_record і incomplete_result, не менше 100 agree разом
+і не менше 10 у кожному типі чату (private, group, topic). Кожен would_interrupt і
+expected_forward потребує ручного перегляду: після нього передайте показані ідентифікатори
+через --reviewed-ids. Зміна запису або періоду робить такий ідентифікатор нечинним.
+Звіт нічого не записує. Без достатнього вікна чи спостережень вердикту немає;
+відомий дефект, розбіжність режимів або непереглянутий запис завжди блокують готовність.
+incomplete_result означає завершений хід без фінального результату; квитанція проміжної
+відповіді його не закриває. Пізній результат залишає нейтральний result_complete, не новий agree.
+
+Код виходу: 0 — критерій виконано; 1 — не виконано; 2 — вердикту немає. --json для машин.
+"""
+import argparse
+import hashlib
+import json
+import os
+import pathlib
+import re
+import sqlite3
+import sys
+import time
+
+AGENT_ROOT = pathlib.Path(os.environ.get("AGENT_ROOT") or os.environ.get("HOME") or "/home/claude")
+STATE_DIR = pathlib.Path(os.environ.get("TELEGRAM_STATE_DIR") or AGENT_ROOT / ".claude/channels/telegram")
+VALUES = ("guard", "shadow", "receiver")
+CHAT_TYPES = ("private", "group", "topic")
+BLOCKING = ("receiver_blind", "no_end_signal", "no_turn_record", "incomplete_result")
+REVIEW = ("would_interrupt", "expected_forward", "incomplete_result_cancelled")
+WINDOW_HOURS = 48
+MIN_AGREE_TOTAL = 100
+MIN_AGREE_PER_TYPE = 10
+HOUR_MS = 3600 * 1000
+FILE_ASSIGNMENT = re.compile(r"^\s*(?:export\s+)?TG_DELIVERY_AUTHORITY=(.*?)\s*$")
+FILE_MODE = re.compile(r"""^(['"]?)(guard|shadow|receiver)\1(?:[ \t]+\#.*)?[ \t]*$""")
+
+
+def chat_type(chat_id: str | None, thread_id: str | None) -> str:
+    if thread_id:
+        return "topic"
+    return "group" if str(chat_id or "").startswith("-") else "private"
+
+
+def stamp(ms: int | None) -> str:
+    return time.strftime("%Y-%m-%d %H:%M", time.localtime(ms / 1000)) if ms else "—"
+
+
+def file_value(path: pathlib.Path) -> str | None:
+    """The assignment in the channel file, unquoted; None when absent or unreadable."""
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError):
+        return None
+    value = None
+    for line in lines:
+        found = FILE_ASSIGNMENT.match(line)
+        if found:
+            raw = found.group(1)
+            mode = FILE_MODE.fullmatch(raw)
+            # Accept only literal modes with balanced optional quotes. Trimming
+            # quotes or treating a quoted # as a comment can turn invalid input
+            # into "shadow" even though the launcher would not run in that mode.
+            value = mode.group(2) if mode else raw
+    return value
+
+
+def read_database(path: pathlib.Path) -> tuple[list[dict], dict | None]:
+    if not path.exists():
+        return [], None
+    connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+    connection.row_factory = sqlite3.Row
+    try:
+        # The effective mode and its observations must come from one snapshot.
+        connection.execute("BEGIN")
+        tables = {row["name"] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        effective = None
+        if "delivery_runtime" in tables:
+            row = connection.execute("SELECT value, updated_at FROM delivery_runtime WHERE key='authority'").fetchone()
+            effective = dict(row) if row else None
+        if effective and "delivery_results" in tables:
+            effective["result_states"] = {row[0]: row[1] for row in connection.execute(
+                "SELECT state, count(*) FROM delivery_results GROUP BY state")}
+        records = []
+        if "delivery_shadow" in tables and effective and effective["value"] == "shadow":
+            records = [dict(row) for row in connection.execute(
+                "SELECT id, created_at, class, chat_id, thread_id, delivery_id, turn_id, detail "
+                "FROM delivery_shadow WHERE created_at>=? ORDER BY created_at, id",
+                (effective["updated_at"],))]
+        return records, effective
+    finally:
+        connection.close()
+
+
+def summarize(records: list[dict], effective: dict | None, in_file: str | None,
+              reviewed_ids: list[str] | None = None) -> dict:
+    since = effective["updated_at"] if effective and effective["value"] == "shadow" else None
+    records = [r for r in records if r["created_at"] >= since] if since is not None else []
+    classes: dict[str, int] = {}
+    chat_types: dict[str, dict[str, int]] = {}
+    chats: dict[str, dict] = {}
+    for record in records:
+        kind = chat_type(record["chat_id"], record["thread_id"])
+        cls = record["class"]
+        classes[cls] = classes.get(cls, 0) + 1
+        chat_types.setdefault(cls, {}).setdefault(kind, 0)
+        chat_types[cls][kind] += 1
+        key = f"{record['chat_id'] or '-'}{'/' + record['thread_id'] if record['thread_id'] else ''}"
+        chat = chats.setdefault(key, {"type": kind, "classes": {}})
+        chat["classes"][cls] = chat["classes"].get(cls, 0) + 1
+
+    window = {
+        "first": records[0]["created_at"] if records else None,
+        "last": records[-1]["created_at"] if records else None,
+        "records": len(records),
+        "since": since,
+    }
+    hours = (window["last"] - window["first"]) / HOUR_MS if records else 0.0
+    window["hours"] = round(hours, 1)
+
+    no_verdict: list[str] = []
+    if effective is None:
+        no_verdict.append("чинний режим не записаний")
+    if not records:
+        no_verdict.append("записів немає")
+    else:
+        if hours < WINDOW_HOURS:
+            no_verdict.append(f"вікно {hours:.1f} год, потрібно {WINDOW_HOURS}")
+        agree = classes.get("agree", 0)
+        if agree < MIN_AGREE_TOTAL:
+            no_verdict.append(f"agree {agree}, потрібно {MIN_AGREE_TOTAL}")
+        for kind in CHAT_TYPES:
+            per_type = chat_types.get("agree", {}).get(kind, 0)
+            if per_type < MIN_AGREE_PER_TYPE:
+                no_verdict.append(f"agree у {kind}: {per_type}, потрібно {MIN_AGREE_PER_TYPE}")
+    blocking = {cls: classes[cls] for cls in BLOCKING if classes.get(cls)}
+    states = (effective or {}).get("result_states", {})
+    for state in ("paused", "resume_pending", "blocked"):
+        if states.get(state):
+            no_verdict.append(f"незавершені збережені запити: {state} {states[state]}")
+    file_valid = in_file is None or in_file in VALUES
+    pending_restart = bool(file_valid and effective and (in_file or "guard") != effective["value"])
+    failures = [f"{cls} {count}" for cls, count in blocking.items()]
+    if effective and effective["value"] != "shadow":
+        failures.append(f"чинний режим {effective['value']}, потрібен shadow")
+    if not file_valid:
+        failures.append("недопустиме значення у файлі каналу")
+    elif pending_restart:
+        failures.append("режим у файлі каналу не збігається з чинним — чекає на перезапуск")
+
+    reviewed = set(reviewed_ids or [])
+    review = []
+    for record in records:
+        if record["class"] not in REVIEW:
+            continue
+        # An ID alone could acknowledge threshold=1 and silently approve a later
+        # threshold=2 update. Bind the acknowledgement to this exact observation
+        # and epoch, without adding writable review state to the runtime database.
+        revision = hashlib.sha256(json.dumps([since, record], sort_keys=True).encode()).hexdigest()[:16]
+        review_id = f"{record['id']}:{revision}"
+        review.append({**record, "review_id": review_id, "reviewed": review_id in reviewed})
+    review_pending = sum(not r["reviewed"] for r in review)
+    if review_pending:
+        failures.append(f"ручний перегляд не підтверджено: {review_pending}")
+    verdict = "not_ready" if failures else (None if no_verdict else "ready")
+
+    return {
+        "effective": effective,
+        "file": {"value": in_file, "valid": file_valid,
+                 "pending_restart": pending_restart},
+        "window": window,
+        "classes": dict(sorted(classes.items())),
+        "chat_types": chat_types,
+        "chats": chats,
+        "review": review,
+        "review_pending": review_pending,
+        "blocking": blocking,
+        "failures": failures,
+        "verdict": verdict,
+        "no_verdict": no_verdict,
+    }
+
+
+def render(summary: dict) -> str:
+    effective, in_file, window = summary["effective"], summary["file"], summary["window"]
+    lines = ["Тіньовий період доставки"]
+    if effective:
+        lines.append(f"  чинне значення: {effective['value']} (з {stamp(effective['updated_at'])})")
+    else:
+        lines.append("  чинне значення: не записане — поллер із прапорцем ще не стартував; сторожі працюють як guard")
+    if in_file["value"] is None:
+        lines.append("  у файлі каналу: не задано (guard)")
+    elif not in_file["valid"]:
+        lines.append(f"  у файлі каналу: «{in_file['value']}» — недопустиме значення; приймач з ним стартує як guard")
+    elif in_file["pending_restart"]:
+        lines.append(f"  у файлі каналу: {in_file['value']} — чекає на перезапуск")
+    else:
+        lines.append(f"  у файлі каналу: {in_file['value']}")
+    lines.append(f"  вікно: {stamp(window['first'])} … {stamp(window['last'])} ({window['hours']} год), записів: {window['records']}")
+    lines.append("  за класами: " + (", ".join(f"{cls} {n}" for cls, n in summary["classes"].items()) or "—"))
+    lines.append("  за типом чату:")
+    for cls, kinds in sorted(summary["chat_types"].items()):
+        lines.append(f"    {cls}: " + ", ".join(f"{kind} {kinds.get(kind, 0)}" for kind in CHAT_TYPES))
+    lines.append("  за чатами:")
+    for key, chat in sorted(summary["chats"].items()):
+        lines.append(f"    {key} ({chat['type']}): " + ", ".join(f"{cls} {n}" for cls, n in sorted(chat["classes"].items())))
+    lines.append("  на перегляд (кожен would_interrupt і expected_forward):")
+    for r in summary["review"]:
+        status = "перегляд підтверджено оператором" if r["reviewed"] else "потрібен ручний перегляд"
+        lines.append(f"    {r['review_id']} [{status}] {stamp(r['created_at'])} {r['class']} chat={r['chat_id'] or '-'} thread={r['thread_id'] or '-'}"
+                     f" delivery={r['delivery_id'] or '-'} turn={r['turn_id'] if r['turn_id'] is not None else '-'}"
+                     f"{' ' + r['detail'] if r['detail'] else ''}")
+    if not summary["review"]:
+        lines.append("    —")
+    else:
+        lines.append("  після ручного перегляду передайте відповідні ідентифікатори через --reviewed-ids ID:REV ...; це підтвердження оператора, а не автоматичне рев'ю")
+    if summary["verdict"] is None:
+        lines.append("  вердикту немає: " + "; ".join(summary["no_verdict"]))
+    elif summary["verdict"] == "ready":
+        lines.append("  вердикт: критерій виконано для цього боксу; загальний rollout також потребує другого боксу за KTD9")
+    else:
+        lines.append("  вердикт: критерій не виконано — " + "; ".join(summary["failures"]))
+        if summary["no_verdict"]:
+            lines.append("  також бракує покриття: " + "; ".join(summary["no_verdict"]))
+    return "\n".join(lines)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--json", action="store_true", help="машинний вивід")
+    parser.add_argument("--reviewed-ids", nargs="+", metavar="ID:REV",
+                        help="ідентифікатори записів, які оператор уже переглянув вручну; не зберігаються")
+    args = parser.parse_args(argv)
+    records, effective = read_database(STATE_DIR / "messages.db")
+    summary = summarize(records, effective, file_value(STATE_DIR / ".env"), args.reviewed_ids)
+    code = {"ready": 0, "not_ready": 1, None: 2}[summary["verdict"]]
+    if args.json:
+        print(json.dumps({**summary, "exit_code": code}, ensure_ascii=False, indent=2))
+    else:
+        print(render(summary))
+    return code
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -141,8 +141,23 @@ cd ~/obsidian-vault
 # approval in Telegram (Paradox, 04.09). Under root the CLI refuses
 # bypassPermissions outright — that install runs on its allow list, exactly
 # as the settings block above already decided.
+# Штамп служби (KTD3): випадкове значення на кожен старт, лише в оточенні
+# процесу CLI — його бачать хуки й інструменти моделі, а крон і сторонні
+# claude -p ні. У .env каналу і в файли воно не пишеться: той файл читає два
+# десятки скриптів, і статичне значення відтворив би будь-який з них.
+export TG_DELIVERY_STAMP="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+# Resume only the exact Telegram-bound session validated against its transcript.
+# A missing old helper/database is a fresh installation, never --continue's
+# arbitrary most recent interactive/cron session.
+RESUME_SESSION=""
+RESUME_HELPER="${AGENT_ROOT:-$HOME}/bin/tg-resume-session"
+if [ -x "$RESUME_HELPER" ]; then
+  RESUME_SESSION=$("$RESUME_HELPER") || RESUME_SESSION=""
+else
+  echo "telegram launcher: session selector unavailable; starting fresh" >&2
+fi
 PERMISSION_MODE=""
 if [ "$(id -u)" -ne 0 ]; then
   PERMISSION_MODE="--permission-mode bypassPermissions"
 fi
-exec $HOME/.local/bin/claude $PERMISSION_MODE ${AGENT_EFFORT:+--effort "$AGENT_EFFORT"} --channels plugin:telegram@claude-plugins-official
+exec $HOME/.local/bin/claude $PERMISSION_MODE ${AGENT_EFFORT:+--effort "$AGENT_EFFORT"} ${RESUME_SESSION:+--resume "$RESUME_SESSION"} --channels plugin:telegram@claude-plugins-official

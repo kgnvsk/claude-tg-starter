@@ -7,8 +7,8 @@ connection needed (business_connection_id is optional for sendRichMessage; it is
 required ONLY for the interactive tappable sendChecklist — a different method).
 
 Usage:
-    tg-rich <chat_id> <html_file> [--reply-to <message_id>]
-    tg-rich <chat_id> --html '<h2>..</h2>' [--reply-to <message_id>]
+    tg-rich <chat_id> <html_file> [--reply-to <message_id>] [--thread-id <positive_id>]
+    tg-rich <chat_id> --html '<h2>..</h2>' [--reply-to <message_id>] [--thread-id <positive_id>]
 
 The HTML body may use only the tags Telegram supports for rich messages
 (https://core.telegram.org/bots/api#rich-html-style): b/i/u/s/code/mark, h1..h6,
@@ -20,8 +20,12 @@ Prints the JSON API response; exit 0 only if Telegram returns ok:true.
 Token resolution (portable across kit/custom layouts): $TELEGRAM_BOT_TOKEN if the
 wrapper already exported it, else the channel .env under $TELEGRAM_STATE_DIR (or
 ~/.claude/channels/telegram).
+
+A confirmed send is recorded in messages.db like a tg-send message (chat, topic
+from the Bot API response, message_id, service stamp): without that row a table
+or checklist answer would leave no receipt for the receiver.
 """
-import sys, os, json, re, subprocess, tempfile
+import sys, os, json, re, subprocess, tempfile, runpy
 
 
 def read_token():
@@ -52,16 +56,30 @@ def main(argv):
         if len(argv) < 4:
             sys.exit("tg-rich: --html needs an argument")
         html_body = argv[3]
+        options = argv[4:]
     else:
         html_body = open(argv[2], encoding="utf-8").read()
+        options = argv[3:]
 
     reply_to = None
     if "--reply-to" in argv:
         reply_to = int(argv[argv.index("--reply-to") + 1])
 
+    delivery = runpy.run_path(os.path.join(os.path.dirname(__file__), 'tg-send'))
+    thread_id = None
+    try:
+        if "--thread-id" in options:
+            if options.count("--thread-id") != 1:
+                raise ValueError("provide --thread-id once")
+            thread_id = delivery['parse_thread_id'](chat_id, options[options.index("--thread-id") + 1])
+        context = delivery['capture_delivery'](chat_id, thread_id)
+    except (ValueError, IndexError) as error:
+        sys.exit(f"tg-rich: {error}" if isinstance(error, ValueError) else "tg-rich: --thread-id needs an argument")
     payload = {"chat_id": int(chat_id), "rich_message": {"html": html_body}}
     if reply_to is not None:
         payload["reply_parameters"] = {"message_id": reply_to}
+    if thread_id is not None:
+        payload["message_thread_id"] = thread_id
 
     descriptor, body_path = tempfile.mkstemp(prefix="tg-rich-body-", suffix=".json")
     os.chmod(body_path, 0o600)
@@ -88,13 +106,35 @@ def main(argv):
     except Exception:
         ok = False
     if ok:
-        subprocess.run(
-            [os.path.expanduser("~/bin/tg-fallback-outbound"), chat_id],
-            check=False,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        record_outbound(chat_id, html_body, out, context)
+        try:
+            subprocess.run(
+                [os.path.expanduser("~/bin/tg-fallback-outbound"), chat_id],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except OSError:
+            pass  # The message was accepted; do not report a delivery failure.
     sys.exit(0 if ok else 1)
+
+
+def record_outbound(chat_id, html_body, raw_receipt, context=None):
+    """History row through the sibling tg-send, which validates the receipt and
+    knows the columns; the visible text is the HTML with its tags stripped."""
+    recorder = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tg-send")
+    text = re.sub(r"<[^>]+>", " ", html_body)
+    text = re.sub(r"[ \t]+", " ", text).strip()
+    try:
+        done = subprocess.run(
+            [sys.executable, recorder, "--record-confirmed-outbound", chat_id, "", "", json.dumps(context)],
+            input=(raw_receipt + "\0" + text).encode("utf-8"),
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15,
+        )
+        if done.returncode != 0:
+            print("tg-rich: history_write_failed; message will not be resent", file=sys.stderr)
+    except (OSError, subprocess.SubprocessError):
+        print("tg-rich: history_write_failed; message will not be resent", file=sys.stderr)
 
 
 if __name__ == "__main__":

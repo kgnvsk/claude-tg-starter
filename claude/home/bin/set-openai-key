@@ -1,0 +1,47 @@
+#!/usr/bin/env python3
+"""Securely configure voice transcription without exposing the key in process args."""
+
+from __future__ import annotations
+
+import getpass
+import json
+from pathlib import Path
+import sys
+
+HOME = Path.home()
+STATE = HOME / ".claude/onboarding-state.json"
+
+args = sys.argv[1:]
+if args == ["--stdin"]:
+    key = sys.stdin.readline().strip()
+elif not args:
+    key = getpass.getpass("OpenAI API key (hidden): ").strip()
+else:
+    print("usage: set-openai-key [--stdin]", file=sys.stderr)
+    raise SystemExit(2)
+
+if not key.startswith("sk-") or len(key) < 23:
+    print("invalid OpenAI API key format", file=sys.stderr)
+    raise SystemExit(2)
+
+from agent_connections import configure_local
+try:
+    configure_local(HOME.resolve(), "openai", key)
+except (OSError, ValueError):
+    raise SystemExit("OpenAI configuration unavailable") from None
+
+if STATE.exists():
+    state = json.loads(STATE.read_text(encoding="utf-8"))
+    voice = state.setdefault("optionalFeatures", {}).setdefault("voice_transcription", {})
+    voice.update({
+        "status": "configured",
+        "model": "gpt-4o-mini-transcribe",
+        "remindAfterDays": 7,
+    })
+    voice["lastReminderAt"] = None
+    state_tmp = STATE.with_suffix(".json.tmp")
+    state_tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    state_tmp.chmod(0o600)
+    state_tmp.replace(STATE)
+
+print("Voice transcription configured. New requests use the current key immediately.")

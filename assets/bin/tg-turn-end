@@ -1,0 +1,256 @@
+#!/usr/bin/env python3
+# Claude hook that marks the end of a CLI turn (Stop, StopFailure) and the
+# start of a CLI session (SessionStart) in the turn ledger of the Telegram
+# plugin's messages.db, next to tg-context-inject which marks the beginning.
+# The receiver owns the schema and settles what a hook cannot see (a replaced
+# session, a delivery removed from the queue); this hook never touches the
+# delivery queue. It blocks exactly once: in receiver mode, a Stop of a turn
+# with pending results is returned to the model with a short hint (R5, KTD5).
+# Transport acknowledgement alone does not complete a result; a registered
+# background task may explicitly defer it. Legacy turns without result records
+# still use receipts bound to their exact identity. The second end closes the
+# turn and the receiver settles it. StopFailure never blocks. In guard and
+# shadow modes the Stop guard is the authority: standalone Stop invocations
+# do nothing. The guard invokes this helper with --guard-accepted only after
+# accepting the Stop, since independent native Stop hooks may run in parallel.
+#
+# Reads hook JSON from stdin. Fails open: any error is logged to
+# <AGENT_ROOT>/logs/tg-turn-end.log and the hook exits 0.
+import json
+import os
+import sqlite3
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+# ATARAX_SUPPRESS_TELEGRAM=1 marks a session that must not touch Telegram
+# (nested claude -p workers, cron sessions): it writes no signals at all.
+if os.environ.get("ATARAX_SUPPRESS_TELEGRAM") == "1":
+    sys.exit(0)
+
+CONFIG_ROOT = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
+TELEGRAM_STATE = Path(
+    os.environ.get("TELEGRAM_STATE_DIR") or CONFIG_ROOT / "channels" / "telegram"
+)
+DB = TELEGRAM_STATE / "messages.db"
+AGENT_ROOT = Path(os.environ.get("AGENT_ROOT", str(Path.home())))
+LOG = AGENT_ROOT / "logs" / "tg-turn-end.log"
+DB_TIMEOUT = 3.0
+LEDGER_TABLES = ("delivery_sessions", "delivery_turns", "delivery_turn_messages")
+CLOSE_KIND = {"Stop": "stop", "StopFailure": "stop_failure"}
+# StopFailure carries a provider class (including the observed rate_limit),
+# never infer quota from user text or ordinary assistant prose.
+ERROR_KEYS = ("error_class", "error_type", "error", "reason")
+AUTHORITY = os.environ.get("TG_DELIVERY_AUTHORITY") or "guard"
+# The one hint the model gets; the receiver never forwards it to a chat.
+BOUNCE_REASON = (
+    "A Telegram request in this turn still needs its final result. A progress reply only acknowledges it: "
+    "send the result with reply phase=final and its delivery_id, or explicitly defer that delivery "
+    "to its registered background task_id. Call no_reply only for a group message that needs no answer."
+)
+
+
+def log(message: str) -> None:
+    try:
+        LOG.parent.mkdir(parents=True, exist_ok=True)
+        with LOG.open("a", encoding="utf-8") as handle:
+            handle.write(f"{datetime.now().astimezone().isoformat(timespec='seconds')} {message}\n")
+    except OSError:
+        pass
+
+
+def ledger_present(conn: sqlite3.Connection) -> bool:
+    marks = ",".join("?" * len(LEDGER_TABLES))
+    (found,) = conn.execute(
+        f"SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ({marks})",
+        LEDGER_TABLES,
+    ).fetchone()
+    return found == len(LEDGER_TABLES)
+
+
+def session_columns(conn: sqlite3.Connection) -> set[str]:
+    # A receiver from before the service stamp has neither column; the session
+    # is still recorded, just without them.
+    return {row[1] for row in conn.execute("PRAGMA table_info(delivery_sessions)")}
+
+
+def error_class(data: dict) -> str | None:
+    for key in ERROR_KEYS:
+        value = data.get(key)
+        if isinstance(value, dict):
+            value = value.get("type") or value.get("name") or value.get("message")
+        if isinstance(value, str) and value.strip():
+            return value.strip()[:200]
+    return None
+
+
+def has_outcome(
+    conn: sqlite3.Connection, turn_id: int, delivery_id: str, chat_id: str, thread_id: str | None,
+) -> bool:
+    """Legacy transport outcome, bound to this delivery rather than a chat clock."""
+    if conn.execute(
+        "SELECT 1 FROM delivery_receipts WHERE turn_id=? AND delivery_id=? "
+        "AND chat_id=? AND thread_id IS ? LIMIT 1",
+        (turn_id, delivery_id, chat_id, thread_id),
+    ).fetchone():
+        return True
+    stamp = os.environ.get("TG_DELIVERY_STAMP")
+    if not stamp:
+        return False
+    # The shell senders write their row and exit; the receiver may not have
+    # scanned it yet. Their frozen context, not their write time, identifies the
+    # turn that initiated the send. Old senders without provenance close none.
+    if "delivery_context" not in {row[1] for row in conn.execute("PRAGMA table_info(messages)")}:
+        return False
+    thread = int(thread_id) if thread_id and thread_id.isdigit() else None
+    rows = conn.execute(
+        "SELECT delivery_context FROM messages WHERE direction='out' AND chat_id=? AND thread_id IS ? "
+        "AND delivery_stamp=? AND (send_origin IS NULL OR send_origin!='stop-guard') AND watchdog_credit=1",
+        (chat_id, thread, stamp),
+    )
+    for (raw,) in rows:
+        try:
+            context = json.loads(raw) if raw else None
+        except (TypeError, ValueError):
+            continue
+        if (not isinstance(context, dict) or context.get("chat_id") != chat_id
+                or context.get("thread_id") != thread or isinstance(context.get("thread_id"), bool)):
+            continue
+        targets = context.get("targets")
+        if not isinstance(targets, list) or not all(
+            isinstance(target, dict) and type(target.get("turn_id")) is int and target["turn_id"] > 0
+            and isinstance(target.get("delivery_id"), str) for target in targets
+        ):
+            continue
+        if any(target["turn_id"] == turn_id and target["delivery_id"] == delivery_id for target in targets):
+            return True
+    return False
+
+
+def bounce_once(conn: sqlite3.Connection, session_id: str) -> bool:
+    """Receiver mode, Stop: the current turn still owes a result — bounce once.
+    A schema this hook does not know fails open: the turn closes as usual."""
+    turn = conn.execute(
+        "SELECT turn_id, bounce_count FROM delivery_turns "
+        "WHERE session_id=? AND closed_at IS NULL ORDER BY turn_id DESC LIMIT 1",
+        (session_id,),
+    ).fetchone()
+    if turn is None or turn[1] > 0:
+        return False
+    turn_id, _ = turn
+    try:
+        results_present = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='delivery_results'"
+        ).fetchone() is not None
+        pending = results_present and conn.execute(
+            "SELECT 1 FROM delivery_results WHERE session_id=? AND state='pending' "
+            "AND COALESCE(response_turn_id, turn_id)=? LIMIT 1",
+            (session_id, turn_id),
+        ).fetchone() is not None
+        legacy_filter = (
+            "AND NOT EXISTS (SELECT 1 FROM delivery_results r "
+            "WHERE r.delivery_id=m.delivery_id AND r.turn_id=m.turn_id)"
+            if results_present else ""
+        )
+        messages = conn.execute(
+            "SELECT delivery_id, chat_id, thread_id FROM delivery_turn_messages m "
+            f"WHERE turn_id=? AND closed_at IS NULL {legacy_filter}", (turn_id,),
+        ).fetchall()
+        if not pending and all(
+            has_outcome(conn, turn_id, delivery_id, chat_id, thread_id)
+            for delivery_id, chat_id, thread_id in messages
+        ):
+            return False
+    except sqlite3.Error as error:
+        log(f"Stop: outcome check failed, turn {turn_id} closed without a bounce: {error}")
+        return False
+    conn.execute("UPDATE delivery_turns SET bounce_count=bounce_count+1 WHERE turn_id=?", (turn_id,))
+    return True
+
+
+def main() -> None:
+    try:
+        data = json.loads(sys.stdin.read() or "{}")
+    except Exception:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    event = data.get("hook_event_name")
+    if event != "SessionStart" and event not in CLOSE_KIND:
+        return
+    if event == "Stop" and AUTHORITY != "receiver" and "--guard-accepted" not in sys.argv[1:]:
+        return
+    session_id = data.get("session_id")
+    if not isinstance(session_id, str) or not session_id:
+        log(f"{event}: no session_id in hook input; nothing recorded")
+        return
+    transcript_path = data.get("transcript_path")
+    if not isinstance(transcript_path, str):
+        transcript_path = None
+    now = int(time.time() * 1000)
+    bounced = False
+
+    conn = None
+    try:
+        conn = sqlite3.connect(f"file:{DB}?mode=rw", uri=True, timeout=DB_TIMEOUT, isolation_level=None)
+        conn.execute("BEGIN IMMEDIATE")
+        if not ledger_present(conn):
+            log(f"{event}: ledger tables missing; nothing recorded")
+        elif event == "Stop" and AUTHORITY == "receiver" and bounce_once(conn, session_id):
+            # The turn stays open: the model continues it with the hint below.
+            bounced = True
+        elif event == "SessionStart":
+            source = data.get("source") if isinstance(data.get("source"), str) else None
+            # A compaction keeps the session and its turn alive; any other start
+            # is a CLI process start, so the session's clock moves to now and the
+            # receiver closes every turn opened before it. The launcher resumes
+            # the exact ledger-bound session, so its ID may be the same.
+            # The service stamp comes from the launcher's environment: a cron
+            # claude -p or a --run task carries none, and the receiver never lets
+            # such a session replace the bot's turn or be replaced by it.
+            verb = "INSERT OR IGNORE" if source == "compact" else "INSERT OR REPLACE"
+            columns = ["session_id", "started_at", "transcript_path", "source"]
+            values = [session_id, now, transcript_path, source]
+            if "stamp" in session_columns(conn):
+                columns.append("stamp")
+                values.append(os.environ.get("TG_DELIVERY_STAMP") or None)
+            conn.execute(
+                f"{verb} INTO delivery_sessions ({', '.join(columns)}) "
+                f"VALUES ({', '.join('?' * len(values))})",
+                values,
+            )
+        else:
+            conn.execute(
+                "UPDATE delivery_turns SET closed_at=?, close_kind=?, close_detail=? "
+                "WHERE session_id=? AND closed_at IS NULL",
+                (now, CLOSE_KIND[event], error_class(data) if event == "StopFailure" else None, session_id),
+            )
+            # The turn boundary is recorded even when no turn was open (the
+            # start hook failed): the receiver needs it to tell a second reply
+            # of the same turn from the next turn's reply.
+            if "last_stop_at" in session_columns(conn):
+                conn.execute(
+                    "UPDATE delivery_sessions SET last_stop_at=? WHERE session_id=?",
+                    (now, session_id),
+                )
+        conn.execute("COMMIT")
+    except sqlite3.Error as error:
+        if conn is not None and conn.in_transaction:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+        log(f"{event}: {error}")
+        return
+    finally:
+        if conn is not None:
+            conn.close()
+    if bounced:
+        print(json.dumps({"decision": "block", "reason": BOUNCE_REASON}))
+
+
+try:
+    main()
+except Exception as error:  # a broken hook must never change how a turn ends
+    log(f"unexpected: {error!r}")

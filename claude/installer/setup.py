@@ -1,0 +1,277 @@
+"""Native configuration import and discovery checks; no model turns."""
+from __future__ import annotations
+import json
+from pathlib import Path
+import pwd
+import queue
+import re
+import shlex
+import subprocess
+import threading
+import time
+
+
+class RPC:
+    def __init__(self, binary, cwd, env, user=None):
+        command = [str(binary), "app-server", "--strict-config", "--stdio"]
+        if user:
+            command = ["runuser", "-u", user, "--", "env", "-i", *[k + "=" + v for k, v in env.items()], *command]
+        self.process = subprocess.Popen(command, cwd=cwd, env=env if not user else None, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1)
+        self.frames = queue.Queue(maxsize=1000)
+        self.saved = []
+        self.counter = 0
+        threading.Thread(target=self.read, daemon=True).start()
+        self.call("initialize", {"clientInfo": {"name": "novsky_kit_setup", "version": "1"}, "capabilities": {"experimentalApi": True}})
+        self.write({"method": "initialized"})
+
+    def read(self):
+        for line in self.process.stdout:
+            try:
+                self.frames.put(json.loads(line), timeout=5)
+            except (ValueError, queue.Full):
+                self.process.terminate()
+                return
+
+    def write(self, frame):
+        self.process.stdin.write(json.dumps({"jsonrpc": "2.0", **frame}) + "\n")
+        self.process.stdin.flush()
+
+    def wait(self, predicate, timeout=60):
+        for i, item in enumerate(self.saved):
+            if predicate(item):
+                return self.saved.pop(i)
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            try:
+                item = self.frames.get(timeout=min(1, max(.01, end - time.monotonic())))
+            except queue.Empty:
+                if self.process.poll() is not None:
+                    raise ValueError("native configuration service exited")
+                continue
+            if "method" in item and "id" in item:
+                self.write({"id": item["id"], "error": {"code": -32601, "message": "Installation does not run model tools or grant approvals"}})
+            elif predicate(item):
+                return item
+            elif len(self.saved) < 1000:
+                self.saved.append(item)
+        raise ValueError("native configuration check timed out")
+
+    def call(self, method, params=None, timeout=60):
+        self.counter += 1
+        number = self.counter
+        self.write({"id": number, "method": method, **({"params": params} if params is not None else {})})
+        frame = self.wait(lambda item: item.get("id") == number, timeout)
+        if "error" in frame:
+            raise ValueError("native method failed: " + method)
+        return frame["result"]
+
+    def close(self):
+        if self.process.stdin:
+            self.process.stdin.close()
+        try:
+            self.process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait()
+
+
+def import_plugins(rpc, stage: Path, expected: list[str]):
+    if not expected:
+        return []
+    # This RPC process has HOME=the public migration stage and CODEX_HOME=the
+    # target native config. The importer supports home-scoped Claude plugins;
+    # it never scans the real owner's Claude configuration.
+    # Native detection omits already imported plugins. An upgrade must verify
+    # that existing plugins are actually enabled, rather than require a second
+    # migration item or assume a downloaded cache means installation succeeded.
+    entries = rpc.call('skills/list', {'cwds': [str(stage)], 'forceReload': True})['data']
+    existing = {skill['pluginId'] for entry in entries for skill in entry['skills']
+                if skill['enabled'] and isinstance(skill.get('pluginId'), str)}
+    detection = rpc.call("externalAgentConfig/detect", {"includeHome": True, "cwds": [], "migrationSource": "claude"})
+    items = [item for item in detection["items"] if item["itemType"] == "PLUGINS"]
+    if not items:
+        if set(expected) <= existing: return sorted(expected)
+        raise ValueError("selected plugins were not detected")
+    imported = rpc.call("externalAgentConfig/import", {"migrationItems": items, "source": "novsky-kit", "migrationSource": "claude"})
+    done = rpc.wait(lambda item: item.get("method") == "externalAgentConfig/import/completed" and item.get("params", {}).get("importId") == imported["importId"], timeout=600)["params"]
+    successes = set(existing)
+    for group in done["itemTypeResults"]:
+        if group["failures"]:
+            raise ValueError("a selected native plugin failed to import")
+        successes.update(item["source"] for item in group["successes"])
+    if not set(expected) <= successes:
+        raise ValueError("native plugin import inventory mismatch")
+    return sorted(successes)
+
+
+def check_discovery(rpc, home, manifest):
+    from install import safe_path, skill_destination
+    workspace = home / "obsidian-vault"
+    entries = rpc.call("skills/list", {"cwds": [str(workspace)], "forceReload": True})["data"]
+    discovered = [skill for entry in entries for skill in entry["skills"]]
+    paths = {skill["path"] for skill in discovered}
+    found = set()
+    for name in manifest["nativeSkills"]:
+        relative = skill_destination(home, ".agents/skills/" + name + "/SKILL.md")
+        path = safe_path(home, relative)
+        # Native enabled:false is still an installed skill. Directory-disabled
+        # skills are intentionally absent from native discovery altogether.
+        if path.is_file() and (str(path) in paths or relative.startswith(".agents/skills.disabled/")):
+            found.add(name)
+    if set(manifest["nativeSkills"]) - found:
+        raise ValueError("native skill discovery missed: " + ", ".join(sorted(set(manifest["nativeSkills"]) - found)))
+    skills = [skill for skill in discovered if skill["enabled"]]
+    contract = json.loads((home / ".local/share/novsky-kit/plugin-contract.json").read_text())["plugins"]
+    for plugin, specification in contract.items():
+        actual = {Path(skill["path"]).parent.name for skill in skills if skill.get("pluginId") == plugin or plugin.split("@")[0] in Path(skill["path"]).parts}
+        # Compare actual enabled native skills, not files in a downloaded cache.
+        missing = set(specification["requiredSkills"]) - actual
+        if missing:
+            raise ValueError("native plugin skills missing: " + plugin + ": " + ", ".join(sorted(missing)))
+    profiles = rpc.call("permissionProfile/list", {"cwd": str(workspace)})
+    if "novsky-agent" not in json.dumps(profiles):
+        raise ValueError("native permissions profile was not loaded")
+    return {"skills": len(manifest["nativeSkills"]), "pluginSkills": sum(bool(skill.get("pluginId")) for skill in skills), "plugins": sorted(contract), "nativeAgents": manifest["nativeAgents"]}
+
+
+def verify_starter_foundation(home, user, env):
+    from dependencies import execute
+    # The fixed host helper reads the private channel configuration itself.
+    # Never put an API key in argv, model context or returned diagnostics.
+    execute([str(home / "bin/memory-index"), "index", "--vault-only", "--embed-budget", "400"],
+            user=user, env=env, label="Starter memory index", timeout=120)
+    probe = '''import json, pathlib, shutil, sqlite3
+import numpy
+home = pathlib.Path.home()
+database = home / '.codex/memory/index.sqlite3'
+with sqlite3.connect(database.as_uri() + '?mode=ro', uri=True) as db:
+    healthy = db.execute('PRAGMA integrity_check').fetchone()[0] == 'ok'
+    notes, vectors = db.execute("SELECT count(*), coalesce(sum(CASE WHEN length(e.vector)=2048 THEN 1 ELSE 0 END), 0) FROM documents d LEFT JOIN embeddings e ON e.doc_id=d.doc_id AND e.model=? WHERE d.source='vault'", ('text-embedding-3-small',)).fetchone()
+vault = (home / 'obsidian-vault/OWNER.md').is_file()
+memory = all((home / '.codex/memory' / name).is_file() for name in ('USER.md', 'MEMORY.md'))
+voice = all(shutil.which(name) for name in ('curl', 'jq', 'ffmpeg')) and (home / 'bin/transcribe').is_file()
+print(json.dumps({'vault': vault, 'memory': memory and healthy, 'notes': notes, 'vectors': vectors, 'voiceConfigured': bool(voice)}))
+'''
+    result = json.loads(execute(["python3", "-c", probe], user=user, env=env, label="Starter foundation check"))
+    if not all(result.get(name) for name in ("vault", "memory", "vectors", "voiceConfigured")) or result.get("notes") != result.get("vectors"):
+        raise ValueError("Novsky Starter memory or voice is not ready; check the OpenAI API key and API balance, then retry")
+    return result
+
+
+def plan_configuration(home, data, previous=None, config_root=".codex"):
+    """Validate owner/access and prepare configuration without changing files."""
+    from install import safe_path
+    owner = str(data["ownerChatId"])
+    if not re.fullmatch(r"[1-9][0-9]{0,18}", owner):
+        raise ValueError("invalid owner identity")
+    if config_root not in (".codex", ".claude"):
+        raise ValueError("invalid native configuration root")
+    access_path = safe_path(home, config_root + "/channels/telegram/access.json")
+    env_path = safe_path(home, config_root + "/channels/telegram/.env")
+    for path in (access_path, env_path):
+        if path.exists() and not path.is_file():
+            raise ValueError("non-file Telegram configuration target")
+    maintenance = data.get("maintenance", False)
+    if not isinstance(maintenance, bool):
+        raise ValueError("invalid maintenance setting")
+    if maintenance and (not access_path.exists() or not env_path.exists()):
+        raise ValueError("existing Telegram configuration is required for maintenance")
+    writes, preserved = [], [access_path] if access_path.exists() else []
+    if access_path.exists():
+        try:
+            access = json.loads(access_path.read_text())
+        except ValueError:
+            raise ValueError("invalid existing Telegram access policy") from None
+        if not isinstance(access, dict) or not isinstance(access.get("admins"), list):
+            raise ValueError("invalid existing Telegram access policy")
+        for field in ("admins", "allowFrom"):
+            if field in access and (not isinstance(access[field], list) or any(not re.fullmatch(r"[1-9][0-9]{0,18}", str(value)) for value in access[field])):
+                raise ValueError("invalid existing Telegram access policy")
+        if owner not in set(map(str, access["admins"])):
+            raise ValueError("existing memory owner differs from installation owner")
+    else:
+        writes.append((access_path, json.dumps({"admins": [owner], "allowFrom": [owner]}), 0o600))
+    existing = env_path.read_text() if env_path.exists() else ""
+    settings = {}
+    entries = [(line, re.match(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$", line)) for line in existing.splitlines()]
+    for line, entry in entries:
+        if entry and entry[1] in ("AGENT_NAME", "OWNER_CHAT_ID", "TZ", "TELEGRAM_BOT_TOKEN"):
+            try:
+                values = shlex.split(entry[2], comments=True)
+            except ValueError:
+                raise ValueError("invalid existing Telegram configuration") from None
+            if len(values) > 1:
+                raise ValueError("invalid existing Telegram configuration")
+            settings[entry[1]] = values[0] if values else ""
+    if settings.get("OWNER_CHAT_ID") and settings["OWNER_CHAT_ID"] != owner:
+        raise ValueError("existing memory owner differs from installation owner")
+    if maintenance and not settings.get("OWNER_CHAT_ID"):
+        raise ValueError("existing Telegram owner is required for maintenance")
+    timezone = settings.get("TZ", (previous or {}).get("timezone", "UTC"))
+    if not maintenance:
+        timezone = data.get("timezone", timezone)
+    if not isinstance(timezone, str) or not re.fullmatch(r"[A-Za-z0-9_+\-/]{1,80}", timezone):
+        raise ValueError("invalid timezone")
+    agent_name = settings.get("AGENT_NAME", "Novsky") if maintenance else data.get("agentName", settings.get("AGENT_NAME", "Novsky"))
+    effective = {**data, "ownerChatId": owner, "timezone": timezone, "agentName": agent_name}
+    old_token, new_token = settings.get("TELEGRAM_BOT_TOKEN"), data.get("botToken")
+    if old_token and new_token and (not isinstance(new_token, str) or old_token.split(":", 1)[0] != new_token.split(":", 1)[0]):
+        raise ValueError("existing bot identity differs; choose a separate agent")
+    if maintenance:
+        if old_token and new_token and old_token != new_token:
+            if not re.fullmatch(r"[1-9][0-9]{4,15}:[A-Za-z0-9_-]{20,100}", new_token):
+                raise ValueError("invalid Telegram bot token")
+            lines = [line for line, entry in entries if not entry or entry[1] != "TELEGRAM_BOT_TOKEN"]
+            lines.append("TELEGRAM_BOT_TOKEN=" + shlex.quote(new_token))
+            writes.append((env_path, "\n".join(lines) + "\n", 0o400))
+            return {"data": effective, "writes": writes, "preserved": preserved, "ownerAccess": "existing-admin"}
+        return {"data": effective, "writes": [], "preserved": [*preserved, env_path], "ownerAccess": "existing-admin"}
+    # Preserve existing integrations; only update fields explicitly supplied by
+    # Novsky. Semantic memory needs its own explicit setup choice.
+    updates = {"OWNER_CHAT_ID": owner}
+    for key, value, supplied in (("AGENT_NAME", agent_name, "agentName"), ("TZ", timezone, "timezone")):
+        if supplied in data or key not in settings:
+            updates[key] = value
+    if data.get("botToken"):
+        updates["TELEGRAM_BOT_TOKEN"] = data["botToken"]
+    if data.get("openaiApiKey"):
+        updates["OPENAI_API_KEY"] = data["openaiApiKey"]
+    if data.get("semanticMemory") is not None:
+        if not isinstance(data["semanticMemory"], bool):
+            raise ValueError("invalid semantic memory setting")
+        updates["MEMORY_EMBEDDINGS_OPENAI"] = "enabled" if data["semanticMemory"] else "disabled"
+    elif "MEMORY_EMBEDDINGS_OPENAI=" not in existing:
+        updates["MEMORY_EMBEDDINGS_OPENAI"] = "disabled"
+    if any(not isinstance(value, str) or any(char in value for char in "\x00\r\n") for value in updates.values()):
+        raise ValueError("invalid Telegram configuration setting")
+    lines = [line for line, entry in entries if not entry or entry[1] not in updates]
+    lines.extend(key + "=" + shlex.quote(value) for key, value in updates.items())
+    writes.append((env_path, "\n".join(lines) + "\n", 0o400))
+    return {"data": effective, "writes": writes, "preserved": preserved,
+            "ownerAccess": "existing-admin" if access_path.exists() else "new-owner"}
+
+
+def configure(home, user, manifest, env, data, configuration=None):
+    from install import atomic
+    configuration = configuration if configuration is not None else plan_configuration(home, data)
+    account = pwd.getpwnam(user)
+    for path, content, mode in configuration["writes"]:
+        atomic(path, content, account.pw_uid, account.pw_gid, mode)
+    binary = home / ".local/lib/novsky-runtime/node_modules/.bin/codex"
+    stage = home / ".local/share/novsky-kit/migration"
+    rpc = RPC(binary, home / "obsidian-vault", {**env, "HOME": str(stage)}, user)
+    try:
+        import_plugins(rpc, stage, manifest["nativePlugins"])
+    finally:
+        rpc.close()
+    # Plugin imports write user configuration. A fresh app-server consumes the
+    # native configuration exactly as the final Telegram service will.
+    rpc = RPC(binary, home / "obsidian-vault", env, user)
+    try:
+        return check_discovery(rpc, home, manifest)
+    finally:
+        rpc.close()

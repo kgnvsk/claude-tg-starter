@@ -28,10 +28,45 @@ UPSTREAM_SERVER_SHA256 = (
 )
 UPSTREAM_PACKAGE_START = "bun install --no-summary 1>&2 && bun server.ts"
 GOLDEN_SERVER_SHA256 = (
-    "7dfbdea2af27d52acb8362960e1685ad0e4dc9a52e5ece2398386dcbbdef19b3"
+    "62f724fd00f08946e3a3f135e6d8b698f62e96eea294fad8e0b1a7be5f2cd120"
 )
 PREVIOUS_GOLDEN_SERVER_SHA256S = frozenset(
     {
+        # The golden before ordinary messages could continue waiting work.
+        "16cc1e5a8a5df714b83b21abf8dd980dae2a70542474d35008767e4433147e35",
+        # The golden before historical provider pause reconciliation.
+        "3506f6b1dbfdf91746460ee889cd19191f77f98580e03cef8c0af9b27ce4fc2d",
+        "b16bd96ed47c9d7dd24585eb3f1bad0939f4d24f08c2fabf9b99919b8c126b85",
+        # Receipt lifecycle before durable request recovery (0536098).
+        "b3d8215d8b80d55e1f5119e8317ad239565a7f94e10383040bcb4f63330f41b3",
+        # The golden before stable receipt origins and truthful shadow decisions.
+        "74f9369b7339e61b59e07960e8531c1cc958c10ee7aa309de052c04669bdd428",
+        # The golden before лестниця бездіяльності, /stop, прапорець старшинства та тіньові записи.
+        "1bd6d5c6762f9761c5346023b310350d92c224a6db4888f5df42c35a35c50f0a",
+        # 3698deecb8a2 Telegram: перемикач старшинства доставки з тіньовим режимом і звітом р
+        "aafa1a334c802e5ab9f2c2cc7d5762a6a86295336819a013ae61c421e1e24342",
+        # The golden before лестниця бездіяльності та /stop.
+        "ee15bd650b4b79b9f4241e5df283fba5be91671db5e822dba7b48410c5263d0a",
+        # The golden before урегулювання кінця ходу.
+        "606312c47a3ca7d340d7a8e17243d1f083e7763af3c1ee060b73342bf3dec321",
+        # The golden before квитанції, no_reply, сповіщення про переривання та ознаки життя.
+        "afe6590b2b2025bd37bc66bca0f8cd524a78f51ef3409087e094239c53b598eb",
+        # cb4ecaff1302 Telegram: доставку відповіді засвідчує сам приймач; мовчання в групі —
+        "fa18409ef0cbcd0ccd5df7f58b1ae09e53c4980d73e96c5a0aa7d5385b35e99f",
+        # The golden before сповіщення про перерваний запит і ознаки життя.
+        "7bb64ef1f1be83cad1bad03ca9cc57164827d445622389279715f639f281b699",
+        # The golden before журнал ходів.
+        "fb1b662c1c34341206c23e587584ccebd366608d813f420b2e2fb7929294e44a",
+        # The golden before a shared place or contact reached the session and typing stopped after a silent close.
+        "3285e6ff2e401033ac2d3cdaff37865fdb457127ce4bc09a4ac9867da2637458",
+        # The golden before a group document could bind late to the mention that followed.
+        "0a1b3816e38631c9ab0e73da766fb29878e7fcc3863a219ab4599080fbb88899",
+        # The golden before the agent could read a rich message.
+        "8e935827ca4280576252e729962480956e0bbdc9370f879e04e1a6734d62a170",
+        # The golden before the owner could release one blocked request by ID.
+        "4f95ea3ea99209af50fc830e67021543ade85883293cb1b35a0136dfe7f4d78a",
+        # The golden before the owner could vouch for one person.
+        "0a0e3b1f903daa16528085dffa4c935f98622929377885667a189384990ac708",
         # The golden before a burst of messages became one turn.
         "03115d23a64bbd0fd09caf282be35740b5416892e76667a8167a06f065183b58",
         "8ed378e93fcc314f3005631bd5398c13caa3051de653f20b6f8c4168214c0b87",
@@ -70,6 +105,41 @@ PREVIOUS_GOLDEN_SERVER_SHA256S = frozenset(
         "1843912ee6ded2eff86de3cd5c25d58d1a64d9394bfc0a318a56c71684b56116",
         # The golden before employee sessions took documents.
         "f25f46419073f59814186540eef1a8df5f7e756df9a08fce2325b746872a397e",
+        # Every receiver this kit published before the album window; an agent
+        # still running one of them must stay updatable (test_telegram_plugin_reconcile
+        # checks the whole history).
+        "7dfbdea2af27d52acb8362960e1685ad0e4dc9a52e5ece2398386dcbbdef19b3",  # 4cbbd11e9b88 telegram: one turn covers everything a person wrote before a
+        "64f9bb5b09a47165d423d4c0ba5c715f9d558c752dd12c570a9880c5ce332f33",  # dc428b715a4e telegram: a burst of messages from one person is one turn (#
+        "33dda192b5e2d40128b099ffba61222b74dc51f0e1a8079ee9e545a395012b20",  # db89aff7cdfb telegram plugin: /start greets allowlisted senders instead o
+        "a7f8142872acf7df6c297dbcca0e55f505f7c09a1d2b1dd51ba5aa7ccde25287",  # 4458494d3753 feat(corporate): add owner and action approvals
+        "08ceff0d8d765b4b41dd47fb4b733c86c964f8f483fdfe1670ec5b33d597a61b",  # ce37055a5c77 fix: make corporate session updates fail closed
+        "987902bbfea07ba7a54bdc3774df6c4fe2530d9b113931b97e1258d47948956e",  # 34de0c8c14e6 fix: separate corporate health from owner recovery
+        "074f33d32a48227068e4aa5fa6d2dbc5404c23e9cdbae3c4cc424a156694aa49",  # dc81f10c5574 feat: deliver and recover corporate turns independently
+        "bbe5b4128a6b4098978b47577cf870804ca2e17647a345219d249f2d4d157152",  # 6838564fb26b fix: fail closed on corrupt corporate marker
+        "380be50114fcf1cc8f727643581c37f6d1f52c4615b7015af70c5f12a7f0559d",  # 9a2496d00c80 fix: close corporate routing fail-open races
+        "8ef0d6964f7114609204233bca6f2fb6a1d4cbc13af3c0ec8345639e62e45c3b",  # 3bbc01583f7f feat: route corporate Telegram conversations in isolation
+        "aede47c62a7223ffb4085d3addbf5caedd33afd1cd2e570ef06dfff46efaedad",  # 90486e56f2ea fix: recover orphaned Telegram FIFO heads safely
+        "227e037304a6ddb3f081e69fa8d1dd66289de0ef4ad09743cc81798ad21e3bfe",  # 100e2374dc64 fix: close corporate store crash recovery gaps
+        "745ac8e168895d6aedee1314e49ec7654537a6f99e192581f7717444652e95bc",  # cc12b5a3e799 feat: add isolated corporate conversation store
+        "e91fa093adafa3367ea4ba9d7eb60ce7ce324e964a4aebb23641a91107c961d2",  # 7c48298844df fix(telegram): make inbound handoff single-flight
+        "f95c6db1bebebcf65a58383a511299d1f3889452096b34059f1967917f8f125f",  # 19dc49cdb909 fix(telegram): rebase and guard the v0.0.7 golden
+        "2a6e2c2f5a1db4c0d73778d589b508cc91c57da2135c0e3522fdf8cdbad41a70",  # 5dbd0069f460 fix(locale): translate pairing confirmation
+        "f9d720aa84f928405e8271e1fa70907bd72f923c1263d7347bcb1d77bb1c77ac",  # d5b5d9b99b24 feat(locale): translate Telegram owner messages
+        "6a67494ae8e0e0e6c747fe57e8ae916606a5084b12c457df063df44a3dee0b6d",  # f21a7ce0d0da fix: read channel posts again, and actually handle them
+        "2f8c6e2ad873a9adf1a8a11c0d54f98439067cc76916ec821b18d31c0d8c7529",  # 8fbdc2ebbecd feat: reaction log and topic-gated group answers
+        "ecd6ed02d0a3dceadad13e873d0a357d344f5c1c98cc1f54476edb1483bfd2e0",  # b1f7a8f20713 fix: transcribe voice messages in observed groups
+        "4d81945eea6f55fe9a2befa27d3e863ee0a70c22b7bad4ac080735416042060b",  # 4bdba14e174b feat: enable automatic group observation
+        "77abd413a9805d7ea6ec4233c6aaf21a0dd624f84bdf44a8130a806bfc90f4a9",  # 4b10680f8f12 feat: add silent group observation mode
+        "23d0597bb6ed8c16b0acd47f570d78f2f3b2a547d38bdd72b2dfd1e6bb4a3d05",  # 7d6b3d800e46 feat: multi-instance — N parallel bots per box (AGENT_USER)
+        "a88011e86b57ff53855cdc17bc12d013108081a66b37471642ea581d8b68aa7f",  # 7e625c3788d7 security: enforce atomic admin-only Telegram access
+        "d7fb75aa2a9652a2984690a7db1dfb3587ed8f6f438f74c66498be248edbf1d2",  # 703d85eabb92 fix: deliver browser screenshots without duplicate replies
+        "6ddba59323642810e8585d67c4d3b4337354b8bcb057ece00ce784375d340619",  # 6dccdb6c8159 fix: harden Telegram recovery and learning review
+        "1a1c81071460d9e9b38829133613d7958a2bddef80209d4724fb2b289768ed16",  # 622a8496e324 refactor: archive experimental multi-user runtime (#5)
+        "5a02178c00adeeb1e96884225dd2ea86e4ce9bcb21082409574a7f4064d2ab72",  # 8ae9383fa096 fix: close remaining upgrade reliability gaps
+        "aadfb12c362ac728848a6b1e815ab849a239b4826c4954e79ab5d3d8beac81f1",  # fa9137c932a8 feat: persist Telegram voice transcripts
+        "821f25705daa2cdeb767c3dc28556f42165dfc7ea01555f537e8b53bff50681b",  # c8f97f197a9f fix: retain Telegram work across delivery failures
+        "aa2c550f22a3a37e9f637d1116ceb1388048050346b1dbf4f281365e20f53eed",  # 6cf67df7dbc7 feat: конкурентные заимствования EightGate — msg-log+reply_t
+        "5520a095bce1570d32f0da615f6ec5f4352bca839b22db325cd1cb33685e02dc",  # 4d43f895a810 claude-tg-starter: generic self-service Claude-Code Telegram
     }
 )
 UPSTREAM_FILE_SHA256 = {
