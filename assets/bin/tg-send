@@ -112,15 +112,20 @@ def capture_delivery(chat_id, thread_id=None):
                 if not targets or not results_present:
                     raise ValueError("TG_DELIVERY_TASK_ID requires a progress send bound to an inbound request")
                 previous = connection.execute(
-                    "SELECT delivery_id FROM delivery_results WHERE task_id=? AND stamp=?", (task_id, stamp),
+                    "SELECT delivery_id FROM delivery_results WHERE task_id=? AND stamp=? "
+                    "AND NOT (state IN ('complete','no_reply','cancelled','failed') "
+                    "AND response_turn_id IS NOT NULL)", (task_id, stamp),
                 ).fetchall()
                 if any(row[0] not in {target[1] for target in targets} for row in previous):
-                    raise ValueError("TG_DELIVERY_TASK_ID belongs to another request; start a fresh background task")
+                    raise ValueError("Another request still owns TG_DELIVERY_TASK_ID; use its original "
+                                     "TG_DELIVERY_ID until its native callback is read, or start a separate task")
                 for turn, delivery in targets:
                     returned = connection.execute(
                         "SELECT 1 FROM delivery_unbound_task_returns u "
                         "JOIN delivery_results r ON r.session_id=u.session_id AND r.stamp=u.stamp "
-                        "WHERE u.task_id=? AND r.delivery_id=? AND r.turn_id=? AND r.stamp=?",
+                        "LEFT JOIN delivery_turn_messages m ON m.turn_id=r.turn_id AND m.delivery_id=r.delivery_id "
+                        "WHERE u.task_id=? AND r.delivery_id=? AND r.turn_id=? AND r.stamp=? "
+                        "AND u.observed_at>=COALESCE(m.taken_at,r.created_at)",
                         (task_id, delivery, turn, stamp),
                     ).fetchone()
                     if returned:

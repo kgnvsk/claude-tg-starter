@@ -1838,15 +1838,21 @@ function registerBackgroundResult(delivery: ResultDelivery): void {
   // The task already exists. Bind it durably before acknowledging it on the
   // network, so even an immediate callback can find its original request.
   MSG_DB.transaction(() => {
-    const previous = MSG_DB.query(`SELECT delivery_id FROM delivery_results WHERE task_id = ? AND stamp IS ?`)
+    // SendMessage reuses the agent ID. Release its previous owner only after
+    // both the native callback and the final disposition, not a terminal ACK
+    // alone: an unread old callback must not claim a new request.
+    const previous = MSG_DB.query(`SELECT delivery_id FROM delivery_results WHERE task_id = ? AND stamp IS ?
+      AND NOT (state IN ('complete', 'no_reply', 'cancelled', 'failed') AND response_turn_id IS NOT NULL)`)
       .all(delivery.task_id, DELIVERY_STAMP) as Array<{ delivery_id: string }>
     if (previous.some(row => !delivery.targets.some(target => target.delivery_id === row.delivery_id))) {
-      throw new Error('This task_id belongs to another request; start a fresh background task')
+      throw new Error('Another request still owns this task_id; use its original delivery_id until its native callback is read, or start a separate task')
     }
     for (const target of delivery.targets) {
       const returned = MSG_DB.query(`SELECT 1 FROM delivery_unbound_task_returns u
         JOIN delivery_results r ON r.session_id = u.session_id AND r.stamp = u.stamp
-        WHERE u.task_id = ? AND r.delivery_id = ? AND r.turn_id = ? AND r.stamp IS ?`)
+        LEFT JOIN delivery_turn_messages m ON m.turn_id = r.turn_id AND m.delivery_id = r.delivery_id
+        WHERE u.task_id = ? AND r.delivery_id = ? AND r.turn_id = ? AND r.stamp IS ?
+          AND u.observed_at >= coalesce(m.taken_at, r.created_at)`)
         .get(delivery.task_id, target.delivery_id, target.turn_id, DELIVERY_STAMP)
       if (returned) {
         throw new Error('This task already returned before registration; send its final result with the original delivery_id, or start a fresh background task')

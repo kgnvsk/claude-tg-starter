@@ -1327,15 +1327,28 @@ def native_background_work(events: list[dict], turn_events: list[dict], delivery
             if not isinstance(call, dict) or call.get('type') != 'tool_use':
                 continue
             name, identifier = call.get('name'), call.get('id')
-            if name not in {'Monitor', 'Bash', 'Agent', 'Task'} or not isinstance(identifier, str):
+            if name not in {'Monitor', 'Bash', 'Agent', 'Task', 'SendMessage'} or not isinstance(identifier, str):
                 continue
             result, native = call_result(event, call)
+            if name == 'SendMessage':
+                # Native SendMessage resumes a completed agent under the same
+                # agent ID, with a new tool-use ID for this round of work.
+                if not native and result:
+                    try:
+                        value = json.loads(text_of(result.get('content')))
+                        native = value if isinstance(value, dict) else {}
+                    except (ValueError, TypeError):
+                        pass
+                if native.get('success') is not True or not native.get('resumedAgentId'):
+                    continue  # A mailbox send alone is not a resumed task.
             parameters = call.get('input') if isinstance(call.get('input'), dict) else {}
             background = (name == 'Monitor' or parameters.get('run_in_background') is True
-                          or native.get('isAsync') is True or bool(native.get('backgroundTaskId')))
+                          or native.get('isAsync') is True or bool(native.get('backgroundTaskId'))
+                          or name == 'SendMessage')
             if not background or (result and result.get('is_error') is True):
                 continue
-            task_id = native.get('backgroundTaskId') or (native.get('agentId') if native.get('isAsync') is True else None)
+            task_id = (native.get('resumedAgentId') if name == 'SendMessage' else
+                       native.get('backgroundTaskId') or (native.get('agentId') if native.get('isAsync') is True else None))
             if task_id is None and result:
                 text = text_of(result.get('content'))
                 pattern = (r'^Monitor started \(task ([A-Za-z0-9_-]{1,128}),' if name == 'Monitor'
@@ -1344,12 +1357,13 @@ def native_background_work(events: list[dict], turn_events: list[dict], delivery
                 match = re.search(pattern, text, re.DOTALL)
                 task_id = match.group(1) if match else None
             if (not isinstance(task_id, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', task_id)
-                    or (task_id in tasks and tasks[task_id][0] != identifier)):
+                    or (task_id in tasks and tasks[task_id][0] != identifier and name != 'SendMessage')):
                 unknown.append(identifier)
             else:
                 tasks[task_id] = (identifier, name, index)
 
-    for index, event in enumerate(scope):
+        # Process launches and completions in native order: a completed agent
+        # may be resumed again even within this same Telegram request.
         text = None
         if event.get('type') == 'user' and event.get('origin') == {'kind': 'task-notification'}:
             text = (event.get('message') or {}).get('content')
