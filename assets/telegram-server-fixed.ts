@@ -678,7 +678,11 @@ function coalesceInboundBurst(row: PendingInboundRow): PendingInboundRow {
   const obligation = MSG_DB.query(`SELECT state FROM delivery_results WHERE delivery_id = ?`).get(row.delivery_id) as { state: string } | null
   if (obligation && obligation.state !== 'queued') return row
   const attachmentKeys = ['image_path', 'attachment_kind', 'attachment_file_id', 'attachment_size', 'attachment_mime', 'attachment_name']
-  const images: string[] = meta.image_path !== undefined ? [meta.image_path] : []
+  // A head that already lists pictures (late-bound group photos) keeps all of
+  // them; folding a burst on top must not shorten the list to its first entry.
+  const images: string[] = meta.image_paths !== undefined
+    ? meta.image_paths.split(',')
+    : meta.image_path !== undefined ? [meta.image_path] : []
   const fileIds: string[] = meta.attachment_file_id !== undefined ? [meta.attachment_file_id] : []
   const fileNames: string[] = meta.attachment_name !== undefined ? [meta.attachment_name] : []
   let content = head.params.content ?? ''
@@ -1618,7 +1622,7 @@ const mcp = new Server(
     instructions: [
       'The sender reads Telegram, not this session. Anything you want them to see must go through the reply tool — your transcript output never reaches their chat.',
       '',
-      'Messages from Telegram arrive as <channel source="telegram" chat_id="..." message_id="..." user="..." ts="...">. If the tag has an image_path attribute, Read that file — it is a photo the sender attached. If the tag has attachment_file_id, call download_attachment with that file_id to fetch the file, then Read the returned path. One tag can carry a whole burst: image_paths lists every photo of it, comma-separated, and attachment_file_ids every file — Read or download all of them, and answer the burst once instead of replying per message. Reply with the reply tool — pass chat_id back. For a forum topic, also pass the inbound thread_id as an integer independently of reply_to, even for the latest message and every follow-up. thread_id selects the topic; reply_to only adds a quote. Use reply_to (set to a message_id) only when quoting an earlier message; omit reply_to for normal responses, never omit an inbound thread_id. Do not guess a topic from the latest activity in another conversation.',
+      'Messages from Telegram arrive as <channel source="telegram" chat_id="..." message_id="..." user="..." ts="...">. If the tag has an image_path attribute, Read that file — it is a photo the sender attached. If the tag has attachment_file_id, call download_attachment with that file_id to fetch the file, then Read the returned path. One tag can carry a whole burst: image_paths lists every photo of it, comma-separated, and attachment_file_ids every file — Read or download all of them, and answer the burst once instead of replying per message. image_paths also carries photos posted in this chat shortly before the message without mentioning you, newest first — Read the ones the message refers to. Reply with the reply tool — pass chat_id back. For a forum topic, also pass the inbound thread_id as an integer independently of reply_to, even for the latest message and every follow-up. thread_id selects the topic; reply_to only adds a quote. Use reply_to (set to a message_id) only when quoting an earlier message; omit reply_to for normal responses, never omit an inbound thread_id. Do not guess a topic from the latest activity in another conversation.',
       '',
       `reply accepts files staged inside ${ATTACHMENT_OUTBOX} for attachments. Pass an absolute path, not ~. Use react to add emoji reactions, and edit_message for interim progress updates. Edits don\'t trigger push notifications — when a long task completes, send a new reply so the user\'s device pings.`,
       '',
@@ -3511,23 +3515,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         return { content: [{ type: 'text', text: 'reacted' }] }
       }
       case 'download_attachment': {
-        const file_id = args.file_id as string
-        const file = await bot.api.getFile(file_id, AbortSignal.timeout(TELEGRAM_FETCH_TIMEOUT_MS))
-        if (!file.file_path) throw new Error('Telegram returned no file_path — file may have expired')
-        const url = `https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`
-        const res = await fetch(url, {
-          signal: AbortSignal.timeout(TELEGRAM_FETCH_TIMEOUT_MS),
-        })
-        if (!res.ok) throw new Error(`download failed: HTTP ${res.status}`)
-        const buf = await readTelegramFileResponse(res, file.file_size)
-        // file_path is from Telegram (trusted), but strip to safe chars anyway
-        // so nothing downstream can be tricked by an unexpected extension.
-        const rawExt = file.file_path.includes('.') ? file.file_path.split('.').pop()! : 'bin'
-        const ext = rawExt.replace(/[^a-zA-Z0-9]/g, '') || 'bin'
-        const uniqueId = (file.file_unique_id ?? '').replace(/[^a-zA-Z0-9_-]/g, '') || 'dl'
-        const path = join(INBOX_DIR, `${Date.now()}-${uniqueId}.${ext}`)
-        mkdirSync(INBOX_DIR, { recursive: true })
-        writeFileSync(path, buf)
+        const path = await downloadAttachmentById(args.file_id as string)
         return { content: [{ type: 'text', text: path }] }
       }
       case 'edit_message': {
@@ -4015,16 +4003,39 @@ async function readTelegramFileResponse(response: Response, expectedSize?: numbe
     return Buffer.concat(chunks, total)
   } finally { await reader.cancel().catch(() => {}); reader.releaseLock() }
 }
+// One downloader for every file the model gets by id — the download_attachment
+// tool and the late binding of group photos share it, bounds included.
+async function downloadAttachmentById(file_id: string): Promise<string> {
+  const file = await bot.api.getFile(file_id, AbortSignal.timeout(TELEGRAM_FETCH_TIMEOUT_MS))
+  if (!file.file_path) throw new Error('Telegram returned no file_path — file may have expired')
+  const url = `https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`
+  const res = await fetch(url, {
+    signal: AbortSignal.timeout(TELEGRAM_FETCH_TIMEOUT_MS),
+  })
+  if (!res.ok) throw new Error(`download failed: HTTP ${res.status}`)
+  const buf = await readTelegramFileResponse(res, file.file_size)
+  // file_path is from Telegram (trusted), but strip to safe chars anyway
+  // so nothing downstream can be tricked by an unexpected extension.
+  const rawExt = file.file_path.includes('.') ? file.file_path.split('.').pop()! : 'bin'
+  const ext = rawExt.replace(/[^a-zA-Z0-9]/g, '') || 'bin'
+  const uniqueId = (file.file_unique_id ?? '').replace(/[^a-zA-Z0-9_-]/g, '') || 'dl'
+  const path = join(INBOX_DIR, `${Date.now()}-${uniqueId}.${ext}`)
+  mkdirSync(INBOX_DIR, { recursive: true })
+  writeFileSync(path, buf)
+  return path
+}
 // End bounded Telegram download
 
 bot.on('message:photo', async ctx => {
   const caption = ctx.message.caption ?? '(photo)'
+  // Largest size is last in the array.
+  const photos = ctx.message.photo
+  const best = photos[photos.length - 1]
   // Defer download until after the gate approves — any user can send photos,
   // and we don't want to burn API quota or fill the inbox for dropped messages.
+  // The file_id still reaches the journal: a photo posted without a mention is
+  // observed, not downloaded, and the mention that follows binds to it late.
   await handleInbound(ctx, caption, async () => {
-    // Largest size is last in the array.
-    const photos = ctx.message.photo
-    const best = photos[photos.length - 1]
     try {
       const file = await ctx.api.getFile(best.file_id, AbortSignal.timeout(TELEGRAM_FETCH_TIMEOUT_MS))
       if (!file.file_path) return undefined
@@ -4042,7 +4053,7 @@ bot.on('message:photo', async ctx => {
       process.stderr.write(`telegram channel: photo download failed: ${err}\n`)
       return undefined
     }
-  })
+  }, { kind: 'photo', file_id: best.file_id, size: best.file_size })
 })
 
 bot.on('message:document', async ctx => {
@@ -4247,9 +4258,21 @@ async function downloadCorporateImage(ctx: Context, attachment?: AttachmentMeta)
   if (!incoming || (!photo && (attachment?.kind !== 'document' || attachment.file_id !== document?.file_id))) {
     throw new Error('current image missing')
   }
+  return downloadCorporateImageFile(ctx.api, {
+    kind: photo ? 'photo' : 'document',
+    file_id: incoming.file_id,
+    ...(incoming.file_size != null ? { size: incoming.file_size } : {}),
+    ...(photo ? {} : document?.mime_type ? { mime: document.mime_type } : {}),
+  })
+}
+
+// The download itself, shared by this update's picture and the late-bound
+// ones: every file_id comes from an update this bot received itself, and the
+// corporate module still bounds and validates the bytes.
+async function downloadCorporateImageFile(api: Context['api'], attachment: AttachmentMeta) {
   const media = await import(new URL('./media.ts', pathToFileURL(CORPORATE_MODULE)).href)
-  if (incoming.file_size != null && incoming.file_size > media.MAX_IMAGE_BYTES) throw new Error('image too large')
-  const file = await ctx.api.getFile(incoming.file_id, AbortSignal.timeout(TELEGRAM_FETCH_TIMEOUT_MS))
+  if (attachment.size != null && attachment.size > media.MAX_IMAGE_BYTES) throw new Error('image too large')
+  const file = await api.getFile(attachment.file_id, AbortSignal.timeout(TELEGRAM_FETCH_TIMEOUT_MS))
   if (!file.file_path || file.file_path.includes('..') || !/^[A-Za-z0-9_./-]+$/.test(file.file_path)) {
     throw new Error('invalid Telegram file path')
   }
@@ -4257,7 +4280,12 @@ async function downloadCorporateImage(ctx: Context, attachment?: AttachmentMeta)
   const response = await fetch(`https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`, {
     signal: AbortSignal.timeout(TELEGRAM_FETCH_TIMEOUT_MS), redirect: 'error',
   })
-  return media.readImageResponse(response, photo ? 'image/jpeg' : document?.mime_type, file.file_size ?? incoming.file_size)
+  // A Telegram photo is always JPEG; a document carries its own declared type.
+  return media.readImageResponse(
+    response,
+    attachment.kind === 'photo' ? 'image/jpeg' : attachment.mime,
+    file.file_size ?? attachment.size,
+  )
 }
 
 async function downloadCorporateDocument(ctx: Context, attachment: AttachmentMeta) {
@@ -4291,28 +4319,60 @@ async function downloadCorporateDocumentFile(api: Context['api'], attachment: At
   return media.validateCorporateDocuments([{ name, mediaType, data: bytes.toString('base64') }])[0]
 }
 
-// ── late-bound group documents (added 2026-09-18) ────────────────────────────
-// A document posted in a group without a mention is observed, not delivered, so
-// the mention that follows ("проаналізуй файл") arrives without the file — the
-// MANZARO finance chat lost six uploads this way. The observe branch journals
-// what it saw; a corporate turn with no attachment of its own then binds the
-// last few observed documents of the same conversation.
+// ── late-bound group documents and photos (added 2026-09-18, photos 2026-09-21)
+// A file posted in a group without a mention is observed, not delivered, so
+// the mention that follows ("проаналізуй файл", "перефразуй текст із фото")
+// arrives without it — the MANZARO finance chat lost six uploads this way, and
+// Maria's groups lost every bare screenshot. The observe branch journals what
+// it saw; a turn with no attachment of its own then binds the last few
+// observed files of the same conversation. Each kind keeps its own window, so
+// a burst of photos cannot evict a document the mention is about.
 const LATE_BIND_WINDOW_MS = 10 * 60 * 1000
 const LATE_BIND_LIMIT = 3
-const observedDocuments = new Map<string, (AttachmentMeta & { ts: number })[]>()
-const lateBindKey = (chat_id: string, threadId: number | undefined) => `${chat_id}|${threadId ?? ''}`
-function journalObservedDocument(
+const LATE_BIND_KINDS = ['document', 'photo']
+const observedAttachments = new Map<string, (AttachmentMeta & { ts: number })[]>()
+const lateBindKey = (kind: string, chat_id: string, threadId: number | undefined) => `${kind}|${chat_id}|${threadId ?? ''}`
+function journalObservedAttachment(
   chat_id: string, threadId: number | undefined, attachment: AttachmentMeta | undefined, now = Date.now(),
 ): void {
-  if (attachment?.kind !== 'document') return
-  const key = lateBindKey(chat_id, threadId)
-  const fresh = (observedDocuments.get(key) ?? []).filter(a => now - a.ts < LATE_BIND_WINDOW_MS)
+  if (!attachment || !LATE_BIND_KINDS.includes(attachment.kind)) return
+  const key = lateBindKey(attachment.kind, chat_id, threadId)
+  const fresh = (observedAttachments.get(key) ?? []).filter(a => now - a.ts < LATE_BIND_WINDOW_MS)
   fresh.push({ ...attachment, ts: now })
-  observedDocuments.set(key, fresh.slice(-LATE_BIND_LIMIT))
+  observedAttachments.set(key, fresh.slice(-LATE_BIND_LIMIT))
 }
-function lateBoundDocuments(chat_id: string, threadId: number | undefined, now = Date.now()): AttachmentMeta[] {
-  const fresh = (observedDocuments.get(lateBindKey(chat_id, threadId)) ?? []).filter(a => now - a.ts < LATE_BIND_WINDOW_MS)
+function lateBoundAttachments(
+  kind: string, chat_id: string, threadId: number | undefined, now = Date.now(),
+): AttachmentMeta[] {
+  const fresh = (observedAttachments.get(lateBindKey(kind, chat_id, threadId)) ?? [])
+    .filter(a => now - a.ts < LATE_BIND_WINDOW_MS)
   return fresh.slice(-LATE_BIND_LIMIT).map(({ ts: _ts, ...attachment }) => attachment)
+}
+const lateBoundDocuments = (chat_id: string, threadId: number | undefined, now = Date.now()) =>
+  lateBoundAttachments('document', chat_id, threadId, now)
+const lateBoundPhotos = (chat_id: string, threadId: number | undefined, now = Date.now()) =>
+  lateBoundAttachments('photo', chat_id, threadId, now)
+
+// Late-bound pictures ride the same envelope as an attached one, so they stop
+// at the module's total-image budget instead of failing the whole turn at
+// enqueue. A picture that no longer downloads is skipped, not fatal.
+async function downloadLateBoundImages(api: Context['api'], attachments: AttachmentMeta[]) {
+  if (!attachments.length) return []
+  const media = await import(new URL('./media.ts', pathToFileURL(CORPORATE_MODULE)).href)
+  const images = []
+  let total = 0
+  for (const late of attachments) {
+    try {
+      const image = await downloadCorporateImageFile(api, late)
+      const size = Buffer.from(image.data, 'base64').byteLength
+      if (total + size > media.MAX_TOTAL_IMAGE_BYTES) break
+      total += size
+      images.push(image)
+    } catch (err) {
+      process.stderr.write(`telegram channel: late-bound photo skipped: ${err}\n`)
+    }
+  }
+  return images
 }
 
 // The uploader picks the name; the module refuses separators, control
@@ -4346,7 +4406,7 @@ async function routeInbound(
     stopTypingKeepAlive(chat_id)
     await ctx.reply(message, inboundTopicOptions(ctx))
   }
-  if (attachment && !['voice', 'audio', 'document'].includes(attachment.kind)) {
+  if (attachment && !['voice', 'audio', 'document', 'photo'].includes(attachment.kind)) {
     await replyCorporate(CORPORATE_FILE_INSPECTION_DISABLED)
     return
   }
@@ -4392,7 +4452,13 @@ async function routeInbound(
         try { bound.push(await downloadCorporateDocumentFile(ctx.api, late)) }
         catch (err) { process.stderr.write(`telegram channel: late-bound document skipped: ${err}\n`) }
       }
+      // A document is the more deliberate upload, so it wins; photos stand in
+      // when the conversation left none.
       if (bound.length) documents = bound
+      else {
+        const pictures = await downloadLateBoundImages(ctx.api, lateBoundPhotos(chat_id, lateThreadId))
+        if (pictures.length) images = pictures
+      }
     }
     if (attachment?.kind === 'voice' || attachment?.kind === 'audio') {
       const transcript = await transcribeObservedAttachment(
@@ -4437,6 +4503,50 @@ async function routeInbound(
 }
 
 // image_path and attachment metadata below are built only for the legacy route.
+
+// file_id → inbox path: a second mention of the same photo does not fetch it again.
+const lateBoundPhotoPaths = new Map<string, string>()
+async function lateBoundPhotoFiles(chat_id: string, threadId: number | undefined): Promise<string[]> {
+  // ponytail: a flat cap instead of per-entry expiry — anything older than the
+  // journal window is unreachable anyway, and dropping it costs one re-download.
+  if (lateBoundPhotoPaths.size > 256) lateBoundPhotoPaths.clear()
+  const paths: string[] = []
+  for (const { file_id } of lateBoundPhotos(chat_id, threadId)) {
+    const cached = lateBoundPhotoPaths.get(file_id)
+    if (cached && existsSync(cached)) { paths.push(cached); continue }
+    try {
+      const path = await downloadAttachmentById(file_id)
+      lateBoundPhotoPaths.set(file_id, path)
+      paths.push(path)
+    } catch (err) {
+      process.stderr.write(`telegram channel: late-bound photo download failed: ${err}\n`)
+    }
+  }
+  return paths
+}
+
+// What the <channel> tag says about pictures: an own photo that downloaded is
+// the whole story; a failed download keeps the file_id as the fallback; with
+// no own picture, earlier photos of the conversation stand in.
+function inboundImageMeta(
+  imagePath: string | undefined,
+  attachment: AttachmentMeta | undefined,
+  latePaths: string[],
+): Record<string, string> {
+  if (imagePath) return { image_path: imagePath }
+  return {
+    // Same attribute and separator as a coalesced burst — one list of pictures,
+    // one thing for the model to learn.
+    ...(latePaths.length ? { image_path: latePaths[0]!, image_paths: latePaths.join(',') } : {}),
+    ...(attachment ? {
+      attachment_kind: attachment.kind,
+      attachment_file_id: attachment.file_id,
+      ...(attachment.size != null ? { attachment_size: String(attachment.size) } : {}),
+      ...(attachment.mime ? { attachment_mime: attachment.mime } : {}),
+      ...(attachment.name ? { attachment_name: attachment.name } : {}),
+    } : {}),
+  }
+}
 
 async function handleInbound(
   ctx: Context,
@@ -4552,7 +4662,7 @@ async function handleInbound(
   // An allowlisted group without a mention is durable PM context, not a Claude
   // turn. Voice/audio is transcribed into durable history without waking Claude.
   if (result.action === 'observe') {
-    journalObservedDocument(chat_id, threadId, attachment)
+    journalObservedAttachment(chat_id, threadId, attachment)
     await transcribeObservedAttachment(ctx, chat_id, msgId, attachment)
     await removeIntegrationInput()
     return
@@ -4608,6 +4718,11 @@ async function handleInbound(
       const transcript = saved?.text && saved.text !== text ? saved.text : await transcribeObservedAttachment(ctx, chat_id, msgId, attachment)
       if (transcript) inboundText = ctx.message?.caption ? `${text}\n${transcript}` : transcript
     }
+    // Only a message that brought no picture of its own binds to earlier ones,
+    // and only in a group — a private chat delivers every photo as it arrives.
+    const latePaths = imagePath == null && downloadImage == null && ctx.chat?.type !== 'private'
+      ? await lateBoundPhotoFiles(chat_id, threadId)
+      : []
     const notification: InboundNotification = {
       method: 'notifications/claude/channel',
       params: {
@@ -4635,14 +4750,7 @@ async function handleInbound(
             }
           })() : {}),
           ...(ctx.message?.media_group_id ? { media_group_id: String(ctx.message.media_group_id) } : {}),
-          ...(imagePath ? { image_path: imagePath } : {}),
-          ...(attachment ? {
-            attachment_kind: attachment.kind,
-            attachment_file_id: attachment.file_id,
-            ...(attachment.size != null ? { attachment_size: String(attachment.size) } : {}),
-            ...(attachment.mime ? { attachment_mime: attachment.mime } : {}),
-            ...(attachment.name ? { attachment_name: attachment.name } : {}),
-          } : {}),
+          ...inboundImageMeta(imagePath, attachment, latePaths),
         },
       },
     }

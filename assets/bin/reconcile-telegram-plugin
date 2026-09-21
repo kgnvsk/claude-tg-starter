@@ -28,10 +28,12 @@ UPSTREAM_SERVER_SHA256 = (
 )
 UPSTREAM_PACKAGE_START = "bun install --no-summary 1>&2 && bun server.ts"
 GOLDEN_SERVER_SHA256 = (
-    "befe493179ed9bdc3300387b572bb5c62ad969fa3a9dab7f2486cca33433c01f"
+    "975962a6ec9b49575ef8c810031fbea6d00c5305c04a937c6714ab914c4f9392"
 )
 PREVIOUS_GOLDEN_SERVER_SHA256S = frozenset(
     {
+        # The golden before a group photo could bind late to the mention that followed.
+        "befe493179ed9bdc3300387b572bb5c62ad969fa3a9dab7f2486cca33433c01f",
         # ee92782904d7 feat: let named assistants connect and use work integrations
         "2a3a73cc7588bb960adc3eed63773ac4f54997517ae3aa6bc6a3cf35f5adbed6",
         # Released native background continuation receiver.
