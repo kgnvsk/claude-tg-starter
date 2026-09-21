@@ -26,6 +26,7 @@ MANAGED_HOOKS = (
     ("PreToolUse", "mcp__plugin_telegram_telegram__reply", "{H}/bin/tg-format-enforcer", 5),
     ("PreToolUse", "Bash|Read|Edit|Write|MultiEdit", "{H}/bin/no-secrets-guard", 5),
     ("PreToolUse", "Bash|Edit|Write|MultiEdit", "{H}/bin/memory-budget-guard", 5),
+    ("PreToolUse", "Bash|Edit|Write|MultiEdit", "{H}/bin/settings-model-guard", 90),
     ("PostToolUse", "Write|Edit|MultiEdit", "jq -r '.tool_input.file_path // .tool_response.filePath // \"\"' | grep -q \"^{H}/obsidian-vault/\" && {H}/bin/vault-sync &", 5),
     ("Stop", None, "{H}/bin/tg-reply-stop-guard", 35),
     ("Stop", None, "{H}/bin/tg-turn-end", 5),

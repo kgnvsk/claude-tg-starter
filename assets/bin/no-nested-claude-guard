@@ -34,6 +34,8 @@ import shlex
 import sys
 
 BYPASS_FILE = os.path.expanduser("~/.claude/state/no-nested-claude-guard.bypass")
+SHELL_WRAPPERS = {"bash", "sh", "zsh", "dash", "ksh", "ash"}
+MAX_UNWRAP_DEPTH = 4  # `bash -c "bash -c …"` must still terminate
 
 
 def segments(cmd: str):
@@ -68,6 +70,24 @@ def first_executable(seg: str):
     return exe, toks[i + 1:], assigned
 
 
+def effective_commands(seg: str, inherited=None, depth: int = 0):
+    """Yield (exe, rest, env) for what a segment actually runs.
+
+    `bash -c '<inner>'` (also `-lc`, `--norc -c`) executes <inner>, so it is
+    scanned by the same rule as a bare command; VAR=val prefixes on the
+    wrapper stay in force inside it, which keeps the suppressed headless form
+    allowed through a shell as well."""
+    exe, rest, assigned = first_executable(seg)
+    env = {**(inherited or {}), **assigned}
+    if exe in SHELL_WRAPPERS and depth < MAX_UNWRAP_DEPTH:
+        for i, tok in enumerate(rest[:-1]):
+            if re.fullmatch(r"-[a-zA-Z]*c", tok):
+                for sub in segments(rest[i + 1]):
+                    yield from effective_commands(sub, env, depth + 1)
+                return
+    yield exe, rest, env
+
+
 def main() -> None:
     try:
         data = json.load(sys.stdin)
@@ -82,8 +102,9 @@ def main() -> None:
 
     cmd = (data.get("tool_input") or {}).get("command") or ""
 
-    for seg in segments(cmd):
-        exe, rest, assigned = first_executable(seg)
+    for exe, rest, assigned in (
+        run for seg in segments(cmd) for run in effective_commands(seg)
+    ):
         if exe != "claude":
             continue
         nxt = rest[0] if rest else ""

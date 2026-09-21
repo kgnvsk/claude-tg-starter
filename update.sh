@@ -512,7 +512,10 @@ fi
 
 env CLAUDE_UPDATE_MAINTENANCE="$CLAUDE_UPDATE_MAINTENANCE" bash "$KIT/assets/install-core.sh"
 
-if python3 "$KIT/assets/lib/product-config.py" \
+# MODULE_TELEGRAM_CORPORATE=0 (never-activated installation on a host without
+# user namespaces for the agent) installs no module; install-core has already
+# refused that value for an activated one.
+if [ "${MODULE_TELEGRAM_CORPORATE:-1}" = 1 ] && python3 "$KIT/assets/lib/product-config.py" \
     --file "$KIT/assets/product/runtime.json" \
     has-feature telegram-corporate-sessions; then
   [ -x "$H/bin/corporate-control" ] || {

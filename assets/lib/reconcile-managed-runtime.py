@@ -88,6 +88,7 @@ MANAGED_BIN_NAMES = frozenset(
         "set-openai-key",
         "set-recall-key",
         "set-sec-identity",
+        "settings-model-guard",
         "set-tg-commands",
         "set-vercel-token",
         "skill-brief",

@@ -94,6 +94,10 @@ MODULE_TRANSPORT_DAEMON="${MODULE_TRANSPORT_DAEMON:-0}"
 MODULE_VAULT_WEB="${MODULE_VAULT_WEB:-0}"
 MODULE_INSTAGRAM_DM="${MODULE_INSTAGRAM_DM:-0}"
 MODULE_YOUTUBE_COMMENTS="${MODULE_YOUTUBE_COMMENTS:-0}"
+# Corporate sessions are part of the product, so the module is on by default.
+# 0 keeps an installation that never activated corporate routing on a host
+# that cannot give the agent user namespaces; once activated it cannot be skipped.
+MODULE_TELEGRAM_CORPORATE="${MODULE_TELEGRAM_CORPORATE:-1}"
 CHANNEL_ID="${CHANNEL_ID:-}"
 SITE_PASSWORD="${SITE_PASSWORD:-}"
 DEPLOY_DATE="$(date +%F)"
@@ -109,6 +113,17 @@ fi
 if [ "$MODULE_YOUTUBE_COMMENTS" = 1 ] && ! product_has_feature youtube-comments; then
   echo "INFO: модуль коментарів YouTube недоступний у цьому продукті; вимикаю його"
   MODULE_YOUTUBE_COMMENTS=0
+fi
+if [ "$MODULE_TELEGRAM_CORPORATE" = 1 ] && ! product_has_feature telegram-corporate-sessions; then
+  MODULE_TELEGRAM_CORPORATE=0
+fi
+if [ "$MODULE_TELEGRAM_CORPORATE" != 1 ] && product_has_feature telegram-corporate-sessions; then
+  CORPORATE_ACTIVATION_MARKER="$H/.claude/channels/telegram/corporate-isolation-activated"
+  if [ -e "$CORPORATE_ACTIVATION_MARKER" ] || [ -L "$CORPORATE_ACTIVATION_MARKER" ]; then
+    echo "FATAL: корпоративну ізоляцію вже активовано — MODULE_TELEGRAM_CORPORATE=0 неприпустимий" >&2
+    exit 1
+  fi
+  echo "INFO: MODULE_TELEGRAM_CORPORATE=0 — корпоративний модуль не встановлюється, корпоративний режим лишається вимкненим"
 fi
 if [ "$MODULE_CHANNEL_PUBLISH" = 1 ]; then
   [[ "$CHANNEL_ID" =~ ^-100[0-9]{6,}$ ]] || {
@@ -217,7 +232,7 @@ fi
 
 # Native corporate sessions use Claude Code's OS sandbox. Provision ordinary
 # runtime packages for those kits only; host security policy is not changed here.
-if product_has_feature telegram-corporate-sessions; then
+if product_has_feature telegram-corporate-sessions && [ "$MODULE_TELEGRAM_CORPORATE" = 1 ]; then
   if ! command -v bwrap >/dev/null 2>&1 || ! command -v socat >/dev/null 2>&1; then
     DEBIAN_FRONTEND=noninteractive apt-get install -y -q bubblewrap socat >/dev/null 2>&1 || true
   fi
@@ -227,6 +242,16 @@ if product_has_feature telegram-corporate-sessions; then
       exit 1
     }
   done
+  # The module installer repeats this probe, but by then ~/bin and the crontab
+  # are already rewritten (18.09.2026). Prove the host policy while nothing has
+  # been touched. On a first install the agent user does not exist yet; the
+  # installer's own probe still guards the module swap there.
+  if id "$AGENT_USER" >/dev/null 2>&1 \
+    && ! runuser -u "$AGENT_USER" -- env HOME="$H" bwrap --unshare-user --unshare-pid --unshare-net \
+      --ro-bind / / --proc /proc --dev /dev -- /usr/bin/true >/dev/null 2>&1; then
+    echo "FATAL: перевірка Linux user namespaces для $AGENT_USER не пройшла — корпоративний модуль не встановиться. Адміністратор має погодити профіль modules/telegram-corporate/native-bwrap.apparmor для /usr/bin/bwrap (UPGRADING.md); не вимикай захист хоста. Інсталяцію не змінено." >&2
+    exit 1
+  fi
 fi
 
 # Semantic memory runs from the system Python. install-base provisions numpy on
@@ -687,7 +712,7 @@ for name in AGENT_NAME OWNER_NAME OWNER_TG_USERNAME OWNER_CHAT_ID ADDITIONAL_ADM
   RECALL_API_KEY RECALL_REGION TG_DROP_PENDING_ON_BOOT TG_CORPORATE_SESSIONS \
   CALENDAR_EMAIL VAULT_LOCALE MODULE_DESIGN_PACK MODULE_CHANNEL_PUBLISH \
   MODULE_SOCIAL_BROWSER MODULE_TRANSPORT_DAEMON MODULE_VAULT_WEB \
-  MODULE_INSTAGRAM_DM MODULE_YOUTUBE_COMMENTS \
+  MODULE_INSTAGRAM_DM MODULE_YOUTUBE_COMMENTS MODULE_TELEGRAM_CORPORATE \
   CHANNEL_ID SITE_PASSWORD ACTIVE_ROLES AGENT_ROLE; do
   write_shell_value "$CONFIG_FILE" "$name"
 done
@@ -1011,7 +1036,7 @@ if product_has_feature video-edit; then
   bash "$KIT/scripts/install-video-edit.sh"
 fi
 
-if product_has_feature telegram-corporate-sessions; then
+if product_has_feature telegram-corporate-sessions && [ "$MODULE_TELEGRAM_CORPORATE" = 1 ]; then
   # The module swap is two renames with a window in which the module path does
   # not exist; a running poller caches that import failure until restart and
   # answers every employee "тимчасово недоступний". update.sh already requires a

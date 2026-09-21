@@ -75,6 +75,16 @@
           }
         ],
         "matcher": "Bash|Edit|Write|MultiEdit"
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "{{AGENT_HOME}}/bin/settings-model-guard",
+            "timeout": 90
+          }
+        ],
+        "matcher": "Bash|Edit|Write|MultiEdit"
       }
     ],
     "PreCompact": [

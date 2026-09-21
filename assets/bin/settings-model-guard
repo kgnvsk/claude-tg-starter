@@ -1,0 +1,172 @@
+#!/usr/bin/env python3
+"""Let a new `model` into settings.json only after the installed CLI accepted it."""
+
+from pathlib import Path
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+
+
+HOME = Path(os.environ.get("HOME") or "/home/claude").expanduser().resolve()
+SETTINGS_PATH = (HOME / ".claude/settings.json").resolve()
+PROBE_TIMEOUT_SECONDS = 75
+# A one-shot headless run with the Telegram plugin inert: the same shape the
+# healthcheck uses, so the poller is never disturbed. The API answers with the
+# provider's own words when this CLI build does not know the identifier.
+PROBE_ENV_INERT = "ATARAX_SUPPRESS_TELEGRAM"
+MODEL_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:\-\[\]]{0,79}")
+SHELL_MUTATION_RE = re.compile(
+    r"(?<![0-9&])>>?(?!&)|"
+    r"\b(?:tee|truncate|rm|mv|cp|ln|link|unlink|install|touch|dd|sponge|shred)\b|"
+    r"\bsed\s+(?:-[A-Za-z]*i|--in-place)\b|"
+    r"\bperl\s+-[A-Za-z]*i\b|"
+    r"\bjq\b|\bpython3?\b",
+    re.IGNORECASE,
+)
+
+
+def normalize_path(value: object) -> Path | None:
+    if not isinstance(value, str) or not value:
+        return None
+    expanded = (
+        value.replace("${HOME}", str(HOME))
+        .replace("$HOME", str(HOME))
+        .replace("~", str(HOME), 1)
+    )
+    try:
+        return Path(expanded).expanduser().resolve()
+    except OSError:
+        return None
+
+
+def block(reason: str) -> None:
+    print(json.dumps({"decision": "block", "reason": reason}))
+
+
+def claude_binary() -> str | None:
+    local = HOME / ".local/bin/claude"
+    if os.access(local, os.X_OK):
+        return str(local)
+    return shutil.which("claude")
+
+
+def probe(model: str) -> tuple[bool, str]:
+    binary = claude_binary()
+    if binary is None:
+        return False, "the Claude CLI binary was not found"
+    env = {**os.environ, "HOME": str(HOME), PROBE_ENV_INERT: "1"}
+    try:
+        run = subprocess.run(
+            [binary, "-p", "ok", "--model", model],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=PROBE_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"the probe did not answer within {PROBE_TIMEOUT_SECONDS}s"
+    except OSError as error:
+        return False, f"the probe could not start: {error}"
+    if run.returncode == 0:
+        return True, ""
+    detail = " ".join((run.stderr or run.stdout or "").split())[-240:]
+    return False, detail or f"exit {run.returncode}"
+
+
+def proposed_text(tool_name: str, tool_input: dict, current: str) -> str | None:
+    if tool_name == "Write":
+        content = tool_input.get("content")
+        return content if isinstance(content, str) else None
+    edits: list[dict] = []
+    if tool_name == "Edit":
+        edits = [tool_input]
+    elif tool_name == "MultiEdit":
+        raw = tool_input.get("edits")
+        if not isinstance(raw, list):
+            return None
+        edits = [e for e in raw if isinstance(e, dict)]
+    text = current
+    for edit in edits:
+        old = edit.get("old_string")
+        new = edit.get("new_string")
+        if not isinstance(old, str) or not isinstance(new, str) or old not in text:
+            return None
+        text = text.replace(old, new) if edit.get("replace_all") else text.replace(old, new, 1)
+    return text
+
+
+def model_of(text: str) -> tuple[bool, object]:
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as error:
+        return False, str(error)
+    return True, data.get("model") if isinstance(data, dict) else None
+
+
+def main() -> None:
+    try:
+        payload = json.load(sys.stdin)
+    except (json.JSONDecodeError, OSError):
+        return
+
+    tool_name = str(payload.get("tool_name") or "")
+    tool_input = payload.get("tool_input") or {}
+    if not isinstance(tool_input, dict):
+        return
+
+    if tool_name == "Bash":
+        command = str(tool_input.get("command") or "")
+        normalized = (
+            command.replace("${HOME}", str(HOME))
+            .replace("$HOME", str(HOME))
+            .replace("~", str(HOME))
+        )
+        references_settings = any(
+            normalize_path(token) == SETTINGS_PATH
+            for token in re.findall(r"[\w./~$-]*\.claude/settings\.json\b", normalized)
+        )
+        if references_settings and SHELL_MUTATION_RE.search(normalized):
+            block(
+                "Shell mutation of settings.json is disabled. Change it with the Edit "
+                "tool: settings-model-guard verifies a new model id with the installed "
+                "Claude CLI before it is written."
+            )
+        return
+
+    if tool_name not in {"Edit", "Write", "MultiEdit"}:
+        return
+    if normalize_path(tool_input.get("file_path") or tool_input.get("path")) != SETTINGS_PATH:
+        return
+
+    try:
+        current = SETTINGS_PATH.read_text(encoding="utf-8")
+    except OSError:
+        current = ""
+    text = proposed_text(tool_name, tool_input, current)
+    if text is None:
+        return
+    valid, new_model = model_of(text)
+    if not valid:
+        block(f"settings.json must remain valid JSON after the change: {new_model}")
+        return
+    _, old_model = model_of(current) if current else (True, None)
+    if new_model is None or new_model == old_model:
+        return
+    if not isinstance(new_model, str) or not MODEL_ID_RE.fullmatch(new_model):
+        block(f"model must be a plain identifier, got {new_model!r}")
+        return
+    ok, detail = probe(new_model)
+    if ok:
+        return
+    block(
+        f"The installed Claude CLI does not accept model '{new_model}': {detail}. "
+        f"Keep the current model ({old_model!r}) or choose an identifier this CLI "
+        "build knows; a newer id needs a CLI update first."
+    )
+
+
+if __name__ == "__main__":
+    main()
