@@ -1,8 +1,8 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-09-21.f0758027af58`
+- Реліз: `2026-09-21.24aa21785302`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `f0758027af58cb9625f373b829d0e47e94abffd8`
+- Ревізія вихідного комплекту: `24aa21785302ef8aa3acacbf61268c3d90de4fe7`
 - Дата релізу: `2026-09-21`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
@@ -19,7 +19,9 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    fix: preserve receipts when native background agents resume (#93)
+    fix: preserve SQLite fields in native Codex kits
+    fix: keep agent configurations reachable after backup setup
+    feat: let named assistants connect and use work integrations
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не

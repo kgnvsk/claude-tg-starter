@@ -121,6 +121,15 @@ function capability(id, options) {
   return { id, delegable: true, ...options };
 }
 var CAPABILITY_CATALOG = Object.freeze({
+  "integrations.manage": capability("integrations.manage", {
+    kind: "write",
+    adapter: "builtin",
+    operations: ["status", "connect", "run", "disconnect", "cancel"],
+    sharedAllowed: false,
+    requiresResource: false,
+    requiresConfirmation: false,
+    namedPersonOnly: true
+  }),
   "browser.read": capability("browser.read", {
     kind: "read",
     adapter: "browser",
@@ -781,7 +790,16 @@ class CapabilityStore {
     const fallback = subject === AGENT_DEFAULT_SUBJECT || isInstalledAgentSubject(subject) ? null : this.policyRow(AGENT_DEFAULT_SUBJECT);
     if (fallback == null)
       return { subject, version: 0, grants: [] };
-    return { subject, version: 0, grants: this.activeGrants(fallback), inheritedFrom: AGENT_DEFAULT_SUBJECT };
+    return { subject, version: 0, grants: this.activeGrants(fallback).filter((grant) => !this.catalog[grant.capabilityId]?.namedPersonOnly), inheritedFrom: AGENT_DEFAULT_SUBJECT };
+  }
+  integrationAuthorizationKey(identity) {
+    if (identity.chatType !== "private" || !/^[1-9]\d{0,15}$/.test(identity.userId) || identity.chatId !== identity.userId)
+      return null;
+    const subject = `user:${identity.userId}`;
+    const policy = this.policyRow(subject);
+    if (policy == null || policy.version < 1 || !JSON.parse(policy.grantsJson).some((grant) => grant.capabilityId === "integrations.manage" && grant.resourceId == null))
+      return null;
+    return `${subject}:${policy.version}`;
   }
   resolveForActor(subject, actorUserId) {
     const policy = this.resolve(subject);
@@ -952,6 +970,11 @@ class CapabilityStore {
     const group = this.resolve(groupSubject);
     return actor.grants.some((grant) => grant.capabilityId === request.capability && grant.resourceId === request.resourceId) && group.grants.some((grant) => grant.capabilityId === readId && grant.resourceId === request.resourceId) ? group.version : null;
   }
+  delegatedMetaActionAuthorized(input) {
+    const key = `user:${input.actorUserId}:${input.policyVersion}`;
+    const args = input.arguments;
+    return input.subject === `user:${input.actorUserId}` && input.chatId === input.actorUserId && input.operation === "meta.run" && input.resourceId === "delegated:meta" && input.groupOrigin == null && this.integrationAuthorizationKey({ chatType: "private", chatId: input.chatId, userId: input.actorUserId }) === key && args != null && typeof args === "object" && !Array.isArray(args) && Object.keys(args).sort().join(",") === "args,authorizationKey,confirmationToken,connectionKey" && Array.isArray(args.args) && args.args.length > 0 && args.args.every((value) => typeof value === "string") && args.authorizationKey === key && typeof args.connectionKey === "string" && args.connectionKey.trim().length > 0 && typeof args.confirmationToken === "string" && args.confirmationToken.trim().length > 0;
+  }
   createActionPreview(input, now) {
     if (input.subject !== `user:${input.actorUserId}` || input.chatId !== input.actorUserId || input.expiresAt <= now)
       throw new Error("write previews require the verified private actor");
@@ -960,11 +983,14 @@ class CapabilityStore {
       throw new Error("stale action policy");
     const definition = this.catalog[input.capability];
     const resource = this.getResource(input.resourceId);
-    if (definition == null || !definition.requiresConfirmation || !definition.operations.includes(input.operation) || resource == null || resource.connector !== definition.adapter || !resource.capabilityIds.includes(input.capability) || !policy.grants.some((grant) => grant.capabilityId === input.capability && grant.resourceId === input.resourceId))
+    const queued = input.originJobId == null ? null : readQueuedGroupAction(this.db, input.originJobId);
+    if (input.capability === "integrations.manage") {
+      if (queued != null || !this.delegatedMetaActionAuthorized(input))
+        throw new Error("action is not authorized");
+    } else if (definition == null || !definition.requiresConfirmation || !definition.operations.includes(input.operation) || resource == null || resource.connector !== definition.adapter || !resource.capabilityIds.includes(input.capability) || !policy.grants.some((grant) => grant.capabilityId === input.capability && grant.resourceId === input.resourceId))
       throw new Error("action is not authorized");
     const argumentsJson = canonicalJson(input.arguments);
     let groupOrigin;
-    const queued = input.originJobId == null ? null : readQueuedGroupAction(this.db, input.originJobId);
     if (input.groupOrigin != null || queued != null) {
       if (input.groupOrigin == null)
         throw new Error("group origin is required");
@@ -1019,6 +1045,10 @@ class CapabilityStore {
     const row = this.db.query(`SELECT state,receipt_id AS receiptId FROM corporate_actions WHERE token=?`).get(token);
     return row == null ? null : { state: row.state, receiptId: row.receiptId };
   }
+  actionCapability(token) {
+    const row = this.db.query("SELECT capability_id AS capability FROM corporate_actions WHERE token=?").get(token);
+    return row?.capability ?? null;
+  }
   reconcileSendingActions(now) {
     const rows = this.db.query(`SELECT token FROM corporate_actions WHERE state='sending' ORDER BY action_id`).all();
     let reconciled = 0;
@@ -1069,6 +1099,22 @@ class CapabilityStore {
         return { ok: false, reason: "tampered" };
       }
       const payload = JSON.parse(row.payloadJson);
+      const delegated = row.capabilityId === "integrations.manage";
+      if (delegated) {
+        if (payload.capability !== row.capabilityId || payload.operation !== row.operation || payload.resourceId !== row.resourceId || payload.arguments == null || canonicalJson(payload.arguments) !== row.argumentsJson) {
+          this.finishWithoutSend(row, "denied", "tampered", now);
+          return { ok: false, reason: "tampered" };
+        }
+        const queued = payload.originJobId == null ? null : readQueuedGroupAction(this.db, payload.originJobId);
+        if (queued != null || !this.delegatedMetaActionAuthorized({
+          ...row,
+          arguments: payload.arguments,
+          groupOrigin: payload.groupOrigin
+        })) {
+          this.finishWithoutSend(row, "denied", "stale", now);
+          return { ok: false, reason: "stale" };
+        }
+      }
       if (payload.groupOrigin != null) {
         const { policyVersion, ...origin } = payload.groupOrigin;
         const request = {
@@ -1087,7 +1133,7 @@ class CapabilityStore {
       const policy = this.resolve(row.subject);
       const definition = this.catalog[row.capabilityId];
       const resource = this.getResource(row.resourceId);
-      if (policy.version !== row.policyVersion || definition == null || !definition.requiresConfirmation || !definition.operations.includes(row.operation) || resource == null || resource.connector !== definition.adapter || !resource.capabilityIds.includes(row.capabilityId) || !policy.grants.some((grant) => grant.capabilityId === row.capabilityId && grant.resourceId === row.resourceId)) {
+      if (!delegated && (policy.version !== row.policyVersion || definition == null || !definition.requiresConfirmation || !definition.operations.includes(row.operation) || resource == null || resource.connector !== definition.adapter || !resource.capabilityIds.includes(row.capabilityId) || !policy.grants.some((grant) => grant.capabilityId === row.capabilityId && grant.resourceId === row.resourceId))) {
         this.finishWithoutSend(row, "denied", "stale", now);
         return { ok: false, reason: "stale" };
       }
@@ -1199,6 +1245,9 @@ class CapabilityStore {
       const definition = this.catalog[grant.capabilityId];
       if (grant.capabilityId === "*" || definition == null || !definition.delegable) {
         throw new Error(`unknown or nondelegable capability: ${grant.capabilityId}`);
+      }
+      if (definition.namedPersonOnly && !/^user:[1-9]\d{0,15}$/.test(subject)) {
+        throw new Error("integration management is only for one named person");
       }
       if (isSharedSubject(subject) && (!definition.sharedAllowed || definition.requiresConfirmation)) {
         throw new Error("write capabilities are not allowed in shared conversations");

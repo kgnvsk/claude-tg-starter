@@ -28,10 +28,12 @@ UPSTREAM_SERVER_SHA256 = (
 )
 UPSTREAM_PACKAGE_START = "bun install --no-summary 1>&2 && bun server.ts"
 GOLDEN_SERVER_SHA256 = (
-    "1b83d0b471a48547a06bf57d1a88a595d4f9d1b5032c9ab3a7cc3a4e94bb6e21"
+    "2a3a73cc7588bb960adc3eed63773ac4f54997517ae3aa6bc6a3cf35f5adbed6"
 )
 PREVIOUS_GOLDEN_SERVER_SHA256S = frozenset(
     {
+        # Released native background continuation receiver.
+        "1b83d0b471a48547a06bf57d1a88a595d4f9d1b5032c9ab3a7cc3a4e94bb6e21",
         # The golden before native agent continuation receipts.
         "62f724fd00f08946e3a3f135e6d8b698f62e96eea294fad8e0b1a7be5f2cd120",
         # The golden before ordinary messages could continue waiting work.

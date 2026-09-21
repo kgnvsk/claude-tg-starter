@@ -1185,7 +1185,7 @@ async function sendCorporateText(
       : undefined
   const sent = await bot.api.sendMessage(chatId, text, {
     ...(threadId != null ? { message_thread_id: threadId } : {}),
-    ...(replyTo != null ? { reply_parameters: { message_id: replyTo } } : {}),
+    ...(replyTo != null ? { reply_parameters: { message_id: replyTo, allow_sending_without_reply: true } } : {}),
     ...(keyboard ? { reply_markup: keyboard } : {}),
   })
   logMsg({
@@ -3245,7 +3245,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     ...(CORPORATE_ENABLED || (OWNER_CHAT_ID && existsSync(CORPORATE_MODULE)) ? [{
       name: 'corporate_policy_preview',
-      description: 'Ask the human owner to change or revoke a connected agent’s access. Employee, group and topic policies also require corporate mode. Set trusted on a grant when the owner says a named person should stop being asked to confirm that action, and send the same grant without trusted to bring the confirmation back. This never applies the change directly; the owner receives Confirm and Cancel buttons in Telegram.',
+      description: 'Ask the human owner to change or revoke a connected agent’s access. Employee, group and topic policies also require corporate mode. For a named assistant allowed to connect and use work Google/Meta accounts, add integrations.manage with resourceId=null to that exact user policy, preserving other grants. This needs no existing account or per-document resources; it never inherits through defaults/groups and does not share owner credentials. Set trusted on a resource grant to remove repeated action confirmations. The owner receives Confirm and Cancel buttons before any policy changes.',
       inputSchema: {
         type: 'object',
         additionalProperties: false,
@@ -4472,6 +4472,48 @@ async function handleInbound(
       ? `topic:${chat_id}:${threadId}`
       : `group:${chat_id}`
 
+  // A pending connection owns only its credential/callback input, never the
+  // person's ordinary dialogue. Consume it before any journal or model sees it.
+  let sensitiveIntegrationInput = false
+  if (!(ctx.chat?.type === 'private' && chat_id === OWNER_CHAT_ID) && msgId != null
+    && (CORPORATE_ENABLED || readCorporateIsolationActivated())) {
+    try {
+      const corporate = await corporateRuntimeReady()
+      if (!corporate) throw new Error('Integration intake unavailable')
+      const consumed = await corporate.consumeIntegrationInput?.({
+        chatType: ctx.chat!.type as 'private' | 'group' | 'supergroup', chatId: chat_id, userId: String(from.id),
+      }, text, msgId)
+      if (gate(ctx).action !== result.action) return
+      if (consumed) {
+        text = consumed.text
+        sensitiveIntegrationInput = true
+        attachment = undefined
+        downloadImage = undefined
+        const message = ctx.message!
+        // Captions, quoted messages and forwarded attachments must not carry
+        // another copy of the submitted credential into the worker.
+        ;(ctx.update as { message?: unknown }).message = {
+          message_id: message.message_id, date: message.date, chat: ctx.chat!, from,
+          ...(isForumTopic ? { is_topic_message: true, message_thread_id: threadId } : {}),
+          text,
+        }
+      }
+    } catch {
+      throw new RetryableInboundDeliveryError(new Error('Integration intake unavailable'))
+    }
+  }
+
+  const removeIntegrationInput = async () => {
+    if (!sensitiveIntegrationInput || msgId == null) return
+    try {
+      if (await ctx.api.deleteMessage(chat_id, msgId, AbortSignal.timeout(5000)) !== true) {
+        throw new Error('Integration input deletion unconfirmed')
+      }
+    } catch {
+      process.stderr.write('telegram channel: integration input deletion unavailable\n')
+    }
+  }
+
   // Persist only traffic that passed the access gate. Pairing attempts and
   // non-allowlisted traffic are not durable agent context.
   logMsg({
@@ -4513,6 +4555,7 @@ async function handleInbound(
   if (result.action === 'observe') {
     journalObservedDocument(chat_id, threadId, attachment)
     await transcribeObservedAttachment(ctx, chat_id, msgId, attachment)
+    await removeIntegrationInput()
     return
   }
 
@@ -4631,6 +4674,7 @@ async function handleInbound(
       }
     }
   })
+  await removeIntegrationInput()
 }
 
 // Without this, any throw in a message handler stops polling permanently

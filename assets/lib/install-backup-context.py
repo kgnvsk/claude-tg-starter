@@ -290,6 +290,23 @@ def agent_python(value, uid):
     return str(path)
 
 
+def prepare_shared_config(backup):
+    # Runtime configs below /etc/novsky/codex are owned by individual agents.
+    # They need traversal of the shared parent, but never a directory listing
+    # or access to the private backup-context directory and its policies.
+    shared = POLICIES.parent
+    with _directory(shared, {0}, create=True) as (descriptor, verify):
+        info = os.fstat(descriptor)
+        mode = stat.S_IMODE(info.st_mode)
+        target = mode | 0o111
+        if target != mode:
+            write(backup / "shared-config-permissions.json", json.dumps({
+                "path": str(shared), "mode": mode, "uid": info.st_uid, "gid": info.st_gid,
+            }).encode())
+            verify()
+            os.fchmod(descriptor, target)
+
+
 def install(home, user, unit, engine, *, source_dir=None, python_binary=None):
     if os.geteuid() != 0 or not re.fullmatch(r"[a-zA-Z0-9@_.-]+\.service", unit):
         raise ValueError("root and an exact agent unit are required")
@@ -331,7 +348,10 @@ def install(home, user, unit, engine, *, source_dir=None, python_binary=None):
     # Back up every existing file this installer owns before making a change.
     backup = BACKUP_DIRECTORY / (str(int(time.time())) + "-" + profile + "-" + secrets.token_hex(4))
     no_links(backup)
-    for path in (ROOT, ROOT / "tools", POLICIES, backup):
+    with _directory(backup, {0}, create=True):
+        pass
+    prepare_shared_config(backup)
+    for path in (ROOT, ROOT / "tools", POLICIES):
         with _directory(path, {0}, create=True):
             pass
     for path in (ROOT / "tools/age", ROOT / "tools/age-keygen"):
