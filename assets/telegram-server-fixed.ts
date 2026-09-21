@@ -683,8 +683,13 @@ function coalesceInboundBurst(row: PendingInboundRow): PendingInboundRow {
   const images: string[] = meta.image_paths !== undefined
     ? meta.image_paths.split(',')
     : meta.image_path !== undefined ? [meta.image_path] : []
-  const fileIds: string[] = meta.attachment_file_id !== undefined ? [meta.attachment_file_id] : []
-  const fileNames: string[] = meta.attachment_name !== undefined ? [meta.attachment_name] : []
+  // Same for a head that already lists files (late-bound group documents).
+  const fileIds: string[] = meta.attachment_file_ids !== undefined
+    ? meta.attachment_file_ids.split(',')
+    : meta.attachment_file_id !== undefined ? [meta.attachment_file_id] : []
+  const fileNames: string[] = meta.attachment_names !== undefined
+    ? meta.attachment_names.split(', ')
+    : meta.attachment_name !== undefined ? [meta.attachment_name] : []
   let content = head.params.content ?? ''
   const folded: { row: PendingInboundRow, meta: Record<string, string> }[] = []
   const followers = MSG_DB.query(
@@ -1622,7 +1627,7 @@ const mcp = new Server(
     instructions: [
       'The sender reads Telegram, not this session. Anything you want them to see must go through the reply tool — your transcript output never reaches their chat.',
       '',
-      'Messages from Telegram arrive as <channel source="telegram" chat_id="..." message_id="..." user="..." ts="...">. If the tag has an image_path attribute, Read that file — it is a photo the sender attached. If the tag has attachment_file_id, call download_attachment with that file_id to fetch the file, then Read the returned path. One tag can carry a whole burst: image_paths lists every photo of it, comma-separated, and attachment_file_ids every file — Read or download all of them, and answer the burst once instead of replying per message. image_paths also carries photos posted in this chat shortly before the message without mentioning you, newest first — Read the ones the message refers to. Reply with the reply tool — pass chat_id back. For a forum topic, also pass the inbound thread_id as an integer independently of reply_to, even for the latest message and every follow-up. thread_id selects the topic; reply_to only adds a quote. Use reply_to (set to a message_id) only when quoting an earlier message; omit reply_to for normal responses, never omit an inbound thread_id. Do not guess a topic from the latest activity in another conversation.',
+      'Messages from Telegram arrive as <channel source="telegram" chat_id="..." message_id="..." user="..." ts="...">. If the tag has an image_path attribute, Read that file — it is a photo the sender attached. If the tag has attachment_file_id, call download_attachment with that file_id to fetch the file, then Read the returned path. One tag can carry a whole burst: image_paths lists every photo of it, comma-separated, and attachment_file_ids every file — Read or download all of them, and answer the burst once instead of replying per message. image_paths also carries photos posted in this chat shortly before the message without mentioning you, newest first — Read the ones the message refers to, and attachment_file_ids does the same for files posted that way. A voice message posted without a mention arrives already transcribed inside the text, labelled "Голосове від …". Reply with the reply tool — pass chat_id back. For a forum topic, also pass the inbound thread_id as an integer independently of reply_to, even for the latest message and every follow-up. thread_id selects the topic; reply_to only adds a quote. Use reply_to (set to a message_id) only when quoting an earlier message; omit reply_to for normal responses, never omit an inbound thread_id. Do not guess a topic from the latest activity in another conversation.',
       '',
       `reply accepts files staged inside ${ATTACHMENT_OUTBOX} for attachments. Pass an absolute path, not ~. Use react to add emoji reactions, and edit_message for interim progress updates. Edits don\'t trigger push notifications — when a long task completes, send a new reply so the user\'s device pings.`,
       '',
@@ -4319,7 +4324,7 @@ async function downloadCorporateDocumentFile(api: Context['api'], attachment: At
   return media.validateCorporateDocuments([{ name, mediaType, data: bytes.toString('base64') }])[0]
 }
 
-// ── late-bound group documents and photos (added 2026-09-18, photos 2026-09-21)
+// ── late-bound group documents, photos and voice (2026-09-18, -09-21, -09-22)
 // A file posted in a group without a mention is observed, not delivered, so
 // the mention that follows ("проаналізуй файл", "перефразуй текст із фото")
 // arrives without it — the MANZARO finance chat lost six uploads this way, and
@@ -4329,21 +4334,29 @@ async function downloadCorporateDocumentFile(api: Context['api'], attachment: At
 // a burst of photos cannot evict a document the mention is about.
 const LATE_BIND_WINDOW_MS = 10 * 60 * 1000
 const LATE_BIND_LIMIT = 3
-const LATE_BIND_KINDS = ['document', 'photo']
-const observedAttachments = new Map<string, (AttachmentMeta & { ts: number })[]>()
+const LATE_BIND_KINDS = ['document', 'photo', 'voice', 'audio']
+// A recording binds as text: the observe branch already transcribed it into
+// durable history, so the journal carries that transcript and who said it when.
+type SpokenMeta = { transcript: string, user: string, at: number }
+const observedAttachments = new Map<string, (AttachmentMeta & Partial<SpokenMeta> & { ts: number })[]>()
 const lateBindKey = (kind: string, chat_id: string, threadId: number | undefined) => `${kind}|${chat_id}|${threadId ?? ''}`
 function journalObservedAttachment(
   chat_id: string, threadId: number | undefined, attachment: AttachmentMeta | undefined, now = Date.now(),
+  spoken?: SpokenMeta,
 ): void {
   if (!attachment || !LATE_BIND_KINDS.includes(attachment.kind)) return
-  const key = lateBindKey(attachment.kind, chat_id, threadId)
+  // Audio shares the voice list — both arrive as a recording — and a recording
+  // whose transcription failed has nothing to bind, so it takes no slot.
+  const recording = attachment.kind === 'voice' || attachment.kind === 'audio'
+  if (recording && !spoken?.transcript) return
+  const key = lateBindKey(recording ? 'voice' : attachment.kind, chat_id, threadId)
   const fresh = (observedAttachments.get(key) ?? []).filter(a => now - a.ts < LATE_BIND_WINDOW_MS)
-  fresh.push({ ...attachment, ts: now })
+  fresh.push({ ...attachment, ...spoken, ts: now })
   observedAttachments.set(key, fresh.slice(-LATE_BIND_LIMIT))
 }
 function lateBoundAttachments(
   kind: string, chat_id: string, threadId: number | undefined, now = Date.now(),
-): AttachmentMeta[] {
+): (AttachmentMeta & Partial<SpokenMeta>)[] {
   const fresh = (observedAttachments.get(lateBindKey(kind, chat_id, threadId)) ?? [])
     .filter(a => now - a.ts < LATE_BIND_WINDOW_MS)
   return fresh.slice(-LATE_BIND_LIMIT).map(({ ts: _ts, ...attachment }) => attachment)
@@ -4352,6 +4365,14 @@ const lateBoundDocuments = (chat_id: string, threadId: number | undefined, now =
   lateBoundAttachments('document', chat_id, threadId, now)
 const lateBoundPhotos = (chat_id: string, threadId: number | undefined, now = Date.now()) =>
   lateBoundAttachments('photo', chat_id, threadId, now)
+// The recordings of the conversation as the agent reads them: one labelled line
+// each, appended to the text of the mention that follows. No file is fetched
+// again — the transcript is what the journal kept.
+const lateBoundVoiceLines = (chat_id: string, threadId: number | undefined, now = Date.now()): string[] =>
+  lateBoundAttachments('voice', chat_id, threadId, now)
+    .filter(a => a.transcript)
+    .map(a => `Голосове від ${a.user ?? 'учасника'} (${new Date((a.at ?? 0) * 1000)
+      .toTimeString().slice(0, 5)}): ${a.transcript}`)
 
 // Late-bound pictures ride the same envelope as an attached one, so they stop
 // at the module's total-image budget instead of failing the whole turn at
@@ -4445,9 +4466,9 @@ async function routeInbound(
         return
       }
     }
+    const lateThreadId = ctx.message?.is_topic_message === true ? ctx.message.message_thread_id : undefined
     if (!images && !documents && ctx.chat?.type !== 'private') {
       const bound = []
-      const lateThreadId = ctx.message?.is_topic_message === true ? ctx.message.message_thread_id : undefined
       for (const late of lateBoundDocuments(chat_id, lateThreadId)) {
         try { bound.push(await downloadCorporateDocumentFile(ctx.api, late)) }
         catch (err) { process.stderr.write(`telegram channel: late-bound document skipped: ${err}\n`) }
@@ -4472,6 +4493,11 @@ async function routeInbound(
         return
       }
       corporateText = transcript
+    } else if (ctx.chat?.type !== 'private') {
+      // Nothing was said in this message, so what was said just before it in the
+      // group reaches the agent with it — as text, the recording stays observed.
+      const spoken = lateBoundVoiceLines(chat_id, lateThreadId)
+      if (spoken.length) corporateText = [corporateText, ...spoken].join('\n')
     }
 
     const isTopicMessage = ctx.chat?.type === 'supergroup'
@@ -4525,25 +4551,36 @@ async function lateBoundPhotoFiles(chat_id: string, threadId: number | undefined
   return paths
 }
 
-// What the <channel> tag says about pictures: an own photo that downloaded is
-// the whole story; a failed download keeps the file_id as the fallback; with
-// no own picture, earlier photos of the conversation stand in.
+// What the <channel> tag says about files: an own photo that downloaded is the
+// whole story; a failed download keeps the file_id as the fallback; with no
+// file of its own, the earlier photos and documents of the conversation stand
+// in. Late documents are named, not fetched — the model downloads what it needs.
 function inboundImageMeta(
   imagePath: string | undefined,
   attachment: AttachmentMeta | undefined,
   latePaths: string[],
+  lateDocuments: AttachmentMeta[] = [],
 ): Record<string, string> {
   if (imagePath) return { image_path: imagePath }
+  const one = (a: AttachmentMeta) => ({
+    attachment_kind: a.kind,
+    attachment_file_id: a.file_id,
+    ...(a.size != null ? { attachment_size: String(a.size) } : {}),
+    ...(a.mime ? { attachment_mime: a.mime } : {}),
+    ...(a.name ? { attachment_name: a.name } : {}),
+  })
+  const late = lateDocuments[0]
   return {
     // Same attribute and separator as a coalesced burst — one list of pictures,
     // one thing for the model to learn.
     ...(latePaths.length ? { image_path: latePaths[0]!, image_paths: latePaths.join(',') } : {}),
-    ...(attachment ? {
-      attachment_kind: attachment.kind,
-      attachment_file_id: attachment.file_id,
-      ...(attachment.size != null ? { attachment_size: String(attachment.size) } : {}),
-      ...(attachment.mime ? { attachment_mime: attachment.mime } : {}),
-      ...(attachment.name ? { attachment_name: attachment.name } : {}),
+    ...(attachment ? one(attachment) : late ? {
+      ...one(late),
+      // The single-file attributes keep naming the first, exactly as a burst does.
+      ...(lateDocuments.length > 1 ? {
+        attachment_file_ids: lateDocuments.map(d => d.file_id).join(','),
+        attachment_names: lateDocuments.map(d => d.name ?? '').join(', '),
+      } : {}),
     } : {}),
   }
 }
@@ -4663,7 +4700,13 @@ async function handleInbound(
   // turn. Voice/audio is transcribed into durable history without waking Claude.
   if (result.action === 'observe') {
     journalObservedAttachment(chat_id, threadId, attachment)
-    await transcribeObservedAttachment(ctx, chat_id, msgId, attachment)
+    const transcript = await transcribeObservedAttachment(ctx, chat_id, msgId, attachment)
+    // A recording binds by its text, so it enters the journal once transcribed;
+    // only voice and audio return a transcript, so nothing else is journaled twice.
+    if (transcript) {
+      journalObservedAttachment(chat_id, threadId, attachment, Date.now(),
+        { transcript, user: from.username ?? String(from.id), at: ctx.message?.date ?? 0 })
+    }
     await removeIntegrationInput()
     return
   }
@@ -4723,6 +4766,15 @@ async function handleInbound(
     const latePaths = imagePath == null && downloadImage == null && ctx.chat?.type !== 'private'
       ? await lateBoundPhotoFiles(chat_id, threadId)
       : []
+    // A message that brought no file at all also names the documents posted
+    // just before it, and carries what was said in the recordings before it.
+    const lateDocs = attachment == null && downloadImage == null && ctx.chat?.type !== 'private'
+      ? lateBoundDocuments(chat_id, threadId)
+      : []
+    if (attachment?.kind !== 'voice' && attachment?.kind !== 'audio' && ctx.chat?.type !== 'private') {
+      const spoken = lateBoundVoiceLines(chat_id, threadId)
+      if (spoken.length) inboundText = [inboundText, ...spoken].join('\n')
+    }
     const notification: InboundNotification = {
       method: 'notifications/claude/channel',
       params: {
@@ -4750,7 +4802,7 @@ async function handleInbound(
             }
           })() : {}),
           ...(ctx.message?.media_group_id ? { media_group_id: String(ctx.message.media_group_id) } : {}),
-          ...inboundImageMeta(imagePath, attachment, latePaths),
+          ...inboundImageMeta(imagePath, attachment, latePaths, lateDocs),
         },
       },
     }

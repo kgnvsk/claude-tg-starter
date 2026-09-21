@@ -7,7 +7,7 @@
     "local-foundation-v1"
   ],
   "source": "codex/starter/product.json",
-  "sourceRevision": "1abdf0eabb8279fafc5dc30c7be1f7014ada5978",
+  "sourceRevision": "467fdbc782698aacece21baef4bf71a73b9af523",
   "sourceDirty": false,
   "features": [
     "browser"
