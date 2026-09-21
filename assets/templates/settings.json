@@ -77,6 +77,17 @@
         "matcher": "Bash|Edit|Write|MultiEdit"
       }
     ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "{{AGENT_HOME}}/bin/tg-compaction-notice",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
     "SessionStart": [
       {
         "hooks": [

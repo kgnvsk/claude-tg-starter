@@ -1,8 +1,8 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-09-21.24aa21785302`
+- Реліз: `2026-09-21.82dc54db28f0`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `24aa21785302ef8aa3acacbf61268c3d90de4fe7`
+- Ревізія вихідного комплекту: `82dc54db28f00208bc925be781a9b44af91712b4`
 - Дата релізу: `2026-09-21`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
@@ -19,9 +19,9 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    fix: preserve SQLite fields in native Codex kits
-    fix: keep agent configurations reachable after backup setup
-    feat: let named assistants connect and use work integrations
+    build: bundle owner Google setup with compaction progress
+    fix: allow owners to connect Google through protected integration host
+    fix: explain Telegram pauses and keep long work responsive
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не

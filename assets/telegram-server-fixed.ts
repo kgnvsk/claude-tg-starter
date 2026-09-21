@@ -3680,14 +3680,13 @@ bot.on('my_chat_member', async ctx => {
     return
   }
   const liveBotInfo = await bot.api.getMe(AbortSignal.timeout(5000)).catch(() => bot.botInfo)
-  const privacyHint = liveBotInfo.can_read_all_group_messages
-    ? ''
-    : `\n\nЩоб я бачив звичайні повідомлення, один раз вимкни Group Privacy ` +
-      `для @${botUsername} у @BotFather, потім видали й знову додай мене.`
+  const readsChat = liveBotInfo.can_read_all_group_messages === true || newStatus === 'administrator'
+  const name = liveBotInfo.first_name || bot.botInfo.first_name || botUsername
   await ctx.reply(
-    `Я підключився до «${chat.title}»: мовчки читаю нові повідомлення й відповідаю, ` +
-    `коли звертаються до мене. Керувати читанням можеш звичайним повідомленням; ` +
-      `голосом — у приватному чаті або відповіддю на моє повідомлення в групі.${privacyHint}`,
+    `Усім привіт! Я — ${name}. ` +
+      (readsChat ? 'Сиджу й читаю весь чат. ' : '') +
+      `Якщо хочете, щоб я відповів, тегніть мене через @${botUsername}` +
+      (readsChat ? ' або зверніться до мене по імені.' : '.'),
     undefined,
     AbortSignal.timeout(5000),
   )

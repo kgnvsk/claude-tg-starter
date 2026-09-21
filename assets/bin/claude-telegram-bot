@@ -9,10 +9,11 @@ if [ -f "$TELEGRAM_STATE_DIR/.env" ]; then
 fi
 export BUN_INSTALL="$HOME/.bun"
 export PATH="$HOME/.local/bin:$BUN_INSTALL/bin:$HOME/bin:/usr/local/bin:/usr/bin:/bin"
-# Opus extended-context sessions can remain below the 1M hard limit while tool-call
-# quality has already degraded. Compact around 270K by default; SessionStart hooks
-# restore bounded hot memory and recent Telegram context after compaction.
-export CLAUDE_CODE_AUTO_COMPACT_WINDOW="${CLAUDE_CODE_AUTO_COMPACT_WINDOW:-300000}"
+# Native Claude clamps this window to the model's supported context. With a 1M
+# model and the output reserve, 850K at 90% compacts around 747K. Keep ordinary
+# conversation history; native background workers own lengthy intermediate work.
+# Explicit operator overrides remain authoritative.
+export CLAUDE_CODE_AUTO_COMPACT_WINDOW="${CLAUDE_CODE_AUTO_COMPACT_WINDOW:-850000}"
 export CLAUDE_AUTOCOMPACT_PCT_OVERRIDE="${CLAUDE_AUTOCOMPACT_PCT_OVERRIDE:-90}"
 
 # Preflight: погасить ВСЕ интерактивные промпты первого старта claude, чтобы `claude --channels`

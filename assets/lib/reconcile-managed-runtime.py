@@ -99,6 +99,7 @@ MANAGED_BIN_NAMES = frozenset(
         "telegram-inbox-prune",
         "tender-watch",
         "tg-context-inject",
+        "tg-compaction-notice",
         "tg-resume-session",
         "tg-escape",
         "tg-fallback-outbound",

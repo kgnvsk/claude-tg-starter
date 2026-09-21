@@ -7,7 +7,7 @@
     "local-foundation-v1"
   ],
   "source": "codex/starter/product.json",
-  "sourceRevision": "24aa21785302ef8aa3acacbf61268c3d90de4fe7",
+  "sourceRevision": "82dc54db28f00208bc925be781a9b44af91712b4",
   "sourceDirty": false,
   "features": [
     "browser"
@@ -54,7 +54,7 @@
     "assets/skills/backup-recovery/SKILL.md": "5cae93e1e72939a9e46eb1a9a78733294e1823d8e59b533576de7042a33dc90d",
     "assets/skills/backup-recovery/guide-uk.md": "ef4597ad520cbf5f7632432f859a267b1b02cc6f0f0f24cd4fce0f739d0d6988",
     "native/templates/CLAUDE.md": "049410896d264e07ad2ea725cb7d7bc8e4d694c12712f04d6c368fc4907837d3",
-    "native/templates/NOVSKY.md": "ea6e5318f02f302f5f7623cb852f2ecc6fb7b6048ccfd5a8a3d94e2a141602bd",
+    "native/templates/NOVSKY.md": "e26d7d9af91e300e970935022b9260793f7175656632b4e6e5ee634ebbb5687c",
     "native/templates/ROLE.md": "8c0210504de2b8554c69097a8de2a4360800aa9909942534e8d4f4d0fa12cf5d",
     "assets/templates/USER.md": "0175b8704a55cb32f951a53a4d6f1522b950299e3ec5b7c700299258cc8b4e09",
     "assets/templates/MEMORY.md": "465d06579da005d53a35557a9a05075b40c887d8a4cc6ada5653a80e5442cfa7",
@@ -116,16 +116,16 @@
     "modules/telegram-corporate/capabilities.ts": "79b111c4e589a6d3b015f3155a16336acec45241a045bb70a30ffff614210954",
     "modules/telegram-corporate/capability-store.ts": "04ce4a66f5674ea1c3ed147e53cbf7449cd6d8b5249680b08489a7ddd4770beb",
     "modules/telegram-corporate/codex-profile.ts": "469623d16ae0336be7d8f8a316b481accc8443b8b8e6c252c653ece6a270fadc",
-    "modules/telegram-corporate/codex-worker.ts": "35012a69d7c52b4c567f214eda8ce6c4767ffba735310ee458a40734c89ca177",
+    "modules/telegram-corporate/codex-worker.ts": "0002025263c4429e8bf7b98213694ab03d829ce2ea42ec73a3d552ebaea4c360",
     "modules/telegram-corporate/delegated-integrations.ts": "fb953287e6e6b53c477bc48f0092a193ced211c415eda5a3ea97f6fbf0f2f951",
     "modules/telegram-corporate/group-action.ts": "21501bd7028d59fa1977a1e0d5fe7450ba9308a1dd6fecafc38b3edfed2c16b1",
-    "modules/telegram-corporate/index.ts": "7e7b2c7b5be326d957a768f62224b008440fd16c1ea32d7a4fa0519c751b74b3",
+    "modules/telegram-corporate/index.ts": "9319bcd8a44e8255ec9c286636a472b5c7cfbb39cc6e4f32c346e1a6593a25ae",
     "modules/telegram-corporate/integration-readiness.ts": "bc1729f202c7447f7bb45f442d0b1582fe6f128a080142cdfe046d0014cf2ddf",
     "modules/telegram-corporate/media.ts": "4f9ed8585eb51a78043d1f81c96f6b6dc56ac173b9ccd4ba5d39121c1739cf48",
     "modules/telegram-corporate/migration-plan.ts": "148176ad375473f7861ac8b6f5a27b13875e244ea1a9515f6ef0acdc9c0630c3",
     "modules/telegram-corporate/native-file-reply.ts": "1176c551a48783ee649f68b860f3659621bd0deb708c41e3136965fb3c223cc5",
     "modules/telegram-corporate/native-mcp.ts": "613720e183c33abdfff77254a8ddec76e9f3d99daecdaf8aced783e7be4ce10f",
-    "modules/telegram-corporate/native-profile.ts": "444a68c29638c00972e066414427613fb1f13c10624cf12b3b31860f9b14be67",
+    "modules/telegram-corporate/native-profile.ts": "d7f89d4a7612de561d802286ae8049c5b8ac0c07469302af8ff56fa08bc2f849",
     "modules/telegram-corporate/native-readiness.ts": "ecff867750a70ca61f242ccddd4d85eefc55bd5383fbeb1e4cde17198ed419d7",
     "modules/telegram-corporate/native-reminder.ts": "32d3db3aee5917cab42a4f59dbe9e056c941d03614fee003638db28923b3eb1c",
     "modules/telegram-corporate/parity.ts": "8b6cb1e3a8c2e26072478f06c9b89802c61f16a629048574945b7f06c3ef63e1",
@@ -138,13 +138,13 @@
     "modules/telegram-corporate/resource-meta-accounts.ts": "92b5678d28236f65c5d68fc5638b97c88a0cda401a86cebfa3abe345c2e5c5a0",
     "modules/telegram-corporate/resource-sheets.ts": "079155f75d48f2aed3d74d8be79a821aac3d976ac05781990b9d72afbbe5c881",
     "modules/telegram-corporate/resource-telegram-groups.ts": "331a591b94e5f82002bfcf791a1017516ab7d535610c22ad382f24f2f6fadd66",
-    "modules/telegram-corporate/runtime.ts": "f672c384142832139788e2dbca31f2039c858cd07eb291d39b6f1f3e1319bec3",
+    "modules/telegram-corporate/runtime.ts": "e6345e5c23fcb24f2a5b8159583fc85f49e3bda6e15e78faeb47b8fc76561b36",
     "modules/telegram-corporate/store.ts": "b7c84c9ed43bdc267cbf2c30caf69be313a33e8c44f44580feed11fbb229ed47",
     "modules/telegram-corporate/tests/helpers.ts": "d9ccdec5c29de1ae83879ad715b78e77f8e39405f3cf6fd6f39f0315465a6402",
     "modules/telegram-corporate/tests/native-cli-canary.ts": "2a4186fd218fbd87d47a6bddbbf59bb53cfa2c8c33059b3ec92c23aee98e6ccb",
-    "modules/telegram-corporate/types.ts": "2f9d49a8482f4e3c712f9a6f955633617566bc8786934a9c23eb62a5dd78c0f6",
+    "modules/telegram-corporate/types.ts": "1f6bae2e43807bfe9ba15b8219d0da80560fa800ee04b9a75ca00c6afdf064ff",
     "modules/telegram-corporate/worker-activity.ts": "fa427eb43fb412da9e84434c742f1d36c5c6c628ce95a000556e5e7a87eb7653",
-    "modules/telegram-corporate/worker.ts": "79f0adc1040b8e20b516d7f5ce8ffeefab6ab7445709e8a67432699f7da611b3"
+    "modules/telegram-corporate/worker.ts": "4048804e502f328cfeedf21de42b749c469047fd6ddee1648f388942b4e491cd"
   },
   "files": {
     "home/.claude/agents/researcher.md": "520cb8590e94a81923f5663cedf92976f50f0dcf705045b34496efc897859395",
@@ -193,7 +193,7 @@
     "plugin-contract.json": "c5ea9ff8efabb69e2ec79e9082f7fbd3ee6b389376a22227702e446a49ba94d3",
     "resources/native/access.js": "3d2d470e0893dcf27ae84db8404cf4178aaf34b40e10127209c9319c77223820",
     "workspace/CLAUDE.md": "049410896d264e07ad2ea725cb7d7bc8e4d694c12712f04d6c368fc4907837d3",
-    "workspace/NOVSKY.md": "ea6e5318f02f302f5f7623cb852f2ecc6fb7b6048ccfd5a8a3d94e2a141602bd",
+    "workspace/NOVSKY.md": "e26d7d9af91e300e970935022b9260793f7175656632b4e6e5ee634ebbb5687c",
     "workspace/OWNER.md": "739b3bb0b79f8abd5facfb14e19372371216402b183c6c7eb3969c0e0e995d33",
     "workspace/ROLE.md": "8c0210504de2b8554c69097a8de2a4360800aa9909942534e8d4f4d0fa12cf5d"
   }

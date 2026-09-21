@@ -18,6 +18,7 @@ DEPRECATED_COMMANDS = (
     "/opt/claude-graphify/bin/graphify",
 )
 MANAGED_HOOKS = (
+    ("PreCompact", None, "{H}/bin/tg-compaction-notice", 10),
     ("SessionStart", None, "{H}/bin/wiki-hot-inject", 10),
     ("SessionStart", "compact", "{H}/bin/tg-context-inject", 5),
     ("UserPromptSubmit", None, "{H}/bin/tg-context-inject", 5),
