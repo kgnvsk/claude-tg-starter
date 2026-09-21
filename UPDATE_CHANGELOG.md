@@ -1,8 +1,8 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-09-21.46bd4fef8112`
+- Реліз: `2026-09-21.8dfeb4eb2ab2`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `46bd4fef8112f5798a8bbee646888fbe9e2a2e1d`
+- Ревізія вихідного комплекту: `8dfeb4eb2ab2e70171a7ce6e72ccbfe136768557`
 - Дата релізу: `2026-09-21`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
@@ -19,8 +19,8 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    fix: confirm recovered owner messages in group conversations
-    fix: allow administrators to reply to the agent owner
+    Codex: бот реєструє групу, коли її додає адміністратор
+    fix: release all completed Telegram inputs before accepting stop
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не
