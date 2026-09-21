@@ -1,8 +1,8 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-09-21.82dc54db28f0`
+- Реліз: `2026-09-21.46bd4fef8112`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `82dc54db28f00208bc925be781a9b44af91712b4`
+- Ревізія вихідного комплекту: `46bd4fef8112f5798a8bbee646888fbe9e2a2e1d`
 - Дата релізу: `2026-09-21`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
@@ -19,9 +19,8 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    build: bundle owner Google setup with compaction progress
-    fix: allow owners to connect Google through protected integration host
-    fix: explain Telegram pauses and keep long work responsive
+    fix: confirm recovered owner messages in group conversations
+    fix: allow administrators to reply to the agent owner
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не
