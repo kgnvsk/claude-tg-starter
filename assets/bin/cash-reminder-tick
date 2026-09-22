@@ -242,6 +242,26 @@ settle_reminder() {
 # headless session so the live poller keeps answering the whole time —
 # ATARAX_SUPPRESS_TELEGRAM keeps that nested session from touching the plugin,
 # which is what auto-publisher has done in production since June.
+# The owner reads the failure in chat, so it names the cause in plain words:
+# a server log path told a client nothing (Кнопа, 22.09.2026). Details stay in
+# the log.
+failure_reason() {
+  local rc="$1" out="$2" last
+  if [ "$rc" = 124 ]; then
+    printf 'перевищено час виконання'
+    return
+  fi
+  case "$out" in
+    *"401"*|*authentication_error*|*"ot logged in"*|*"OAuth token"*|*"nvalid API key"*|*invalid_api_key*)
+      printf 'помилка входу в Claude — потрібен повторний вхід' ;;
+    *"429"*|*"rate limit"*|*"usage limit"*|*"weekly limit"*|*"ut of usage"*|*"hit your"*)
+      printf 'вичерпано ліміт Claude' ;;
+    *)
+      last=$(printf '%s' "$out" | grep -v '^[[:space:]]*$' | tail -n 1 | cut -c1-160)
+      printf 'помилка виконання%s' "${last:+ — $last}" ;;
+  esac
+}
+
 run_agent_task() {
   local file="$1" prompt="$2" out rc
   local workdir="${AGENT_TASK_DIR:-$HOME/.atarax/agent-task}"
@@ -266,8 +286,8 @@ ${prompt}"
   if [ $rc -ne 0 ]; then
     log_message "run $(basename "$file"): помилка виконання rc=$rc: $(printf '%s' "$out" | tail -c 200 | tr '\n' ' ')"
     # The owner hears about it rather than facing silence.
-    printf '⚠️ Автоматичне завдання не виконано (%s). Причина в журналі: %s' \
-      "$task_id" "$LOG"
+    printf '⚠️ Автоматичне завдання «%s» не виконано: %s.' \
+      "$task_id" "$(failure_reason "$rc" "$out")"
     return 0
   fi
   out=$(printf '%s' "$out" | sed -e 's/[[:space:]]*$//')
@@ -275,8 +295,7 @@ ${prompt}"
     # The occurrence is already spent by the time we get here, so an empty run
     # cannot be retried into silence — say so instead.
     log_message "run $(basename "$file") produced nothing"
-    printf '⚠️ Автоматичне завдання не виконано (%s). Причина в журналі: %s' \
-      "$task_id" "$LOG"
+    printf '⚠️ Автоматичне завдання «%s» не виконано: агент нічого не відповів.' "$task_id"
     return 0
   fi
   # The whole result: delivery below splits it into messages Telegram accepts.

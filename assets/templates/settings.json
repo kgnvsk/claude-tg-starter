@@ -31,7 +31,7 @@
       "Edit(/etc/claude-tg-starter/**)"
     ]
   },
-  "model": "claude-opus-5",
+  "model": "claude-opus-5-5[1m]",
   "skillListingBudgetFraction": 0.08,
   "skillListingMaxDescChars": 240,
   "hooks": {

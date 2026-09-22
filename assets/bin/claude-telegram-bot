@@ -157,8 +157,21 @@ if [ -x "$RESUME_HELPER" ]; then
 else
   echo "telegram launcher: session selector unavailable; starting fresh" >&2
 fi
+# The owner's model from settings.json goes on the command line: --resume
+# keeps the model the session started with and ignores the file, so the fleet
+# switch to Opus 5.5 left resumed bots on Opus 5 (Лилу, 22.09.2026). A missing
+# or malformed value adds nothing and the CLI keeps its own default.
+AGENT_MODEL=$(python3 -c '
+import json, re, sys
+try:
+    model = json.load(open(sys.argv[1], encoding="utf-8")).get("model")
+except Exception:
+    model = None
+if isinstance(model, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:\-\[\]]{0,79}", model):
+    print(model)
+' "$SETTINGS" 2>/dev/null) || AGENT_MODEL=""
 PERMISSION_MODE=""
 if [ "$(id -u)" -ne 0 ]; then
   PERMISSION_MODE="--permission-mode bypassPermissions"
 fi
-exec $HOME/.local/bin/claude $PERMISSION_MODE ${AGENT_EFFORT:+--effort "$AGENT_EFFORT"} ${RESUME_SESSION:+--resume "$RESUME_SESSION"} --channels plugin:telegram@claude-plugins-official
+exec $HOME/.local/bin/claude $PERMISSION_MODE ${AGENT_EFFORT:+--effort "$AGENT_EFFORT"} ${AGENT_MODEL:+--model "$AGENT_MODEL"} ${RESUME_SESSION:+--resume "$RESUME_SESSION"} --channels plugin:telegram@claude-plugins-official
