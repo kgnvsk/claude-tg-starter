@@ -593,6 +593,8 @@ type CorporateGatewayRuntime = {
     token: string,
     context: CorporateGatewayCallbackContext,
   ): Promise<CorporateGatewayPolicyResult>
+  approveResourcePreview(token: string, context: CorporateGatewayCallbackContext): Promise<CorporateGatewayPolicyResult>
+  cancelResourcePreview(token: string, context: CorporateGatewayCallbackContext): Promise<CorporateGatewayPolicyResult>
   previewPolicy(
     input: {
       subject: string
@@ -619,6 +621,7 @@ type CorporateGatewayActionResult =
 
 type CorporateGatewayPolicyResult =
   | { ok: true; version: number }
+  | { ok: true; resourceId: string; admissionState: 'active' | 'paused' | 'legacy' }
   | { ok: true; state: 'cancelled' }
   | { ok: false; reason: string }
 
@@ -1184,7 +1187,7 @@ async function sendCorporateText(
   threadId: number | null,
   replyTo: number | null,
   text: string,
-  options?: { actionToken?: string; policyToken?: string },
+  options?: { actionToken?: string; policyToken?: string; resourceToken?: string },
 ): Promise<number> {
   assertAllowedChat(chatId)
   const keyboard = options?.actionToken
@@ -1195,7 +1198,11 @@ async function sendCorporateText(
       ? new InlineKeyboard()
         .text('✅ Підтвердити', `corp-policy:approve:${options.policyToken}`)
         .text('❌ Скасувати', `corp-policy:cancel:${options.policyToken}`)
-      : undefined
+      : options?.resourceToken
+        ? new InlineKeyboard()
+          .text('✅ Підтвердити', `corp-resource:approve:${options.resourceToken}`)
+          .text('❌ Скасувати', `corp-resource:cancel:${options.resourceToken}`)
+        : undefined
   const sent = await bot.api.sendMessage(chatId, text, {
     ...(threadId != null ? { message_thread_id: threadId } : {}),
     ...(replyTo != null ? { reply_parameters: { message_id: replyTo, allow_sending_without_reply: true } } : {}),
@@ -3809,9 +3816,10 @@ bot.command('status', async ctx => {
 const CALLBACK_UUID = '([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})'
 const CORPORATE_ACTION_CALLBACK_RE = new RegExp(`^corp-action:(approve|cancel):${CALLBACK_UUID}$`)
 const CORPORATE_POLICY_CALLBACK_RE = new RegExp(`^corp-policy:(approve|cancel):${CALLBACK_UUID}$`)
+const CORPORATE_RESOURCE_CALLBACK_RE = new RegExp(`^corp-resource:(approve|cancel):${CALLBACK_UUID}$`)
 
 function corporateCallbackLabel(
-  kind: 'action' | 'policy',
+  kind: 'action' | 'policy' | 'resource',
   result: CorporateGatewayActionResult | CorporateGatewayPolicyResult,
 ): string {
   if (result.ok) {
@@ -3822,7 +3830,7 @@ function corporateCallbackLabel(
       }
       return `✅ Виконано\nРезультат: ${result.resourceUrl ?? result.receiptId}`
     }
-    return kind === 'action' ? '✅ Виконано' : '✅ Права оновлено'
+    return kind === 'action' ? '✅ Виконано' : kind === 'resource' ? '✅ Ресурс оновлено' : '✅ Права оновлено'
   }
   if (result.reason === 'actor') return 'Немає доступу.'
   if (result.reason === 'expired') return 'Час підтвердження минув.'
@@ -3841,9 +3849,10 @@ bot.on('callback_query:data', async ctx => {
   const data = ctx.callbackQuery.data
   const action = CORPORATE_ACTION_CALLBACK_RE.exec(data)
   const policy = CORPORATE_POLICY_CALLBACK_RE.exec(data)
-  if (action || policy) {
-    const kind = action ? 'action' as const : 'policy' as const
-    const match = action ?? policy!
+  const resource = CORPORATE_RESOURCE_CALLBACK_RE.exec(data)
+  if (action || policy || resource) {
+    const kind = action ? 'action' as const : policy ? 'policy' as const : 'resource' as const
+    const match = action ?? policy ?? resource!
     const behavior = match[1] as 'approve' | 'cancel'
     const token = match[2]!
     const message = ctx.callbackQuery.message
@@ -3894,7 +3903,11 @@ bot.on('callback_query:data', async ctx => {
       ? behavior === 'approve'
         ? await corporate.confirmAction(token, callbackContext)
         : await corporate.cancelAction(token, callbackContext)
-      : behavior === 'approve'
+      : kind === 'resource'
+        ? behavior === 'approve'
+          ? await corporate.approveResourcePreview(token, callbackContext)
+          : await corporate.cancelResourcePreview(token, callbackContext)
+        : behavior === 'approve'
         ? await corporate.approvePolicyPreview(token, callbackContext)
         : await corporate.cancelPolicyPreview(token, callbackContext)
     const label = corporateCallbackLabel(kind, result)
@@ -4421,8 +4434,13 @@ async function routeInbound(
     : `${chat_id}:${Date.now()}:${randomBytes(6).toString('hex')}`
   const ownerDirect = ctx.chat?.type === 'private' && chat_id === OWNER_CHAT_ID
   const isolationActivated = readCorporateIsolationActivated()
+  const configuredSuperadmins = loadAccess().superadmins
+  // An ordinary bot still shares the owner's Claude session. Once a business
+  // assistant is configured, never fall back to that session for anyone else:
+  // an installation awaiting corporate activation must fail closed instead.
+  const roleIsolationRequired = Array.isArray(configuredSuperadmins) && configuredSuperadmins.length > 0
 
-  if (ownerDirect || (!isolationActivated && !CORPORATE_ENABLED)) {
+  if (ownerDirect || (!isolationActivated && !CORPORATE_ENABLED && !roleIsolationRequired)) {
     await legacyInbound(deliveryId)
     return
   }

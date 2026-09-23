@@ -28,10 +28,14 @@ UPSTREAM_SERVER_SHA256 = (
 )
 UPSTREAM_PACKAGE_START = "bun install --no-summary 1>&2 && bun server.ts"
 GOLDEN_SERVER_SHA256 = (
-    "276dc32e0f36f7050177e5f345acfece6d9a4c8c7e9339e3f68f8d94ee011b45"
+    "14be9b96df91fe248c3386713ac463be68e0bbad87632760536d2ddb6a6b73b2"
 )
 PREVIOUS_GOLDEN_SERVER_SHA256S = frozenset(
     {
+        # The golden before fail-closed superadmin routing.
+        "f2c7f6068704518bc9ba2e70f2295a20ff694f133c7062621f85fe9d23b9031f",
+        # The golden before superadmin business setup and resource confirmations.
+        "276dc32e0f36f7050177e5f345acfece6d9a4c8c7e9339e3f68f8d94ee011b45",
         # The golden before the receiver kept access.json keys it does not model (superadmins).
         "613f9c6ddfbe391cf6a78f76e2163a16958d2ae4e57d97d906169c890413d79d",
         # The golden before a group voice message could bind late to the mention that followed.

@@ -381,6 +381,22 @@ function isInstalledAgentSubject(subject) {
 function isValidSubject(subject) {
   return subject === AGENT_DEFAULT_SUBJECT || isInstalledAgentSubject(subject) || /^user:\d+$/.test(subject) || /^group:-?\d+$/.test(subject) || /^topic:-?\d+:\d+$/.test(subject);
 }
+function expandFullAccess(catalog, resources) {
+  const grants = [];
+  for (const definition of Object.values(catalog)) {
+    if (!definition.delegable || definition.namedPersonOnly)
+      continue;
+    if (!definition.requiresResource) {
+      grants.push({ capabilityId: definition.id, resourceId: null });
+      continue;
+    }
+    for (const resource of resources) {
+      if (resource.connector === definition.adapter && resource.capabilityIds.includes(definition.id))
+        grants.push({ capabilityId: definition.id, resourceId: resource.id });
+    }
+  }
+  return grants.sort((left, right) => left.capabilityId.localeCompare(right.capabilityId) || (left.resourceId ?? "").localeCompare(right.resourceId ?? ""));
+}
 
 // modules/telegram-corporate/protocol.ts
 var malformed = { ok: false, reason: "malformed" };
@@ -617,9 +633,11 @@ class CapabilityStore {
   db;
   primaryOwnerId;
   catalog;
+  isSuperadmin;
   constructor(path, options) {
     this.primaryOwnerId = options.primaryOwnerId;
     this.catalog = options.catalog ?? CAPABILITY_CATALOG;
+    this.isSuperadmin = options.isSuperadmin ?? (() => false);
     this.db = new Database(path, { create: true });
     this.db.run("PRAGMA journal_mode=WAL");
     this.db.run("PRAGMA busy_timeout=5000");
@@ -636,10 +654,31 @@ class CapabilityStore {
       this.db.exec("ALTER TABLE corporate_resources ADD COLUMN revision INTEGER NOT NULL DEFAULT 1");
     }
   }
+  isVerifiedSuperadmin(actorUserId) {
+    return actorUserId !== this.primaryOwnerId && /^[1-9]\d{0,19}$/.test(actorUserId) && this.isSuperadmin(actorUserId);
+  }
+  businessAdministrator(actorUserId) {
+    return actorUserId === this.primaryOwnerId || this.isVerifiedSuperadmin(actorUserId);
+  }
+  businessSubjectAllowed(actorUserId, subject) {
+    return this.businessAdministrator(actorUserId) && (actorUserId === this.primaryOwnerId || subject !== `user:${this.primaryOwnerId}`);
+  }
+  businessResourceVisible(actorUserId, resource) {
+    if (actorUserId === this.primaryOwnerId)
+      return true;
+    return resource.connector !== "memory" || resource.config.corporateKey === "company" || resource.config.corporateKey === `user:${actorUserId}`;
+  }
+  businessResources(actorUserId) {
+    if (!this.businessAdministrator(actorUserId))
+      return [];
+    return this.listResources().filter((resource) => this.businessResourceVisible(actorUserId, resource));
+  }
   registerResource(resource, actorUserId, now) {
-    if (actorUserId !== this.primaryOwnerId) {
-      throw new Error("only the primary owner can register a resource");
+    if (!this.businessAdministrator(actorUserId)) {
+      throw new Error("only the owner or a superadministrator can register a resource");
     }
+    if (!this.businessResourceVisible(actorUserId, resource))
+      throw new Error("owner private resource");
     this.validateResource(resource);
     const capabilityIds = [...new Set(resource.capabilityIds)].sort();
     this.db.transaction(() => {
@@ -670,13 +709,17 @@ class CapabilityStore {
     return row ? { id, label: row.label, connector: row.connector, capabilityIds: JSON.parse(row.capabilities), config: JSON.parse(row.config) } : null;
   }
   createResourcePreview(input, actorUserId, expiresAt, now) {
-    if (actorUserId !== this.primaryOwnerId)
-      throw new Error("only the primary owner can preview a resource");
+    if (!this.businessAdministrator(actorUserId))
+      throw new Error("only the owner or a superadministrator can preview a resource");
     if (!Number.isSafeInteger(expiresAt) || expiresAt <= now)
       throw new Error("invalid resource preview expiry");
     return this.db.transaction(() => {
       const current = typeof input?.id === "string" ? this.resourceForControl(input.id) : null;
+      if (current && !this.businessResourceVisible(actorUserId, current))
+        throw new Error("owner private resource");
       const resource = resourceFromControl(input, current);
+      if (resource && !this.businessResourceVisible(actorUserId, resource))
+        throw new Error("owner private resource");
       if (resource)
         this.validateResource(resource);
       const token = randomUUID(), baseRevision = this.resourceRevision(input.id);
@@ -693,7 +736,7 @@ class CapabilityStore {
   resourcePreviewError(row, actor, now, state) {
     if (!row)
       return { ok: false, reason: "missing" };
-    if (actor !== this.primaryOwnerId || row.requestedBy !== actor)
+    if (!this.businessAdministrator(actor) || row.requestedBy !== actor)
       return { ok: false, reason: "actor" };
     if (row.state !== state)
       return { ok: false, reason: "used" };
@@ -795,6 +838,8 @@ class CapabilityStore {
   integrationAuthorizationKey(identity) {
     if (identity.chatType !== "private" || !/^[1-9]\d{0,15}$/.test(identity.userId) || identity.chatId !== identity.userId)
       return null;
+    if (this.isVerifiedSuperadmin(identity.userId))
+      return `superadmin:${identity.userId}`;
     const subject = `user:${identity.userId}`;
     const policy = this.policyRow(subject);
     if (policy == null || policy.version < 1 || !JSON.parse(policy.grantsJson).some((grant) => grant.capabilityId === "integrations.manage" && grant.resourceId == null))
@@ -806,7 +851,15 @@ class CapabilityStore {
     if (!/^\d+$/.test(actorUserId))
       return { ...policy, grants: [] };
     if (!isSharedSubject(subject)) {
-      return subject === `user:${actorUserId}` ? policy : { ...policy, grants: [] };
+      if (subject !== `user:${actorUserId}`)
+        return { ...policy, grants: [] };
+      if (this.isVerifiedSuperadmin(actorUserId)) {
+        return { ...policy, version: Math.max(1, policy.version), grants: [
+          ...expandFullAccess(this.catalog, this.businessResources(actorUserId)),
+          { capabilityId: "integrations.manage", resourceId: null }
+        ] };
+      }
+      return policy;
     }
     const actor = this.resolve(`user:${actorUserId}`);
     return { ...policy, grants: policy.grants.filter((grant) => this.catalog[grant.capabilityId]?.sharedAllowed === true && actor.grants.some((personal) => personal.capabilityId === grant.capabilityId && personal.resourceId === grant.resourceId)) };
@@ -821,15 +874,20 @@ class CapabilityStore {
     return grants.filter((grant) => grant.resourceId == null || activeResources.has(grant.resourceId));
   }
   createPolicyPreview(input, now) {
-    if (input.requestedBy !== this.primaryOwnerId) {
-      throw new Error("only the primary owner can create a policy preview");
+    if (!this.businessSubjectAllowed(input.requestedBy, input.subject)) {
+      throw new Error("only the owner or a superadministrator can create a business policy preview");
     }
     if (!isValidSubject(input.subject))
       throw new Error("invalid policy subject");
     if (!Number.isSafeInteger(input.expiresAt) || input.expiresAt <= now) {
       throw new Error("policy preview expiry must be in the future");
     }
-    const proposedGrants = sortedUniqueGrants(input.proposedGrants);
+    const visibleResources = new Set(this.businessResources(input.requestedBy).map((resource) => resource.id));
+    const requested = sortedUniqueGrants(input.proposedGrants);
+    if (input.requestedBy !== this.primaryOwnerId && requested.some((grant) => grant.resourceId != null && !visibleResources.has(grant.resourceId)))
+      throw new Error("owner private resource");
+    const protectedGrants = input.requestedBy === this.primaryOwnerId ? [] : this.resolve(input.subject).grants.filter((grant) => grant.resourceId != null && !visibleResources.has(grant.resourceId));
+    const proposedGrants = sortedUniqueGrants([...requested, ...protectedGrants]);
     this.validateGrants(input.subject, proposedGrants);
     const baseVersion = this.resolve(input.subject).version;
     const token = randomUUID();
@@ -858,7 +916,7 @@ class CapabilityStore {
       const row = this.preview(token);
       if (row == null)
         return { ok: false, reason: "missing" };
-      if (actorUserId !== this.primaryOwnerId || actorUserId !== row.requestedBy) {
+      if (!this.businessSubjectAllowed(actorUserId, row.subject) || actorUserId !== row.requestedBy) {
         return { ok: false, reason: "actor" };
       }
       if (!this.validAgentMessage(row, message))
@@ -906,7 +964,7 @@ class CapabilityStore {
       const row = this.preview(token);
       if (row == null)
         return { ok: false, reason: "missing" };
-      if (actorUserId !== this.primaryOwnerId || actorUserId !== row.requestedBy) {
+      if (!this.businessSubjectAllowed(actorUserId, row.subject) || actorUserId !== row.requestedBy) {
         return { ok: false, reason: "actor" };
       }
       if (!this.validAgentMessage(row, message))
@@ -971,14 +1029,14 @@ class CapabilityStore {
     return actor.grants.some((grant) => grant.capabilityId === request.capability && grant.resourceId === request.resourceId) && group.grants.some((grant) => grant.capabilityId === readId && grant.resourceId === request.resourceId) ? group.version : null;
   }
   delegatedMetaActionAuthorized(input) {
-    const key = `user:${input.actorUserId}:${input.policyVersion}`;
+    const key = this.integrationAuthorizationKey({ chatType: "private", chatId: input.chatId, userId: input.actorUserId });
     const args = input.arguments;
-    return input.subject === `user:${input.actorUserId}` && input.chatId === input.actorUserId && input.operation === "meta.run" && input.resourceId === "delegated:meta" && input.groupOrigin == null && this.integrationAuthorizationKey({ chatType: "private", chatId: input.chatId, userId: input.actorUserId }) === key && args != null && typeof args === "object" && !Array.isArray(args) && Object.keys(args).sort().join(",") === "args,authorizationKey,confirmationToken,connectionKey" && Array.isArray(args.args) && args.args.length > 0 && args.args.every((value) => typeof value === "string") && args.authorizationKey === key && typeof args.connectionKey === "string" && args.connectionKey.trim().length > 0 && typeof args.confirmationToken === "string" && args.confirmationToken.trim().length > 0;
+    return key !== null && input.subject === `user:${input.actorUserId}` && input.chatId === input.actorUserId && input.operation === "meta.run" && input.resourceId === "delegated:meta" && input.groupOrigin == null && this.integrationAuthorizationKey({ chatType: "private", chatId: input.chatId, userId: input.actorUserId }) === key && args != null && typeof args === "object" && !Array.isArray(args) && Object.keys(args).sort().join(",") === "args,authorizationKey,confirmationToken,connectionKey" && Array.isArray(args.args) && args.args.length > 0 && args.args.every((value) => typeof value === "string") && args.authorizationKey === key && typeof args.connectionKey === "string" && args.connectionKey.trim().length > 0 && typeof args.confirmationToken === "string" && args.confirmationToken.trim().length > 0;
   }
   createActionPreview(input, now) {
     if (input.subject !== `user:${input.actorUserId}` || input.chatId !== input.actorUserId || input.expiresAt <= now)
       throw new Error("write previews require the verified private actor");
-    const policy = this.resolve(input.subject);
+    const policy = this.resolveForActor(input.subject, input.actorUserId);
     if (policy.version !== input.policyVersion)
       throw new Error("stale action policy");
     const definition = this.catalog[input.capability];
@@ -1130,7 +1188,7 @@ class CapabilityStore {
           return { ok: false, reason: "stale" };
         }
       }
-      const policy = this.resolve(row.subject);
+      const policy = this.resolveForActor(row.subject, actorUserId);
       const definition = this.catalog[row.capabilityId];
       const resource = this.getResource(row.resourceId);
       if (!delegated && (policy.version !== row.policyVersion || definition == null || !definition.requiresConfirmation || !definition.operations.includes(row.operation) || resource == null || resource.connector !== definition.adapter || !resource.capabilityIds.includes(row.capabilityId) || !policy.grants.some((grant) => grant.capabilityId === row.capabilityId && grant.resourceId === row.resourceId))) {
