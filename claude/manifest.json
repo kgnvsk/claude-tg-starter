@@ -7,7 +7,7 @@
     "local-foundation-v1"
   ],
   "source": "codex/starter/product.json",
-  "sourceRevision": "e419629a9de0a92524802916fcdfb81d0c15f1ce",
+  "sourceRevision": "a942848362931350d3bc5c968008ba42cc3d457e",
   "sourceDirty": false,
   "features": [
     "browser"
@@ -58,8 +58,8 @@
     "native/templates/ROLE.md": "8c0210504de2b8554c69097a8de2a4360800aa9909942534e8d4f4d0fa12cf5d",
     "assets/templates/USER.md": "0175b8704a55cb32f951a53a4d6f1522b950299e3ec5b7c700299258cc8b4e09",
     "assets/templates/MEMORY.md": "465d06579da005d53a35557a9a05075b40c887d8a4cc6ada5653a80e5442cfa7",
-    "assets/agents/worker.md": "f63e5b24ae42791abccfaa2f6ee07ccb013e7dee31b6dff5a4de549d001e23c2",
-    "assets/agents/researcher.md": "520cb8590e94a81923f5663cedf92976f50f0dcf705045b34496efc897859395",
+    "assets/agents/worker.md": "c14c580a0600f4e921882466c606b63e90c5c364b33207e15d2b3d4a52c8100e",
+    "assets/agents/researcher.md": "d3781912006696258dc84032c2bd56ef8bbadb91848c04f793da35e55b4d2390",
     "codex/native-lifecycle": "6ca0752158b58aa9a4353841a48e9614b355639267d89682f726d9b5cbcf3720",
     "assets/bin/agent-backup": "c74a4f09af023421b040f519c1225ea42c76eab174f17cd5a384aa779105bb07",
     "assets/bin/agent-backup-chat": "de2ed466a499d0b19d5db1e9405f6a6786da74fc9626509011ff85d38e96921a",
@@ -147,8 +147,8 @@
     "modules/telegram-corporate/worker.ts": "69b48b752f712ce4d5dd42100b9d51c40b4eca3f712fd24ce0af7905cb4f8f47"
   },
   "files": {
-    "home/.claude/agents/researcher.md": "520cb8590e94a81923f5663cedf92976f50f0dcf705045b34496efc897859395",
-    "home/.claude/agents/worker.md": "f63e5b24ae42791abccfaa2f6ee07ccb013e7dee31b6dff5a4de549d001e23c2",
+    "home/.claude/agents/researcher.md": "d3781912006696258dc84032c2bd56ef8bbadb91848c04f793da35e55b4d2390",
+    "home/.claude/agents/worker.md": "c14c580a0600f4e921882466c606b63e90c5c364b33207e15d2b3d4a52c8100e",
     "home/.claude/memory/MEMORY.md": "465d06579da005d53a35557a9a05075b40c887d8a4cc6ada5653a80e5442cfa7",
     "home/.claude/memory/USER.md": "0175b8704a55cb32f951a53a4d6f1522b950299e3ec5b7c700299258cc8b4e09",
     "home/.claude/skills/backup-recovery/SKILL.md": "5cae93e1e72939a9e46eb1a9a78733294e1823d8e59b533576de7042a33dc90d",
