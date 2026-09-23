@@ -10,6 +10,9 @@
 #   RUN=1  → the body is a task for the agent, not a message for the owner:
 #            run it headless and send the RESULT. Everything else (repeat,
 #            quiet hours, until, dedup) behaves exactly the same.
+#   QUIET=1 (with RUN=1) → the task delivers by itself with tg-send/tg-send-file,
+#            e.g. into group topics; its returned text only goes to the log, and
+#            a failure notice goes to the owner's private chat, not into CHAT.
 #   TASK=<stable_task_identifier>
 #   REPEAT_SECONDS=<positive_interval>
 #   TIMEZONE=<safe_IANA_timezone>
@@ -278,10 +281,26 @@ run_agent_task() {
   # The task text was written for a chat, so it often says "send it to X".
   # Sending from here is closed on purpose; the agent hears where its answer
   # goes instead of reporting a blocked tg-send as the result (Menni, 03.09).
-  prompt="Це автоматичне завдання планувальника. Напиши лише текст результату: планувальник сам доставить його в чат ${chat}. Файли надсилай через tg-send-file.
+  # QUIET=1 is the other contract: the task sends by itself, usually into group
+  # topics this worker knows nothing about, and nothing it returns reaches CHAT.
+  # Without it Пара's topic reports fell into the group's General (22.09.2026).
+  local quiet=0
+  [ "${quiet_run:-}" = "1" ] && quiet=1
+  if [ "$quiet" -eq 1 ]; then
+    prompt="Це автоматичне завдання планувальника. Результат доставляй сам через tg-send і tg-send-file туди, куди сказано в завданні, мовою завдання. Текст, який ти повернеш, у чат не піде.
 
 ${prompt}"
-  out=$(cd "$workdir" && ATARAX_SUPPRESS_TELEGRAM=1 ATARAX_TASK_DELIVERY=1 $limit "$HOME/.local/bin/claude" -p --output-format text <<<"$prompt" 2>&1)
+  else
+    prompt="Це автоматичне завдання планувальника. Напиши лише текст результату мовою завдання: планувальник сам доставить його в чат ${chat}. Файли надсилай через tg-send-file.
+
+${prompt}"
+  fi
+  # A task started from the live session must not settle that session's pending
+  # request with its own sends: it runs without the service's delivery binding.
+  out=$(cd "$workdir" &&
+    export TG_DELIVERY_STAMP= TG_DELIVERY_ID= TG_DELIVERY_TASK_ID= TG_DELIVERY_PHASE=final \
+      ATARAX_TASK_QUIET="$quiet" ATARAX_TASK_ID="${task_id:-$(basename "$file" .rem)}" ATARAX_TASK_OCCURRENCE="$epoch" &&
+    ATARAX_SUPPRESS_TELEGRAM=1 ATARAX_TASK_DELIVERY=1 $limit "$HOME/.local/bin/claude" -p --output-format text <<<"$prompt" 2>&1)
   rc=$?
   if [ $rc -ne 0 ]; then
     log_message "run $(basename "$file"): помилка виконання rc=$rc: $(printf '%s' "$out" | tail -c 200 | tr '\n' ' ')"
@@ -291,6 +310,10 @@ ${prompt}"
     return 0
   fi
   out=$(printf '%s' "$out" | sed -e 's/[[:space:]]*$//')
+  if [ "$quiet" -eq 1 ]; then
+    log_message "quiet $(basename "$file"): output withheld from chat: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-200)"
+    return 3
+  fi
   if [ -z "$out" ]; then
     # The occurrence is already spent by the time we get here, so an empty run
     # cannot be retried into silence — say so instead.
@@ -382,6 +405,7 @@ for f in "$REM_DIR"/*.rem; do
   chat=$(header_value "$f" CHAT)
   parse=$(header_value "$f" PARSE)
   run_mode=$(header_value "$f" RUN)
+  quiet_run=$(header_value "$f" QUIET)
   # Read while the file is still there: a RUN=1 task leaves the queue before it
   # runs, and its failure message still has to name the task.
   task_id=$(header_value "$f" TASK)
@@ -543,11 +567,23 @@ for f in "$REM_DIR"/*.rem; do
       log_message "skip $(basename "$f"): RUN occurrence was not durably settled"
       continue
     fi
-    body=$(run_agent_task "$f" "$body") || {
-      log_message "FAILED to run $(basename "$f"): agent returned nothing"
-      continue
-    }
+    body=$(run_agent_task "$f" "$body")
+    case $? in
+      0) ;;
+      3) continue ;;  # a quiet task delivered by itself; the log keeps its words
+      *) log_message "FAILED to run $(basename "$f"): agent returned nothing"
+         continue ;;
+    esac
     parse=text
+    if [ "${quiet_run:-}" = "1" ]; then
+      # Only a failure notice is left, and it is for the owner, not for the group
+      # whose topics the task writes into.
+      chat=$(grep '^OWNER_CHAT_ID=' "$PROFILE_FILE" 2>/dev/null | head -n1 | cut -d= -f2- | tr -d "\"'")
+      if [ -z "$chat" ]; then
+        log_message "quiet $(basename "$f"): failure notice not sent, no OWNER_CHAT_ID"
+        continue
+      fi
+    fi
   fi
   # Every piece must land, in order; the first refusal stops the rest and is
   # what the retry/give-up path below sees.

@@ -1446,13 +1446,27 @@ def native_background_work(events: list[dict], turn_events: list[dict], delivery
                 del tasks[task.group(1)]
                 read_uuid = event.get('uuid')
         for call in content_blocks(event):
-            if not isinstance(call, dict) or call.get('type') != 'tool_use' or call.get('name') != 'TaskOutput':
+            if not isinstance(call, dict) or call.get('type') != 'tool_use' or call.get('name') not in {'TaskOutput', 'TaskStop'}:
                 continue
             parameters = call.get('input') if isinstance(call.get('input'), dict) else {}
-            task_id = parameters.get('task_id')
+            task_id = parameters.get('task_id') or parameters.get('shell_id')
             bound = tasks.get(task_id)
             result, native = call_result(event, call)
             if not bound or index <= bound[2] or not result:
+                continue
+            if call.get('name') == 'TaskStop':
+                # A task the model stopped itself has nothing left to wait for; no
+                # callback may ever come for it (Пара, 23.09.2026: eight blocks).
+                if not native:
+                    try:
+                        value = json.loads(text_of(result.get('content')))
+                        native = value if isinstance(value, dict) else {}
+                    except (ValueError, TypeError):
+                        pass
+                if (result.get('is_error') is not True and native.get('task_id') == task_id
+                        and str(native.get('message', '')).startswith('Successfully stopped task')):
+                    del tasks[task_id]
+                    read_uuid = event.get('uuid')
                 continue
             if result.get('is_error') is True:
                 # A service restart may have killed its child. Native absence
@@ -1477,19 +1491,29 @@ def native_background_work(events: list[dict], turn_events: list[dict], delivery
 
 
 def native_task_deferred(hook: dict, delivery_id: str | None, task_ids: list[str]) -> bool:
-    """A confirmed progress receipt may defer only this exact native obligation."""
-    if not delivery_id or len(task_ids) != 1 or not hook.get('session_id') or not os.environ.get('TG_DELIVERY_STAMP'):
+    """A confirmed progress receipt may defer the request to one of its own pending native tasks.
+
+    The receipt holds one task. With several, that task's callback reopens the
+    request, and the rest are checked again then (Пара, 23.09.2026: two workers
+    for one request, eight blocks while exactly one task was required).
+    """
+    if not delivery_id or not task_ids or not hook.get('session_id') or not os.environ.get('TG_DELIVERY_STAMP'):
         return False
+    # The deferral must belong to the newest turn. Registration ties the receipt back
+    # to the turn that launched the task (response_turn_id=NULL), so progress for an
+    # agent resumed in its callback turn counts by time: a callback resets the row to
+    # pending when that turn opens (Пара, 23.09.2026: seven blocks for the same progress).
     try:
         with sqlite3.connect(f"file:{telegram_state_dir() / 'messages.db'}?mode=ro", uri=True, timeout=0.2) as conn:
             return conn.execute(
                 'SELECT 1 FROM delivery_results r JOIN delivery_sessions s ON s.session_id=r.session_id '
-                'JOIN delivery_turns t ON t.turn_id=coalesce(r.response_turn_id,r.turn_id) '
-                "WHERE r.delivery_id=? AND r.session_id=? AND r.stamp=? AND r.state='deferred' AND r.task_id=? "
+                'JOIN delivery_turns t ON t.turn_id=(SELECT max(turn_id) FROM delivery_turns WHERE session_id=r.session_id) '
+                "WHERE r.delivery_id=? AND r.session_id=? AND r.stamp=? AND r.state='deferred' "
+                f"AND r.task_id IN ({','.join('?' * len(task_ids))}) "
                 'AND r.acknowledged_at IS NOT NULL AND r.request_payload IS NOT NULL '
                 'AND s.stamp=r.stamp AND t.session_id=r.session_id '
-                'AND t.turn_id=(SELECT max(turn_id) FROM delivery_turns WHERE session_id=r.session_id)',
-                (delivery_id, hook['session_id'], os.environ['TG_DELIVERY_STAMP'], task_ids[0]),
+                'AND (t.turn_id=coalesce(r.response_turn_id,r.turn_id) OR r.updated_at>=t.opened_at)',
+                (delivery_id, hook['session_id'], os.environ['TG_DELIVERY_STAMP'], *task_ids),
             ).fetchone() is not None
     except sqlite3.Error:
         return False
@@ -1746,7 +1770,7 @@ def evaluate_stop(hook: dict) -> None:
             f'This Telegram request still has unread native background work: {task_ids}. '
             f'Keep the original delivery_id={delivery_id}; inspect the existing task before any continuation and do not repeat completed actions. '
             'A launch acknowledgement or promise is not the final result. Read the existing task result, '
-            'or use the Telegram reply tool with phase=progress, this exact delivery_id and the existing task_id '
+            'or use the Telegram reply tool with phase=progress, this exact delivery_id and the ID of one of these tasks '
             'to durably defer this request until its native callback. Do not use phase=final or no_reply before reading the result.')
         return
     if native_work['read_uuid']:

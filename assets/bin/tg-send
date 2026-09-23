@@ -252,7 +252,10 @@ def main(argv):
     # escalate to another delivery channel — that escalation is what leaked rewrite
     # drafts to the owner in July. And no "ok", because an agent reading "ok: True"
     # reports the owner as answered when nothing was sent.
-    if os.environ.get("ATARAX_SUPPRESS_TELEGRAM") == "1":
+    # The one exception is a scheduled QUIET=1 task: it delivers by itself (group
+    # topics included) and the scheduler sends nothing of its own.
+    quiet_task = os.environ.get("ATARAX_TASK_QUIET") == "1"
+    if os.environ.get("ATARAX_SUPPRESS_TELEGRAM") == "1" and not quiet_task:
         print(
             "not delivered: this session does not send to Telegram. "
             "Nothing was sent, and no other channel should be tried — "
@@ -308,7 +311,9 @@ def main(argv):
             if ok and watchdog_credit:
                 part_context = (context if index == len(starts) - 1 else
                                 {**context, "phase": "progress", "task_id": None})
-                if not record_outbound(chat_id, chunk, payload, context=part_context):
+                task = ((os.environ.get("ATARAX_TASK_ID", ""), os.environ.get("ATARAX_TASK_OCCURRENCE", ""))
+                        if quiet_task else ("", ""))
+                if not record_outbound(chat_id, chunk, payload, *task, context=part_context):
                     print("tg-send: history_write_failed; message will not be resent", file=sys.stderr)
         except Exception as e:
             print("tg-send error:", type(e).__name__)

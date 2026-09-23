@@ -302,12 +302,9 @@ def require_repository() -> None:
     git_path = VAULT / ".git"
     if git_path.is_symlink() or not git_path.is_dir():
         raise BackupError("repository-missing")
-    branch = require_success(
-        git("symbolic-ref", "--quiet", "--short", "HEAD"),
-        "branch-invalid",
-    )
-    if decoded(branch) != "main":
-        raise BackupError("branch-invalid")
+    # Any local branch: the checked revision is always pushed to refs/heads/main,
+    # and install-core's `git init` leaves vaults on master (Пара, 23.09.2026).
+    require_success(git("symbolic-ref", "--quiet", "HEAD"), "branch-invalid")
 
 
 def git_config_values(name: str) -> list[str]:
@@ -736,6 +733,9 @@ def push_head(remote: str, environment: dict[str, str], revision: str) -> None:
 
 
 def run_backup() -> dict:
+    # A box where nobody set a backup up says exactly that, before any repository check.
+    if os.environ.get("AGENT_BACKUP_TESTING") != "1" and load_state()["remoteIdentity"] is None:
+        raise BackupError("not-configured")
     require_repository()
     clean_index()
     remote, identity = remote_identity()
@@ -784,6 +784,9 @@ def run_backup() -> dict:
 
 
 def backup_status() -> dict:
+    # A box where nobody set a backup up says exactly that, before any repository check.
+    if os.environ.get("AGENT_BACKUP_TESTING") != "1" and load_state()["remoteIdentity"] is None:
+        raise BackupError("not-configured")
     require_repository()
     remote, identity = remote_identity()
     state = load_state()

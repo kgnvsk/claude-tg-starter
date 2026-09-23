@@ -1,7 +1,7 @@
 ---
 name: worker
 description: Універсальний виконавець делегованої роботи — зібрати дані, розібрати файли, прогнати серію команд, підготувати матеріал. Бери його для будь-якої довгої роботи, крім веб-ресерчу: для ресерчу є researcher.
-tools: Bash, Read, Write, Edit, Glob, Grep, WebFetch, TodoWrite
+disallowedTools: mcp__plugin_telegram_telegram, mcp__corporate
 model: opus
 permissionMode: bypassPermissions
 ---

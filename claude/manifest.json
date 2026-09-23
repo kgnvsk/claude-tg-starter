@@ -7,7 +7,7 @@
     "local-foundation-v1"
   ],
   "source": "codex/starter/product.json",
-  "sourceRevision": "c4fa5a862f27ef5d2463e198d9ab500d547a40fe",
+  "sourceRevision": "ea8c78e6ac14431a5b5c5bbfdfa18a2363c121d2",
   "sourceDirty": false,
   "features": [
     "browser"
@@ -58,7 +58,7 @@
     "native/templates/ROLE.md": "8c0210504de2b8554c69097a8de2a4360800aa9909942534e8d4f4d0fa12cf5d",
     "assets/templates/USER.md": "0175b8704a55cb32f951a53a4d6f1522b950299e3ec5b7c700299258cc8b4e09",
     "assets/templates/MEMORY.md": "465d06579da005d53a35557a9a05075b40c887d8a4cc6ada5653a80e5442cfa7",
-    "assets/agents/worker.md": "c14c580a0600f4e921882466c606b63e90c5c364b33207e15d2b3d4a52c8100e",
+    "assets/agents/worker.md": "dc587315b55cb42800b1835a6e9d15dd118f8749b51b1bb3db37f1f77dbcdb16",
     "assets/agents/researcher.md": "d3781912006696258dc84032c2bd56ef8bbadb91848c04f793da35e55b4d2390",
     "codex/native-lifecycle": "6ca0752158b58aa9a4353841a48e9614b355639267d89682f726d9b5cbcf3720",
     "assets/bin/agent-backup": "c74a4f09af023421b040f519c1225ea42c76eab174f17cd5a384aa779105bb07",
@@ -70,7 +70,7 @@
     "assets/bin/agent-full-backup": "12c8f25803538475e6e06cccc092cc9a83c5b9c593d15e77c3beabd20cf94a60",
     "assets/bin/agent-full-restore": "a6039676304611c59e40e12c97d22b9ae52274be3d14afe1f3b538c24efdd3c8",
     "assets/bin/agent-full-snapshot": "7ef8f06434da28caf3aa72e0c6436f390050cf35e981b142bc5ffcbae6239f54",
-    "assets/bin/agent-github-backup": "aecb12222f61453c9bff3aa162b3533a4455415ffa6993a522593cb7d8dd2cb7",
+    "assets/bin/agent-github-backup": "709c331a33925462fc2f74d6e41f2f720444129bf01e135bf2914bbb43ca7f4c",
     "assets/bin/agent-goal": "5a6b434b195f9eda4790635e563091d7623ae341baf6f60e033e022d820f1bbb",
     "assets/bin/agent-provider-run": "b0d5700a1a356231b9d5f264db1c08794ad5cc5e30b32b9f83eaed4d030660e2",
     "assets/bin/agent_connections.py": "83bc42d8140c5f4a0f623b8ae4e1eae2318a3134726f5c50fda202cce0b78296",
@@ -148,7 +148,7 @@
   },
   "files": {
     "home/.claude/agents/researcher.md": "d3781912006696258dc84032c2bd56ef8bbadb91848c04f793da35e55b4d2390",
-    "home/.claude/agents/worker.md": "c14c580a0600f4e921882466c606b63e90c5c364b33207e15d2b3d4a52c8100e",
+    "home/.claude/agents/worker.md": "dc587315b55cb42800b1835a6e9d15dd118f8749b51b1bb3db37f1f77dbcdb16",
     "home/.claude/memory/MEMORY.md": "465d06579da005d53a35557a9a05075b40c887d8a4cc6ada5653a80e5442cfa7",
     "home/.claude/memory/USER.md": "0175b8704a55cb32f951a53a4d6f1522b950299e3ec5b7c700299258cc8b4e09",
     "home/.claude/skills/backup-recovery/SKILL.md": "5cae93e1e72939a9e46eb1a9a78733294e1823d8e59b533576de7042a33dc90d",
@@ -163,7 +163,7 @@
     "home/bin/agent-full-backup": "12c8f25803538475e6e06cccc092cc9a83c5b9c593d15e77c3beabd20cf94a60",
     "home/bin/agent-full-restore": "a6039676304611c59e40e12c97d22b9ae52274be3d14afe1f3b538c24efdd3c8",
     "home/bin/agent-full-snapshot": "7ef8f06434da28caf3aa72e0c6436f390050cf35e981b142bc5ffcbae6239f54",
-    "home/bin/agent-github-backup": "aecb12222f61453c9bff3aa162b3533a4455415ffa6993a522593cb7d8dd2cb7",
+    "home/bin/agent-github-backup": "709c331a33925462fc2f74d6e41f2f720444129bf01e135bf2914bbb43ca7f4c",
     "home/bin/agent-goal": "5a6b434b195f9eda4790635e563091d7623ae341baf6f60e033e022d820f1bbb",
     "home/bin/agent-provider-run": "b0d5700a1a356231b9d5f264db1c08794ad5cc5e30b32b9f83eaed4d030660e2",
     "home/bin/agent_connections.py": "83bc42d8140c5f4a0f623b8ae4e1eae2318a3134726f5c50fda202cce0b78296",
