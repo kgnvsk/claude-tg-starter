@@ -4,6 +4,36 @@ import { Database } from "bun:sqlite";
 import { createHash as createHash2, randomUUID } from "crypto";
 
 // modules/telegram-corporate/resource-control.ts
+import { isIP } from "net";
+var FILE_ID = /^[A-Za-z0-9_-]{10,256}$/;
+var ACCOUNT = /^[A-Za-z0-9][A-Za-z0-9._%+-]*@[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?\.[A-Za-z]{2,63}$/;
+var LABEL_CONTROLS = /[\x00-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]/;
+var BUSINESS_CAPABILITIES = {
+  sheet: [["google.sheets.read"], ["google.sheets.write"]],
+  doc: [["google.docs.read", "google.drive.read"], ["google.docs.write", "google.drive.share"]],
+  slide: [["google.slides.read", "google.drive.read"], ["google.drive.share"]],
+  file: [["google.drive.read"], ["google.drive.share"]],
+  folder: [
+    ["google.drive.read", "google.docs.read", "google.sheets.read", "google.slides.read"],
+    ["google.drive.share", "google.docs.write", "google.sheets.write"]
+  ],
+  mailbox: [["google.gmail.read"], ["google.gmail.send"]],
+  calendar: [["google.calendar.read"], ["google.calendar.write"]],
+  contacts: [["google.contacts.read"], ["google.contacts.write"]],
+  tasks: [["google.tasks.read"], ["google.tasks.write"]]
+};
+function exactFields(input, fields) {
+  return Object.keys(input).length === fields.length && Object.keys(input).every((key) => fields.includes(key));
+}
+function fixedScope(resource, current, labelKey, allowed) {
+  if (current) {
+    const oldKeys = Object.keys(current.config).sort(), newKeys = Object.keys(resource.config).sort();
+    if (current.connector !== resource.connector || JSON.stringify(oldKeys) !== JSON.stringify(newKeys) || oldKeys.some((key) => key !== labelKey && current.config[key] !== resource.config[key]) || current.capabilityIds.some((id) => !allowed.includes(id))) {
+      throw new Error("existing resource scope cannot be replaced through chat");
+    }
+  }
+  return resource;
+}
 function resourceFromControl(input, current) {
   if (!input || typeof input !== "object" || Array.isArray(input) || typeof input.id !== "string" || !/^[a-z0-9][a-z0-9._-]{0,63}$/.test(input.id))
     throw new Error("invalid resource id");
@@ -12,18 +42,69 @@ function resourceFromControl(input, current) {
       throw new Error("invalid resource revocation");
     return null;
   }
-  if (input.action !== "register" || Object.keys(input).some((key) => !["action", "id", "label", "connector", "kind", "account", "spreadsheetId", "access"].includes(key)) || input.connector !== "google" || input.kind !== "sheet" || !["read", "read_write"].includes(input.access) || typeof input.label !== "string" || !input.label.trim() || input.label.trim().length > 120 || /[\x00-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]/.test(input.label) || typeof input.account !== "string" || input.account.length > 254 || !/^[A-Za-z0-9][A-Za-z0-9._%+-]*@[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?\.[A-Za-z]{2,63}$/.test(input.account) || typeof input.spreadsheetId !== "string" || !/^[A-Za-z0-9_-]{10,256}$/.test(input.spreadsheetId))
-    throw new Error("invalid Google sheet resource");
-  const fileKey = "sheet." + input.spreadsheetId;
-  if (current && (current.connector !== "google" || current.config.account !== input.account || current.config.allowCreate !== false || typeof current.config[fileKey] !== "string" || Object.keys(current.config).some((key) => !["account", "allowCreate", fileKey].includes(key)) || current.capabilityIds.some((id) => !["google.sheets.read", "google.sheets.write"].includes(id))))
-    throw new Error("existing resource scope cannot be replaced through chat");
-  return {
-    id: input.id,
-    label: input.label.trim(),
-    connector: "google",
-    capabilityIds: input.access === "read_write" ? ["google.sheets.read", "google.sheets.write"] : ["google.sheets.read"],
-    config: { account: input.account, allowCreate: false, [fileKey]: input.label.trim() }
-  };
+  if (input.action !== "register" || typeof input.label !== "string" || !input.label.trim() || input.label.trim().length > 120 || LABEL_CONTROLS.test(input.label))
+    throw new Error("invalid business resource");
+  const label = input.label.trim();
+  if (input.connector !== "google") {
+    let resource2;
+    let labelKey = null;
+    if (input.connector === "meta" && input.kind === "ad_account" && exactFields(input, ["action", "id", "label", "connector", "kind", "accountId"]) && /^act_\d{4,30}$/.test(input.accountId)) {
+      labelKey = `account.${input.accountId}`;
+      resource2 = { id: input.id, label, connector: "meta", capabilityIds: ["meta.ads.read", "meta.insights.read"], config: { [labelKey]: label } };
+    } else if (input.connector === "gads" && input.kind === "customer" && exactFields(input, ["action", "id", "label", "connector", "kind", "customerId"]) && /^\d{6,12}$/.test(input.customerId)) {
+      labelKey = `customer.${input.customerId}`;
+      resource2 = { id: input.id, label, connector: "gads", capabilityIds: ["google.ads.read"], config: { [labelKey]: label } };
+    } else if (input.connector === "browser" && input.kind === "origin" && exactFields(input, ["action", "id", "label", "connector", "kind", "origin"]) && typeof input.origin === "string" && input.origin.length <= 2048) {
+      let url;
+      try {
+        url = new URL(input.origin);
+      } catch {
+        throw new Error("invalid browser origin");
+      }
+      if (url.protocol !== "https:" || url.origin !== input.origin || url.username || url.password || isIP(url.hostname) || !url.hostname.includes(".") || url.hostname.endsWith(".") || url.hostname.endsWith(".local") || url.hostname.endsWith(".internal") || url.hostname.endsWith(".localhost"))
+        throw new Error("invalid browser origin");
+      labelKey = "origin.1";
+      resource2 = { id: input.id, label, connector: "browser", capabilityIds: ["browser.read"], config: { [labelKey]: url.origin } };
+    } else if (input.connector === "memory" && input.kind === "company" && exactFields(input, ["action", "id", "label", "connector", "kind"])) {
+      resource2 = { id: input.id, label, connector: "memory", capabilityIds: ["memory.company.read"], config: { corporateKey: "company" } };
+    } else if (input.connector === "image" && input.kind === "generator" && exactFields(input, ["action", "id", "label", "connector", "kind"])) {
+      resource2 = { id: input.id, label, connector: "image", capabilityIds: ["image.generate"], config: {} };
+    } else if (input.connector === "telegram" && input.kind === "group" && exactFields(input, ["action", "id", "label", "connector", "kind", "chatId", "access"]) && /^-\d{5,20}$/.test(input.chatId) && ["read", "read_write"].includes(input.access)) {
+      labelKey = `group.${input.chatId}`;
+      resource2 = {
+        id: input.id,
+        label,
+        connector: "telegram",
+        capabilityIds: input.access === "read_write" ? ["telegram.group.read", "telegram.message.send"] : ["telegram.group.read"],
+        config: { source: "static", [labelKey]: label }
+      };
+    } else
+      throw new Error("invalid business resource");
+    return fixedScope(resource2, current, labelKey, resource2.connector === "telegram" ? ["telegram.group.read", "telegram.message.send"] : resource2.capabilityIds);
+  }
+  if (typeof input.kind !== "string" || !Object.hasOwn(BUSINESS_CAPABILITIES, input.kind) || !["read", "read_write"].includes(input.access) || typeof input.account !== "string" || input.account.length > 254 || !ACCOUNT.test(input.account)) {
+    throw new Error("invalid business resource");
+  }
+  const kind = input.kind;
+  const extra = kind === "sheet" ? "spreadsheetId" : ["doc", "slide", "file", "folder"].includes(kind) ? "fileId" : kind === "calendar" ? "calendarId" : null;
+  const fields = ["action", "id", "label", "connector", "kind", "account", "access", ...extra ? [extra] : []];
+  if (Object.keys(input).some((key) => !fields.includes(key)))
+    throw new Error("invalid business resource fields");
+  const value = extra ? input[extra] : undefined;
+  if (extra === "calendarId" ? typeof value !== "string" || value.length > 254 || !/^(?:primary|[A-Za-z0-9._@#%-]{3,254})$/.test(value) : extra != null && (typeof value !== "string" || !FILE_ID.test(value))) {
+    throw new Error("invalid business resource target");
+  }
+  const config = { account: input.account };
+  const targetKey = extra === "spreadsheetId" ? `sheet.${value}` : extra === "fileId" ? `${kind}.${value}` : null;
+  if (targetKey) {
+    config.allowCreate = false;
+    config[targetKey] = label;
+  } else if (extra === "calendarId")
+    config.calendarId = value;
+  const [read, write] = BUSINESS_CAPABILITIES[kind];
+  const capabilityIds = [...read, ...input.access === "read_write" ? write : []];
+  const resource = { id: input.id, label, connector: "google", capabilityIds, config };
+  return fixedScope(resource, current, targetKey, [...read, ...write]);
 }
 
 // modules/telegram-corporate/resource-google-files.ts
