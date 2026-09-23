@@ -25,6 +25,8 @@ HOME = Path(os.environ.get("HOME", "/home/claude"))
 # queue-settle-sweep шукає цей файл як AGENT_ROOT/bin/tg-reply-stop-guard —
 # тож і шляхи всередині мають рахуватися від того самого кореня.
 AGENT_ROOT = Path(os.environ.get("AGENT_ROOT", str(HOME)))
+# Inputs an accepted Stop left at the queue head, one JSON line each (ids only).
+UNSETTLED_STOP_LOG = AGENT_ROOT / "logs" / "tg-unsettled-stop.jsonl"
 MALFORMED_WINDOW_SECONDS = 10 * 60
 MAX_ANCESTRY_EVENTS = 20_000
 OUTBOUND_SUFFIXES = (
@@ -97,6 +99,16 @@ CONTINUATION_ATTACHMENT_TYPES = frozenset(
         "environment",
         "model",
         "deferred_tools_record",
+        # Claude 2.1.280 renders these as meta reminders (isMeta), never as user
+        # input. silent_turn_reminder follows the reply receipt; unknown, it hid
+        # Мартин's turn on 22.09: the answered head stayed «started» and the
+        # client's next question waited 1 h 40 min behind it.
+        "silent_turn_reminder",
+        "batching_reminder",
+        "secondary_reminder",
+        "token_usage",
+        "output_token_usage",
+        "budget_usd",
     }
 )
 # Позначки рантайму, які Claude Code пише окремими записами ВЕРХНЬОГО рівня,
@@ -357,6 +369,34 @@ def retain_request(
     return row[0], row[1]
 
 
+def terminal_result_predicate(
+    connection: sqlite3.Connection, session_id: str | None,
+) -> tuple[str, tuple]:
+    """SQL over alias r: a result finished in the session's latest turn.
+
+    A background result is answered in its callback's response turn, which
+    tg-context-inject binds without a turn-message row, so its original
+    turn_id is no longer the latest one (22.09, Мартин: the answered head
+    stayed «started» for three hours). There only a receipted final answer or
+    an explicit no_reply counts.
+    """
+    latest = '(SELECT max(turn_id) FROM delivery_turns WHERE session_id=?)'
+    # The latest-turn set keeps its #97 meaning: cancelled/failed retire the
+    # head there, they are not evidence of an answer.
+    direct = f"(r.turn_id={latest} AND r.state IN ('complete','no_reply','cancelled','failed'))"
+    columns = {row[1] for row in connection.execute('PRAGMA table_info(delivery_results)')}
+    receipt_columns = {row[1] for row in connection.execute('PRAGMA table_info(delivery_receipts)')}
+    if ('response_turn_id' not in columns
+            or not {'delivery_id', 'turn_id', 'chat_id', 'thread_id', 'stamp', 'source'} <= receipt_columns):
+        return direct, (session_id,)
+    # The exact reply receipt of this request; complete supplies "final".
+    response = (f"(r.response_turn_id={latest} AND (r.state='no_reply' OR (r.state='complete' "
+                'AND EXISTS (SELECT 1 FROM delivery_receipts c WHERE c.delivery_id=r.delivery_id '
+                'AND c.turn_id=r.turn_id AND c.chat_id=r.chat_id AND c.thread_id IS r.thread_id '
+                "AND c.stamp=r.stamp AND c.source='reply'))))")
+    return f'({direct} OR {response})', (session_id, session_id)
+
+
 def settle_result(
     connection: sqlite3.Connection, delivery_id: str, binding: tuple[int, str] | None,
     closed_by: str,
@@ -399,11 +439,11 @@ def complete_started_delivery(
         binding = retain_request(connection, delivery_id, session_id, closed_by)
         if binding is False:
             return False
+        predicate, predicate_args = terminal_result_predicate(connection, session_id)
         if terminal_only and (binding is None or not session_id or connection.execute(
-            'SELECT 1 FROM delivery_results WHERE delivery_id=? AND session_id=? '
-            "AND state IN ('complete','no_reply','cancelled','failed') "
-            'AND turn_id=(SELECT max(turn_id) FROM delivery_turns WHERE session_id=?)',
-            (delivery_id, session_id, session_id),
+            'SELECT 1 FROM delivery_results r JOIN delivery_sessions s ON s.session_id=r.session_id '
+            'AND s.stamp=r.stamp WHERE r.delivery_id=? AND r.session_id=? AND ' + predicate,
+            (delivery_id, session_id, *predicate_args),
         ).fetchone() is None):
             return False  # Recheck the receipt under the deletion transaction.
         if silent:
@@ -442,7 +482,19 @@ def complete_started_delivery(
                 settle_result(connection, delivery_id, binding, closed_by)
             connection.commit()
             return settled
-        if allow_offered:
+        if terminal_only:
+            held = connection.execute(
+                "SELECT state FROM pending_inbound_deliveries WHERE delivery_id=?", (delivery_id,),
+            ).fetchone()
+            if held is not None and held[0] != 'started':
+                # A recovery reservation belongs to its owner; this Stop retires nothing.
+                connection.rollback()
+                return True
+            deleted = connection.execute(
+                "DELETE FROM pending_inbound_deliveries WHERE delivery_id=? AND state='started'",
+                (delivery_id,),
+            )
+        elif allow_offered:
             deleted = connection.execute(
                 "DELETE FROM pending_inbound_deliveries "
                 "WHERE delivery_id=? AND state IN ('offered','started','recovering')",
@@ -1513,20 +1565,38 @@ def current_stop_targets(hook: dict) -> list[tuple[str, str, str | None, bool]]:
         has_results = connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='delivery_results'"
         ).fetchone() is not None
+        if has_results and 'response_turn_id' in {
+                row[1] for row in connection.execute('PRAGMA table_info(delivery_results)')}:
+            # A background result answered in its callback's response turn keeps
+            # its turn-message row on the original turn.
+            rows += connection.execute(
+                'SELECT DISTINCT m.delivery_id,m.chat_id,m.thread_id,p.payload '
+                'FROM delivery_results r JOIN delivery_sessions s ON s.session_id=r.session_id '
+                'JOIN delivery_turn_messages m ON m.turn_id=r.turn_id AND m.delivery_id=r.delivery_id '
+                'JOIN pending_inbound_deliveries p ON p.delivery_id=r.delivery_id '
+                "WHERE r.session_id=? AND s.stamp=? AND r.stamp=s.stamp AND p.state='started' "
+                'AND m.chat_id=r.chat_id AND m.thread_id IS r.thread_id '
+                'AND r.response_turn_id=(SELECT max(turn_id) FROM delivery_turns WHERE session_id=?)',
+                (session, stamp, session),
+            ).fetchall()
+        if has_results:
+            predicate, predicate_args = terminal_result_predicate(connection, session)
+        seen = set()
         for delivery_id, chat_id, thread_id, payload in rows:
             if not isinstance(delivery_id, str) or not re.fullmatch(r'-?[0-9]+:[0-9]+', delivery_id):
                 return []
+            if delivery_id in seen:
+                continue
+            seen.add(delivery_id)
             meta = json.loads(payload)['params']['meta']
             if (meta.get('delivery_id') != delivery_id or str(meta.get('chat_id')) != chat_id
                     or delivery_id != f"{chat_id}:{meta.get('message_id')}"
                     or (str(meta['thread_id']) if meta.get('thread_id') is not None else None) != thread_id):
                 return []
             terminal = has_results and connection.execute(
-                    'SELECT 1 FROM delivery_results WHERE delivery_id=? AND session_id=? AND stamp=? '
-                    'AND chat_id=? AND thread_id IS ? '
-                    "AND state IN ('complete','no_reply','cancelled','failed') "
-                    'AND turn_id=(SELECT max(turn_id) FROM delivery_turns WHERE session_id=?)',
-                    (delivery_id, session, stamp, chat_id, thread_id, session),
+                    'SELECT 1 FROM delivery_results r WHERE r.delivery_id=? AND r.session_id=? AND r.stamp=? '
+                    'AND r.chat_id=? AND r.thread_id IS ? AND ' + predicate,
+                    (delivery_id, session, stamp, chat_id, thread_id, *predicate_args),
                 ).fetchone() is not None
             targets.append((delivery_id, chat_id, thread_id, terminal))
         return targets
@@ -1541,6 +1611,51 @@ def current_stop_target(hook: dict) -> tuple[str, str, str | None, bool] | None:
     """Only a unique input may supply a missing transcript's reply destination."""
     targets = current_stop_targets(hook)
     return targets[0] if len(targets) == 1 else None
+
+
+def record_unsettled_stop(hook: dict, targets: list, reason: str) -> None:
+    """One line per input this Stop leaves at the queue head: ids only, never text.
+
+    Terminal members are left out: the Stop's own terminal release retires them.
+    With no bound input at all, a Telegram-bound session still gets one line,
+    because a lost binding (no stamp, unreadable ledger) is the case that most
+    needs a trace; sessions the ledger never saw (cron, local) stay silent.
+    """
+    session = hook.get('session_id')
+    pending = [item for item in targets if not item[3]]
+    if targets and not pending:
+        return
+    turn_id = None
+    bound = None
+    try:
+        with sqlite3.connect(f"file:{telegram_state_dir() / 'messages.db'}?mode=ro", uri=True, timeout=0.2) as conn:
+            row = conn.execute('SELECT max(turn_id) FROM delivery_turns WHERE session_id=?', (session,)).fetchone()
+            turn_id = row[0] if row else None
+            bound = conn.execute('SELECT 1 FROM delivery_sessions WHERE session_id=?', (session,)).fetchone()
+    except sqlite3.Error:
+        reason = f'{reason}; ledger unreadable'
+        bound = True
+    if not pending:
+        if not bound:
+            return
+        pending = [(None, None, None, False)]
+        reason = f'{reason}; no input bound to this Stop'
+    now = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+    try:
+        UNSETTLED_STOP_LOG.parent.mkdir(parents=True, exist_ok=True)
+        descriptor = os.open(UNSETTLED_STOP_LOG,
+                             os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, 'O_NOFOLLOW', 0), 0o600)
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            os.close(descriptor)
+            return
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, 'a', encoding='utf-8') as handle:
+            for delivery_id, _, _, _ in pending:
+                handle.write(json.dumps({
+                    'ts': now, 'session_id': session, 'turn_id': turn_id, 'delivery_id': delivery_id,
+                    'stop_hook_active': hook.get('stop_hook_active') is True, 'reason': reason}) + '\n')
+    except OSError:
+        pass  # Evidence only: a failed write must never hold the Stop.
 
 
 def complete_terminal_stop_deliveries(hook: dict) -> bool:
@@ -1604,6 +1719,11 @@ def evaluate_stop(hook: dict) -> None:
                 'terminal text alone is invisible to the person. Do not repeat completed work. '
                 'For a group observation that accepted no work, use the no_reply tool instead. '
                 'Do not claim delivery without a successful tool result.')
+            return
+        # This Stop is accepted either way. Keep the head, but leave evidence:
+        # an invisible turn is how an answered head stayed «started» for hours
+        # while every watchdog stayed quiet (22.09, Мартин).
+        record_unsettled_stop(hook, targets, 'turn not visible in the transcript')
         return
     events, turn = current
     turn_events, prompt, origin, queued_carrier = turn

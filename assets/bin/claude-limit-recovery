@@ -1347,8 +1347,13 @@ def scan_incremental(projects_dir: Path, state: dict) -> tuple[dict, list[dict]]
         and not incident["resolved"]
         and incident["transcript"] not in discovered
     ):
-        # Expiry suppresses retries; it does not prove the queued work resolved.
-        raise StateError("unresolved incident transcript is unavailable")
+        if not incident["expired"]:
+            # A live incident's history vanishing is not normal: stop, don't guess.
+            raise StateError("unresolved incident transcript is unavailable")
+        # An expired incident is never retried again. Claude Code deletes
+        # transcripts untouched for 30 days, and keeping the incident then failed
+        # every later scan, so a new limit went unnoticed (Максимус, 22.09.2026).
+        current["incident"] = None
     missing = set(current["transcripts"]) - set(discovered)
     for relative in sorted(missing):
         _confirm_checkpoint_absent(projects_dir, relative)

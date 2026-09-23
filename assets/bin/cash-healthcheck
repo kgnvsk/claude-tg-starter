@@ -373,6 +373,9 @@ alert() {
     local key="$1"
     local msg="$2"
     local cooldown="${3:-$ALERT_COOLDOWN}"
+    # Optional chat_message scope: one incident per delivery, so two stuck
+    # heads never silence each other.
+    local scope="${4:-}"
     # Silent by default (2026-06-28): the bot self-heals (restart / golden-restore /
     # token-reread), so routine alerts (token dying/expired, service restarted, bun
     # respawned, codex) are pure noise to the owner. Ping ONLY for states it genuinely
@@ -390,8 +393,13 @@ alert() {
     # api-error-turns: the service is up, the login is valid and every turn ends
     # in a second — with a provider refusal instead of an answer (a model this
     # CLI does not know, a revoked key). No restart fixes it; only the owner can.
-    case "$key" in browser-down|crash-loop|low-disk|service-down|stuck-escalate|corporate-paused|corporate-unavailable|limit-detector-silent|api-error-turns) ;; *) return 0 ;; esac
-    local last_file="$STAMP/cash-alert-${key}.ts"
+    # answered-unsettled: the answer went out, the request still holds the
+    # queue and nothing here may remove it (22.09, Мартин: 1 h 40 min).
+    case "$key" in browser-down|crash-loop|low-disk|service-down|stuck-escalate|corporate-paused|corporate-unavailable|limit-detector-silent|api-error-turns|answered-unsettled) ;; *) return 0 ;; esac
+    if [ -n "$scope" ] && ! [[ "$scope" =~ ^-?[0-9]+_[0-9]+$ ]]; then
+        return 0
+    fi
+    local last_file="$STAMP/cash-alert-${key}${scope:+-$scope}.ts"
     local now=$(date +%s)
     local last=$(cat "$last_file" 2>/dev/null || echo 0)
     local delta=$((now - last))
@@ -407,19 +415,26 @@ alert() {
         echo "[$(date -u +%FT%TZ)] ALERT [${key}]: no valid recipient configured" >> "$LOG"
         return 0
     fi
-    echo "$now" > "$last_file"
-    local chat_id
+    local chat_id delivered=0 first=1
     while IFS= read -r chat_id; do
         [ -n "$chat_id" ] || continue
-        if ! curl -sS --max-time 10 -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+        if curl -sS --fail --max-time 10 -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
             --data-urlencode "chat_id=${chat_id}" \
             --data-urlencode "text=🚨 {{AGENT_NAME}}, перевірка стану: ${msg}" \
             --data-urlencode "parse_mode=HTML" >/dev/null 2>&1; then
+            [ "$first" = 1 ] && delivered=1
+        else
             echo "[$(date -u +%FT%TZ)] ALERT [${key}]: delivery failed for one configured recipient" >> "$LOG"
         fi
+        first=0
     done <<ALERT_RECIPIENTS_EOF
 $recipients
 ALERT_RECIPIENTS_EOF
+    # The cooldown starts once the owner (the first recipient) was told; a copy
+    # alone does not count, and a send the owner did not get retries next tick.
+    if [ "$delivered" = 1 ]; then
+        echo "$now" > "$last_file"
+    fi
     echo "[$(date -u +%FT%TZ)] ALERT [${key}]: ${msg}" >> "$LOG"
 }
 
@@ -782,6 +797,74 @@ DURABLE_REQUEST_RECOVERY=0
 if [ -f "$DB" ] && command -v sqlite3 >/dev/null 2>&1; then
     RECEIPT_CONTRACT=$(sqlite3 "$DB" "SELECT value FROM delivery_runtime WHERE key='receipt_contract';" 2>/dev/null || true)
     case "$RECEIPT_CONTRACT" in ''|*[!0-9]*) ;; *) [ "$RECEIPT_CONTRACT" -lt 3 ] || DURABLE_REQUEST_RECOVERY=1 ;; esac
+fi
+
+# An answered request that still holds the head of the queue (22.09, Мартин:
+# the reply went out, the head stayed «started» for three hours and every rule
+# here deferred to the durable ledger). Any authority: two minutes after its
+# receipted final answer the head is an anomaly. Read-only: the queue owner
+# removes heads; this only tells the owner, ids only.
+if [ -f "$DB" ] && command -v python3 >/dev/null 2>&1; then
+    UNSETTLED_HEADS=$(python3 - "$DB" <<'PY' 2>/dev/null || echo schema-unavailable
+import sqlite3
+import sys
+import time
+
+NEED = {
+    'pending_inbound_deliveries': {'delivery_id', 'state', 'started_at', 'created_at'},
+    'delivery_results': {'delivery_id', 'turn_id', 'session_id', 'stamp', 'chat_id', 'thread_id',
+                         'state', 'finished_at', 'response_turn_id'},
+    'delivery_sessions': {'session_id', 'stamp'},
+    'delivery_turns': {'turn_id', 'session_id'},
+    'delivery_turn_messages': {'turn_id', 'delivery_id', 'chat_id', 'thread_id'},
+    'delivery_receipts': {'receipt_id', 'delivery_id', 'turn_id', 'chat_id', 'thread_id', 'stamp', 'source'},
+}
+QUERY = """
+SELECT p.delivery_id, r.turn_id, coalesce(r.response_turn_id, r.turn_id) AS answer_turn,
+       max(c.receipt_id) AS receipt_id, p.started_at
+FROM pending_inbound_deliveries p
+JOIN delivery_results r ON r.delivery_id = p.delivery_id
+JOIN delivery_sessions s ON s.session_id = r.session_id
+JOIN delivery_turns orig ON orig.turn_id = r.turn_id AND orig.session_id = r.session_id
+JOIN delivery_turns ans ON ans.turn_id = coalesce(r.response_turn_id, r.turn_id)
+                       AND ans.session_id = r.session_id
+JOIN delivery_turn_messages m ON m.turn_id = r.turn_id AND m.delivery_id = r.delivery_id
+                             AND m.chat_id = r.chat_id AND m.thread_id IS r.thread_id
+JOIN delivery_receipts c ON c.delivery_id = r.delivery_id AND c.turn_id = r.turn_id
+                        AND c.chat_id = r.chat_id AND c.thread_id IS r.thread_id
+                        AND c.stamp = r.stamp AND c.source = 'reply'
+WHERE p.rowid = (SELECT rowid FROM pending_inbound_deliveries ORDER BY created_at, rowid LIMIT 1)
+  AND p.state = 'started' AND p.started_at > 0 AND p.started_at <= :cutoff
+  AND r.state = 'complete' AND r.finished_at > 0 AND r.finished_at <= :cutoff
+  AND r.stamp IS NOT NULL AND r.stamp <> '' AND s.stamp = r.stamp
+GROUP BY p.delivery_id, r.turn_id, answer_turn
+"""
+connection = sqlite3.connect(f'file:{sys.argv[1]}?mode=ro', uri=True, timeout=2)
+tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+if 'delivery_results' not in tables:
+    raise SystemExit(0)  # an older receiver: no ledger, nothing to judge here
+for table, columns in NEED.items():
+    if not columns <= {row[1] for row in connection.execute(f'PRAGMA table_info({table})')}:
+        print('schema-unavailable')
+        raise SystemExit(0)
+now = int(time.time() * 1000)
+for delivery_id, turn_id, answer_turn, receipt_id, started_at in connection.execute(
+        QUERY, {'cutoff': now - 120000}):
+    print(delivery_id, turn_id, answer_turn, receipt_id, max(0, (now - started_at) // 60000))
+PY
+)
+    case "$UNSETTLED_HEADS" in
+        '') ;;
+        schema-unavailable)
+            echo "[$(date -u +%FT%TZ)] answered-unsettled check: delivery ledger unreadable" >> "$LOG" ;;
+        *)
+            while read -r UH_DELIVERY UH_TURN UH_ANSWER UH_RECEIPT UH_AGE; do
+                [[ "$UH_DELIVERY" =~ ^-?[0-9]+:[0-9]+$ ]] || continue
+                echo "[$(date -u +%FT%TZ)] answered but unsettled head ${UH_DELIVERY} turn ${UH_TURN}/${UH_ANSWER} receipt ${UH_RECEIPT}, ${UH_AGE} min" >> "$LOG"
+                alert "answered-unsettled" "Відповідь на повідомлення ${UH_DELIVERY} уже надіслано, але воно ${UH_AGE} хв тримає чергу, і наступні повідомлення чекають. Сам я його не знімаю — потрібна перевірка сторожа доставки." 3600 "${UH_DELIVERY/:/_}"
+            done <<< "$UNSETTLED_HEADS"
+            ;;
+    esac
 fi
 STARTED_RECOVERY_STAMP=$STAMP/runtime-started-head-restart.json
 
