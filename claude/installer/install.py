@@ -234,11 +234,15 @@ def reconcile(root: Path, home: Path, manifest: dict, previous: dict, uid: int, 
 
 def native_config(home: Path, user: str, browser: dict | None, integrations: Path | None = None) -> str:
     rules = {
+        # The whole home is writable; the narrower rules keep credentials, the access list,
+        # the kit and its runtime, and the memory core out of reach.
+        str(home): "write",
         str(home / ".codex/auth.json"): "deny",
         str(home / ".codex/config.toml"): "read",
         str(home / ".codex/agents"): "read",
         str(home / ".agents"): "read",
         str(home / "obsidian-vault/.codex"): "read",
+        str(home / ".codex/channels/telegram/access.json"): "read",
         str(home / ".codex/channels/telegram/.env"): "deny",
         str(home / ".codex/memory"): "read",
         str(home / ".codex/channels/telegram/messages.db"): "deny",
@@ -253,11 +257,14 @@ def native_config(home: Path, user: str, browser: dict | None, integrations: Pat
         str(home / ".venvs"): "read",
         str(home / ".config"): "deny",
         str(home / ".curlrc"): "deny",
+        str(home / ".ssh"): "read",
         "/etc/novsky/codex/" + user + ".json": "deny",
     }
-    text = 'approval_policy = "on-request"\ndefault_permissions = "novsky-agent"\n\n[permissions.novsky-agent]\nextends = ":workspace"\ndescription = "Workspace tools, private credentials and controlled core memory."\n\n[permissions.novsky-agent.filesystem]\n'
+    # Owner's rule (23.09.2026): the agent and its helpers never stop on an approval prompt
+    # and work with the network.
+    text = 'approval_policy = "never"\ndefault_permissions = "novsky-agent"\n\n[permissions.novsky-agent]\nextends = ":workspace"\ndescription = "Workspace tools with network, private credentials and controlled core memory."\n\n[permissions.novsky-agent.filesystem]\n'
     text += "\n".join(json.dumps(path) + " = " + json.dumps(value) for path, value in rules.items())
-    text += '\n\n[permissions.novsky-agent.network]\nenabled = false\n'
+    text += '\n\n[permissions.novsky-agent.network]\nenabled = true\n'
     if browser:
         text += '\n[mcp_servers.browser]\ncommand = ' + json.dumps(browser["command"]) + '\nargs = ' + json.dumps(browser["args"]) + '\nstartup_timeout_sec = 60\ntool_timeout_sec = 180\n'
     if integrations:

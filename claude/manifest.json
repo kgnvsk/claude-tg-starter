@@ -7,7 +7,7 @@
     "local-foundation-v1"
   ],
   "source": "codex/starter/product.json",
-  "sourceRevision": "a942848362931350d3bc5c968008ba42cc3d457e",
+  "sourceRevision": "2aaa8bf3ba36e07451948809be998be2ff75fba9",
   "sourceDirty": false,
   "features": [
     "browser"
@@ -46,7 +46,7 @@
     "codex/starter/product.json": "71cf9bae55acfc1b64466557dbbafce19130ffed24a81ea7801f8a10b29ebcb7",
     "codex/build.py": "200e42758c2ce614c1b1a5365866ef052e6d02f76fed0887cf17d446c5a9db0f",
     "native/build_claude.py": "d8e2abd369bbed16fc74b05ccf1f2dc423cf65cf4207167a4069f59961fdbb70",
-    "codex/install.py": "d5daf54e2cd9d639d5d7acb39bd55eeeca2289070888f4cbb30d9ef8a1de0e73",
+    "codex/install.py": "a7088ff88f92955d33e5fdacdc02c09979a9746aca0a2ebff535e0aab265e719",
     "codex/setup.py": "d950735dde0ed1cdd9a96edd5e52b2573ce4691c938c47b4b56a39176af39e8b",
     "native/local_claude.py": "ebdba3706e15a1f1843e66150493a3f51a6866a6c92390b491ec0ecdb06a9ce6",
     "assets/lib/agent-license.py": "95c523edbfb2a1149b83c6ac2bc7b9e56cd3ae4cd1f942886d437cef8d9ac335",
@@ -187,7 +187,7 @@
     "home/bin/ukargparse.py": "50bae922beaa0173a070b5d27aefefa73f64bcd89bb18223f4c3a29ca3e28ecc",
     "home/bin/vault-sync": "6de522400e6b313d6d6e4dc5c4d0c6ea34934d689dd8b71c9bee55df1db1a962",
     "installer/agent_license.py": "95c523edbfb2a1149b83c6ac2bc7b9e56cd3ae4cd1f942886d437cef8d9ac335",
-    "installer/install.py": "d5daf54e2cd9d639d5d7acb39bd55eeeca2289070888f4cbb30d9ef8a1de0e73",
+    "installer/install.py": "a7088ff88f92955d33e5fdacdc02c09979a9746aca0a2ebff535e0aab265e719",
     "installer/local.py": "ebdba3706e15a1f1843e66150493a3f51a6866a6c92390b491ec0ecdb06a9ce6",
     "installer/setup.py": "d950735dde0ed1cdd9a96edd5e52b2573ce4691c938c47b4b56a39176af39e8b",
     "plugin-contract.json": "c5ea9ff8efabb69e2ec79e9082f7fbd3ee6b389376a22227702e446a49ba94d3",
