@@ -98,7 +98,26 @@ def reconcile_admins(data: dict, owner: str, additional_csv: str) -> str:
     ]
     data["admins"] = desired
     data["allowFrom"] = [*guests, *desired]
+    if "superadmins" in data:
+        # A super-administrator is an administrator first: losing that loses the role too.
+        data["superadmins"] = [chat_id for chat_id in unique(data.get("superadmins", [])) if chat_id in desired and chat_id != owner]
     return f"Узгоджено адміністраторів: {len(desired)}; збережено гостей: {len(guests)}"
+
+
+def set_superadmins(data: dict, owner: str, csv: str) -> str:
+    """The owner's business assistants: administrators with his rights, never his private chat.
+    Set only from the host (Novsky, installer); no chat helper can grant it."""
+    wanted = unique(csv.split(","))
+    admins, admitted = set(unique(data.get("admins", []))), set(unique(data.get("allowFrom", [])))
+    for chat_id in wanted:
+        if not chat_id.isdigit():
+            raise SystemExit(f"Telegram ID суперадміністратора має бути числом: {chat_id}")
+        if chat_id == owner:
+            raise SystemExit("Основний власник не може бути суперадміністратором")
+        if chat_id not in admins or chat_id not in admitted:
+            raise SystemExit(f"Суперадміністратор має бути адміністратором цього бота: {chat_id}")
+    data["superadmins"] = wanted
+    return f"Суперадміністраторів: {len(wanted)}"
 
 
 def preserve_admins(data: dict, owner: str, additional_csv: str) -> str:
@@ -304,6 +323,7 @@ def main(argv: list[str]) -> int:
         print(
             f"Використання: {command_name} reconcile-admins <path> <chat_id_власника> [additional_csv]\n"
             f"       {command_name} preserve-admins <path> <chat_id_власника> [additional_csv]\n"
+            f"       {command_name} set-superadmins <path> <chat_id_власника> <csv>\n"
             f"       {command_name} allow <path> <requester> <message_id> <chat_id> [name]\n"
             f"       {command_name} revoke <path> <requester> <message_id> <chat_id>\n"
             f"       {command_name} {observation_command} <path> <requester> <on|off|status> <group>\n"
@@ -317,6 +337,8 @@ def main(argv: list[str]) -> int:
         message = locked_update(
             path, lambda data: reconcile_admins(data, argv[3], argv[4] if len(argv) == 5 else "")
         )
+    elif command == "set-superadmins" and len(argv) == 5:
+        message = locked_update(path, lambda data: set_superadmins(data, argv[3], argv[4]))
     elif command == "preserve-admins" and len(argv) in (4, 5):
         message = locked_inspect(
             path, lambda data: preserve_admins(data, argv[3], argv[4] if len(argv) == 5 else "")

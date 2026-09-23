@@ -985,6 +985,8 @@ type Access = {
   dmPolicy: 'pairing' | 'allowlist' | 'disabled'
   allowFrom: string[]
   admins: string[]
+  /** Owner's business assistants (a subset of admins); the corporate runtime reads it live. */
+  superadmins?: string[]
   groups: Record<string, GroupPolicy>
   pending: Record<string, PendingEntry>
   mentionPatterns?: string[]
@@ -1124,6 +1126,8 @@ function readAccessFile(): Access {
     const raw = readFileSync(ACCESS_FILE, 'utf8')
     const parsed = JSON.parse(raw) as Partial<Access>
     return {
+      // Keep every key this receiver does not model: saveAccess writes back exactly this object.
+      ...parsed,
       dmPolicy: parsed.dmPolicy ?? 'pairing',
       allowFrom: parsed.allowFrom ?? [],
       admins: parsed.admins ?? [],
