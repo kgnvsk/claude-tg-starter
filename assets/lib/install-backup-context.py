@@ -26,6 +26,34 @@ SYSTEMD_ROOTS = tuple(map(Path, ("/etc/systemd/system", "/usr/lib/systemd/system
 SYSTEMD_RUNTIME = Path("/run/systemd/system")
 CODEX_DIRECTORY = Path("/etc/novsky/codex")
 CLAUDE_DIRECTORY = Path("/etc/claude-tg-starter")
+# Each agent runs its own collector job from ROOT/<profile> with its policy in
+# POLICIES/agents. Until its next install, an agent may still use the shared
+# --all job of older kits; maintenance accepts that job only with the last
+# shared collector and sanitizer those kits shipped.
+LEGACY_SHARED_COLLECTOR_SHA256 = "19411aaa43ae7c21100cfac8da19924724a293fb99f8eded6841a12d7519b705"
+LEGACY_SHARED_SANITIZER_SHA256 = "09964c6d58b72da0b4198cc536e9c80052468df09ed756fd348015208db8d04a"
+
+# A temporary, explicit maintenance exception for the two owner canaries on
+# 38.49.212.20. Fresh installs and ordinary fleet updates always require the
+# current shared collector. No customer policy may be added or changed.
+LEGACY_CANARY_IDENTITIES = frozenset({
+    ("/home/claude-8709793308", "claude-8709793308",
+     "claude-telegram@claude-8709793308.service", "claude"),
+    ("/home/codex-8865933230", "codex-8865933230",
+     "codex-telegram@codex-8865933230.service", "codex"),
+})
+PINNED_LEGACY_SHARED_CONTEXT = {
+    "collector": "1f42de9ec0daaf82080fef29f6b9f3cfca96b9df7772f22b305d8b35ec1441f2",
+    "sanitizer": "b743ec0d11e58aa2a933e109d2389200581fea5b5b35742d140566607bd58b0b",
+    "cron": "01ada025e7027ee7f6c21b416493e0188a3ed88100f1d10c2bc80a0d4aeac8b0",
+    "policies": {
+        "042486f3ed904967f169c75e.json": "5d4fd6e03c1163fee1d37b6e8d3c34f3d298b9288b6781a7544aed61dae8639d",
+        "0644d29c7bf393dd102d507e.json": "991709c8700cfc7708a0d5b3683b97bb532c91e468ee1f8193bfad8e70fcbbe4",
+        "136498cc50b46c58ed0c7452.json": "bd7fa92bd1c5d8da09c81a85cbd3cbb28628748381622c6d73e8af9fe7bfd2e0",
+        "3d1c2515996719be2d369315.json": "ca3dd4bea0fa79b1758a4309389967a07c21897853e7a10edcfbf36655c0ecee",
+        "a75a2027b89f1a075f8fa68c.json": "043153d3337c56ed7563d1652ecc6a258574c0e8151d2edbd251adb367b87689",
+    },
+}
 
 
 def _metadata(info, owners, *, directory=False):
@@ -112,6 +140,28 @@ def write(path, data, uid=0, gid=0, mode=0o600):
                 os.unlink(name, dir_fd=directory)
             except FileNotFoundError:
                 pass
+
+
+def context_job(collector, age, policy=None):
+    selector = f"--policy {policy}" if policy else "--all"
+    return ("# Encrypted system context only; no model calls or bot restarts.\n"
+            f"* * * * * root /usr/bin/python3 {collector} {selector} --age-binary {age} >/dev/null 2>&1\n").encode()
+
+
+def remove(path):
+    with _directory(path.parent, {0}) as (directory, verify):
+        try:
+            os.unlink(path.name, dir_fd=directory)
+        except FileNotFoundError:
+            pass
+        verify()
+
+
+def shared_policies():
+    with _directory(POLICIES, {0}) as (directory, verify):
+        names = [name for name in os.listdir(directory) if name.endswith(".json")]
+        verify()
+    return names
 
 
 def module(path):
@@ -307,6 +357,213 @@ def prepare_shared_config(backup):
             os.fchmod(descriptor, target)
 
 
+def retire_legacy_user_backup_cron(home, user, backup):
+    # Older full-backup onboarding added an independent user cron line. The
+    # root-provisioned nightly selector now owns that schedule. Keep a private
+    # rollback copy before removing only the kit's exact marked command.
+    if not (home / ".local/state/agent-full-backup/config.json").is_file():
+        return
+    command = ["crontab", "-u", user, "-l"]
+    current = subprocess.run(command, capture_output=True, timeout=15)
+    if current.returncode:
+        if b"no crontab" in current.stderr.lower():
+            return
+        raise ValueError("legacy backup schedule read failed")
+    try:
+        lines = current.stdout.decode("utf-8").splitlines(keepends=True)
+    except UnicodeError as error:
+        raise ValueError("legacy backup schedule invalid") from error
+    old = str(home / "bin/agent-full-backup")
+    home_option = "--home " + shlex.quote(str(home)) + " scheduled"
+    kept = [line for line in lines if not (
+        old in line and home_option in line
+        and re.search(r"# com\.novsky\.agent-backup\.[0-9a-f]{24}\s*$", line)
+    )]
+    if len(kept) == len(lines):
+        return
+    write(backup / "legacy-user-crontab", current.stdout)
+    latest = subprocess.run(command, capture_output=True, timeout=15)
+    if latest.returncode != current.returncode or latest.stdout != current.stdout:
+        raise ValueError("legacy backup schedule changed")
+    result = subprocess.run(["crontab", "-u", user, "-"], input="".join(kept).encode("utf-8"), capture_output=True, timeout=15)
+    if result.returncode:
+        raise ValueError("legacy backup schedule removal failed")
+
+
+def _check_current(home, user, unit, engine, *, source_dir=None, python_binary=None,
+                   allow_maintenance_hold=False, allow_pinned_legacy_shared_context=False):
+    """Read-only proof that maintenance need not touch root backup context."""
+    if os.geteuid() != 0 or not re.fullmatch(r"[a-zA-Z0-9@_.-]+\.service", unit):
+        raise ValueError("root and an exact agent unit are required")
+    account = pwd.getpwnam(user)
+    home = Path(home).absolute()
+    if ".." in home.parts:
+        raise ValueError("unsafe agent home")
+    no_links(home)
+    if home != Path(account.pw_dir) and Path(account.pw_dir) not in home.parents:
+        raise ValueError("agent home does not belong to account")
+    if not home.is_dir() or home.stat().st_uid != account.pw_uid:
+        raise ValueError("agent home ownership mismatch")
+    files = required_files(home, unit, engine)
+    profile = hashlib.sha256(str(home).encode()).hexdigest()[:24]
+    agent_cron = CRON_DIRECTORY / ("novsky-agent-full-backup-" + profile)
+    if allow_maintenance_hold:
+        names = ["zz-maintenance-hold.conf"]
+        if engine == "claude" and unit == "claude-telegram.service":
+            names.append("zy-novsky-transaction.conf")
+        expected = f"[Unit]\nConditionPathExists=!{home}/logs/restart-hold.until\n".encode()
+        for name in names:
+            hold = Path("/etc/systemd/system") / (unit + ".d") / name
+            if str(hold) in files:
+                if (_read(hold, {0}) != expected
+                        or stat.S_IMODE(hold.stat(follow_symlinks=False).st_mode) != 0o644):
+                    raise ValueError("unexpected maintenance hold")
+                files.remove(str(hold))
+    files.append(str(agent_cron))
+    source = Path(source_dir) if source_dir else Path(__file__).resolve().parent
+    collector = source / "agent-backup-context.py"
+    bootstrap = source.parent / "bin/agent-full-backup"
+    if not bootstrap.is_file():
+        bootstrap = source / "agent-full-backup"
+    sanitizer = bootstrap.with_name("agent-backup-sanitize")
+    for path in (collector, bootstrap, sanitizer):
+        no_links(path)
+        _read(path, {0})
+    state = home / ".local/state/agent-full-backup"
+    config_path = state / "context.json"
+    own = ROOT / profile
+    legacy = POLICIES / (profile + ".json")
+    no_links(legacy)
+    shared = legacy.exists() or legacy.is_symlink()
+    directories = [(ROOT, {0}, 0, 0o700), (ROOT / "tools", {0}, 0, 0o700), (POLICIES, {0}, 0, 0o700),
+                   (state, {0, account.pw_uid}, account.pw_uid, 0o700)]
+    if not shared:
+        directories += [(own, {0}, 0, 0o700), (POLICIES / "agents", {0}, 0, 0o700)]
+    for directory, owners, uid, mode in directories:
+        no_links(directory)
+        with _directory(directory, owners) as (descriptor, verify):
+            info = os.fstat(descriptor)
+            if uid == 0:
+                _metadata(info, {0}, directory=True)
+            elif info.st_uid != uid:
+                raise ValueError("backup context directory changed")
+            if stat.S_IMODE(info.st_mode) != mode:
+                raise ValueError("backup context directory changed")
+            verify()
+    with _directory(POLICIES.parent, {0}) as (descriptor, verify):
+        if stat.S_IMODE(os.fstat(descriptor).st_mode) & 0o111 != 0o111:
+            raise ValueError("backup context parent is not traversable")
+        verify()
+
+    def exact(path, expected, owners, mode):
+        no_links(path)
+        current = _read(path, owners)
+        info = path.stat(follow_symlinks=False)
+        if current != expected or stat.S_IMODE(info.st_mode) != mode:
+            raise ValueError("backup context file changed")
+
+    context_bytes = _read(config_path, {account.pw_uid}, limit=128 * 1024)
+    context = json.loads(context_bytes)
+    if not isinstance(context, dict):
+        raise ValueError("backup context configuration invalid")
+    selected_python = context.get("pythonExecutable")
+    if selected_python is not None:
+        selected_python = agent_python(selected_python, account.pw_uid)
+    if python_binary is not None and agent_python(python_binary, account.pw_uid) != selected_python:
+        raise ValueError("backup Python selection changed")
+    managed = dict(systemContextRequired=True, systemContextProfileId=profile,
+                   sharedAccount=home != Path(account.pw_dir), engine=engine, unit=unit,
+                   scheduleProvisioned=True)
+    if any(context.get(key) != value for key, value in managed.items()):
+        raise ValueError("backup context configuration changed")
+    exact(config_path, context_bytes, {account.pw_uid}, 0o600)
+    policy = {"schemaVersion": 1, "agentHome": str(home), "uid": account.pw_uid,
+              "gid": account.pw_gid, "unit": unit, "requiredFiles": files}
+    policy_bytes = (json.dumps(policy, sort_keys=True) + "\n").encode()
+    active = legacy if shared else POLICIES / "agents" / (profile + ".json")
+    exact(active, policy_bytes, {0}, 0o600)
+    if not shared:
+        if allow_pinned_legacy_shared_context:
+            raise ValueError("legacy shared backup context is canary-only")
+        exact(own / collector.name, _read(collector, {0}), {0}, 0o700)
+        exact(own / sanitizer.name, _read(sanitizer, {0}), {0}, 0o700)
+        exact(CRON_DIRECTORY / ("novsky-backup-context-" + profile),
+              context_job(own / collector.name, ROOT / "tools/age", active), {0}, 0o644)
+    elif allow_pinned_legacy_shared_context:
+        if (str(home), user, unit, engine) not in LEGACY_CANARY_IDENTITIES:
+            raise ValueError("legacy shared backup context is canary-only")
+        secret_store = home / ".config/novsky/secrets.json"
+        no_links(secret_store)
+        if secret_store.exists() or secret_store.is_symlink():
+            raise ValueError("legacy shared backup context cannot inspect saved credentials")
+        expected = PINNED_LEGACY_SHARED_CONTEXT
+        for path, digest, mode in (
+            (ROOT / collector.name, expected["collector"], 0o700),
+            (ROOT / sanitizer.name, expected["sanitizer"], 0o700),
+            (CRON_DIRECTORY / "novsky-backup-context", expected["cron"], 0o644),
+        ):
+            no_links(path)
+            contents = _read(path, {0})
+            if hashlib.sha256(contents).hexdigest() != digest or stat.S_IMODE(path.stat().st_mode) != mode:
+                raise ValueError("pinned legacy shared backup context changed")
+        with _directory(POLICIES, {0}) as (directory, verify):
+            names = {name for name in os.listdir(directory) if name.endswith(".json")}
+            if names != set(expected["policies"]):
+                raise ValueError("legacy shared backup policy set changed")
+            verify()
+        for name, digest in expected["policies"].items():
+            path = POLICIES / name
+            contents = _read(path, {0})
+            if hashlib.sha256(contents).hexdigest() != digest or stat.S_IMODE(path.stat().st_mode) != 0o600:
+                raise ValueError("legacy shared backup policy changed")
+    else:
+        for path, digest in ((ROOT / collector.name, LEGACY_SHARED_COLLECTOR_SHA256),
+                             (ROOT / sanitizer.name, LEGACY_SHARED_SANITIZER_SHA256)):
+            no_links(path)
+            if (hashlib.sha256(_read(path, {0})).hexdigest() != digest
+                    or stat.S_IMODE(path.stat(follow_symlinks=False).st_mode) != 0o700):
+                raise ValueError("shared backup context changed")
+    for name in ("age", "age-keygen"):
+        binary = ROOT / "tools" / name
+        no_links(binary)
+        data = _read(binary, {0})
+        if not data or stat.S_IMODE(binary.stat(follow_symlinks=False).st_mode) != 0o700:
+            raise ValueError("backup age tool changed")
+    if shared:
+        exact(CRON_DIRECTORY / "novsky-backup-context",
+              context_job(ROOT / collector.name, ROOT / "tools/age"), {0}, 0o644)
+    scheduled = shlex.join([selected_python or "/usr/bin/python3",
+                            str(home / "bin/agent-nightly-github-backup"), "--home", str(home)])
+    exact(agent_cron,
+          (f"# Local hourly check; one configured GitHub backup at 22:00 Europe/Lisbon.\n"
+           f"0 * * * * {user} {scheduled} >>{shlex.quote(str(state / 'scheduled.log'))} 2>&1\n").encode(),
+          {0}, 0o644)
+    # The fresh installer removes only its own legacy backup job. An ordinary
+    # update cannot silently leave a second schedule or edit the owner's table.
+    if (state / "config.json").is_file():
+        current = subprocess.run(["crontab", "-u", user, "-l"], capture_output=True, timeout=15)
+        if current.returncode and b"no crontab" not in current.stderr.lower():
+            raise ValueError("legacy backup schedule read failed")
+        old = str(home / "bin/agent-full-backup")
+        home_option = "--home " + shlex.quote(str(home)) + " scheduled"
+        if any(old in line and home_option in line
+               and re.search(r"# com\.novsky\.agent-backup\.[0-9a-f]{24}\s*$", line)
+               for line in current.stdout.decode("utf-8").splitlines()):
+            raise ValueError("legacy backup schedule requires migration")
+    return {"profileId": profile, "policy": str(active), "contextRequired": True}
+
+
+def check_current(home, user, unit, engine, *, source_dir=None, python_binary=None,
+                  allow_maintenance_hold=False, allow_pinned_legacy_shared_context=False):
+    try:
+        return _check_current(home, user, unit, engine, source_dir=source_dir,
+                              python_binary=python_binary,
+                              allow_maintenance_hold=allow_maintenance_hold,
+                              allow_pinned_legacy_shared_context=allow_pinned_legacy_shared_context)
+    except Exception as error:
+        raise ValueError("backup context requires reviewed migration before maintenance") from error
+
+
 def install(home, user, unit, engine, *, source_dir=None, python_binary=None):
     if os.geteuid() != 0 or not re.fullmatch(r"[a-zA-Z0-9@_.-]+\.service", unit):
         raise ValueError("root and an exact agent unit are required")
@@ -338,20 +595,23 @@ def install(home, user, unit, engine, *, source_dir=None, python_binary=None):
         _read(path, {0})
     policy = {"schemaVersion": 1, "agentHome": str(home), "uid": account.pw_uid,
               "gid": account.pw_gid, "unit": unit, "requiredFiles": files}
-    target = POLICIES / (profile + ".json")
+    own = ROOT / profile
+    target = POLICIES / "agents" / (profile + ".json")
+    legacy = POLICIES / (profile + ".json")
     state = home / ".local/state/agent-full-backup"
     config_path = state / "context.json"
     for path in (ROOT, POLICIES, state):
         no_links(path)
     no_links(config_path)
-    cron = CRON_DIRECTORY / "novsky-backup-context"
+    cron = CRON_DIRECTORY / ("novsky-backup-context-" + profile)
+    shared = (ROOT / collector.name, ROOT / sanitizer.name, CRON_DIRECTORY / "novsky-backup-context")
     # Back up every existing file this installer owns before making a change.
     backup = BACKUP_DIRECTORY / (str(int(time.time())) + "-" + profile + "-" + secrets.token_hex(4))
     no_links(backup)
     with _directory(backup, {0}, create=True):
         pass
     prepare_shared_config(backup)
-    for path in (ROOT, ROOT / "tools", POLICIES):
+    for path in (ROOT, ROOT / "tools", own, POLICIES, POLICIES / "agents"):
         with _directory(path, {0}, create=True):
             pass
     for path in (ROOT / "tools/age", ROOT / "tools/age-keygen"):
@@ -367,7 +627,8 @@ def install(home, user, unit, engine, *, source_dir=None, python_binary=None):
     context.update(systemContextRequired=True, systemContextProfileId=profile,
                    sharedAccount=home != Path(account.pw_dir), engine=engine, unit=unit,
                    scheduleProvisioned=True)
-    for path in (ROOT / collector.name, ROOT / sanitizer.name, target, cron, agent_cron, config_path):
+    for path in (own / collector.name, own / sanitizer.name, target, legacy, cron, agent_cron, config_path,
+                 *shared):
         no_links(path)
         if path.exists():
             if not path.is_file():
@@ -380,14 +641,20 @@ def install(home, user, unit, engine, *, source_dir=None, python_binary=None):
         no_links(path)
         os.chown(path, 0, 0)
         os.chmod(path, 0o700)
-    write(ROOT / collector.name, _read(collector, {0}), mode=0o700)
-    write(ROOT / sanitizer.name, _read(sanitizer, {0}), mode=0o700)
-    command = f"* * * * * root /usr/bin/python3 {ROOT}/agent-backup-context.py --all --age-binary {age} >/dev/null 2>&1\n"
-    write(cron, ("# Encrypted system context only; no model calls or bot restarts.\n" + command).encode(), mode=0o644)
-    scheduled = shlex.join([selected_python or "/usr/bin/python3", str(home / "bin/agent-full-backup"), "--home", str(home), "scheduled"])
-    minute = int(profile[:4], 16) % 60
-    write(agent_cron, (f"# Full encrypted backup for one agent; enabled only after owner setup.\n{minute} * * * * {user} {scheduled} >>{shlex.quote(str(state / 'scheduled.log'))} 2>&1\n").encode(), mode=0o644)
+    write(own / collector.name, _read(collector, {0}), mode=0o700)
+    write(own / sanitizer.name, _read(sanitizer, {0}), mode=0o700)
+    # 1. The agent's own job; it waits while the shared job still has its policy.
+    write(cron, context_job(own / collector.name, age, target), mode=0o644)
+    scheduled = shlex.join([selected_python or "/usr/bin/python3", str(home / "bin/agent-nightly-github-backup"), "--home", str(home)])
+    write(agent_cron, (f"# Local hourly check; one configured GitHub backup at 22:00 Europe/Lisbon.\n0 * * * * {user} {scheduled} >>{shlex.quote(str(state / 'scheduled.log'))} 2>&1\n").encode(), mode=0o644)
+    retire_legacy_user_backup_cron(home, user, backup)
+    # 2. Move the policy out of the shared job's list.
     write(target, (json.dumps(policy, sort_keys=True) + "\n").encode())
+    remove(legacy)
+    # 3. The last agent to move retires the shared job; tools and locks stay.
+    if not shared_policies():
+        for path in shared:
+            remove(path)
     write(config_path, (json.dumps(context, sort_keys=True) + "\n").encode(), account.pw_uid, account.pw_gid)
     return {"profileId": profile, "policy": str(target), "contextRequired": True, "backup": str(backup)}
 
@@ -399,12 +666,23 @@ def main():
     parser.add_argument("--unit", required=True)
     parser.add_argument("--engine", choices=("claude", "codex"), required=True)
     parser.add_argument("--python-binary", help="Existing Python used only by the agent's backup job")
+    parser.add_argument("--check-current", action="store_true", help="Read-only maintenance compatibility check")
+    parser.add_argument("--allow-maintenance-hold", action="store_true", help="Ignore this updater's exact temporary systemd hold")
+    parser.add_argument("--allow-pinned-legacy-shared-context", action="store_true",
+                        help="Maintenance only for two owner canaries on the exact witnessed legacy host")
     args = parser.parse_args()
     try:
-        result = install(args.home, args.user, args.unit, args.engine, python_binary=args.python_binary)
+        if args.allow_pinned_legacy_shared_context and not args.check_current:
+            raise ValueError("legacy shared context is maintenance-only")
+        action = check_current if args.check_current else install
+        result = action(args.home, args.user, args.unit, args.engine, python_binary=args.python_binary,
+                        **({"allow_maintenance_hold": args.allow_maintenance_hold,
+                            "allow_pinned_legacy_shared_context": args.allow_pinned_legacy_shared_context}
+                           if args.check_current else {}))
         print(json.dumps({"ok": True, **result}))
     except Exception:
-        print(json.dumps({"ok": False, "error": "backup-context-install-failed"}))
+        error_code = "backup-context-migration-required" if args.check_current else "backup-context-install-failed"
+        print(json.dumps({"ok": False, "error": error_code}))
         return 1
     return 0
 

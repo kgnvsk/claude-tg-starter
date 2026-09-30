@@ -3,10 +3,25 @@ import { constants, lstatSync, openSync, closeSync, readFileSync, fstatSync } fr
 import { dirname, join } from 'node:path';
 
 type Message = { message_id: number; text?: string; caption?: string; from?: { id: number }; chat: { id: number; type: string } };
-type Options = { home: string; ownerChatId: string; botToken: string; message: Message };
+type Options = { home: string; ownerChatId: string; botToken: string; message: Message; text?: string };
 type Result = { ok: boolean; error?: string; text?: string; recoveryKey?: boolean; enable?: boolean; githubLogin?: boolean; nonce?: string };
-export const backupIntent = /(?:б[еэ]к[аі]п|backup|резервн.{0,12}коп)/iu;
-export const githubSecret = /(?:github_pat_|gh[pousr]_)[A-Za-z0-9_]*/u;
+// A GitHub token is a word of its own: «highs_and_lows.csv» or «laughs_count» is not one.
+export const githubSecret = /(?<![A-Za-z0-9_])(?:github_pat_|gh[pousr]_)[A-Za-z0-9_]{20,}/u;
+// A backup command is a whole message in the kit's words: «хочу підключити бекап», «…вручну»,
+// «увімкни / перевір / повтори бекап», «онови токен бекапу», or their ru/en forms. Any other
+// message that mentions a backup, e.g. «зроби бекап таблиці», is ordinary work for the model.
+const lead = String.raw`(?:(?:я\s+)?хочу|давай|будь\s+ласка|пожалуйста|please|i\s+want\s+to)[\s,]+`;
+const verb = String.raw`(?:підключ|налашт|увімкн|ввімкн|включ|перевір|повтор|онов|замін|подключ|настро|провер|обнов|замен)\S*|connect|set\s*up|enable|turn\s+on|check|retry|update|renew|replace`;
+const noun = String.raw`(?:(?:мені|мне|my|the|a|токен|token)\s+)*(?:(?:авто|auto)\S*\s*)?(?:б[еэ]к[аі]п|backup|резервн\S*\s+коп)\S*`;
+const tail = String.raw`вручн\S*|manually|через\s+токен|токен\S*|token|(?:(?:на|в|у|через|to|on|via)\s+)?(?:github|гітхаб\S*|гитхаб\S*)|агент\S*|бот\S*|знову|again|будь\s+ласка|пожалуйста|please`;
+export const backupCommand = new RegExp(String.raw`^(?:${lead})?(?:${verb})\s+${noun}(?:[\s,]+(?:${tail}))*[\s.,!?]*$`, 'iu');
+// The answers a setup step asks for, as agent-backup-chat reads them. Only an explicit cancel
+// ends a step («скасуй бекап», «cancel backup»): a bare «стоп» is how the owner stops the agent.
+const setup = String.raw`(?:налаштування|підключення|настройк\S*|подключени\S*|setup)`;
+const cancelReply = new RegExp(String.raw`^(?:скасу|відмін|отмен|cancel|стоп|stop)\S*\s+(?:${setup}\s+)?${noun}(?:\s+${setup})?[\s.!]*$`, 'iu');
+// A GitHub link, or a bare owner/repo with letters and three characters on each side: not «yes/no» or «50/50».
+const repositoryReply = /^(?:https:\/\/github\.com\/[A-Za-z0-9][A-Za-z0-9-]{0,38}\/[A-Za-z0-9][A-Za-z0-9_.-]{0,99}|(?=[^\/]*[A-Za-z])[A-Za-z0-9][A-Za-z0-9-]{2,38}\/(?=[^\/]*[A-Za-z])[A-Za-z0-9][A-Za-z0-9_.-]{2,99})\/?$/u;
+const keySaved = /(?:збер[іе]г|збережено|сохранил|сохранено|saved)/iu;
 
 function privateRead(path: string): Buffer {
   for (let parent = dirname(path);; parent = dirname(parent)) {
@@ -67,18 +82,27 @@ export function createBackupChat(deps = { run, api, privateRead }) {
   const logins = new Set<string>();
   const seen = new Set<string>();
   async function handle(o: Options): Promise<boolean> {
-    const m = o.message, text = m.text ?? m.caption ?? '';
+    // The receiver passes the words it gives the model: a Telegram 10.1+ rich message has no `text`.
+    const m = o.message, text = o.text ?? m.text ?? m.caption ?? '';
     const secret = githubSecret.test(text);
     const owner = /^[1-9]\d*$/.test(o.ownerChatId) && m.chat.type === 'private'
       && String(m.from?.id) === o.ownerChatId && String(m.chat.id) === o.ownerChatId;
-    let active = queues.has(o.home + ':' + o.ownerChatId);
+    const pending = queues.has(o.home + ':' + o.ownerChatId);
+    let phase = '';
     if (owner) {
       try {
         const state = JSON.parse(deps.privateRead(join(o.home, '.local/state/agent-full-backup/chat.json')).toString());
-        active ||= !!state.phase && state.owner === o.ownerChatId && state.expires > Date.now() / 1000;
+        if (state.owner === o.ownerChatId && state.expires > Date.now() / 1000) phase = String(state.phase ?? '');
       } catch { /* No setup yet. */ }
     }
-    if (!secret && (!owner || (!active && !backupIntent.test(text)))) return false;
+    // Only a command or the answer the current step asks for belongs to the setup; everything
+    // else goes to the model. While a helper call is in flight the next step is not written yet.
+    const t = text.trim(), step = (...names: string[]) => pending || names.includes(phase);
+    const flow = backupCommand.test(t)
+      || (pending || phase !== '') && cancelReply.test(t)
+      || step('repository', 'token') && repositoryReply.test(t)
+      || step('key', 'ready') && keySaved.test(t) && (/ключ|key/iu.test(t) || !/\s/u.test(t));
+    if (!secret && (!owner || !flow)) return false;
     const say = (text: string) => deps.api(o.botToken, 'sendMessage', { chat_id: m.chat.id, text });
     let deleted = false;
     if (secret) {
@@ -118,7 +142,11 @@ export function createBackupChat(deps = { run, api, privateRead }) {
           if (result.text) await say(result.text);
           void deps.run(o.home, 'agent-backup-github-login', [], { owner: o.ownerChatId, nonce: result.nonce }, 660_000,
             event => { if (event.text) void say(event.text).catch(() => {}); },
-          ).then(deliver).catch(() => {}).finally(() => logins.delete(key));
+          ).then(async login => {
+            // A login that failed or expired closes its setup: one notice, then the chat is the model's.
+            if (!login.ok && login.error !== 'setup-cancelled') await deps.run(o.home, 'agent-backup-chat', [], { owner: o.ownerChatId, operation: 'login-ended', nonce: result.nonce });
+            await deliver(login);
+          }).catch(() => {}).finally(() => logins.delete(key));
           return;
         }
         if (result.text) await say(result.text);
@@ -137,7 +165,7 @@ export function createBackupChat(deps = { run, api, privateRead }) {
           ).then(async completed => {
             await deps.run(o.home, 'agent-backup-chat', [], { owner: o.ownerChatId, operation: 'finished' });
             await say(completed.ok
-              ? 'Готово: першу копію завантажено й перевірено. Автобекап працює кожні 12 годин, зберігає 14 останніх копій у приватному репозиторії. Ключі доступу до сервісів не входять у копію.'
+              ? 'Готово: першу копію завантажено й перевірено. Далі автобекап працює раз на добу о 22:00 за часом Лісабона й зберігає 14 останніх копій у приватному репозиторії. Ключі доступу до сервісів не входять у копію.'
               : 'Першу копію не підтверджено. Налаштування збережено. Напиши «перевір бекап» — перевіримо стан.');
           }).catch(() => {}).finally(() => running.delete(key));
         }

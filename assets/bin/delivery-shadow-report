@@ -5,14 +5,26 @@
 тіньові записи delivery_shadow, чинне значення прапорця з delivery_runtime — те, з яким
 стартував поллер, — і значення з .env каналу, яке набуде сили лише після перезапуску.
 Вердикт для цього боксу за KTD9 враховує лише поточний період shadow: вікно не коротше
-48 годин, нуль receiver_blind, no_end_signal, no_turn_record і incomplete_result, не менше 100 agree разом
+48 годин, нуль receiver_blind, no_end_signal, no_turn_record, incomplete_result і launch_unrecorded,
+не менше 100 agree разом
 і не менше 10 у кожному типі чату (private, group, topic). Кожен would_interrupt і
 expected_forward потребує ручного перегляду: після нього передайте показані ідентифікатори
 через --reviewed-ids. Зміна запису або періоду робить такий ідентифікатор нечинним.
-Звіт нічого не записує. Без достатнього вікна чи спостережень вердикту немає;
-відомий дефект, розбіжність режимів або непереглянутий запис завжди блокують готовність.
+Звіт нічого не записує. Без достатнього вікна чи спостережень вердикту немає; відомий дефект,
+розбіжність режимів, непереглянутий запис або запит, що завершився failed у цьому періоді, завжди блокують готовність.
 incomplete_result означає завершений хід без фінального результату; квитанція проміжної
 відповіді його не закриває. Пізній результат залишає нейтральний result_complete, не новий agree.
+launch_unrecorded означає фоновий запуск, який журнал не зміг записати: у shadow він пішов, а приймач
+відхилив би такий виклик.
+guard_wrong_origin (старий сторож зарахував голові відправку іншого запиту) і would_interrupt_no_reply
+(закритий хід, усі повідомлення якого з груп і закриті через no_reply) лише рахуються. Записи без чату
+належать ходу: їхній тип turn показано окремо, і в покриття private, group, topic вони не входять.
+Вердикту немає, поки хоч один збережений запит не в кінцевому стані (complete, no_reply, cancelled, failed):
+queued, deferred, pending, paused, resume_pending, blocked чи будь-який новий стан.
+failed — це пропущена доставка. Запит failed належить періоду, якщо його час завершення (finished_at,
+а без нього updated_at) не раніше початку періоду; звіт називає такі запити лише ідентифікатором і часом.
+Давніший failed не рахується, інакше одна стара помилка блокувала б кожен наступний період.
+Колонки delivery_results звіт читає лише ті, що є; failed без часу завершення не рахується.
 
 Код виходу: 0 — критерій виконано; 1 — не виконано; 2 — вердикту немає. --json для машин.
 """
@@ -30,7 +42,7 @@ AGENT_ROOT = pathlib.Path(os.environ.get("AGENT_ROOT") or os.environ.get("HOME")
 STATE_DIR = pathlib.Path(os.environ.get("TELEGRAM_STATE_DIR") or AGENT_ROOT / ".claude/channels/telegram")
 VALUES = ("guard", "shadow", "receiver")
 CHAT_TYPES = ("private", "group", "topic")
-BLOCKING = ("receiver_blind", "no_end_signal", "no_turn_record", "incomplete_result")
+BLOCKING = ("receiver_blind", "no_end_signal", "no_turn_record", "incomplete_result", "launch_unrecorded")
 REVIEW = ("would_interrupt", "expected_forward", "incomplete_result_cancelled")
 WINDOW_HOURS = 48
 MIN_AGREE_TOTAL = 100
@@ -41,9 +53,11 @@ FILE_MODE = re.compile(r"""^(['"]?)(guard|shadow|receiver)\1(?:[ \t]+\#.*)?[ \t]
 
 
 def chat_type(chat_id: str | None, thread_id: str | None) -> str:
+    if not chat_id:
+        return "turn"
     if thread_id:
         return "topic"
-    return "group" if str(chat_id or "").startswith("-") else "private"
+    return "group" if str(chat_id).startswith("-") else "private"
 
 
 def stamp(ms: int | None) -> str:
@@ -85,6 +99,17 @@ def read_database(path: pathlib.Path) -> tuple[list[dict], dict | None]:
         if effective and "delivery_results" in tables:
             effective["result_states"] = {row[0]: row[1] for row in connection.execute(
                 "SELECT state, count(*) FROM delivery_results GROUP BY state")}
+            if effective["value"] == "shadow":
+                # An older receiver may lack any of these columns: read only those that exist.
+                columns = {row[1] for row in connection.execute("PRAGMA table_info(delivery_results)")}
+                picked = ", ".join(c if c in columns else "NULL" for c in ("delivery_id", "finished_at", "updated_at"))
+                effective["failed_results"] = []
+                for delivery_id, finished_at, updated_at in connection.execute(
+                        f"SELECT {picked} FROM delivery_results WHERE state='failed'"):
+                    at = updated_at if finished_at is None else finished_at
+                    # Only a failure of this epoch counts; an older one would block every later epoch.
+                    if at is not None and at >= effective["updated_at"]:
+                        effective["failed_results"].append({"delivery_id": delivery_id, "finished_at": at})
         records = []
         if "delivery_shadow" in tables and effective and effective["value"] == "shadow":
             records = [dict(row) for row in connection.execute(
@@ -139,12 +164,18 @@ def summarize(records: list[dict], effective: dict | None, in_file: str | None,
                 no_verdict.append(f"agree у {kind}: {per_type}, потрібно {MIN_AGREE_PER_TYPE}")
     blocking = {cls: classes[cls] for cls in BLOCKING if classes.get(cls)}
     states = (effective or {}).get("result_states", {})
-    for state in ("paused", "resume_pending", "blocked"):
-        if states.get(state):
-            no_verdict.append(f"незавершені збережені запити: {state} {states[state]}")
+    for state, count in states.items():
+        # Name the final states, not the unfinished ones: an unknown or future state stays unfinished.
+        if state not in ("complete", "no_reply", "cancelled", "failed"):
+            no_verdict.append(f"незавершені збережені запити: {state} {count}")
     file_valid = in_file is None or in_file in VALUES
     pending_restart = bool(file_valid and effective and (in_file or "guard") != effective["value"])
     failures = [f"{cls} {count}" for cls, count in blocking.items()]
+    failed = (effective or {}).get("failed_results", [])
+    if failed:
+        # A failed request is a missed delivery: name it by ID and time only, never by its text.
+        failures.append("failed у цьому періоді: " + ", ".join(
+            f"{r['delivery_id'] or '-'} ({stamp(r['finished_at'])})" for r in failed))
     if effective and effective["value"] != "shadow":
         failures.append(f"чинний режим {effective['value']}, потрібен shadow")
     if not file_valid:
@@ -204,7 +235,8 @@ def render(summary: dict) -> str:
     lines.append("  за класами: " + (", ".join(f"{cls} {n}" for cls, n in summary["classes"].items()) or "—"))
     lines.append("  за типом чату:")
     for cls, kinds in sorted(summary["chat_types"].items()):
-        lines.append(f"    {cls}: " + ", ".join(f"{kind} {kinds.get(kind, 0)}" for kind in CHAT_TYPES))
+        lines.append(f"    {cls}: " + ", ".join(f"{kind} {kinds.get(kind, 0)}" for kind in CHAT_TYPES)
+                     + (f"; turn {kinds['turn']}" if kinds.get("turn") else ""))
     lines.append("  за чатами:")
     for key, chat in sorted(summary["chats"].items()):
         lines.append(f"    {key} ({chat['type']}): " + ", ".join(f"{cls} {n}" for cls, n in sorted(chat["classes"].items())))

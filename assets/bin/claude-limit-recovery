@@ -7,6 +7,7 @@ import copy
 import fcntl
 from heapq import nlargest
 import io
+import importlib.util
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -19,6 +20,12 @@ import tempfile
 import time as time_module
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+_NOTICE_SPEC = importlib.util.spec_from_file_location(
+    "agent_notice_locale", Path(__file__).with_name("agent_notice_locale.py")
+)
+_NOTICE_MODULE = importlib.util.module_from_spec(_NOTICE_SPEC)
+_NOTICE_SPEC.loader.exec_module(_NOTICE_MODULE)
+
 
 STATE_SCHEMA_VERSION = 1
 MAX_STATE_BYTES = 1024 * 1024
@@ -26,7 +33,9 @@ MAX_ANCESTRY_EVENTS = 20_000
 MAX_CONTEXT_BYTES = 8 * 1024 * 1024
 MAX_INCREMENT_BYTES = 64 * 1024 * 1024
 MAX_INCREMENT_EVENTS = 100_000
-MAX_TRANSCRIPT_LINE_BYTES = 16 * 1024 * 1024
+# Large tool outputs are valid Claude rows; every other event keeps the old cap.
+MAX_TRANSCRIPT_LINE_BYTES = 32 * 1024 * 1024
+MAX_NON_TOOL_RESULT_LINE_BYTES = 16 * 1024 * 1024
 TURN_STATUS_MAX_FILES = 20
 TURN_STATUS_TAIL_BYTES = 16 * 1024 * 1024
 TURN_ACCEPTANCE_CLOCK_SKEW_MS = 300_000
@@ -36,7 +45,16 @@ COOLDOWN_MS = 900_000
 EARLY_WINDOW_MS = 3_600_000
 MAX_EARLY_ATTEMPTS = 2
 RESET_MARGIN_MS = 120_000
+# "resets 5pm" in an error stamped 17:00:30 means today's 5pm, not tomorrow's.
+# One stamped 17:05 means tomorrow's: a weekly or Opus reset under 24 h away
+# prints no date. The allowance covers only the CLI rounding to the minute.
+RESET_CLOCK_SKEW_MS = 90_000
 INCIDENT_TTL_MS = 86_400_000
+# A session limit resets within five hours; a dated reset (weekly, credits)
+# lies at most about a month ahead.
+LIMIT_HOLD_MS = 5 * 3_600_000
+MAX_DATED_RESET_MS = 32 * INCIDENT_TTL_MS
+LIMIT_UNTIL_TAIL_BYTES = 4 * 1024 * 1024
 READINESS_POLLS = 6
 READINESS_SLEEP_SECONDS = 2
 COMMAND_TIMEOUT_SECONDS = 3
@@ -45,15 +63,11 @@ ACTION_DEADLINE_SECONDS = 40
 INITIALIZE_LOCK_BUSY_EXIT = 75
 TRANSPORT_PATTERN = "bun.*plugins-official.*telegram"
 NOTICE_TEXT = (
-    "Процес агента перезапущено після підтвердженого ліміту Claude. "
-    "Збережений запит очікує відновлення з попереднього контексту."
+    "Я знову на зв'язку після ліміту Claude. "
+    "Твій запит збережено — продовжу його сам, нічого надсилати не треба."
 )
 OVERLOAD_NOTICE_TEXT = (
     "⚠️ Anthropic зараз перевантажений. Запит збережено; продовжу його після відновлення доступу."
-)
-LIMIT_NOTICE_TEXT = (
-    "⏳ Я вперся в ліміт Claude. Запит збережено; після скидання ліміту продовжу з попереднього місця. "
-    "Стан доступний через /health."
 )
 OWNER_OVERLOAD_NOTICE_TEXT = (
     "⚠️ Один із дозволених чатів не отримав відповідь: Anthropic перевантажений. "
@@ -68,6 +82,11 @@ NOTICE_LOCK_NAME = "claude-interruption-notices.lock"
 MAX_NOTICE_EVENT_UUIDS = 512
 ACCOUNT_NOTICE_KINDS = frozenset({"subscription_expired", "subscription_required", "billing"})
 ACCOUNT_NOTICE_PREFIX = "account-notice:"
+RESET_NOTICE_PREFIX = "notice-reset:"
+# An untimed limit (a spend cap, the bare «limit») names no reset to dedupe on. Without
+# the ledger its refused request is replayed about every LIMIT_HOLD_MS, so a recipient
+# told about it hears again only after a day, or after a real answer (28E-J2 review L3).
+UNTIMED_NOTICE_PAUSE_MS = 24 * 3_600_000
 STATE_KEYS = frozenset(
     {
         "schema_version",
@@ -117,17 +136,41 @@ CHANNEL_ATTRIBUTE = re.compile(
     re.DOTALL,
 )
 ZONE_SEGMENT = r"[A-Za-z][A-Za-z0-9._+-]*"
+# The limit names Claude Code prints after "You've hit your ", taken from the
+# CLI's own table (2.1.280: five_hour "session limit", seven_day "weekly
+# limit", seven_day_opus "Opus limit", seven_day_sonnet "Sonnet limit",
+# seven_day_overage_included "Fable limit", overage "usage credit limit"),
+# plus "usage limit" from earlier versions.
+LIMIT_KINDS = r"session|weekly|Opus|Sonnet|Fable|usage credit|usage"
+# Limits whose reset is not read (2.1.280): the bare "limit" and the Team and
+# Enterprise spend caps. They hold like a limit with no reset time.
+UNTIMED_LIMITS = (r"limit|individual usage limit|org's monthly usage limit"
+                  r"|channel's monthly usage limit|team's shared budget")
 # Two provider phrasings: the classic "hit your … limit" and the credits pool
 # of Team/Enterprise seats ("out of usage credits", resets monthly).
 LIMIT_ERROR_PATTERN = re.compile(
-    r"\A(?:You've hit your (?P<kind>session|weekly|usage) limit"
+    rf"\A(?:You've hit your (?P<kind>{LIMIT_KINDS}) limit"
+    rf"|You've hit your (?:{UNTIMED_LIMITS})"
     r"|You're out of usage credits)\b"
 )
 OVERLOAD_PATTERN = re.compile(r"\bOverloaded\b", re.IGNORECASE)
 LIMIT_PATTERN = re.compile(
     # Клас ліміту є частиною стабільного ключа дедуплікації.
-    r"\A(?:You've hit your (?P<kind>session|weekly|usage) limit · resets "
+    rf"\A(?:You've hit your (?P<kind>{LIMIT_KINDS}) limit · resets "
     r"|You're out of usage credits · resets )"
+    r"(?P<hour>(?:[1-9]|1[0-2]))"
+    r"(?::(?P<minute>[0-5][0-9]))?"
+    r"(?P<period>am|pm) "
+    rf"\((?P<zone>UTC|(?:{ZONE_SEGMENT}/)+{ZONE_SEGMENT})\)"
+    r"(?: · progress saved)?\Z"
+)
+# A weekly limit or usage credits reset on a later day: "resets Aug 23, 5pm (UTC)",
+# with the year when it differs: "resets Jan 2, 2027, 9am (Europe/Kyiv)".
+MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+DATED_LIMIT_PATTERN = re.compile(
+    rf"\A(?:You've hit your (?P<kind>{LIMIT_KINDS}) limit · resets "
+    r"|You're out of usage credits · resets )"
+    rf"(?P<month>{'|'.join(MONTHS)}) (?P<day>[1-9]|[12][0-9]|3[01])(?:, (?P<year>[0-9]{{4}}))?, "
     r"(?P<hour>(?:[1-9]|1[0-2]))"
     r"(?::(?P<minute>[0-5][0-9]))?"
     r"(?P<period>am|pm) "
@@ -288,13 +331,20 @@ def _valid_local_instants(
 
 
 def parse_reset(error: str, event_epoch_ms: int) -> ResetAt | None:
-    """Resolve the next real local reset instant at or after the event."""
+    """Resolve the next real local reset instant at or after the event.
+
+    "At or after" allows RESET_CLOCK_SKEW_MS: an error stamped moments after
+    the reset minute it names still means that minute, not a day later.
+    """
     if not isinstance(error, str):
         return None
-    match = LIMIT_PATTERN.fullmatch(error)
+    match = LIMIT_PATTERN.fullmatch(error) or DATED_LIMIT_PATTERN.fullmatch(error)
     event_instant = _event_instant(event_epoch_ms)
     if match is None or event_instant is None:
         return None
+    dated = match.re is DATED_LIMIT_PATTERN
+    year_text = match.groupdict().get("year")
+    earliest = event_instant - timedelta(milliseconds=RESET_CLOCK_SKEW_MS)
 
     zone_name = match.group("zone")
     try:
@@ -316,16 +366,29 @@ def parse_reset(error: str, event_epoch_ms: int) -> ResetAt | None:
 
     for day_offset in (0, 1):
         try:
-            local_day = local_event_day + timedelta(days=day_offset)
+            if dated:
+                # The year the CLI names; without one, that day of this year
+                # or, across New Year, of the next.
+                if year_text is not None and day_offset:
+                    break
+                local_day = date(
+                    int(year_text) if year_text is not None else local_event_day.year + day_offset,
+                    MONTHS.index(match.group("month")) + 1,
+                    int(match.group("day")),
+                )
+            else:
+                local_day = local_event_day + timedelta(days=day_offset)
         except OverflowError:
             return None
+        except ValueError:
+            continue  # no such day that year (Feb 30, Feb 29)
         candidates = _valid_local_instants(local_day, local_time, zone)
         if not candidates:
             return None
         eligible = [
             candidate
             for candidate in candidates
-            if candidate.astimezone(timezone.utc) >= event_instant
+            if candidate.astimezone(timezone.utc) >= earliest
         ]
         if not eligible:
             continue
@@ -333,10 +396,13 @@ def parse_reset(error: str, event_epoch_ms: int) -> ResetAt | None:
             eligible,
             key=lambda value: value.astimezone(timezone.utc),
         )
+        reset_epoch_ms = _datetime_epoch_ms(chosen.astimezone(timezone.utc))
+        if dated and reset_epoch_ms - event_epoch_ms > MAX_DATED_RESET_MS:
+            return None  # a day already behind the event, not one a year ahead
         return ResetAt(
             kind=match.group("kind") or "credits",
             key=chosen.isoformat(timespec="seconds"),
-            epoch_ms=_datetime_epoch_ms(chosen.astimezone(timezone.utc)),
+            epoch_ms=reset_epoch_ms,
         )
     return None
 
@@ -490,6 +556,38 @@ def telegram_origin(
     return None
 
 
+def _interruption_ancestry_truncated(
+    event: dict,
+    events_by_uuid: dict[str, dict],
+) -> bool:
+    """Distinguish a bounded context miss from a known non-Telegram parent."""
+    if event.get("isSidechain") is not False or event.get("userType") != "external":
+        return False
+    parent_uuid = event.get("parentUuid")
+    visited = {event.get("uuid")}
+    for _ in range(min(len(events_by_uuid) + 1, MAX_ANCESTRY_EVENTS)):
+        if not isinstance(parent_uuid, str) or not parent_uuid or parent_uuid in visited:
+            return False
+        parent = events_by_uuid.get(parent_uuid)
+        if parent is None:
+            return True
+        if not _active_ancestry_event(parent):
+            return False
+        visited.add(parent_uuid)
+        disposition, _ref = _ancestry_disposition(parent)
+        if disposition == "carrier":
+            carrier_parent = parent.get("parentUuid")
+            return (
+                isinstance(carrier_parent, str)
+                and bool(carrier_parent)
+                and carrier_parent not in events_by_uuid
+            )
+        if disposition != "continue":
+            return False
+        parent_uuid = parent.get("parentUuid")
+    return True
+
+
 def _datetime_epoch_ms(value: datetime) -> int:
     utc_value = value.astimezone(timezone.utc)
     delta = utc_value - UNIX_EPOCH
@@ -588,6 +686,30 @@ def provider_failure_kind(status: int | None, rendered: str) -> str | None:
     return None
 
 
+def _needs_interruption_ancestry(event: dict) -> bool:
+    """Only actionable provider errors justify a wider context read."""
+    status = event.get("apiErrorStatus")
+    event_uuid = event.get("uuid")
+    if (
+        event.get("type") != "assistant"
+        or event.get("isApiErrorMessage") is not True
+        or type(status) is not int
+        or status not in (400, 401, 402, 403, 429, 529)
+        or event.get("isSidechain") is not False
+        or event.get("userType") != "external"
+        or not isinstance(event_uuid, str)
+        or not event_uuid
+        or _event_epoch_ms(event) is None
+    ):
+        return False
+    rendered = rendered_assistant_text(event)
+    if rendered is None:
+        return False
+    return provider_failure_kind(status, rendered) in {
+        "limit", "overloaded", *ACCOUNT_NOTICE_KINDS,
+    }
+
+
 def classify_interruption(
     event: dict,
     events_by_uuid: dict[str, dict],
@@ -619,6 +741,7 @@ def classify_interruption(
     # interruption message here would duplicate its owner login notification.
     if kind not in {"limit", "overloaded", *ACCOUNT_NOTICE_KINDS}:
         return None
+    reset = parse_reset(rendered, event_epoch_ms) if kind == "limit" else None
     return {
         "event_uuid": event_uuid,
         "event_epoch_ms": event_epoch_ms,
@@ -626,6 +749,7 @@ def classify_interruption(
         "message_id": channel.message_id,
         "kind": kind,
         **({"thread_id": channel.thread_id} if channel.thread_id is not None else {}),
+        **({"reset_key": f"{reset.kind}:{reset.key}", "reset_epoch_ms": reset.epoch_ms} if reset is not None else {}),
     }
 
 
@@ -1127,6 +1251,16 @@ def _discover_transcripts(projects_dir: Path) -> dict[str, tuple[Path, os.stat_r
         discovered: dict[str, tuple[Path, os.stat_result]] = {}
 
         def raise_walk_error(error: OSError) -> None:
+            # A folder under the projects the agent cannot read (another
+            # user's, a sandbox's) holds nothing it could act on. Failing on
+            # it failed --status and --limit-until on every tick for as long
+            # as it existed; an unreadable projects root still fails.
+            if (
+                isinstance(error, PermissionError)
+                and error.filename is not None
+                and Path(error.filename) != projects_dir
+            ):
+                return
             raise StateError("cannot completely scan transcripts") from error
 
         for directory, directory_names, file_names in os.walk(
@@ -1214,6 +1348,31 @@ def _decode_jsonl(
             raise StateError("invalid transcript row") from error
         if not isinstance(record, dict):
             raise StateError("invalid transcript record")
+        if len(line) > MAX_NON_TOOL_RESULT_LINE_BYTES:
+            message = record.get("message")
+            content = message.get("content") if isinstance(message, dict) else None
+            if not (
+                record.get("type") == "user"
+                and isinstance(message, dict)
+                and message.get("role") == "user"
+                and isinstance(content, list)
+                and content
+                and all(
+                    isinstance(block, dict) and block.get("type") == "tool_result"
+                    for block in content
+                )
+            ):
+                raise StateError("transcript row exceeds size limit")
+            metadata = dict(record)
+            metadata["message"] = dict(message)
+            metadata["message"]["content"] = [
+                {**block, "content": None} for block in content
+            ]
+            metadata_size = len(
+                json.dumps(metadata, separators=(",", ":")).encode("utf-8")
+            )
+            if metadata_size > MAX_NON_TOOL_RESULT_LINE_BYTES:
+                raise StateError("transcript row exceeds size limit")
         next_ordinal += 1
         envelopes.append(
             {"record": record, "ordinal": next_ordinal, "is_new": is_new}
@@ -1261,17 +1420,6 @@ def _scan_transcript(
             }, []
 
         context_start = max(0, offset - MAX_CONTEXT_BYTES)
-        context_payload = _read_range(
-            descriptor,
-            context_start,
-            offset - context_start,
-        )
-        if context_start:
-            first_boundary = context_payload.find(b"\n")
-            context_payload = (
-                b"" if first_boundary < 0 else context_payload[first_boundary + 1 :]
-            )
-
         new_payload = _read_range(
             descriptor,
             offset,
@@ -1290,18 +1438,46 @@ def _scan_transcript(
                 raise StateError("transcript row exceeds size limit")
             complete_end = line_end + 1
         complete_new = new_payload[:complete_end]
-        context_events = _decode_jsonl(
-            _tail_jsonl(context_payload, MAX_ANCESTRY_EVENTS),
-            is_new=False,
-            ordinal=0,
-            max_events=MAX_ANCESTRY_EVENTS,
-        )
         new_events = _decode_jsonl(
             complete_new,
             is_new=True,
             ordinal=metadata["ordinal"],
             max_events=MAX_INCREMENT_EVENTS,
         )
+        interruptions = [
+            event["record"] for event in new_events
+            if _needs_interruption_ancestry(event["record"])
+        ]
+        if context_start and interruptions:
+            # A checkpointed tool result can be larger than the usual context
+            # window. Include that row and one preceding ordinary row so a
+            # later interruption can still reach its Telegram carrier.
+            context_start = max(
+                0,
+                offset - MAX_CONTEXT_BYTES - MAX_TRANSCRIPT_LINE_BYTES
+                - MAX_NON_TOOL_RESULT_LINE_BYTES,
+            )
+        context_payload = _read_range(
+            descriptor, context_start, offset - context_start
+        )
+        if context_start:
+            first_boundary = context_payload.find(b"\n")
+            context_payload = (
+                b"" if first_boundary < 0 else context_payload[first_boundary + 1 :]
+            )
+        context_events = _decode_jsonl(
+            _tail_jsonl(context_payload, MAX_ANCESTRY_EVENTS),
+            is_new=False,
+            ordinal=0,
+            max_events=MAX_ANCESTRY_EVENTS,
+        )
+        if context_start and interruptions:
+            events_by_uuid = _batch_uuid_map(context_events + new_events)
+            if any(
+                _interruption_ancestry_truncated(event, events_by_uuid)
+                for event in interruptions
+            ):
+                raise StateError("provider interruption ancestry exceeds context limit")
         # A prefix read must not hide truncation of the unread snapshot suffix.
         # Appends are safe: bytes beyond this snapshot wait for the next tick.
         if os.fstat(descriptor).st_size < opened_stat.st_size:
@@ -1629,6 +1805,69 @@ def turn_status(projects_dir: Path, chat_id: str, message_id: str) -> str:
         return "handled" if handled else "unknown"
     except (StateError, OSError, OverflowError, TypeError, ValueError):
         return "unknown"
+
+
+def limit_until(projects_dir: Path) -> int:
+    """Until when the newest transcripts keep a Claude limit in force, in epoch ms.
+
+    Stateless and lock-free, so it still answers when --status cannot. A
+    limit error holds until its own reset, and for LIMIT_HOLD_MS after it
+    when no reset can be read or it reads as earlier than the error. A
+    later real answer from the account ends every earlier limit; a retry
+    that hits the limit again writes a new error that holds by itself.
+    0 means no limit. A transcript that cannot be read raises, never "none".
+    """
+    discovered = _discover_transcripts(Path(projects_dir))
+    recent = nlargest(
+        TURN_STATUS_MAX_FILES,
+        discovered.items(),
+        key=lambda item: (item[1][1].st_mtime_ns, item[0]),
+    )
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    limits: list[tuple[int, int]] = []
+    answered_at = 0
+    for _relative, (transcript, _transcript_stat) in recent:
+        descriptor = os.open(transcript, flags)
+        try:
+            size = os.fstat(descriptor).st_size
+            start = max(0, size - LIMIT_UNTIL_TAIL_BYTES)
+            payload = _read_range(descriptor, start, size - start)
+        finally:
+            os.close(descriptor)
+        for raw in payload.splitlines():
+            if b'"assistant"' not in raw:
+                continue
+            try:
+                event = json.loads(raw)
+            except ValueError:
+                continue  # a row the tail cut in half cannot be a readable limit
+            if (
+                not isinstance(event, dict)
+                or event.get("type") != "assistant"
+                or event.get("isSidechain") is not False
+                or event.get("userType") != "external"
+            ):
+                continue
+            event_ms = _event_epoch_ms(event)
+            if event_ms is None:
+                continue
+            if event.get("isApiErrorMessage") is not True:
+                message = event.get("message")
+                if isinstance(message, dict) and message.get("model") not in (None, "<synthetic>"):
+                    answered_at = max(answered_at, event_ms)
+                continue
+            error = rendered_error(event)
+            status = event.get("apiErrorStatus")
+            if error is None or type(status) is not int or status != 429:
+                continue
+            # parse_reset never returns a reset earlier than the error beyond
+            # the clock skew: that one, like an unreadable copy, is None.
+            reset = parse_reset(error, event_ms)
+            if reset is not None:
+                limits.append((event_ms, reset.epoch_ms + RESET_MARGIN_MS))
+            else:
+                limits.append((event_ms, event_ms + LIMIT_HOLD_MS))
+    return max((until for event_ms, until in limits if event_ms > answered_at), default=0)
 
 
 def _new_incident(classified: dict, transcript: str) -> dict:
@@ -2325,6 +2564,88 @@ def durable_scheduler_owns_recovery(db: Path) -> bool:
             connection.close()
 
 
+def addressed_to_bot(db: Path, chat_id: str, message_id: str | None) -> bool:
+    """Group talk that addressed nobody here is no one's request (Кнопа, 15.09).
+
+    The receiver keeps such a message marked addressed="false"; anything it
+    cannot read counts as a request.
+    """
+    if not chat_id.startswith("-") or message_id is None:
+        return True
+    connection = None
+    try:
+        connection = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=1)
+        row = connection.execute(
+            "SELECT request_payload FROM delivery_results WHERE delivery_id=?",
+            (f"{chat_id}:{message_id}",),
+        ).fetchone()
+        return json.loads(row[0])["params"]["meta"].get("addressed") != "false"
+    except (sqlite3.Error, TypeError, ValueError, KeyError, AttributeError):
+        return True
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def refused_request(state: dict, now_ms: int) -> str | None:
+    """The request the limit refused, once its known reset has passed.
+
+    A receiver without the delivery ledger keeps it as the started head of its
+    queue, and nothing offers it again when no later message arrives (Cash
+    1.02, Mani 1.40). That receiver offers a queued head within seconds; a
+    restart would drop the started head and ask the person to resend.
+    """
+    incident = state["incident"]
+    if incident is None or incident["resolved"] or incident["expired"]:
+        return None
+    # No reset read: the limit holds LIMIT_HOLD_MS after the error, as limit_until says.
+    due = incident["reset_epoch_ms"]
+    if due is None:
+        due = incident["event_epoch_ms"] + LIMIT_HOLD_MS
+    if now_ms < due + RESET_MARGIN_MS or incident["limit_origin"]["message_id"] is None:
+        return None
+    origin = incident["limit_origin"]
+    delivery_id = f"{origin['chat_id']}:{origin['message_id']}"
+    if f"requeue:{delivery_id}" in incident["attempted_pending_keys"]:
+        return None
+    return delivery_id
+
+
+def requeue_started_head(db: Path, delivery_id: str) -> bool:
+    connection = None
+    try:
+        connection = sqlite3.connect(f"file:{db}?mode=rw", uri=True, timeout=1)
+        with connection:
+            changed = connection.execute(
+                "UPDATE pending_inbound_deliveries SET state='queued', attempts=0, next_attempt_at=0 "
+                "WHERE delivery_id=? AND state='started' AND rowid=(SELECT rowid "
+                "FROM pending_inbound_deliveries ORDER BY created_at, rowid LIMIT 1)",
+                (delivery_id,),
+            ).rowcount
+        return changed == 1
+    except sqlite3.Error:
+        return False
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def receiver_owns_limit_notices(db: Path) -> bool:
+    """The receiver that holds the queue tells each waiting chat about a limit."""
+    connection = None
+    try:
+        connection = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=1)
+        row = connection.execute(
+            "SELECT value FROM delivery_runtime WHERE key='limit_notice_owner'"
+        ).fetchone()
+        return row is not None and row[0] == "receiver"
+    except sqlite3.Error:
+        return False
+    finally:
+        if connection is not None:
+            connection.close()
+
+
 def _projects_dir(agent_root: Path) -> Path:
     """Use this instance's Claude config without moving its Telegram state."""
     configured = os.environ.get("CLAUDE_CONFIG_DIR")
@@ -2417,7 +2738,7 @@ def restart_and_notify(state: dict, service: str, runner) -> bool:
                 break
             _command_ok(
                 runner,
-                [helper, chat_id, NOTICE_TEXT],
+                [helper, chat_id, _NOTICE_MODULE.notice_text("queue.restarted", NOTICE_TEXT, home=_agent_root())],
                 timeout=remaining_timeout(COMMAND_TIMEOUT_SECONDS),
             )
         return True
@@ -2529,25 +2850,35 @@ def _refresh_transcripts(agent_root: Path, state: dict, now_ms: int) -> dict:
     return state
 
 
-def _notice_copy(kind: str, *, owner: bool) -> str:
+def _notice_copy(kind: str, *, owner: bool, reset_epoch_ms: int | None = None) -> str:
     if kind == "overloaded":
-        return OWNER_OVERLOAD_NOTICE_TEXT if owner else OVERLOAD_NOTICE_TEXT
+        key = "queue.owner_overloaded" if owner else "queue.overloaded"
+        return _NOTICE_MODULE.notice_text(
+            key, OWNER_OVERLOAD_NOTICE_TEXT if owner else OVERLOAD_NOTICE_TEXT, home=_agent_root()
+        )
     if kind == "limit":
-        return OWNER_LIMIT_NOTICE_TEXT if owner else LIMIT_NOTICE_TEXT
+        if not owner:
+            # The chat hears the owner's line (27.09), the same as the receiver's.
+            return _NOTICE_MODULE.accepted_line(_agent_root(), reset_epoch_ms, _now_ms())
+        return _NOTICE_MODULE.notice_text("queue.owner_limit", OWNER_LIMIT_NOTICE_TEXT, home=_agent_root())
     if kind in ACCOUNT_NOTICE_KINDS:
         if not owner:
-            return "⚠️ Агент тимчасово недоступний через стан облікового запису Claude. Потрібна дія власника."
+            text = "⚠️ Агент тимчасово недоступний через стан облікового запису Claude. Потрібна дія власника."
+            return _NOTICE_MODULE.notice_text("queue.account_unavailable", text, home=_agent_root())
         if kind == "subscription_expired":
-            return ("⚠️ Claude повідомив, що підписка завершилася. Відкрий Claude → Settings → Billing "
+            text = ("⚠️ Claude повідомив, що підписка завершилася. Відкрий Claude → Settings → Billing "
                     "та перевір поновлення. Після поновлення напиши /relogin, якщо потрібен повторний вхід. "
                     "Автоматично повторювати це повідомлення не буду.")
+            return _NOTICE_MODULE.notice_text("queue.subscription_expired", text, home=_agent_root())
         if kind == "subscription_required":
-            return ("⚠️ Claude повідомив, що немає активної підписки. Перевір план у Claude → Settings → Billing. "
+            text = ("⚠️ Claude повідомив, що немає активної підписки. Перевір план у Claude → Settings → Billing. "
                     "Після підключення напиши /relogin, якщо потрібен повторний вхід. "
                     "Автоматично повторювати це повідомлення не буду.")
-        return ("⚠️ Claude повідомив про проблему з оплатою або недостатній баланс. "
+            return _NOTICE_MODULE.notice_text("queue.subscription_required", text, home=_agent_root())
+        text = ("⚠️ Claude повідомив про проблему з оплатою або недостатній баланс. "
                 "Перевір оплату в обліковому записі Claude чи Anthropic Console, яким користується агент. "
                 "Автоматично повторювати повідомлення не буду.")
+        return _NOTICE_MODULE.notice_text("queue.billing", text, home=_agent_root())
     raise StateError("invalid interruption kind")
 
 
@@ -2626,6 +2957,12 @@ def notification_tick(mode: str) -> int:
         success_at = _account_success_at(batches)
         _clear_account_notices_before(state, success_at)
         _clear_account_notices_before(retry_state, success_at)
+        if success_at:
+            # A real answer ends the limit: the next one is news, whatever reset it names.
+            for current in (state, retry_state):
+                current["handled_reset_keys"][:] = [
+                    key for key in current["handled_reset_keys"] if not key.startswith(RESET_NOTICE_PREFIX)
+                ]
         reserved: list[dict] = []
         handled = state["handled_event_uuids"]
         retry_handled = retry_state["handled_event_uuids"]
@@ -2654,10 +2991,18 @@ def notification_tick(mode: str) -> int:
             owner_chat = None
         runner = _runner_factory()
         sender = str(agent_root / "bin" / "tg-send")
+        # The receiver that holds the queue tells every waiting chat about a
+        # usage limit, with its reset time. The owner copy stays here, once per
+        # limit until the model answers again, like the account notices.
+        receiver_notices = receiver_owns_limit_notices(
+            agent_root / ".claude" / "channels" / "telegram" / "messages.db"
+        )
         for interruption in reserved:
             event_uuid = interruption["event_uuid"]
+            receiver_owned = receiver_notices and interruption["kind"] == "limit"
+            latched = receiver_owned or interruption["kind"] in ACCOUNT_NOTICE_KINDS
             account_prefix = f"{ACCOUNT_NOTICE_PREFIX}{interruption['kind']}:"
-            if interruption["kind"] in ACCOUNT_NOTICE_KINDS and (
+            if latched and (
                 interruption["event_epoch_ms"] <= success_at
                 or any(key.startswith(account_prefix) for key in state["handled_reset_keys"])
             ):
@@ -2667,7 +3012,25 @@ def notification_tick(mode: str) -> int:
             affected_chat = interruption["chat_id"]
             affected_marker = _notice_recipient_marker(event_uuid, "affected")
             owner_marker = _notice_recipient_marker(event_uuid, "owner")
-            if affected_marker not in retry_handled:
+            # One notice per recipient and reset: a retry refused by the same
+            # limit (monthly credits, past the receiver's horizon) is not news.
+            reset_marks = {
+                recipient: f"{RESET_NOTICE_PREFIX}{interruption['reset_key']}:{recipient}"
+                for recipient in (affected_chat, "owner")
+            } if interruption.get("reset_key") else {}
+            told = {mark for mark in reset_marks.values() if mark in state["handled_reset_keys"]}
+            if interruption["kind"] == "limit" and not interruption.get("reset_key"):
+                at = interruption["event_epoch_ms"]
+                reset_marks = {recipient: f"{RESET_NOTICE_PREFIX}untimed:{recipient}:{at}"
+                               for recipient in (affected_chat, "owner")}
+                told = {mark for recipient, mark in reset_marks.items() if any(
+                    key.startswith(f"{RESET_NOTICE_PREFIX}untimed:{recipient}:")
+                    and 0 <= at - int(key.rsplit(":", 1)[1]) < UNTIMED_NOTICE_PAUSE_MS
+                    for key in state["handled_reset_keys"])}
+            if (affected_marker not in retry_handled and not receiver_owned
+                    and reset_marks.get(affected_chat) not in told
+                    and addressed_to_bot(agent_root / ".claude" / "channels" / "telegram" / "messages.db",
+                                         affected_chat, interruption["message_id"])):
                 if not _command_ok(
                     runner,
                     [
@@ -2676,7 +3039,7 @@ def notification_tick(mode: str) -> int:
                         affected_chat,
                         _notice_copy(interruption["kind"], owner=(
                             interruption["kind"] in ACCOUNT_NOTICE_KINDS and affected_chat == owner_chat
-                        )),
+                        ), reset_epoch_ms=interruption.get("reset_epoch_ms")),
                         *(["--thread-id", interruption["thread_id"]] if interruption.get("thread_id") else []),
                     ],
                     timeout=COMMAND_TIMEOUT_SECONDS,
@@ -2691,6 +3054,7 @@ def notification_tick(mode: str) -> int:
                 owner_chat is not None
                 and owner_chat != affected_chat
                 and owner_marker not in retry_handled
+                and reset_marks.get("owner") not in told
             ):
                 if not _command_ok(
                     runner,
@@ -2705,12 +3069,19 @@ def notification_tick(mode: str) -> int:
                     return 1
                 _append_notice_checkpoint(handled, owner_marker)
                 _append_notice_checkpoint(retry_handled, owner_marker)
+            # Only a recipient that heard counts as told: chatter the limit refused must not
+            # silence the next addressed request in its chat (28E-J2 fix review).
+            heard = {reset_marks.get(affected_chat) if affected_marker in retry_handled else None,
+                     reset_marks.get("owner") if owner_marker in retry_handled else None} - {None}
             _complete_notice_checkpoint(handled, event_uuid)
             _complete_notice_checkpoint(retry_handled, event_uuid)
-            if interruption["kind"] in ACCOUNT_NOTICE_KINDS:
+            if latched:
                 key = f"{account_prefix}{interruption['event_epoch_ms']}"
                 state["handled_reset_keys"].append(key)
                 retry_state["handled_reset_keys"].append(key)
+            for mark in heard - told:
+                state["handled_reset_keys"].append(mark)
+                retry_state["handled_reset_keys"].append(mark)
             # Checkpoint each fully delivered event before attempting the next
             # one, so a later failure cannot duplicate any confirmed recipient.
             atomic_write_state(state_path, retry_state)
@@ -2773,6 +3144,16 @@ def tick(mode: str) -> int:
             atomic_write_state(state_path, state)
             _record_suppression(agent_root, "durable_scheduler_owns_recovery")
             return 0
+
+        refused = refused_request(state, now_ms)
+        if refused is not None and _restart_hold_status(agent_root) is None:
+            # Reserved before the queue changes: a crash may skip the replay,
+            # never repeat it over the request's new turn.
+            state["incident"]["attempted_pending_keys"].append(f"requeue:{refused}")
+            atomic_write_state(state_path, state)
+            if requeue_started_head(messages_db, refused):
+                _record_suppression(agent_root, "refused_request_requeued")
+                return 0
 
         decision = decide_attempt(state, now_ms)
         if not decision.eligible:
@@ -2896,6 +3277,13 @@ def main() -> int:
             arguments[2],
         )
         print(status)
+        return 0
+    if arguments == ["--limit-until"]:
+        try:
+            until = limit_until(_agent_root() / ".claude" / "projects")
+        except (StateError, OSError, OverflowError, TypeError, ValueError):
+            return 1
+        print(until)
         return 0
     if len(arguments) != 1:
         return 2

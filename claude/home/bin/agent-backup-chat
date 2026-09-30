@@ -16,9 +16,17 @@ spec = importlib.util.spec_from_loader(loader.name, loader)
 backend = importlib.util.module_from_spec(spec)
 loader.exec_module(backend)
 
-TOKEN = re.compile(r'(?:github_pat_|gh[pousr]_)[A-Za-z0-9_]+')
+# A GitHub token is a word of its own: «highs_and_lows.csv» or «laughs_count» is not one.
+TOKEN = re.compile(r'(?<![A-Za-z0-9_])(?:github_pat_|gh[pousr]_)[A-Za-z0-9_]{20,}')
 INTENT = re.compile(r'(?i)(?:б[еэ]к[аі]п|backup|резервн.{0,12}коп)')
-CANCEL = re.compile(r'(?i)^(?:скасуй|скасувати|відміна|отмена|отмени|cancel|стоп|stop)[.!\s]*$')
+# Only an explicit cancel ends a step («скасуй бекап», «cancel backup»): a bare «стоп» is how
+# the owner stops the agent. The same words as telegram-backup-chat.ts.
+BACKUP = r'(?:(?:мені|мне|my|the|a|токен|token)\s+)*(?:(?:авто|auto)\S*\s*)?(?:б[еэ]к[аі]п|backup|резервн\S*\s+коп)\S*'
+SETUP = r'(?:налаштування|підключення|настройк\S*|подключени\S*|setup)'
+CANCEL = re.compile(r'(?i)(?:скасу|відмін|отмен|cancel|стоп|stop)\S*\s+(?:' + SETUP + r'\s+)?' + BACKUP + r'(?:\s+' + SETUP + r')?[.!\s]*')
+# A GitHub link, or a bare owner/repo with letters and three characters on each side: not «yes/no» or «50/50».
+REPOSITORY = re.compile(r'https://github\.com/([A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9][A-Za-z0-9_.-]{0,99})/?'
+                        r'|((?=[^/]*[A-Za-z])[A-Za-z0-9][A-Za-z0-9-]{2,38}/(?=[^/]*[A-Za-z])[A-Za-z0-9][A-Za-z0-9_.-]{2,99})/?')
 SAVED = re.compile(r'(?i)(?:збер[іе]г|збережено|сохранил|сохранено|saved)')
 TTL = 24 * 3600
 
@@ -55,6 +63,11 @@ def handle(backup, value, now=None):
     if value.get('operation') == 'finished':
         backup.save(state_path, {})
         return {'ok': True}
+    if value.get('operation') == 'login-ended':
+        # A GitHub login that failed or expired closes its own setup; a newer setup keeps going.
+        if state.get('nonce') and state.get('nonce') == value.get('nonce'):
+            backup.save(state_path, {})
+        return {'ok': True}
     if value.get('operation') == 'key-delivered':
         if state.get('phase') == 'key':
             state['keyDelivered'] = True
@@ -80,7 +93,7 @@ def handle(backup, value, now=None):
         backup.save(state_path, state)
         return reply('Доступ до приватного репозиторію перевірено. Збережи цей файл ключа на своєму комп’ютері або в менеджері паролів. Він потрібен для відновлення після втрати сервера. Потім напиши «ключ збережено».', recoveryKey=True)
     if state.get('phase') == 'github':
-        return reply('Очікую підтвердження входу на сторінці GitHub. Щоб закрити налаштування, напиши «скасуй».', githubLogin=True, nonce=state['nonce'])
+        return reply('Очікую підтвердження входу на сторінці GitHub. Щоб закрити налаштування, напиши «скасуй бекап».', githubLogin=True, nonce=state['nonce'])
     if state.get('phase') == 'key':
         if SAVED.search(text) and state.get('keyDelivered'):
             backup.confirm_key_saved()
@@ -91,13 +104,13 @@ def handle(backup, value, now=None):
     if state.get('phase') == 'ready':
         if INTENT.search(text) or SAVED.search(text):
             return reply('Запускаю копію та автоматичний бекап. Повідомлю результат після перевірки завантаження.', enable=True)
-        return reply('Напиши «увімкни бекап» або «скасуй».')
+        return reply('Напиши «увімкни бекап» або «скасуй бекап».')
     if state.get('phase') in ('repository', 'token'):
-        match = re.fullmatch(r'(?:https://github\.com/)?([A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9][A-Za-z0-9_.-]{0,99})/?', text.strip())
+        match = REPOSITORY.fullmatch(text.strip())
         if match:
-            state.update(phase='token', repository=match[1])
+            state.update(phase='token', repository=match[1] or match[2])
             backup.save(state_path, state)
-            return reply(token_guide(match[1]))
+            return reply(token_guide(state['repository']))
         if state.get('phase') == 'token':
             return reply(token_guide(state['repository']))
     if status.get('configured') and not state and not status.get('enabled'):
@@ -119,7 +132,7 @@ def handle(backup, value, now=None):
         return reply('Підключимо GitHub. Зараз надішлю посилання й одноразовий код для входу. Якщо акаунта ще немає, спочатку зареєструйся на https://github.com/signup. Далі я сам створю приватний репозиторій і налаштую копії.', githubLogin=True, nonce=state['nonce'])
     state = {'owner': owner, 'phase': 'repository', 'expires': now + TTL}
     backup.save(state_path, state)
-    return reply('Підключимо автоматичний бекап. Якщо ще немає GitHub — зареєструйся: https://github.com/signup\n\nВідкрий https://github.com/new, назви репозиторій my-agent-backup, обери Private та додай README. Створи його й надішли сюди посилання. Далі підкажу, як дати доступ лише до цього репозиторію. Термінал не потрібен. Щоб перервати діалог, напиши «скасуй».')
+    return reply('Підключимо автоматичний бекап. Якщо ще немає GitHub — зареєструйся: https://github.com/signup\n\nВідкрий https://github.com/new, назви репозиторій my-agent-backup, обери Private та додай README. Створи його й надішли сюди посилання. Далі підкажу, як дати доступ лише до цього репозиторію. Термінал не потрібен. Щоб перервати діалог, напиши «скасуй бекап».')
 
 
 def token_guide(repo):

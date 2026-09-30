@@ -70,6 +70,21 @@ def owner() -> str:
     return str(ids[0]) if ids else ""
 
 
+def control_chats(primary: str) -> set[str]:
+    """Current owner and verified superadmins; never infer authority from a group."""
+    allowed = {primary}
+    try:
+        access = json.loads(ACCESS_FILE.read_text(encoding="utf-8"))
+        admins, admitted, superadmins = (access[key] for key in ("admins", "allowFrom", "superadmins"))
+        if not all(isinstance(items, list) and all(isinstance(item, str) and re.fullmatch(r"[1-9]\d{0,19}", item)
+                                                   for item in items) for items in (admins, admitted, superadmins)):
+            return allowed
+        allowed.update((set(superadmins) & set(admins) & set(admitted)) - {primary})
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return allowed
+
+
 def send(chat: str, text: str, thread_id: str | None = None) -> bool:
     token = env_val("TELEGRAM_BOT_TOKEN")
     if not token or not chat:
@@ -266,65 +281,75 @@ def main() -> int:
 
         try:
             conn = sqlite3.connect(f"file:{MESSAGES_DB}?mode=ro", uri=True, timeout=2)
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(messages)")}
+            chats = control_chats(chat) if "user_id" in columns else {chat}
+            placeholders = ",".join("?" for _ in chats)
             rows = conn.execute(
-                "SELECT ts,text FROM messages WHERE chat_id=? AND direction='in' "
-                "AND ts>? ORDER BY ts", (chat, last)).fetchall()
-            latest_out = conn.execute(
-                "SELECT COALESCE(MAX(ts), 0) FROM messages "
-                "WHERE chat_id=? AND direction='out'", (chat,)
-            ).fetchone()[0]
+                f"SELECT ts,text,chat_id FROM messages WHERE chat_id IN ({placeholders}) "
+                "AND direction='in' AND ts>? "
+                + ("AND chat_id=user_id " if "user_id" in columns else "")
+                + "ORDER BY ts", (*sorted(chats), last)).fetchall()
+            latest_out_by_chat = dict(conn.execute(
+                f"SELECT chat_id,MAX(ts) FROM messages WHERE chat_id IN ({placeholders}) "
+                "AND direction='out' GROUP BY chat_id", tuple(sorted(chats))).fetchall())
             conn.close()
         except Exception:
             return 0
 
-        latest_out = max(latest_out, fallback_outbound(chat))
-
-        fired = False
-        explicit_restart = False
-        latest_trigger = 0
+        triggers: dict[str, list[tuple[int, bool]]] = {}
         newest = last
-        for ts, text in rows:
+        for ts, text, sender_chat in rows:
             newest = max(newest, ts)
             if text and TRIGGER.match(text.strip()):
-                fired = True
-                latest_trigger = max(latest_trigger, ts)
                 explicit_restart = text.strip().lower() == '/restart'
+                # The owner's bare /unstick is the out-of-band whole-service
+                # escape hatch. A superadmin's /unstick is handled by the
+                # corporate runtime for that person's own conversation.
+                if sender_chat == chat or explicit_restart:
+                    triggers.setdefault(sender_chat, []).append((ts, explicit_restart))
 
         # Preserve the existing at-most-once command semantics by checkpointing
         # before the first side effect. Non-trigger advancement uses the same lock
         # so an older scan can never roll a completed /unstick checkpoint back.
         atomic_write_checkpoint(newest)
-        if not fired:
+        if not triggers:
             return 0
-        if latest_out > latest_trigger and not explicit_restart:
-            note("/unstick already received a confirmed reply — restart skipped")
+        authorized = control_chats(owner())
+        active: dict[str, bool] = {}
+        for sender, commands in triggers.items():
+            if sender not in authorized:
+                continue
+            latest_out = max(latest_out_by_chat.get(sender, 0), fallback_outbound(sender))
+            pending = [explicit for ts, explicit in commands if explicit or latest_out <= ts]
+            if pending:
+                active[sender] = all(pending)  # Any unanswered /unstick requests the hold.
+        if not active:
+            note("/unstick commands already answered or no longer authorized — restart skipped")
             return 0
+        needs_hold = any(not explicit for explicit in active.values())
 
         if restart_hold_active():
-            send(chat, "🛠 Зараз триває оновлення — перезапускати мене саме "
-                       "зараз небезпечно, це перерве його на півдорозі. "
-                       "Напиши ще раз за кілька хвилин.")
+            for sender in active:
+                send(sender, "🛠 Зараз триває оновлення — перезапускати мене саме "
+                             "зараз небезпечно, це перерве його на півдорозі. "
+                             "Напиши ще раз за кілька хвилин.")
             return 0
 
         loops = recent_restarts()
-        if not explicit_restart:
+        if needs_hold:
             atomic_write_restart_hold(int(time.time()) + HOLD_SECONDS)
-            note(f"/unstick from owner: holding automatic restarts {HOLD_SECONDS // 60}m, "
+            note(f"/unstick from authorized chat: holding automatic restarts {HOLD_SECONDS // 60}m, "
                  f"restarts in last 10m={loops}")
         else:
-            note('/restart from owner: one service restart, automatic recovery remains enabled')
+            note('/restart from authorized chat: one service restart, automatic recovery remains enabled')
 
         verdict = (f"Автоперезапуски вимкнено на {HOLD_SECONDS // 60} хв — "
                    f"сторож перезапускав мене {loops} разів за 10 хвилин, саме це й заважало."
                    if loops >= 2 else
                    f"Автоперезапуски вимкнено на {HOLD_SECONDS // 60} хв, щоб нічого не заважало.")
-        if explicit_restart:
-            send(chat, "🔄 Прийнято. Перезапускаю службу один раз.")
-        else:
-            send(chat, f"🛠 Прийнято. {verdict} Перезапускаюся один раз — "
-                       "збережені запити залишаються в черзі.")
-
-        command_name = '/restart' if explicit_restart else '/unstick'
+        command_name = '/unstick' if needs_hold else '/restart'
+        stop_ok = False
+        start_ok = False
         try:
             try:
                 stopped = subprocess.run(
@@ -335,15 +360,14 @@ def main() -> int:
                 )
             except (OSError, subprocess.TimeoutExpired):
                 note(f"{command_name}: stop failed or timed out; queue retained")
-                return 0
-            if stopped.returncode != 0:
-                note(f"{command_name}: stop failed; queue retained")
-                return 0
-
-            # Restart changes the process, not the person's intent. Keep the
-            # request, turn and send proofs intact, including on older schemas.
-            # Only the receiver decides whether and how to resume them on boot.
-            note(f"{command_name}: requests and delivery evidence retained for receiver recovery")
+            else:
+                stop_ok = stopped.returncode == 0
+                if not stop_ok:
+                    note(f"{command_name}: stop failed; queue retained")
+            if stop_ok:
+                # Restart changes the process, not the person's intent. Keep
+                # request, turn and send proofs intact for receiver recovery.
+                note(f"{command_name}: requests and delivery evidence retained for receiver recovery")
         finally:
             # A failed/timed-out stop can already have stopped the service. Never
             # leave it down even when the stop client reports a failure.
@@ -354,9 +378,22 @@ def main() -> int:
                     stderr=subprocess.DEVNULL,
                     timeout=30,
                 )
+                start_ok = started.returncode == 0
                 note(f"{command_name}: service start " + ('succeeded' if started.returncode == 0 else 'failed'))
             except (OSError, subprocess.TimeoutExpired):
                 note(f"{command_name}: service start failed or timed out")
+        # Telegram sends can take 20 seconds each including fallback evidence.
+        # They must not consume the 180-second cron budget before service
+        # recovery, after the commands have already been checkpointed.
+        for sender, explicit_restart in active.items():
+            if not stop_ok or not start_ok:
+                send(sender, "🛠 Прийнято, але я не зміг перезапуститися. Твої запити збережено; "
+                             "якщо за кілька хвилин я не відповім — напиши нам.")
+            elif explicit_restart:
+                send(sender, "🔄 Прийнято. Службу перезапущено один раз.")
+            else:
+                send(sender, f"🛠 Прийнято. {verdict} Службу перезапущено один раз — "
+                             "збережені запити залишаються в черзі.")
         return 0
     finally:
         try:

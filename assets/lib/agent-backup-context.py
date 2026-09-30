@@ -2,8 +2,9 @@
 """Sanitize and encrypt exact system files from an installed root-owned policy.
 
 Installer contract (no agent-controlled source paths):
-  /etc/novsky/backup-context/<profile-id>.json, root-owned, not group/other
-  writable, no symlinks/hardlinks, with these fields:
+  /etc/novsky/backup-context/agents/<profile-id>.json (older kits: directly in
+  /etc/novsky/backup-context), root-owned, not group/other writable, no
+  symlinks/hardlinks, with these fields:
   {"schemaVersion": 1, "agentHome": "/home/claude", "uid": 1000, "gid": 1000,
    "unit": "claude-telegram.service", "requiredFiles": [
      "/etc/systemd/system/claude-telegram.service",
@@ -18,10 +19,13 @@ and /etc/cron.d/novsky-agent-full-backup-<sha256(agentHome)[:24]> are accepted.
 Missing required files fail the capture; installers must list every required
 file explicitly. uid=0 is supported only for a home already owned by root.
 
-Install this script, agent-backup-sanitize and age outside all agent homes, with root-owned ancestry
-and no group/other writes. Bootstrap age from a digest-pinned official release;
-this helper never downloads or executes an agent-home binary. Root cron may run
---all. A profile without a prepared public recipient is skipped.
+Install this script with agent-backup-sanitize beside it, one folder per agent,
+and age outside all agent homes, with root-owned ancestry and no group/other
+writes. Bootstrap age from a digest-pinned official release; this helper never
+downloads or executes an agent-home binary. Each agent's root cron runs
+--policy for its own policy; the shared --all job of older kits lists only the
+top-level policies, and an agent policy waits while a top-level policy of the
+same profile exists. A profile without a prepared public recipient is skipped.
 
 Output is only ciphertext plus a secret-free receipt, both atomic 0600 files
 owned by the configured agent under its .local/state/agent-full-backup/context:
@@ -59,7 +63,8 @@ SYSTEMD_VENDOR_DIRECTORIES = (Path("/usr/lib/systemd/system"), Path("/lib/system
 CODEX_DIRECTORY = Path("/etc/novsky/codex")
 CLAUDE_DIRECTORY = Path("/etc/claude-tg-starter")
 CRON_DIRECTORY = Path("/etc/cron.d")
-SANITIZER = Path("/usr/local/lib/novsky-backup/agent-backup-sanitize")
+# Each agent's collector runs from its own root folder, next to its sanitizer.
+SANITIZER = Path(__file__).parent / "agent-backup-sanitize"
 PRIVACY_POLICY = "no-secrets-v1"
 PROFILE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,79}$")
 UNIT = re.compile(r"^[A-Za-z0-9_.:-]+(?:@[A-Za-z0-9_.:-]*)?\.service$")
@@ -233,7 +238,8 @@ def _source_archive_name(path, home, unit):
 
 def load_policy(policy_path):
     path = _normal_path(str(policy_path), "policy-path-invalid")
-    if path.parent != POLICY_DIRECTORY or path.suffix != ".json" or not PROFILE.fullmatch(path.stem):
+    if (path.parent not in (POLICY_DIRECTORY, POLICY_DIRECTORY / "agents")
+            or path.suffix != ".json" or not PROFILE.fullmatch(path.stem)):
         raise ContextError("policy-path-invalid")
     with _Directories() as directory:
         directory.walk(path.parent)
@@ -560,10 +566,26 @@ def _capture(policy, age_binary):
                     pass
 
 
+def _shared_policy_exists(profile):
+    with _Directories() as directory:
+        directory.walk(POLICY_DIRECTORY)
+        try:
+            os.stat(profile + ".json", dir_fd=directory.fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return False
+        return True
+
+
 def capture_policy(policy_path: Path, *, age_binary: Path):
     if os.geteuid() != 0:
         raise ContextError("root-required")
-    policy = load_policy(policy_path)
+    path = _normal_path(str(policy_path), "policy-path-invalid")
+    # While a profile still has its top-level policy, the shared --all job of
+    # an older kit captures it; this agent's own job waits for the move.
+    if (path.parent == POLICY_DIRECTORY / "agents" and PROFILE.fullmatch(path.stem)
+            and _shared_policy_exists(path.stem)):
+        return {"status": "shared-job", "profileId": path.stem}
+    policy = load_policy(path)
     # Serialize root refreshes separately from agent-controlled backup locks.
     with _Directories() as directory:
         directory.walk(POLICY_DIRECTORY)
@@ -584,7 +606,8 @@ def capture_policy(policy_path: Path, *, age_binary: Path):
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("--policy", type=Path, help="Exact installed /etc/novsky/backup-context/<profile>.json")
+    group.add_argument("--policy", type=Path,
+                       help="Exact installed /etc/novsky/backup-context/agents/<profile>.json")
     group.add_argument("--all", action="store_true", help="Capture all installed policies for root cron")
     parser.add_argument("--age-binary", type=Path, required=True, help="Root-owned age from a digest-pinned official release")
     args = parser.parse_args()

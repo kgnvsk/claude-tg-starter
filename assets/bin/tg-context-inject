@@ -11,6 +11,7 @@
 # Reads hook JSON from stdin, prints hookSpecificOutput JSON. Fails open:
 # any error → plain {"continue": true} so a broken hook never blocks a turn.
 import json
+import hashlib
 import os
 import re
 import sqlite3
@@ -203,6 +204,7 @@ def take_delivery(
                 "turn_id=excluded.turn_id, session_id=excluded.session_id, stamp=excluded.stamp, "
                 "state='pending', response_turn_id=NULL, task_id=NULL, resume_after=0, "
                 "updated_at=excluded.updated_at, finished_at=NULL, "
+                "result_generation=delivery_results.result_generation+1, "
                 "request_payload=COALESCE(delivery_results.request_payload,excluded.request_payload) "
                 "WHERE delivery_results.state IN ('queued','resume_pending','paused')",
                 (delivery_id, turn_id, session["session_id"], os.environ.get("TG_DELIVERY_STAMP") or None,
@@ -306,6 +308,129 @@ def task_notification_id(prompt: str) -> str | None:
     return match.group(1)
 
 
+def return_callback(conn: sqlite3.Connection, session_id: str, stamp: str, turn_id: int,
+                    task_id: str, prompt: str, now: int) -> list[dict]:
+    """Resolve a native notification by the obligation of its exact launch.
+
+    The owner row of (session, stamp, task_id) is open and the notice's
+    <tool-use-id> is its launch_ref; a task registered with no recorded launch
+    returns by its bound task ID. Only then the obligation is returned, the
+    return is written with its request and occurrence, and that request is
+    reopened; a paused one keeps its pause and is only named. A request-less
+    obligation returns without reopening anything. Anything else (a legacy
+    obligation, an earlier occurrence, another stamp, a replay) is unbound and
+    visible. `killed` confirms a stop: the obligation is stopped, and it is
+    neither a return nor a reopening.
+    """
+    launch = re.search(r"<tool-use-id>([^<]{1,256})</tool-use-id>", prompt)
+    launch = launch.group(1) if launch else None
+    prompt_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+    owner = conn.execute(
+        "SELECT delivery_id, state, launch_ref, occurrence, launched_turn FROM delivery_task_owners "
+        "WHERE session_id=? AND stamp=? AND task_id=?", (session_id, stamp, task_id),
+    ).fetchone()
+    exact = owner is not None and owner[1] in ("owned", "unowned") and (
+        owner[2] == launch if owner[2] is not None else owner[1] == "owned")
+    if re.search(r"<status>killed</status>", prompt):
+        if not exact:
+            return []
+        conn.execute("UPDATE delivery_task_owners SET state='stopped' WHERE session_id=? AND stamp=? "
+                     "AND task_id=? AND state=?", (session_id, stamp, task_id, owner[1]))
+        # Codex U4 review P1-5: a stop is no return, but a request no other worker holds is
+        # owed its final now, in this turn, as every mode bound this notice before U4.
+        # Otherwise the worker still running answers it.
+        delivery = owner[0] if owner[1] == "owned" else launch_turn_request(conn, session_id, stamp, owner[4])
+        request = conn.execute(
+            "SELECT chat_id, thread_id, state, turn_id, response_turn_id FROM delivery_results "
+            "WHERE delivery_id=? AND session_id=? AND stamp=?", (delivery, session_id, stamp),
+        ).fetchone() if delivery else None
+        if request is None or request[2] not in ("pending", "deferred") or conn.execute(
+                "SELECT 1 FROM delivery_task_launches WHERE session_id=? AND stamp=? AND state='launching' "
+                "AND launched_turn IN (?, ?) AND silent_notified_at IS NULL "
+                "UNION ALL SELECT 1 FROM delivery_task_owners WHERE session_id=? AND stamp=? "
+                "AND ((state IN ('owned','legacy') AND delivery_id=?) OR (state='unowned' AND launched_turn IN (?, ?))) "
+                "AND silent_notified_at IS NULL LIMIT 1",
+                (session_id, stamp, request[3], request[4], session_id, stamp, delivery, request[3], request[4]),
+        ).fetchone():
+            return []
+        return reopen_request(conn, delivery, request, turn_id, now)
+    # A replayed notification never returns an obligation a second time.
+    exact = exact and not conn.execute(
+        "SELECT 1 FROM delivery_task_returns WHERE session_id=? AND stamp=? AND task_id=? AND prompt_hash=? LIMIT 1",
+        (session_id, stamp, task_id, prompt_hash),
+    ).fetchone()
+    delivery = owner[0] if exact else None
+    if exact and owner[1] == "unowned" and owner[4] is not None:
+        delivery = launch_turn_request(conn, session_id, stamp, owner[4])
+        exact = delivery is not None
+    if exact:
+        conn.execute("UPDATE delivery_task_owners SET state='returned', delivery_id=? WHERE session_id=? "
+                     "AND stamp=? AND task_id=? AND state=?", (delivery, session_id, stamp, task_id, owner[1]))
+    conn.execute(
+        "INSERT INTO delivery_task_returns "
+        "(session_id,stamp,turn_id,task_id,prompt_hash,delivery_id,observed_at,occurrence) VALUES (?,?,?,?,?,?,?,?)",
+        (session_id, stamp, turn_id, task_id, prompt_hash, delivery, now, owner[3] if exact else None),
+    )
+    # Retain only unmatched returns: a returned task may be resumed and
+    # registered again, and an unmatched callback must not be lost before a retry.
+    conn.execute("DELETE FROM delivery_unbound_task_returns WHERE observed_at < ?", (now - 14 * 24 * 60 * 60 * 1000,))
+    if exact:
+        conn.execute("DELETE FROM delivery_unbound_task_returns WHERE task_id=? AND session_id=? AND stamp=?",
+                     (task_id, session_id, stamp))
+    else:
+        conn.execute(
+            "INSERT INTO delivery_unbound_task_returns (task_id,session_id,stamp,observed_at) VALUES (?,?,?,?) "
+            "ON CONFLICT(task_id,session_id,stamp) DO UPDATE SET observed_at=excluded.observed_at",
+            (task_id, session_id, stamp, now),
+        )
+    request = conn.execute(
+        "SELECT chat_id, thread_id, state FROM delivery_results WHERE delivery_id=? AND session_id=? AND stamp=?",
+        (delivery, session_id, stamp),
+    ).fetchone() if delivery else None
+    if request is None or request[2] not in ("pending", "deferred", "complete", "paused", "resume_pending"):
+        return []
+    if request[2] == "complete" and AUTHORITY != "receiver":
+        # Codex U4 review P0-2: guard and shadow sent this final themselves while the
+        # worker still ran. Its late callback keeps the evidence above but owes no second
+        # answer there; what the receiver would do is recorded.
+        if conn.execute("SELECT 1 FROM sqlite_master WHERE name='delivery_shadow' AND type='table'").fetchone():
+            conn.execute(
+                "INSERT OR IGNORE INTO delivery_shadow (created_at,class,chat_id,thread_id,delivery_id,turn_id,detail) "
+                "VALUES (?,'would_reopen_completed',?,?,?,?,?)", (now, request[0], request[1], delivery, turn_id, task_id))
+        return []
+    if request[2] in ("pending", "deferred", "complete"):
+        # The callback's result is owed now, in this turn. Under the receiver a final
+        # that went out while this worker still ran does not answer it.
+        return reopen_request(conn, delivery, request, turn_id, now)
+    return [{"delivery_id": delivery, "chat_id": request[0], "thread_id": request[1]}]
+
+
+def launch_turn_request(conn: sqlite3.Connection, session_id: str, stamp: str, launched_turn: int | None) -> str | None:
+    """No progress registered the worker: under the receiver it belongs to the one open
+    request of the turn it was launched in, like a deferral (B0-a)."""
+    if AUTHORITY != "receiver" or launched_turn is None:
+        return None
+    open_requests = conn.execute(
+        "SELECT delivery_id FROM delivery_results WHERE session_id=? AND stamp=? "
+        "AND state IN ('pending','deferred') AND (turn_id=? OR response_turn_id=?)",
+        (session_id, stamp, launched_turn, launched_turn),
+    ).fetchall()
+    return open_requests[0][0] if len(open_requests) == 1 else None
+
+
+def reopen_request(conn: sqlite3.Connection, delivery: str, request: tuple, turn_id: int, now: int) -> list[dict]:
+    """The request is owed its final in this turn. An ACK of an older final kept for the
+    calls of its turn is evidence from here on (P2-2)."""
+    acked = "superseded_ack" in {row[1] for row in conn.execute("PRAGMA table_info(delivery_results)")}
+    conn.execute(
+        "UPDATE delivery_results SET state='pending', response_turn_id=?, finished_at=NULL, "
+        "result_generation=result_generation+1, updated_at=?"
+        + (", superseded_by=NULL, superseded_ack=NULL" if acked else "") + " WHERE delivery_id=?",
+        (turn_id, now, delivery),
+    )
+    return [{"delivery_id": delivery, "chat_id": request[0], "thread_id": request[1]}]
+
+
 def open_service_turn(data: dict, prompt: str) -> list[dict]:
     session = session_of(data)
     if session is None:
@@ -320,12 +445,45 @@ def open_service_turn(data: dict, prompt: str) -> list[dict]:
             turn_id = open_turn(conn, session, now)
             task_id = task_notification_id(prompt)
             stamp = os.environ.get("TG_DELIVERY_STAMP")
-            if task_id and stamp and results_present(conn):
+            if task_id and stamp and results_present(conn) and {"state", "launch_ref"} <= {
+                    row[1] for row in conn.execute("PRAGMA table_info(delivery_task_owners)")}:
+                results = return_callback(conn, session["session_id"], stamp, turn_id, task_id, prompt, now)
+            elif task_id and stamp and results_present(conn):
+                # A receiver from before worker obligations: the one deferred
+                # request that holds this task_id, as that receiver bound it.
                 rows = conn.execute(
                     "SELECT delivery_id, chat_id, thread_id FROM delivery_results "
                     "WHERE state='deferred' AND task_id=? AND session_id=? AND stamp=?",
                     (task_id, session["session_id"], stamp),
                 ).fetchall()
+                returns_present = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE name='delivery_task_returns' AND type='table'"
+                ).fetchone()
+                prompt_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+                # A resumed agent ID may be registered for a newer request.
+                # Replaying an earlier notification cannot borrow that newer
+                # mutable task_id binding, even if exactly one result matches.
+                previously_seen = returns_present and conn.execute(
+                    "SELECT 1 FROM delivery_task_returns WHERE session_id=? AND stamp=? "
+                    "AND task_id=? AND prompt_hash=? LIMIT 1",
+                    (session["session_id"], stamp, task_id, prompt_hash),
+                ).fetchone()
+                owner = conn.execute(
+                    "SELECT delivery_id FROM delivery_task_owners WHERE session_id=? AND stamp=? AND task_id=?",
+                    (session["session_id"], stamp, task_id),
+                ).fetchone() if conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE name='delivery_task_owners' AND type='table'"
+                ).fetchone() else None
+                bound_rows = (rows if len(rows) == 1 and returns_present and not previously_seen
+                              and owner and owner[0] == rows[0][0] else [])
+                if returns_present:
+                    conn.execute(
+                        "INSERT INTO delivery_task_returns "
+                        "(session_id,stamp,turn_id,task_id,prompt_hash,delivery_id,observed_at) "
+                        "VALUES (?,?,?,?,?,?,?)",
+                        (session["session_id"], stamp, turn_id, task_id, prompt_hash,
+                         bound_rows[0][0] if bound_rows else None, now),
+                    )
                 if conn.execute(
                     "SELECT 1 FROM sqlite_master WHERE name='delivery_unbound_task_returns' AND type='table'"
                 ).fetchone():
@@ -336,7 +494,7 @@ def open_service_turn(data: dict, prompt: str) -> list[dict]:
                         "DELETE FROM delivery_unbound_task_returns WHERE observed_at < ?",
                         (now - 14 * 24 * 60 * 60 * 1000,),
                     )
-                    if rows:
+                    if bound_rows:
                         conn.execute(
                             "DELETE FROM delivery_unbound_task_returns WHERE task_id=? AND session_id=? AND stamp=?",
                             (task_id, session["session_id"], stamp),
@@ -347,9 +505,10 @@ def open_service_turn(data: dict, prompt: str) -> list[dict]:
                             "VALUES (?,?,?,?) ON CONFLICT(task_id,session_id,stamp) DO UPDATE SET observed_at=excluded.observed_at",
                             (task_id, session["session_id"], stamp, now),
                         )
-                for delivery_id, chat_id, thread_id in rows:
+                for delivery_id, chat_id, thread_id in bound_rows:
                     conn.execute(
-                        "UPDATE delivery_results SET state='pending', response_turn_id=?, updated_at=? "
+                        "UPDATE delivery_results SET state='pending', response_turn_id=?, "
+                        "result_generation=result_generation+1, updated_at=? "
                         "WHERE delivery_id=?",
                         (turn_id, now, delivery_id),
                     )
@@ -503,6 +662,27 @@ def recent_chat(chat_id: str, skip_msg_id: str | None, thread_id: str | None = N
     return block
 
 
+def acknowledged_note(at: object) -> str:
+    """Кнопа 24605 (27.09): a request acknowledged once needs its result, not a
+    second acknowledgement. `at` is the last receipt's time in milliseconds."""
+    if not isinstance(at, int) or at <= 0:
+        return ""
+    return (f"The author was already acknowledged at {time.strftime('%H:%M', time.gmtime(at / 1000))} UTC; "
+            "do not acknowledge again: continue the work and answer with the result. ")
+
+
+def last_receipt(delivery_id: str) -> int | None:
+    try:
+        conn = sqlite3.connect(f"file:{DB}?mode=ro", uri=True, timeout=1.0)
+        try:
+            return conn.execute("SELECT max(created_at) FROM delivery_receipts WHERE delivery_id=? "
+                                "AND phase='progress'", (delivery_id,)).fetchone()[0]
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return None
+
+
 def recovery_context(prompt: str, data: dict) -> str:
     """Context comes from the retained claim, never recovery tags in user prose."""
     receipts = []
@@ -524,8 +704,10 @@ def recovery_context(prompt: str, data: dict) -> str:
             ).fetchone()
             if not row:
                 return ""
+            phase = ", phase" if "phase" in {
+                column[1] for column in conn.execute("PRAGMA table_info(delivery_receipts)")} else ""
             receipts = [dict(receipt) for receipt in conn.execute(
-                "SELECT turn_id, message_id, source, created_at FROM delivery_receipts "
+                f"SELECT turn_id, message_id, source, created_at{phase} FROM delivery_receipts "
                 "WHERE delivery_id=? ORDER BY created_at DESC LIMIT 20", (row["delivery_id"],),
             )]
         finally:
@@ -550,8 +732,19 @@ def recovery_context(prompt: str, data: dict) -> str:
             checkpoint["verification_evidence"] = json.loads(row["verification_evidence"])
         except (ValueError, TypeError):
             pass
+    # B4: the attempt before this one ended with text the person never saw.
+    # This is its one recovery turn; a second silent end gets no third.
+    # Only the receiver caps it at one turn, so only the receiver says so (B4v2 review L1).
+    forgotten = (
+        "The previous attempt of this request ended without an answer: text written outside the reply "
+        "tool never reaches the person. Answer now with reply phase=final and this exact delivery_id; "
+        "for a group message that needs no answer, call no_reply instead. "
+        + ("This is the one retry. " if AUTHORITY == "receiver" else "")
+    ) if row["recovery_reason"] == "stop" else ""
     return (
         '<recovery-context source="durable-request-ledger">\n'
+        + forgotten + acknowledged_note(next((receipt["created_at"] for receipt in receipts
+                                              if receipt.get("phase") == "progress"), None)) +
         "This is continuation of the same saved request, not a new instruction to repeat every step. "
         "Keep the original author, chat and topic. Use native conversation history and the checkpoint below. "
         "Before any external write, inspect previous tool results in the exact prior transcript if available. "
@@ -658,6 +851,8 @@ def main() -> None:
             'phase="final" and the exact delivery_id, chat_id and thread_id below. '
             "A progress reply does not complete this request.\n"
             + json.dumps(completed_tasks, ensure_ascii=False)
+            + "".join(f"\n{task['delivery_id']}: {note}" for task in completed_tasks
+                      if (note := acknowledged_note(last_receipt(task["delivery_id"]))))
         )
     output_event = "UserPromptSubmit"
     chat_id = None

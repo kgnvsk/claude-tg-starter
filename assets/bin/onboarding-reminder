@@ -9,6 +9,7 @@ week forever, and an alert nobody can silence stops being read at all.
 from __future__ import annotations
 
 import json
+import importlib.util
 import os
 from pathlib import Path
 import re
@@ -17,6 +18,12 @@ import sys
 import tempfile
 import time
 from urllib import parse, request
+
+_NOTICE_SPEC = importlib.util.spec_from_file_location(
+    "agent_notice_locale", Path(__file__).with_name("agent_notice_locale.py")
+)
+_NOTICE_MODULE = importlib.util.module_from_spec(_NOTICE_SPEC)
+_NOTICE_SPEC.loader.exec_module(_NOTICE_MODULE)
 
 HOME = Path.home()
 STATE = HOME / ".claude/onboarding-state.json"
@@ -156,7 +163,9 @@ for name, feature in features.items():
 if not due:
     raise SystemExit(0)
 
-messages = [(BACKUP_REMINDER_TEXT, ["memory_backup"])]
+messages = [(_NOTICE_MODULE.notice_text(
+    "reminder.memory_backup", BACKUP_REMINDER_TEXT, home=HOME
+), ["memory_backup"])]
 
 state_changed = False
 for text, names in messages:

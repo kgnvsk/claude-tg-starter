@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import fcntl
 import mimetypes
 import os
 from pathlib import Path
@@ -14,6 +16,7 @@ import sqlite3
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -28,6 +31,10 @@ BOT_TOKEN = re.compile(r"[A-Za-z0-9:_-]+\Z")
 
 class SendError(Exception):
     pass
+
+
+class RejectedSend(SendError):
+    """Bot API explicitly rejected this file before accepting it."""
 
 
 def fail(message: str, *, code: int = 1) -> None:
@@ -232,7 +239,45 @@ def multipart(
     return b"\r\n".join(parts), boundary
 
 
-def send(chat_id: str, filename: str, data: bytes, caption: str, thread_id: int | None = None) -> int:
+def validate_destination(chat_id: str, thread_id: int | None, general_topic: bool) -> None:
+    if (not CHAT_ID.fullmatch(chat_id) or type(general_topic) is not bool
+            or (thread_id is not None and (type(thread_id) is not int or not 0 < thread_id <= 2_147_483_647))
+            or (thread_id is not None and general_topic)
+            or ((thread_id is not None or general_topic) and not chat_id.startswith("-"))):
+        raise SendError("not delivered: routing validation failed; topic and General must not conflict")
+
+
+def destination_status(chat_id: str, thread_id: int | None, general_topic: bool,
+                       base: str, bot_token: str, timeout: float) -> bool | None:
+    validate_destination(chat_id, thread_id, general_topic)
+    if not chat_id.startswith("-") or thread_id is not None or general_topic:
+        return True
+    request = urllib.request.Request(
+        f"{base}/bot{bot_token}/getChat",
+        data=urllib.parse.urlencode({"chat_id": chat_id}).encode(), method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            payload = json.loads(response.read())
+    except (OSError, ValueError, urllib.error.URLError):
+        return None
+    result = payload.get("result") if isinstance(payload, dict) and payload.get("ok") is True else None
+    if result is None:
+        return None
+    return (isinstance(result, dict) and type(result.get("id")) is int
+            and str(result["id"]) == chat_id and result.get("type") in ("group", "supergroup")
+            and ("is_forum" not in result or result["is_forum"] is False))
+
+
+def ensure_destination(chat_id: str, thread_id: int | None, general_topic: bool,
+                       base: str, bot_token: str, timeout: float) -> None:
+    if destination_status(chat_id, thread_id, general_topic, base, bot_token, timeout) is not True:
+        raise SendError("not delivered: routing validation failed; preserve the verified topic "
+                        "or choose General explicitly. Do not bypass this rejection using another tool")
+
+
+def send(chat_id: str, filename: str, data: bytes, caption: str, thread_id: int | None = None,
+         general_topic: bool = False) -> int:
     photo = Path(filename).suffix.lower() in PHOTO_SUFFIXES
     method = "sendPhoto" if photo else "sendDocument"
     field = "photo" if photo else "document"
@@ -247,8 +292,10 @@ def send(chat_id: str, filename: str, data: bytes, caption: str, thread_id: int 
             raise ValueError
     except ValueError:
         timeout = 20.0
+    bot_token = read_token()
+    ensure_destination(chat_id, thread_id, general_topic, base, bot_token, timeout)
     request = urllib.request.Request(
-        f"{base}/bot{read_token()}/{method}",
+        f"{base}/bot{bot_token}/{method}",
         data=body,
         headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
         method="POST",
@@ -257,9 +304,18 @@ def send(chat_id: str, filename: str, data: bytes, caption: str, thread_id: int 
         with urllib.request.urlopen(request, timeout=timeout) as response:
             raw = response.read()
     except urllib.error.HTTPError as error:
+        try:
+            rejected = json.loads(error.read())
+        except (ValueError, UnicodeError, OSError):
+            rejected = None
+        if (isinstance(rejected, dict) and rejected.get("ok") is False
+                and type(rejected.get("error_code")) is int
+                and rejected["error_code"] == error.code
+                and error.code in (400, 401, 403, 404, 429)):
+            raise RejectedSend("not delivered: Telegram rejected the file") from None
         if error.code >= 500:
             fail("delivery state unknown: Telegram server failed; do not retry", code=2)
-        fail("not delivered: Telegram rejected the file")
+        fail("delivery state unknown: Telegram did not prove rejection; do not retry", code=2)
     except (OSError, TimeoutError, urllib.error.URLError):
         fail("delivery state unknown: transport failed; do not retry", code=2)
 
@@ -270,15 +326,29 @@ def send(chat_id: str, filename: str, data: bytes, caption: str, thread_id: int 
     if not isinstance(payload, dict):
         fail("delivery state unknown: malformed Telegram response; do not retry", code=2)
     if payload.get("ok") is not True:
-        fail("not delivered: Telegram rejected the file")
+        if (payload.get("ok") is False and type(payload.get("error_code")) is int
+                and payload["error_code"] in (400, 401, 403, 404, 429)):
+            raise RejectedSend("not delivered: Telegram rejected the file")
+        fail("delivery state unknown: Telegram did not prove rejection; do not retry", code=2)
     result = payload.get("result")
     message_id = result.get("message_id") if isinstance(result, dict) else None
+    chat = result.get("chat") if isinstance(result, dict) else None
     if (
         isinstance(message_id, bool)
         or not isinstance(message_id, int)
         or message_id <= 0
+        or not isinstance(chat, dict) or type(chat.get("id")) is not int
+        or str(chat["id"]) != chat_id
     ):
         fail("delivery state unknown: Telegram did not prove delivery; do not retry", code=2)
+    if thread_id is not None:
+        matching_topic = (result.get("is_topic_message") is True
+                          and type(result.get("message_thread_id")) is int
+                          and result["message_thread_id"] == thread_id)
+    else:
+        matching_topic = "is_topic_message" not in result or result["is_topic_message"] is False
+    if not matching_topic:
+        fail("delivery state unknown: Telegram did not prove the requested topic; do not retry", code=2)
     return message_id
 
 
@@ -294,13 +364,15 @@ def mark_outbound(chat_id: str) -> None:
         pass
 
 
-def record_outbound(chat_id: str, text: str, message_id: int, thread_id: int | None = None, context=None) -> None:
-    """Best-effort history for a file Telegram confirmed as delivered."""
+def record_outbound(chat_id: str, text: str, message_id: int, thread_id: int | None = None, context=None) -> bool:
+    """History for a file Telegram confirmed as delivered, with its send's settlement.
+    False when that transaction could not be written."""
     try:
         database = telegram_state_dir() / "messages.db"
         if not database.is_file():
-            return
-        connection = sqlite3.connect(database, timeout=0.5)
+            return True
+        # Its transaction also ends the send's fence: give a busy ledger time.
+        connection = sqlite3.connect(database, timeout=3)
         try:
             columns = {row[1] for row in connection.execute("PRAGMA table_info(messages)")}
             extra = {}
@@ -330,16 +402,258 @@ def record_outbound(chat_id: str, text: str, message_id: int, thread_id: int | N
             )
             if inserted.rowcount:
                 runpy.run_path(str(Path(__file__).with_name('tg-send')))['record_completion'](
-                    connection, chat_id, thread_id, context, now,
+                    connection, chat_id, thread_id, context, now, message_id,
                 )
             connection.commit()
         finally:
             connection.close()
     except Exception:
-        pass
+        return False
+    return True
+
+
+def parse_arguments(argv: list[str]) -> tuple[str, str, str, int | None, bool]:
+    thread_id, general_topic = None, False
+    positional = []
+    index = 1
+    while index < len(argv):
+        argument = argv[index]
+        if argument == "--thread-id" and thread_id is None:
+            index += 1
+            if (index >= len(argv) or not re.fullmatch(r"[1-9][0-9]{0,9}", argv[index])
+                    or int(argv[index]) > 2_147_483_647):
+                fail("tg-send-file: invalid topic id")
+            thread_id = int(argv[index])
+        elif argument == "--general-topic" and not general_topic:
+            general_topic = True
+        elif argument.startswith("--"):
+            fail("tg-send-file: invalid routing option")
+        else:
+            positional.append(argument)
+        index += 1
+    if len(positional) not in (2, 3):
+        fail("usage: tg-send-file <chat_id> <outbox-file> [caption] [--thread-id ID | --general-topic]")
+    chat_id, path = positional[:2]
+    caption = positional[2] if len(positional) == 3 else ""
+    if len(caption) > 1024:
+        fail("tg-send-file: caption exceeds 1024 characters")
+    return chat_id, path, caption, thread_id, general_topic
+
+
+def quiet_file_root(helpers: dict) -> Path:
+    root = helpers["quiet_root"]() / "files"
+    if root.is_symlink():
+        raise SendError("tg-send-file: quiet file queue is a symlink")
+    root.mkdir(mode=0o700, exist_ok=True)
+    if root.is_symlink() or not root.is_dir() or root.stat().st_mode & 0o077:
+        raise SendError("tg-send-file: quiet file queue must be private")
+    return root
+
+
+def quiet_file_load(path: Path) -> dict:
+    if path.is_symlink():
+        raise SendError("tg-send-file: quiet file record is a symlink")
+    record = json.loads(path.read_text(encoding="utf-8"))
+    if (not isinstance(record, dict) or record.get("version") != 1
+            or record.get("kind") != "file"
+            or record.get("state") not in {"ready", "sending", "uncertain", "blocked", "delivered"}
+            or record.get("blob") != path.stem + ".blob"
+            or not isinstance(record.get("sha256"), str)
+            or not isinstance(record.get("size"), int)
+            or not 0 < record["size"] <= MAX_BYTES
+            or type(record.get("general_topic", False)) is not bool):
+        raise SendError("tg-send-file: invalid quiet file record")
+    return record
+
+
+def quiet_copy_blob(root: Path, name: str, data: bytes) -> None:
+    descriptor, temporary = tempfile.mkstemp(prefix=".quiet-file.", dir=root)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, root / name)
+        directory = os.open(root, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def quiet_blob(root: Path, record: dict) -> bytes:
+    path = root / record["blob"]
+    metadata = path.lstat()
+    if not stat.S_ISREG(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) != 0o600:
+        raise SendError("tg-send-file: saved file is not private and regular")
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        before = os.fstat(descriptor)
+        chunks = []
+        remaining = MAX_BYTES + 1
+        while remaining:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        data = b"".join(chunks)
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    identity = lambda item: (item.st_dev, item.st_ino, item.st_size, item.st_mtime_ns)
+    if (identity(metadata) != identity(before) or identity(before) != identity(after)
+            or len(data) != record["size"] or hashlib.sha256(data).hexdigest() != record["sha256"]):
+        raise SendError("tg-send-file: saved file changed")
+    return data
+
+
+def quiet_file_send(root: Path, path: Path, record: dict, helpers: dict) -> str:
+    write = helpers["quiet_write"]
+    if record["state"] == "sending":
+        record["state"] = "uncertain"  # the prior process could have reached Telegram
+        write(path, record)
+    if record["state"] != "ready" or record.get("retry_at", 0) > time.time():
+        return record["state"]
+    try:
+        data = quiet_blob(root, record)
+    except (OSError, SendError):
+        record["state"] = "blocked"
+        write(path, record)
+        return record["state"]
+    base = test_setting("TG_SEND_FILE_API_BASE", "https://api.telegram.org").rstrip("/")
+    try:
+        destination = destination_status(record["chat"], record["thread"],
+                                         record.get("general_topic", False), base, read_token(), 20)
+    except SendError:
+        destination = False
+    if destination is not True:
+        record["state"] = "blocked" if destination is False else "ready"
+        record["retry_at"] = 0 if destination is False else int(time.time()) + 1
+        write(path, record)
+        return record["state"]
+    photo = Path(record["filename"]).suffix.lower() in PHOTO_SUFFIXES
+    body, boundary = multipart(record["chat"], record["filename"], data,
+                               record["caption"], file_field="photo" if photo else "document",
+                               thread_id=record["thread"])
+    request = urllib.request.Request(
+        f"{base}/bot{read_token()}/{'sendPhoto' if photo else 'sendDocument'}",
+        data=body, headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        method="POST")
+    record["state"] = "sending"
+    write(path, record)
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            payload = json.loads(response.read())
+    except urllib.error.HTTPError as error:
+        try:
+            payload = json.loads(error.read())
+        except (ValueError, UnicodeError, OSError):
+            payload = None
+        helpers["quiet_failure"](record, path, error.code, payload)
+        return record["state"]
+    except Exception:
+        helpers["quiet_failure"](record, path, None)
+        return record["state"]
+    if not isinstance(payload, dict) or payload.get("ok") is not True:
+        helpers["quiet_failure"](record, path,
+                                 payload.get("error_code") if isinstance(payload, dict) else None,
+                                 payload)
+        return record["state"]
+    result = payload.get("result")
+    chat = result.get("chat") if isinstance(result, dict) else None
+    message_id = result.get("message_id") if isinstance(result, dict) else None
+    returned_thread = result.get("message_thread_id") if isinstance(result, dict) else None
+    if (type(message_id) is not int or message_id < 1 or not isinstance(chat, dict)
+            or type(chat.get("id")) is not int or str(chat["id"]) != record["chat"]
+            or (record["thread"] is None and
+                (returned_thread is not None or result.get("is_topic_message") is True))
+            or (record["thread"] is not None and
+                (returned_thread != record["thread"] or result.get("is_topic_message") is not True))):
+        helpers["quiet_failure"](record, path, None)
+        return record["state"]
+    record["receipt"] = message_id
+    record["state"] = "delivered"
+    record["retry_at"] = 0
+    write(path, record)
+    record_outbound(record["chat"], f"[файл] {record['filename']}" +
+                    (f" — {record['caption']}" if record["caption"] else ""),
+                    message_id, record["thread"])
+    mark_outbound(record["chat"])
+    return record["state"]
+
+
+def quiet_file_main(argv: list[str]) -> None:
+    helpers = runpy.run_path(str(Path(__file__).with_name("tg-send")))
+    root = quiet_file_root(helpers)
+    lock = os.open(root / ".lock", os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if argv[1:] == ["--drain-quiet"]:
+            counts = {"delivered": 0, "ready": 0, "uncertain": 0, "blocked": 0}
+            for path in sorted(root.glob("*.json")):
+                try:
+                    state = quiet_file_send(root, path, quiet_file_load(path), helpers)
+                    counts[state] += 1
+                except (OSError, ValueError, TypeError, KeyError, SendError):
+                    counts["uncertain"] += 1
+            print("quiet file delivery: " + " ".join(f"{key}={value}" for key, value in counts.items()))
+            return
+        chat_id, source, caption, thread_id, general_topic = parse_arguments(argv)
+        ensure_allowed_chat(chat_id)
+        task = os.environ.get("ATARAX_TASK_ID", "")
+        occurrence = os.environ.get("ATARAX_TASK_OCCURRENCE", "")
+        run_key = os.environ.get("ATARAX_TASK_RUN_KEY", "")
+        if (not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", task)
+                or not re.fullmatch(r"[0-9]{1,20}", occurrence)
+                or (run_key and not re.fullmatch(r"[0-9a-f]{64}", run_key))):
+            raise SendError("tg-send-file: quiet delivery requires a task and occurrence")
+        source = str(Path(source).absolute())
+        identity = (task, occurrence, chat_id, str(thread_id), source, caption)
+        if run_key:
+            identity = (run_key,) + identity
+        if general_topic:
+            identity += ("general-topic",)
+        digest = hashlib.sha256("\0".join(identity).encode()).hexdigest()
+        path = root / f"{digest}.json"
+        if path.exists():
+            record = quiet_file_load(path)
+            if (record.get("run_key", ""), record["task"], record["occurrence"], record["chat"], record["thread"],
+                    record["source"], record["caption"], record.get("general_topic", False)) != (
+                        run_key, task, occurrence, chat_id, thread_id, source, caption, general_topic):
+                raise SendError("tg-send-file: quiet file record does not match this request")
+        else:
+            filename, data = read_outbox_file(source)
+            if not data:
+                raise SendError("tg-send-file: file is empty")
+            blob_name = f"{digest}.blob"
+            quiet_copy_blob(root, blob_name, data)
+            record = {"version": 1, "kind": "file", "run_key": run_key, "task": task,
+                      "occurrence": occurrence, "chat": chat_id, "thread": thread_id,
+                      "general_topic": general_topic,
+                      "source": source, "filename": filename, "caption": caption,
+                      "size": len(data), "sha256": hashlib.sha256(data).hexdigest(),
+                      "blob": blob_name, "state": "ready", "retry_at": 0, "receipt": None}
+            helpers["quiet_write"](path, record)
+        state = quiet_file_send(root, path, record, helpers)
+        if state == "delivered":
+            print(json.dumps({"status": state, "messageId": record["receipt"]}))
+        else:
+            print(f"delivery {state}: saved scheduled file; do not send it again")
+    finally:
+        os.close(lock)
 
 
 def main(argv: list[str]) -> None:
+    if os.environ.get("ATARAX_TASK_QUIET") == "1" or argv[1:] == ["--drain-quiet"]:
+        try:
+            quiet_file_main(argv)
+        except (SendError, OSError, ValueError, TypeError, KeyError) as error:
+            fail(str(error))
+        return
     if (
         os.environ.get("ATARAX_SUPPRESS_TELEGRAM") == "1"
         and os.environ.get("ATARAX_TASK_DELIVERY") != "1"
@@ -349,36 +663,41 @@ def main(argv: list[str]) -> None:
             "Nothing was sent, and no other channel should be tried."
         )
         return
-    thread_id = None
-    if len(argv) >= 5 and argv[-2] == "--thread-id":
-        if not re.fullmatch(r"[1-9]\d{0,9}", argv[-1]) or int(argv[-1]) > 2_147_483_647:
-            fail("tg-send-file: invalid topic id")
-        thread_id = int(argv[-1])
-        argv = argv[:-2]
-    if len(argv) not in (3, 4) or "--thread-id" in argv[3:]:
-        fail("usage: tg-send-file <chat_id> <outbox-file> [caption] [--thread-id <positive_id>]")
-    chat_id, path = argv[1:3]
-    if thread_id is not None and not chat_id.startswith("-"):
-        fail("tg-send-file: topics require a group chat")
-    caption = argv[3] if len(argv) == 4 else ""
-    if len(caption) > 1024:
-        fail("tg-send-file: caption exceeds 1024 characters")
+    chat_id, path, caption, thread_id, general_topic = parse_arguments(argv)
     try:
+        validate_destination(chat_id, thread_id, general_topic)
         ensure_allowed_chat(chat_id)
         filename, data = read_outbox_file(path)
         if not data:
             raise SendError("tg-send-file: file is empty")
-        context = runpy.run_path(str(Path(__file__).with_name('tg-send')))['capture_delivery'](chat_id, thread_id)
-        message_id = send(chat_id, filename, data, caption, thread_id)
+        delivery = runpy.run_path(str(Path(__file__).with_name('tg-send')))
+        context = delivery['capture_delivery'](chat_id, thread_id)
+        delivery['settle_on_signals'](context, [])
+        try:
+            message_id = send(chat_id, filename, data, caption, thread_id, general_topic)
+        except SystemExit:  # code 2: the outcome is unknown
+            delivery['abandon_attempt'](context, [], False)
+            raise
+        except SendError as error:  # nothing reached Telegram, or it rejected the file
+            delivery['abandon_attempt'](context, [], True)
+            if isinstance(error, RejectedSend) and context.get('task_id'):
+                fail(f"{error}; {delivery['rejected_background_notice'](context)}")
+            raise
     except (SendError, ValueError) as error:
         fail(str(error))
-    record_outbound(
+    if not record_outbound(
         chat_id,
         f"[файл] {filename}" + (f" — {caption}" if caption else ""),
         message_id,
         thread_id,
         context,
-    )
+    ):
+        # Delivered but not recorded: this sender did not die, so the receiver's tick leaves
+        # its fence for the startup check (R4-7), as tg-send does.
+        delivery['detach_attempt'](context)
+        print("tg-send-file: delivered, not recorded; do not resend"
+              + (": the request holds until the receiver records or settles it"
+                 if os.environ.get("TG_DELIVERY_AUTHORITY") == "receiver" else ""), file=sys.stderr)
     mark_outbound(chat_id)
     print(json.dumps({"status": "delivered", "messageId": message_id}))
 

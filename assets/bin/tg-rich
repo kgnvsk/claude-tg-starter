@@ -75,6 +75,7 @@ def main(argv):
         context = delivery['capture_delivery'](chat_id, thread_id)
     except (ValueError, IndexError) as error:
         sys.exit(f"tg-rich: {error}" if isinstance(error, ValueError) else "tg-rich: --thread-id needs an argument")
+    delivery['settle_on_signals'](context, [])
     payload = {"chat_id": int(chat_id), "rich_message": {"html": html_body}}
     if reply_to is not None:
         payload["reply_parameters"] = {"message_id": reply_to}
@@ -102,11 +103,18 @@ def main(argv):
     out = r.stdout.strip()
     print(out[:2000])
     try:
-        ok = json.loads(out).get("ok") is True
-    except Exception:
-        ok = False
+        response = json.loads(out)
+    except (ValueError, UnicodeError):
+        response = None
+    ok = isinstance(response, dict) and response.get("ok") is True
     if ok:
-        record_outbound(chat_id, html_body, out, context)
+        if not record_outbound(chat_id, html_body, out, context):
+            # Delivered but not recorded: this sender did not die, so the receiver's tick leaves
+            # its fence for the startup check (R4-7), as tg-send does.
+            delivery['detach_attempt'](context)
+            print("tg-rich: delivered, not recorded; do not resend"
+                  + (": the request holds until the receiver records or settles it"
+                     if os.environ.get("TG_DELIVERY_AUTHORITY") == "receiver" else ""), file=sys.stderr)
         try:
             subprocess.run(
                 [os.path.expanduser("~/bin/tg-fallback-outbound"), chat_id],
@@ -116,12 +124,18 @@ def main(argv):
             )
         except OSError:
             pass  # The message was accepted; do not report a delivery failure.
+    else:
+        rejected = r.returncode == 0 and delivery['definite_bot_api_rejection'](response)
+        delivery['abandon_attempt'](context, [], rejected)
+        if rejected and context.get("task_id"):
+            print(delivery['rejected_background_notice'](context), file=sys.stderr)
     sys.exit(0 if ok else 1)
 
 
 def record_outbound(chat_id, html_body, raw_receipt, context=None):
     """History row through the sibling tg-send, which validates the receipt and
-    knows the columns; the visible text is the HTML with its tags stripped."""
+    knows the columns; the visible text is the HTML with its tags stripped.
+    False when it could not be written."""
     recorder = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tg-send")
     text = re.sub(r"<[^>]+>", " ", html_body)
     text = re.sub(r"[ \t]+", " ", text).strip()
@@ -131,10 +145,9 @@ def record_outbound(chat_id, html_body, raw_receipt, context=None):
             input=(raw_receipt + "\0" + text).encode("utf-8"),
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15,
         )
-        if done.returncode != 0:
-            print("tg-rich: history_write_failed; message will not be resent", file=sys.stderr)
+        return done.returncode == 0
     except (OSError, subprocess.SubprocessError):
-        print("tg-rich: history_write_failed; message will not be resent", file=sys.stderr)
+        return False
 
 
 if __name__ == "__main__":

@@ -2,8 +2,9 @@
 """Block one Stop event when a Telegram turn was never delivered to Telegram."""
 
 from datetime import datetime, timezone
-from contextlib import redirect_stdout
+from contextlib import closing, redirect_stdout
 import fcntl
+import hashlib
 import io
 import json
 import subprocess
@@ -42,6 +43,9 @@ BASH_SENDER = re.compile(
     r"(?:(?:~|/home/[^/\s]+)/bin/)?"
     r"(?:tg-(?:rich|send|send-file|md|video)|tg_send)\Z"
 )
+POSSIBLE_BASH_SENDER = re.compile(
+    r"(?<![A-Za-z0-9_-])(?:tg-(?:rich|send|send-file|md|video)|tg_send)(?![A-Za-z0-9_-])"
+)
 UNSAFE_FALLBACK_TEXT = re.compile(
     r"(?:\btg[_-]send\b|\bmessage_id\b|\bdelivery_id\b|\btoolu_[A-Za-z0-9]+\b|"
     r"\bmcp__[A-Za-z0-9_]+\b|\bstop_hook\b|/home/|\.jsonl\b|<channel\b|\*\*|```)",
@@ -70,6 +74,7 @@ CONTINUATION_ATTACHMENT_TYPES = frozenset(
         "hook_additional_context",
         "hook_system_message",
         "hook_blocking_error",
+        "hook_non_blocking_error",
         "skill_listing",
         "command_permissions",
         "date_change",
@@ -96,9 +101,19 @@ CONTINUATION_ATTACHMENT_TYPES = frozenset(
         "session_context",
         "date",
         "prompt_snapshot",
+        "credential_org",
         "environment",
         "model",
         "deferred_tools_record",
+        # 26.09: CLI 2.1.275+ records the thinking blocks it dropped from a request,
+        # often right after a compaction; it renders nothing to the model, and unknown
+        # it hid the turn (review of the Руфус compaction fix, P2-3).
+        "thinking_drop",
+        # The same review, again metadata that hid every turn it was in: the CLI
+        # marks stripped thinking blocks right after a compaction summary
+        # (2.1.260-2.1.275) and a truncated Read with a banner (2.1.270+).
+        "thinking_stripped",
+        "read_truncation_notice",
         # Claude 2.1.280 renders these as meta reminders (isMeta), never as user
         # input. silent_turn_reminder follows the reply receipt; unknown, it hid
         # Мартин's turn on 22.09: the answered head stayed «started» and the
@@ -211,9 +226,46 @@ def telegram_chat_id(prompt: object, origin: object) -> str | None:
     if attributes.get("source") != "plugin:telegram:telegram":
         return None
     chat_id = attributes.get("chat_id")
-    if chat_id is None or re.fullmatch(r"-?[0-9]+", chat_id) is None:
+    if chat_id is None or re.fullmatch(r"-?[1-9][0-9]*", chat_id) is None:
         return None
     return chat_id
+
+
+def routing_scope(attributes: dict) -> tuple[str, int | None, bool] | None:
+    """Validate the exact carrier/notification scope, without a latest-chat lookup."""
+    chat_id = attributes.get("chat_id")
+    if not isinstance(chat_id, str) or re.fullmatch(r"-?[1-9][0-9]*", chat_id) is None:
+        return None
+    thread_id = None
+    if "thread_id" in attributes:
+        value = attributes["thread_id"]
+        if (not isinstance(value, str) or re.fullmatch(r"[1-9][0-9]{0,9}", value) is None
+                or int(value) > 2_147_483_647 or not chat_id.startswith("-")):
+            return None
+        thread_id = int(value)
+    if "general_topic" in attributes and attributes["general_topic"] not in ("true", "false"):
+        return None
+    general_topic = attributes.get("general_topic") == "true"
+    if general_topic and (thread_id is not None or not chat_id.startswith("-")):
+        return None
+    expected = (f"topic:{chat_id}:{thread_id}" if thread_id is not None
+                else ("group:" if chat_id.startswith("-") else "user:") + chat_id)
+    if "conversation_key" in attributes:
+        if attributes["conversation_key"] != expected:
+            return None
+        general_topic = general_topic or (chat_id.startswith("-") and thread_id is None)
+    return chat_id, thread_id, general_topic
+
+
+def telegram_scope(prompt: object, origin: object) -> tuple[str, int | None, bool] | None:
+    if telegram_chat_id(prompt, origin) is None:
+        return None
+    attributes = channel_attributes(prompt)
+    if attributes is None:
+        return None
+    if "delivery_id" in attributes and telegram_delivery_id(prompt, origin) is None:
+        return None
+    return routing_scope(attributes)
 
 
 def telegram_delivery_id(prompt: object, origin: object) -> str | None:
@@ -476,7 +528,14 @@ def complete_started_delivery(
             receipt = connection.execute(
                 "SELECT 1 FROM telegram_silent_deliveries WHERE delivery_id=?", (delivery_id,)
             ).fetchone()
-            settled = remaining is None and receipt is not None
+            # A message the receiver already closed as terminal leaves nothing to settle: refusing
+            # the Stop only made the model repeat no_reply 9 times (Кнопа 29.09 07:55, 14:48). A
+            # paused or resuming request with no row is still live and stays open (Codex, task 47).
+            terminal = binding is not None and connection.execute(
+                "SELECT 1 FROM delivery_results WHERE delivery_id=? AND turn_id=? AND session_id=? "
+                "AND state IN ('no_reply','complete','cancelled','failed')", (delivery_id, *binding)
+            ).fetchone() is not None
+            settled = remaining is None and (receipt is not None or terminal)
             if settled:
                 mark_turn_message(connection, delivery_id, closed_by)
                 settle_result(connection, delivery_id, binding, closed_by)
@@ -570,7 +629,8 @@ def fsync_cleanup_proof_directory() -> None:
         os.close(descriptor)
 
 
-def cleanup_identity(delivery_id: str | None, chat_id: str) -> dict[str, str] | None:
+def cleanup_identity(delivery_id: str | None, chat_id: str,
+                     thread_id: int | None = None) -> dict[str, str] | None:
     if delivery_id is None:
         return None
     prefix = f"{chat_id}:"
@@ -579,17 +639,22 @@ def cleanup_identity(delivery_id: str | None, chat_id: str) -> dict[str, str] | 
     message_id = delivery_id[len(prefix) :]
     if re.fullmatch(r"[0-9]+", message_id) is None:
         return None
-    return {
+    identity = {
         "delivery_id": delivery_id,
         "chat_id": chat_id,
         "message_id": message_id,
     }
+    if thread_id is not None:
+        if type(thread_id) is not int or not 0 < thread_id <= 2_147_483_647 or not chat_id.startswith("-"):
+            return None
+        identity["thread_id"] = str(thread_id)
+    return identity
 
 
 def write_cleanup_proof(
-    delivery_id: str | None, chat_id: str, status_value: str
+    delivery_id: str | None, chat_id: str, status_value: str, thread_id: int | None = None
 ) -> bool:
-    identity = cleanup_identity(delivery_id, chat_id)
+    identity = cleanup_identity(delivery_id, chat_id, thread_id)
     if identity is None:
         return delivery_id is None
     if status_value not in {"prepared", "delivered"}:
@@ -649,23 +714,26 @@ def read_cleanup_proof_unlocked() -> dict[str, str] | None:
             os.close(descriptor)
     if not isinstance(proof, dict):
         return None
-    if set(proof) != {"delivery_id", "chat_id", "message_id", "status"}:
+    if set(proof) not in ({"delivery_id", "chat_id", "message_id", "status"},
+                         {"delivery_id", "chat_id", "message_id", "status", "thread_id"}):
         return None
     if not all(isinstance(value, str) for value in proof.values()):
         return None
     status_value = proof.get("status")
     if status_value not in {"prepared", "delivered"}:
         return None
-    identity = cleanup_identity(proof["delivery_id"], proof["chat_id"])
-    return proof if identity == {
-        "delivery_id": proof["delivery_id"],
-        "chat_id": proof["chat_id"],
-        "message_id": proof["message_id"],
-    } else None
+    thread_id = None
+    if "thread_id" in proof:
+        if re.fullmatch(r"[1-9][0-9]{0,9}", proof["thread_id"]) is None:
+            return None
+        thread_id = int(proof["thread_id"])
+    identity = cleanup_identity(proof["delivery_id"], proof["chat_id"], thread_id)
+    return proof if identity == {key: value for key, value in proof.items() if key != "status"} else None
 
 
-def cleanup_proof_status(delivery_id: str | None, chat_id: str) -> str | None:
-    identity = cleanup_identity(delivery_id, chat_id)
+def cleanup_proof_status(delivery_id: str | None, chat_id: str,
+                         thread_id: int | None = None) -> str | None:
+    identity = cleanup_identity(delivery_id, chat_id, thread_id)
     if identity is None:
         return None
     lock = open_cleanup_proof_lock()
@@ -681,8 +749,9 @@ def cleanup_proof_status(delivery_id: str | None, chat_id: str) -> str | None:
         close_cleanup_proof_lock(lock)
 
 
-def remove_cleanup_proof(delivery_id: str | None, chat_id: str) -> bool:
-    identity = cleanup_identity(delivery_id, chat_id)
+def remove_cleanup_proof(delivery_id: str | None, chat_id: str,
+                         thread_id: int | None = None) -> bool:
+    identity = cleanup_identity(delivery_id, chat_id, thread_id)
     if identity is None:
         return False
     lock = open_cleanup_proof_lock()
@@ -723,6 +792,32 @@ def delivery_still_pending(delivery_id: str) -> bool | None:
         return row is not None
     except sqlite3.Error:
         return None
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def delivery_ready_for_fallback(delivery_id: str | None, queued_carrier: bool) -> bool:
+    """An existing queued row is not an active turn, even if its carrier is visible."""
+    if delivery_id is None:
+        return True
+    database = telegram_state_dir() / "messages.db"
+    if not database.exists():
+        return True
+    connection = None
+    try:
+        connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True, timeout=0.5)
+        table = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pending_inbound_deliveries'",
+        ).fetchone()
+        if table is None:
+            return True  # Legacy installations have no durable queue.
+        row = connection.execute(
+            "SELECT state FROM pending_inbound_deliveries WHERE delivery_id=?", (delivery_id,),
+        ).fetchone()
+        return row is None or row[0] in ("started", "recovering") or (queued_carrier and row[0] == "offered")
+    except sqlite3.Error:
+        return False
     finally:
         if connection is not None:
             connection.close()
@@ -790,7 +885,17 @@ def newest_active_assistant(events: list[object]) -> dict | None:
     return None
 
 
-def event_disposition(event: dict) -> tuple[str, object, object]:
+def runtime_task_origin(origin: object) -> bool:
+    """The CLI's own background-task notice, whatever else its origin carries.
+
+    CLI 2.1.284 added "producer": "session-task" (Кнопа, 29.09 12:24 UTC). The exact
+    dict no longer matched, a completed task stayed unread and Stop was refused 9 times
+    in a row after the final answer. A notice naming a channel server is never the runtime.
+    """
+    return isinstance(origin, dict) and origin.get("kind") == "task-notification" and "server" not in origin
+
+
+def listed_event_disposition(event: dict) -> tuple[str, object, object]:
     """Return continuation, carrier, or ambiguous for an ancestry event."""
     event_type = event.get("type")
     if event_type == "assistant":
@@ -809,7 +914,7 @@ def event_disposition(event: dict) -> tuple[str, object, object]:
             # але це продовження поточного ходу, не новий Telegram-запит.
             if (
                 attachment.get("commandMode") == "task-notification"
-                and attachment.get("origin") in (None, {"kind": "task-notification"})
+                and (attachment.get("origin") is None or runtime_task_origin(attachment.get("origin")))
             ):
                 return "continuation", None, None
             return "carrier", attachment.get("prompt"), attachment.get("origin")
@@ -849,7 +954,33 @@ def event_disposition(event: dict) -> tuple[str, object, object]:
     return "ambiguous", None, None
 
 
-def ancestry_parent_uuid(event: dict) -> str | None:
+# 29.09, the owner's rule: a person reaches this bot only inside a Telegram channel
+# envelope. Every other record is the CLI's own bookkeeping, whatever it is called,
+# so a kind missing from the lists above continues the turn instead of hiding it.
+# Each new name used to leave an answered head «started» (Кнопа 24.09 «Usage limit
+# reset», 28.09 hook_cancelled; Кеш 26.09). A system record is the CLI's own notice
+# even when it quotes an envelope: a message blocked by a hook never reached the model
+# and the receiver delivers it again (Кнопа 27–28.09, 6 turns hidden). A record of any
+# other kind that quotes an envelope where we do not read one stays ambiguous, and so
+# do a user record the lists do not know and an attachment of a person's media (the kit's
+# contract in test_user_photo_stops_the_search_on_purpose): either may be someone typing
+# into the session, and its answer must never be forwarded to a Telegram chat.
+TELEGRAM_ENVELOPE_TRACE = re.compile(r"<channel\b[^>]*plugin:telegram:telegram")
+PERSON_MEDIA_ATTACHMENT = re.compile(r"image|paste|photo|picture|video|audio|voice|document|media", re.IGNORECASE)
+
+
+def event_disposition(event: dict) -> tuple[str, object, object]:
+    disposition = listed_event_disposition(event)
+    attachment = event.get("attachment") if event.get("type") == "attachment" else None
+    person_media = isinstance(attachment, dict) and PERSON_MEDIA_ATTACHMENT.search(str(attachment.get("type") or ""))
+    if disposition[0] == "ambiguous" and event.get("type") != "user" and not person_media and (
+            event.get("type") == "system"
+            or TELEGRAM_ENVELOPE_TRACE.search(json.dumps(event, ensure_ascii=False)) is None):
+        return "continuation", None, None
+    return disposition
+
+
+def ancestry_parent_uuid(event: dict, visited: set[str] = frozenset(), known: dict | None = None) -> str | None:
     parent_uuid = event.get("parentUuid")
     if (
         parent_uuid is None
@@ -857,6 +988,19 @@ def ancestry_parent_uuid(event: dict) -> str | None:
         and event.get("subtype") == "compact_boundary"
     ):
         parent_uuid = event.get("logicalParentUuid")
+        if isinstance(parent_uuid, str) and (parent_uuid in visited or known is not None and parent_uuid not in known):
+            # CLI 2.1.273+ may write the kept tail of a compaction only after the
+            # boundary, under the summary, while logicalParentUuid names it, so the
+            # walk returns to it. The turn goes on before the boundary at the nearest
+            # kept message not walked yet, in the order the CLI relinks them (Руфус
+            # 26.09: a compaction inside the turn hid it; the head waited two hours).
+            # A logical parent the CLI never wrote (an empty hook result, a progress
+            # record) is crossed the same way.
+            metadata = event.get("compactMetadata")
+            kept = metadata.get("preservedMessages") if isinstance(metadata, dict) else None
+            uuids = kept.get("uuids") if isinstance(kept, dict) else None
+            parent_uuid = next((uuid for uuid in reversed(uuids) if isinstance(uuid, str)
+                                and uuid not in visited), None) if isinstance(uuids, list) else None
     if not isinstance(parent_uuid, str) or not parent_uuid:
         return None
     return parent_uuid
@@ -906,7 +1050,7 @@ def active_turn(
         if disposition != "continuation":
             return None
 
-        parent_uuid = ancestry_parent_uuid(current)
+        parent_uuid = ancestry_parent_uuid(current, visited, by_uuid)
         if parent_uuid is None:
             return None
         parent = by_uuid.get(parent_uuid)
@@ -978,20 +1122,72 @@ def request_clean_restart(events: list[object], chat_id: str) -> None:
     temporary.replace(marker)
 
 
-def delivery_attempt_chat_ids(block: object) -> set[str]:
-    if not isinstance(block, dict) or block.get("type") != "tool_use":
-        return set()
-    name = str(block.get("name", ""))
-    if "telegram" in name and name.endswith(OUTBOUND_SUFFIXES):
-        tool_input = block.get("input")
-        if not isinstance(tool_input, dict):
-            return set()
-        chat_id = str(tool_input.get("chat_id", ""))
-        return {chat_id} if re.fullmatch(r"-?[0-9]+", chat_id) else set()
-    if name != "Bash":
-        return set()
+def bash_delivery_arguments(block: dict) -> dict | None:
     tool_input = block.get("input")
     command = str(tool_input.get("command", "")) if isinstance(tool_input, dict) else ""
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|<>()\r\n")
+        lexer.whitespace = " \t"
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        tokens = list(lexer)
+    except ValueError:
+        return None
+    if not tokens or BASH_SENDER.fullmatch(tokens[0]) is None:
+        return None
+    if any(re.fullmatch(r"[;&|<>()\r\n]+", token) for token in tokens[1:]):
+        return None
+    values, positional = {}, []
+    index = 1
+    while index < len(tokens):
+        value = tokens[index]
+        if value == "--thread-id" and "thread_id" not in values:
+            index += 1
+            if index >= len(tokens) or re.fullmatch(r"[1-9][0-9]{0,9}", tokens[index]) is None:
+                return None
+            values["thread_id"] = int(tokens[index])
+        elif value == "--general-topic" and "general_topic" not in values:
+            values["general_topic"] = True
+        elif value == "--no-watchdog-credit" and "no_watchdog_credit" not in values:
+            values["no_watchdog_credit"] = True
+        elif value.startswith("--"):
+            return None
+        else:
+            positional.append(value)
+        index += 1
+    if not positional or any(BASH_SENDER.fullmatch(value) for value in positional[1:]):
+        return None
+    values["chat_id"] = positional[0]
+    return values
+
+
+def shell_has_expansion(command: str) -> bool:
+    """Reject dynamic Bash words before shlex discards their quoting context."""
+    quote = None
+    escaped = False
+    for char in command:
+        if quote == "'":
+            if char == "'":
+                quote = None
+            continue
+        if escaped:
+            escaped = False
+            continue
+        if char == '\\':
+            escaped = True
+        elif char == '"':
+            quote = None if quote == '"' else '"'
+        elif char == "'" and quote is None:
+            quote = "'"
+        elif char in ('$', '`') or (quote is None and char in '*?[{'):
+            return True
+    return False
+
+
+def shell_sender_origin(command: str, depth: int = 0) -> tuple[str, str | None, str | None] | None:
+    """Read one shell send, including a simple wrapper and output redirects."""
+    if depth > 2 or shell_has_expansion(command):
+        return None
     try:
         lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|<>()\r\n")
         # Новий рядок усередині лапок — текст; поза ними — інша shell-команда.
@@ -1000,20 +1196,295 @@ def delivery_attempt_chat_ids(block: object) -> set[str]:
         lexer.commenters = ""
         tokens = list(lexer)
     except ValueError:
-        return set()
-    if not tokens or BASH_SENDER.fullmatch(tokens[0]) is None:
-        return set()
-    if any(re.fullmatch(r"[;&|<>()\r\n]+", token) for token in tokens[1:]):
-        return set()
-    chat_index = 2 if tokens[1:2] == ["--no-watchdog-credit"] else 1
+        return None
+    if not tokens:
+        return None
+    # A redirect does not launch a second command. A pipe, separator, input
+    # redirect or substitution would make a successful Bash result ambiguous.
+    redirect = len(tokens)
+    for index, token in enumerate(tokens):
+        if token in ('>', '>>', '>&'):
+            redirect = index - 1 if token == '>&' and index > 0 and tokens[index - 1] == '2' else index
+            break
+        if re.fullmatch(r'[;&|<>()\r\n]+', token):
+            return None
+    trailing = tokens[redirect:]
+    offset = 0
+    while offset < len(trailing):
+        descriptor = trailing[offset] if trailing[offset] in ('1', '2') else None
+        offset += 1 if descriptor else 0
+        if offset >= len(trailing):
+            return None
+        operator = trailing[offset]
+        target = trailing[offset + 1] if offset + 1 < len(trailing) else None
+        if operator in ('>', '>>') and target and not re.fullmatch(r'[;&|<>()\r\n]+', target):
+            offset += 2
+        elif operator == '>&' and descriptor == '2' and target == '1':
+            offset += 2
+        else:
+            return None
+    tokens = tokens[:redirect]
+    if not tokens:
+        return None
+    sender_index = 1 if tokens[0] in ("env", "/usr/bin/env") else 0
+    explicit_id = None
+    while sender_index < len(tokens) and re.match(r"[A-Za-z_][A-Za-z0-9_]*=", tokens[sender_index]):
+        key, value = tokens[sender_index].split("=", 1)
+        if key == "TG_DELIVERY_ID":
+            explicit_id = value
+        else:
+            return None  # PATH, suppression and sender-origin overrides change what Bash proves.
+        sender_index += 1
+    if sender_index + 2 < len(tokens) and tokens[sender_index] in {
+            'bash', '/bin/bash', 'sh', '/bin/sh'} and tokens[sender_index + 1] in {'-c', '-lc'}:
+        if len(tokens) != sender_index + 3:
+            return None
+        nested = shell_sender_origin(tokens[sender_index + 2], depth + 1)
+        return (nested[0], nested[1] if nested[1] is not None else explicit_id, nested[2]) if nested else None
+    if sender_index >= len(tokens) or BASH_SENDER.fullmatch(tokens[sender_index]) is None:
+        return None
+    chat_index = sender_index + 1
+    topic = None
+    general_topic = False
+    no_watchdog_credit = False
+    while chat_index < len(tokens) and tokens[chat_index].startswith('--'):
+        flag = tokens[chat_index]
+        if flag == '--no-watchdog-credit' and not no_watchdog_credit:
+            no_watchdog_credit = True
+            chat_index += 1
+        elif flag == '--general-topic' and not general_topic and topic is None:
+            general_topic = True
+            chat_index += 1
+        elif flag == '--thread-id' and topic is None and not general_topic and chat_index + 1 < len(tokens):
+            topic = tokens[chat_index + 1]
+            chat_index += 2
+        else:
+            return None
     if len(tokens) <= chat_index:
-        return set()
+        return None
     chat_id = tokens[chat_index]
     if re.fullmatch(r"-?[0-9]+", chat_id) is None:
-        return set()
+        return None
     if any(BASH_SENDER.fullmatch(token) for token in tokens[chat_index + 1 :]):
+        return None
+    arguments = tokens[chat_index + 1 :]
+    # Telegram may route a quoted group message into the quoted message's
+    # topic, regardless of the visible chat_id. Its exact receiver receipt,
+    # not a successful Bash exit, must settle that request.
+    if chat_id.startswith('-') and any(
+        token == '--reply-to' or token.startswith('--reply-to=') for token in arguments
+    ):
+        return None
+    for index, token in enumerate(arguments):
+        if token == '--thread-id':
+            if topic is not None or general_topic or index + 1 >= len(arguments):
+                return None
+            topic = arguments[index + 1]
+        elif token.startswith('--thread-id='):
+            if topic is not None or general_topic:
+                return None
+            topic = token.partition('=')[2]
+        elif token == '--general-topic':
+            if general_topic or topic is not None:
+                return None
+            general_topic = True
+    if topic is not None and (not topic.isdecimal() or int(topic) <= 0):
+        return None
+    if no_watchdog_credit or '--no-watchdog-credit' in arguments:
+        return None  # A successful Bash exit cannot credit an uncredited send.
+    return chat_id, explicit_id, topic
+
+
+def verified_message_thread(chat_id: str, message_id: str) -> tuple[bool, int | None]:
+    if not isinstance(message_id, str) or re.fullmatch(r"[1-9][0-9]*", message_id) is None:
+        return False, None
+    connection = None
+    try:
+        connection = sqlite3.connect(f"file:{telegram_state_dir() / 'messages.db'}?mode=ro", uri=True, timeout=0.5)
+        rows = connection.execute(
+            "SELECT thread_id,conversation_key FROM messages WHERE chat_id=? AND message_id=?",
+            (chat_id, message_id),
+        ).fetchall()
+        threads = set()
+        for thread_id, key in rows:
+            attributes = {"chat_id": chat_id, "conversation_key": key}
+            if thread_id is not None:
+                if type(thread_id) is not int:
+                    return False, None
+                attributes["thread_id"] = str(thread_id)
+            scope = routing_scope(attributes)
+            if scope is None:
+                return False, None
+            threads.add(scope[1])
+        return (True, threads.pop()) if len(threads) == 1 else (False, None)
+    except sqlite3.Error:
+        return False, None
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def verified_delivery_thread(chat_id: str, delivery_id: object) -> tuple[bool, int | None]:
+    if not isinstance(delivery_id, str) or re.fullmatch(re.escape(chat_id) + r":[1-9][0-9]*", delivery_id) is None:
+        return False, None
+    connection = None
+    try:
+        connection = sqlite3.connect(f"file:{telegram_state_dir() / 'messages.db'}?mode=ro", uri=True, timeout=0.5)
+        row = connection.execute(
+            "SELECT payload,state FROM pending_inbound_deliveries WHERE delivery_id=?", (delivery_id,),
+        ).fetchone()
+        offered = row if row is not None and row[1] in ("offered", "started") else None
+        # A progress/final receipt can retire or requeue the transport row
+        # before Stop reads the transcript. The admitted request remains in
+        # the durable ledger, so its original topic can still be verified.
+        durable = None if offered is not None else connection.execute(
+            "SELECT request_payload,thread_id FROM delivery_results "
+            "WHERE delivery_id=? AND chat_id=? AND request_payload IS NOT NULL",
+            (delivery_id, chat_id),
+        ).fetchone()
+        payload = offered[0] if offered is not None else durable[0] if durable is not None else None
+        if payload is None:
+            return False, None
+        notification = json.loads(payload)
+        if not isinstance(notification, dict) or notification.get("method") != "notifications/claude/channel":
+            return False, None
+        params = notification.get("params")
+        meta = params.get("meta") if isinstance(params, dict) else None
+        if (not isinstance(params, dict) or not isinstance(params.get("content"), str)
+                or not isinstance(meta, dict) or "conversation_key" not in meta or meta.get("chat_id") != chat_id
+                or meta.get("delivery_id") != delivery_id
+                or meta.get("message_id") != delivery_id[len(chat_id) + 1:]):
+            return False, None
+        scope = routing_scope(meta)
+        verified, thread = verified_message_thread(chat_id, meta["message_id"])
+        durable_matches = durable is None or durable[1] == (str(thread) if thread is not None else None)
+        return (True, thread) if scope is not None and verified and scope[1] == thread and durable_matches else (False, None)
+    except (sqlite3.Error, ValueError, TypeError):
+        return False, None
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def delivery_attempt_scope(block: object) -> tuple[str, int | None] | None:
+    if not isinstance(block, dict) or block.get("type") != "tool_use":
+        return None
+    name = str(block.get("name", ""))
+    if "telegram" in name and name.endswith(OUTBOUND_SUFFIXES):
+        tool_input = block.get("input")
+    elif name == "Bash":
+        tool_input = bash_delivery_arguments(block)
+    else:
+        return None
+    if not isinstance(tool_input, dict):
+        return None
+    chat_id = str(tool_input.get("chat_id", ""))
+    if re.fullmatch(r"-?[1-9][0-9]*", chat_id) is None:
+        return None
+    evidence = []
+    if "thread_id" in tool_input:
+        thread = tool_input["thread_id"]
+        if type(thread) is not int or not 0 < thread <= 2_147_483_647 or not chat_id.startswith("-"):
+            return None
+        evidence.append(thread)
+    if "general_topic" in tool_input:
+        if type(tool_input["general_topic"]) is not bool:
+            return None
+        if tool_input["general_topic"]:
+            if not chat_id.startswith("-"):
+                return None
+            evidence.append(None)
+    for field, lookup in (("reply_to", verified_message_thread), ("delivery_id", verified_delivery_thread)):
+        if field not in tool_input:
+            continue
+        if field == "reply_to" and not chat_id.startswith("-"):
+            # A private chat has no alternate topic; preserve pre-scope history.
+            value = tool_input[field]
+            if not isinstance(value, str) or re.fullmatch(r"[1-9][0-9]*", value) is None:
+                return None
+            continue
+        verified, thread = lookup(chat_id, tool_input[field])
+        if not verified:
+            return None
+        evidence.append(thread)
+    if len(set(evidence)) > 1:
+        return None
+    return chat_id, evidence[0] if evidence else None
+
+
+def delivery_attempt_chat_ids(block: object) -> set[str]:
+    """Recognise a pending send even before its topic proof is complete."""
+    origin = delivery_attempt_origin(block)
+    if origin is not None:
+        return {origin[0]}
+    if not isinstance(block, dict) or block.get("type") != "tool_use":
         return set()
-    return {chat_id}
+    name = str(block.get("name", ""))
+    if "telegram" in name and name.endswith(OUTBOUND_SUFFIXES):
+        tool_input = block.get("input")
+    elif name == "Bash":
+        tool_input = bash_delivery_arguments(block)
+    else:
+        return set()
+    if not isinstance(tool_input, dict):
+        return set()
+    chat_id = str(tool_input.get("chat_id", ""))
+    return {chat_id} if re.fullmatch(r"-?[1-9][0-9]*", chat_id) else set()
+
+
+
+def delivery_attempt_origin(block: object) -> tuple[str, str | None, int | None] | None:
+    """Prove both the destination topic and any explicit originating request."""
+    if not isinstance(block, dict) or block.get("type") != "tool_use":
+        return None
+    name = str(block.get("name", ""))
+    if "telegram" in name and name.endswith(OUTBOUND_SUFFIXES):
+        scope = delivery_attempt_scope(block)
+        if scope is None:
+            return None
+        arguments = block.get("input")
+        delivery_id = arguments.get("delivery_id") if isinstance(arguments, dict) else None
+        if delivery_id is not None and not isinstance(delivery_id, str):
+            return None
+        return scope[0], delivery_id, scope[1]
+    if name != "Bash":
+        return None
+    arguments = block.get("input")
+    command = arguments.get("command", "") if isinstance(arguments, dict) else ""
+    parsed = shell_sender_origin(command) if isinstance(command, str) else None
+    if parsed is None:
+        return None
+    chat_id, delivery_id, topic = parsed
+    if re.fullmatch(r"-?[1-9][0-9]*", chat_id) is None:
+        return None
+    thread = int(topic) if topic is not None else None
+    if thread is not None and (not chat_id.startswith("-") or thread > 2_147_483_647):
+        return None
+    if delivery_id is not None and not isinstance(delivery_id, str):
+        return None
+    return chat_id, delivery_id, thread
+
+
+def possible_delivery_attempt(block: object) -> bool:
+    """Ambiguous shell syntax may have sent; never fall back blindly."""
+    if not isinstance(block, dict) or block.get("type") != "tool_use":
+        return False
+    name = str(block.get("name", ""))
+    if "telegram" in name and name.endswith(OUTBOUND_SUFFIXES):
+        return True
+    arguments = block.get("input")
+    return (name == "Bash" and isinstance(arguments, dict)
+            and isinstance(arguments.get("command"), str)
+            and POSSIBLE_BASH_SENDER.search(arguments["command"]) is not None)
+
+
+def delivery_attempt_matches_origin(
+    block: object, chat_id: str, delivery_id: str | None, thread_id: int | None,
+) -> bool:
+    origin = delivery_attempt_origin(block)
+    if origin is None or origin[0] != chat_id or origin[2] != thread_id:
+        return False
+    return delivery_id is None or origin[1] is None or origin[1] == delivery_id
 
 
 def content_blocks(event: object) -> list[object]:
@@ -1024,10 +1495,60 @@ def content_blocks(event: object) -> list[object]:
     return content if isinstance(content, list) else []
 
 
+def shell_delivery_complete(chat_id: str, delivery_id: str | None, thread_id: int | None) -> bool:
+    """A successful Bash exit counts only after the exact result is durable."""
+    stamp = os.environ.get('TG_DELIVERY_STAMP')
+    if not delivery_id or not stamp:
+        return False
+    try:
+        with closing(sqlite3.connect(f"file:{telegram_state_dir() / 'messages.db'}?mode=ro",
+                                     uri=True, timeout=0.2)) as connection:
+            return connection.execute(
+                'SELECT 1 FROM delivery_results r JOIN delivery_sessions s '
+                'ON s.session_id=r.session_id AND s.stamp=r.stamp '
+                "WHERE r.delivery_id=? AND r.chat_id=? AND r.thread_id IS ? AND r.stamp=? "
+                "AND r.state='complete' AND r.acknowledged_at IS NOT NULL LIMIT 1",
+                (delivery_id, chat_id, str(thread_id) if thread_id is not None else None, stamp),
+            ).fetchone() is not None
+    except sqlite3.Error:
+        return False
+
+
+def receipted_elsewhere(result: dict, chat_id: str, delivery_id: str) -> bool:
+    """The receiver's receipt of `sent (id: N)` names another request.
+
+    The receiver binds an implicit reply to whichever request it resolves, so
+    tool input alone cannot prove the origin (Кнопа, 25.09: a reply receipted
+    to 23269 retired 23271). No receipt yet keeps the credit: a slow receipt
+    write must not hold a real answer.
+    """
+    content = result.get("content")
+    if isinstance(content, list):
+        content = "".join(part["text"] for part in content
+                          if isinstance(part, dict) and isinstance(part.get("text"), str))
+    sent = re.fullmatch(r"sent (?:\(id: |[0-9]+ parts \(ids: )([0-9]+(?:, [0-9]+)*)\)",
+                        content.strip()) if isinstance(content, str) else None
+    if sent is None:
+        return False
+    ids = [int(value) for value in sent.group(1).split(", ")]
+    try:
+        with closing(sqlite3.connect(f"file:{telegram_state_dir() / 'messages.db'}?mode=ro",
+                                     uri=True, timeout=0.2)) as connection:
+            return connection.execute(
+                "SELECT 1 FROM delivery_receipts WHERE chat_id=? AND message_id IN ("
+                + ",".join("?" * len(ids)) + ") AND delivery_id IS NOT NULL AND delivery_id!=? LIMIT 1",
+                (chat_id, *ids, delivery_id),
+            ).fetchone() is not None
+    except sqlite3.Error:
+        return False
+
+
 def successful_delivery(
     events: list[object],
     chat_id: str,
     result_events: list[object] | None = None,
+    delivery_id: str | None = None,
+    thread_id: int | None = None,
 ) -> bool:
     """True when a delivery attempt in `events` came back without an error.
 
@@ -1045,9 +1566,14 @@ def successful_delivery(
             continue
         for block in content_blocks(event):
             if (
-                chat_id in delivery_attempt_chat_ids(block)
+                delivery_attempt_matches_origin(block, chat_id, delivery_id, thread_id)
                 and isinstance(block, dict)
             ):
+                if block.get('name') == 'Bash':
+                    origin = delivery_attempt_origin(block)
+                    if origin is None or not shell_delivery_complete(
+                            chat_id, origin[1] or delivery_id, thread_id):
+                        continue
                 tool_id = str(block.get("id", ""))
                 if tool_id:
                     delivery_ids.add(tool_id)
@@ -1060,12 +1586,47 @@ def successful_delivery(
                 continue
             if str(block.get("tool_use_id", "")) not in delivery_ids:
                 continue
-            if block.get("is_error") is not True:
+            if block.get("is_error") is not True and not (
+                    delivery_id and receipted_elsewhere(block, chat_id, delivery_id)):
                 return True
     return False
 
 
-def delivery_is_newer_than_last_incoming(events: list[object], chat_id: str) -> bool:
+def latest_delivery_unconfirmed(events: list[object], chat_id: str,
+                                result_events: list[object], delivery_id: str | None = None) -> bool:
+    """Never turn a rejected, partial or still-running send into an automatic retry."""
+    latest_id = None
+    latest_shell_origin = None
+    for event in events:
+        if not isinstance(event, dict) or event.get("type") != "assistant":
+            continue
+        for block in content_blocks(event):
+            if not isinstance(block, dict) or block.get("type") != "tool_use":
+                continue
+            name = str(block.get("name", ""))
+            if "telegram" in name and name.endswith(OUTBOUND_SUFFIXES):
+                tool_input = block.get("input")
+            elif name == "Bash":
+                tool_input = bash_delivery_arguments(block)
+            else:
+                continue
+            origin = delivery_attempt_origin(block)
+            if origin is not None and origin[0] == chat_id:
+                latest_id = str(block.get("id", ""))
+                latest_shell_origin = origin if name == 'Bash' else None
+    if latest_id is None:
+        return False
+    receipts = [block for event in result_events for block in content_blocks(event)
+                if isinstance(block, dict) and block.get("type") == "tool_result"
+                and str(block.get("tool_use_id", "")) == latest_id]
+    return (not receipts or any(block.get("is_error") is True for block in receipts)
+            or (latest_shell_origin is not None and not shell_delivery_complete(
+                chat_id, latest_shell_origin[1] or delivery_id, latest_shell_origin[2])))
+
+
+def delivery_is_newer_than_last_incoming(events: list[object], chat_id: str,
+                                       delivery_id: str | None = None,
+                                       thread_id: int | None = None) -> bool:
     """Чи є підтверджена доставка ПІСЛЯ останнього вхідного в цьому чаті.
 
     Гонка запису: транскрипт дописується на диск не миттєво, і в момент Stop
@@ -1083,7 +1644,10 @@ def delivery_is_newer_than_last_incoming(events: list[object], chat_id: str) -> 
         disposition, prompt, origin = event_disposition(event)
         if disposition != "carrier":
             continue
-        if telegram_chat_id(prompt, origin) != chat_id:
+        scope = telegram_scope(prompt, origin)
+        if scope is None or scope[:2] != (chat_id, thread_id):
+            continue
+        if (channel_attributes(prompt) or {}).get('thread_id') != thread_id:
             continue
         stamp = event_timestamp(event)
         if stamp is not None and stamp > last_in:
@@ -1091,30 +1655,8 @@ def delivery_is_newer_than_last_incoming(events: list[object], chat_id: str) -> 
     if not last_in:
         return True
 
-    delivery_ids: set[str] = set()
-    for event in events:
-        if not isinstance(event, dict) or event.get("type") != "assistant":
-            continue
-        stamp = event_timestamp(event)
-        if stamp is None or stamp < last_in:
-            continue
-        for block in content_blocks(event):
-            if (
-                chat_id in delivery_attempt_chat_ids(block)
-                and isinstance(block, dict)
-            ):
-                tool_id = str(block.get("id", ""))
-                if tool_id:
-                    delivery_ids.add(tool_id)
-    if not delivery_ids:
-        return False
-    for event in events:
-        for block in content_blocks(event):
-            if not isinstance(block, dict) or block.get("type") != "tool_result":
-                continue
-            if str(block.get("tool_use_id", "")) in delivery_ids and block.get("is_error") is not True:
-                return True
-    return False
+    newer_events = [event for event in events if (event_timestamp(event) or 0) >= last_in]
+    return successful_delivery(newer_events, chat_id, events, delivery_id, thread_id)
 
 
 def final_answer_text(turn_events: list[object]) -> str:
@@ -1134,7 +1676,8 @@ def final_answer_text(turn_events: list[object]) -> str:
     return ""
 
 
-def deliver_pending_answer(turn_events: list[object], chat_id: str) -> bool:
+def deliver_pending_answer(turn_events: list[object], chat_id: str,
+                           *, thread_id: int | None = None, general_topic: bool = False) -> bool:
     """Доставити відповідь самотужки, коли агент її написав і не надіслав.
 
     Спілкування з цим агентом іде лише через Telegram, тож ненадісланий текст —
@@ -1155,9 +1698,14 @@ def deliver_pending_answer(turn_events: list[object], chat_id: str) -> bool:
     # visible in the shadow report.
     environment = {key: value for key, value in os.environ.items() if key != "TG_DELIVERY_STAMP"}
     environment["TG_SEND_ORIGIN"] = "stop-guard"
+    command = [str(sender), chat_id, text]
+    if thread_id is not None:
+        command.extend(("--thread-id", str(thread_id)))
+    elif general_topic:
+        command.append("--general-topic")
     try:
         done = subprocess.run(
-            [str(sender), chat_id, text],
+            command,
             capture_output=True, text=True, timeout=30, env=environment,
         )
     except (OSError, subprocess.SubprocessError):
@@ -1197,7 +1745,7 @@ def observation_only(turn_events: list[dict], result_events: list[object] | None
     failed = False
     for event in turn_events:
         for block in content_blocks(event):
-            if isinstance(block, dict) and delivery_attempt_chat_ids(block):
+            if possible_delivery_attempt(block):
                 sends.add(block.get("id"))
     for event in result_events if result_events is not None else turn_events:
         for block in content_blocks(event):
@@ -1234,7 +1782,9 @@ def explicit_no_reply(turn_events: list[dict]) -> bool:
     return False
 
 
-def successful_no_reply(turn_events: list[dict], events: list[object]) -> bool:
+def successful_no_reply(
+    turn_events: list[dict], events: list[object], chat_id: str, thread_id: int | None,
+) -> bool:
     """A no_reply tool call of this turn that came back without an error.
 
     The result is a child of the assistant event that made the call, so when
@@ -1249,7 +1799,11 @@ def successful_no_reply(turn_events: list[dict], events: list[object]) -> bool:
             if not isinstance(block, dict) or block.get("type") != "tool_use":
                 continue
             name = str(block.get("name", ""))
-            if "telegram" in name and name.endswith(NO_REPLY_TOOL_SUFFIX) and block.get("id"):
+            arguments = block.get('input')
+            if ("telegram" in name and name.endswith(NO_REPLY_TOOL_SUFFIX) and block.get("id")
+                    and isinstance(arguments, dict) and str(arguments.get('chat_id')) == chat_id
+                    and ('thread_id' not in arguments or type(arguments['thread_id']) is int)
+                    and arguments.get('thread_id') == thread_id):
                 calls.add(str(block["id"]))
     if not calls:
         return False
@@ -1315,14 +1869,20 @@ def finish_group_observation(
 
 
 def native_request_events(events: list[dict], turn_events: list[dict], delivery_id: str | None) -> list[dict]:
-    """A recovery carrier continues the same request's native work, not a new launch."""
+    """A recovery carrier continues the same request's native work, not a new launch.
+
+    A message folded in mid-turn joins the native turn already running, so that
+    turn's launches and callbacks stay in scope: cut at the newcomer, a callback
+    turn's proof vanished and every Stop was refused as unproven.
+    """
     scope = list(turn_events)
     by_uuid = transcript_uuid_map(events) or {}
-    carrier = by_uuid.get(ancestry_parent_uuid(scope[0])) if scope else None
+    carrier = by_uuid.get(ancestry_parent_uuid(scope[0], {e.get('uuid') for e in scope}, by_uuid)) if scope else None
     visited: set[str] = set()
     while carrier and len(visited) < MAX_ANCESTRY_EVENTS:
         _, prompt, origin = event_disposition(carrier)
-        if (not delivery_id or telegram_delivery_id(prompt, origin) != delivery_id
+        folded = (carrier.get('attachment') or {}).get('type') == 'queued_command'
+        if not folded and (not delivery_id or telegram_delivery_id(prompt, origin) != delivery_id
                 or not (channel_attributes(prompt) or {}).get('recovery_attempt')):
             break
         current = by_uuid.get(ancestry_parent_uuid(carrier))
@@ -1334,7 +1894,7 @@ def native_request_events(events: list[dict], turn_events: list[dict], delivery_
             visited.add(identifier)
             disposition, prompt, origin = event_disposition(current)
             if disposition == 'carrier':
-                if telegram_delivery_id(prompt, origin) != delivery_id:
+                if not folded and telegram_delivery_id(prompt, origin) != delivery_id:
                     return scope
                 scope = list(reversed(previous)) + scope
                 carrier = current
@@ -1342,7 +1902,7 @@ def native_request_events(events: list[dict], turn_events: list[dict], delivery_
             if disposition != 'continuation':
                 return scope
             previous.append(current)
-            current = by_uuid.get(ancestry_parent_uuid(current))
+            current = by_uuid.get(ancestry_parent_uuid(current, visited, by_uuid))
         else:
             break
     return scope
@@ -1357,9 +1917,14 @@ def native_background_work(events: list[dict], turn_events: list[dict], delivery
     """
     scope = native_request_events(events, turn_events, delivery_id)
     tasks: dict[str, tuple[str, str, int]] = {}
+    launches: set[tuple[str, str]] = set()
     unknown: list[str] = []
     lost: list[str] = []
     read_uuid = None
+    unidentified_callback = False
+    external_callback_tasks: set[str] = set()
+    callback_events: list[dict] = []
+    unverified_resume: set[str] = set()
 
     def text_of(content):
         if isinstance(content, str):
@@ -1421,27 +1986,66 @@ def native_background_work(events: list[dict], turn_events: list[dict], delivery
                 unknown.append(identifier)
             else:
                 tasks[task_id] = (identifier, name, index)
+                launches.add((task_id, identifier))
 
         # Process launches and completions in native order: a completed agent
         # may be resumed again even within this same Telegram request.
         text = None
-        if event.get('type') == 'user' and event.get('origin') == {'kind': 'task-notification'}:
+        if event.get('type') == 'user' and runtime_task_origin(event.get('origin')):
             text = (event.get('message') or {}).get('content')
         elif event.get('type') == 'attachment':
             attachment = event.get('attachment') or {}
             if (attachment.get('type') == 'queued_command' and attachment.get('commandMode') == 'task-notification'
-                    and attachment.get('origin') in (None, {'kind': 'task-notification'})):
+                    and (attachment.get('origin') is None or runtime_task_origin(attachment.get('origin')))):
                 text = attachment.get('prompt')
-        if (isinstance(text, str) and re.fullmatch(r'\s*<task-notification>.*</task-notification>\s*', text, re.DOTALL)
+        # The runtime's origin already marks the notice; the CLI may write a line around its
+        # block, so the one block is found rather than matched whole (29.09).
+        if (isinstance(text, str) and text.count('<task-notification>') == 1
+                and re.search(r'<task-notification>.*</task-notification>', text, re.DOTALL)
                 and text.count('<task-id>') == 1 and text.count('</task-notification>') == 1):
             task = re.search(r'<task-id>([A-Za-z0-9_-]{1,128})</task-id>', text)
             bound = tasks.get(task.group(1)) if task else None
             tool = re.search(r'<tool-use-id>([^<]+)</tool-use-id>', text)
+            if re.search(r'<status>killed</status>', text):
+                # An agent Claude stopped: the notice confirms the stop of that exact
+                # launch and carries no result. It closes the task like TaskStop and
+                # is no callback, as the receiver records no return for it.
+                if bound and index > bound[2] and tool and tool.group(1) == bound[0]:
+                    del tasks[task.group(1)]
+                    unverified_resume.discard(task.group(1))
+                    read_uuid = event.get('uuid')
+                continue
+            ambiguous_resume = bool(bound and bound[1] == 'SendMessage' and not tool)
+            known_launch = bool(task and tool and (task.group(1), tool.group(1)) in launches)
+            external = (
+                (not known_launch and (not bound or bool(tool and tool.group(1) != bound[0])))
+                or ambiguous_resume
+            )
+            callback_events.append({
+                'task_id': task.group(1) if task else None,
+                'prompt_hash': hashlib.sha256(text.encode('utf-8')).hexdigest(),
+                'timestamp': event_timestamp(event), 'index': index,
+                'external': external,
+            })
+            if external and not ambiguous_resume:
+                # A callback from an earlier service turn has no launch in
+                # this request's scope, or refers to an older launch under
+                # a reused agent ID. Never infer its owner from the carrier.
+                if task:
+                    external_callback_tasks.add(task.group(1))
+                else:
+                    unidentified_callback = True
+            elif ambiguous_resume:
+                # A resumed agent reuses its ID. Without the tool-use ID the
+                # notification could describe an earlier round. Require a
+                # TaskOutput/TaskStop result for this exact current task.
+                unverified_resume.add(task.group(1))
             terminal = re.search(r'<status>(completed|failed|killed|stopped|cancelled)</status>', text)
             # A native Monitor event is already read input; the model can send
             # its meaningful result or explicitly keep the same watch deferred.
             streamed = re.search(r'<event>.+</event>', text, re.DOTALL)
-            if (bound and index > bound[2] and (not tool or tool.group(1) == bound[0])
+            if (bound and index > bound[2] and not ambiguous_resume
+                    and (not tool or tool.group(1) == bound[0])
                     and (terminal or (bound[1] == 'Monitor' and streamed))):
                 del tasks[task.group(1)]
                 read_uuid = event.get('uuid')
@@ -1463,9 +2067,12 @@ def native_background_work(events: list[dict], turn_events: list[dict], delivery
                         native = value if isinstance(value, dict) else {}
                     except (ValueError, TypeError):
                         pass
+                # A matching task field names the attempted stop, not its outcome: the success
+                # sentence stays the proof until the CLI records one (Codex, task 47 v7).
                 if (result.get('is_error') is not True and native.get('task_id') == task_id
                         and str(native.get('message', '')).startswith('Successfully stopped task')):
                     del tasks[task_id]
+                    unverified_resume.discard(task_id)
                     read_uuid = event.get('uuid')
                 continue
             if result.get('is_error') is True:
@@ -1474,6 +2081,7 @@ def native_background_work(events: list[dict], turn_events: list[dict], delivery
                 if re.match(r'^No task found with ID: ' + re.escape(task_id) + r'(?:$|[.\n])',
                             text_of(result.get('content'))):
                     del tasks[task_id]
+                    unverified_resume.discard(task_id)
                     lost.append(task_id)
                     read_uuid = event.get('uuid')
                 continue
@@ -1486,8 +2094,17 @@ def native_background_work(events: list[dict], turn_events: list[dict], delivery
             if (isinstance(task, dict) and task.get('task_id', task.get('id')) == task_id
                     and task.get('status') in {'completed', 'failed', 'killed', 'stopped', 'cancelled'}):
                 del tasks[task_id]
+                unverified_resume.discard(task_id)
                 read_uuid = event.get('uuid')
-    return {'pending': list(tasks), 'unknown': unknown, 'lost': lost, 'read_uuid': read_uuid}
+    return {'pending': list(tasks), 'unknown': unknown, 'lost': lost,
+            'read_uuid': read_uuid,
+            'unbound_callback': unidentified_callback or any(event['external'] for event in callback_events)
+                                or bool(unverified_resume),
+            'external_callback_tasks': sorted(external_callback_tasks),
+            'callback_events': callback_events,
+            'pending_launches': {task_id: launch[2] for task_id, launch in tasks.items()},
+            'pending_calls': {task_id: launch[0] for task_id, launch in tasks.items()},
+            'unverified_resume': sorted(unverified_resume)}
 
 
 def native_task_deferred(hook: dict, delivery_id: str | None, task_ids: list[str]) -> bool:
@@ -1499,22 +2116,285 @@ def native_task_deferred(hook: dict, delivery_id: str | None, task_ids: list[str
     """
     if not delivery_id or not task_ids or not hook.get('session_id') or not os.environ.get('TG_DELIVERY_STAMP'):
         return False
-    # The deferral must belong to the newest turn. Registration ties the receipt back
-    # to the turn that launched the task (response_turn_id=NULL), so progress for an
-    # agent resumed in its callback turn counts by time: a callback resets the row to
-    # pending when that turn opens (Пара, 23.09.2026: seven blocks for the same progress).
+    # A deferral holds, whichever turn recorded it, until the task's callback or a
+    # recovery claim resets its row, or a restart changes the stamp. Another
+    # request's callback turn follows the newest carrier, whose progress is older
+    # (Мартин, 23.09.2026: 170 s and 310 s of waiting for an existing deferral).
     try:
         with sqlite3.connect(f"file:{telegram_state_dir() / 'messages.db'}?mode=ro", uri=True, timeout=0.2) as conn:
             return conn.execute(
                 'SELECT 1 FROM delivery_results r JOIN delivery_sessions s ON s.session_id=r.session_id '
-                'JOIN delivery_turns t ON t.turn_id=(SELECT max(turn_id) FROM delivery_turns WHERE session_id=r.session_id) '
                 "WHERE r.delivery_id=? AND r.session_id=? AND r.stamp=? AND r.state='deferred' "
                 f"AND r.task_id IN ({','.join('?' * len(task_ids))}) "
                 'AND r.acknowledged_at IS NOT NULL AND r.request_payload IS NOT NULL '
-                'AND s.stamp=r.stamp AND t.session_id=r.session_id '
-                'AND (t.turn_id=coalesce(r.response_turn_id,r.turn_id) OR r.updated_at>=t.opened_at)',
+                'AND s.stamp=r.stamp',
                 (delivery_id, hook['session_id'], os.environ['TG_DELIVERY_STAMP'], *task_ids),
             ).fetchone() is not None
+    except sqlite3.Error:
+        return False
+
+
+def record_unowned_workers(hook: dict, delivery_id: str, native_work: dict) -> None:
+    """Record `would_block_unowned_worker` for the pending workers the request does not own.
+
+    Under the receiver each worker is its request's obligation: the request
+    waits for every one. Guard and shadow run the whole fleet, and nothing new
+    may block there before the receiver has proven it (NOVSKY, 27.09), so the
+    guard decides as before and records which worker the receiver would wait
+    for: its launch, and where it was seen, by the launch hook or only in the
+    transcript. A verdict never changes the decision; a failure is ignored.
+    """
+    session = hook.get('session_id')
+    stamp = os.environ.get('TG_DELIVERY_STAMP')
+    tasks = native_work['pending']
+    if not session or not stamp or not tasks:
+        return
+    try:
+        with closing(sqlite3.connect(f"file:{telegram_state_dir() / 'messages.db'}?mode=rw", uri=True,
+                                     timeout=1.0)) as conn, conn:
+            if not {'state', 'launch_ref'} <= {row[1] for row in conn.execute('PRAGMA table_info(delivery_task_owners)')}:
+                return
+            owners = {row[0]: (row[1], row[2]) for row in conn.execute(
+                'SELECT task_id, state, delivery_id FROM delivery_task_owners WHERE session_id=? AND stamp=? '
+                f"AND task_id IN ({','.join('?' * len(tasks))})", (session, stamp, *tasks))}
+            unowned = [task for task in tasks if owners.get(task) != ('owned', delivery_id)]
+            if not unowned:
+                return
+            request = conn.execute('SELECT chat_id, thread_id FROM delivery_results WHERE delivery_id=?',
+                                   (delivery_id,)).fetchone()
+            turn = conn.execute('SELECT max(turn_id) FROM delivery_turns WHERE session_id=?', (session,)).fetchone()
+            conn.execute(
+                'INSERT OR IGNORE INTO delivery_shadow (created_at,class,chat_id,thread_id,delivery_id,turn_id,detail) '
+                "VALUES (?,'would_block_unowned_worker',?,?,?,?,?)",
+                (int(time.time() * 1000), request[0] if request else None, request[1] if request else None,
+                 delivery_id, turn[0] if turn else None,
+                 '; '.join(f"{task} launch={native_work['pending_calls'].get(task)} "
+                           f"source={'hook' if task in owners else 'transcript'}" for task in unowned)))
+    except sqlite3.Error:
+        pass
+
+
+def request_less_tasks(hook: dict, task_ids: list[str]) -> set[str]:
+    """Pending tasks launched after every request of their turn was answered.
+
+    The launch ledger records such a worker as belonging to no request: nothing
+    waits for it, and its callback returns without reopening anything.
+    """
+    session = hook.get('session_id')
+    stamp = os.environ.get('TG_DELIVERY_STAMP')
+    if not task_ids or not session or not stamp:
+        return set()
+    try:
+        with closing(sqlite3.connect(f"file:{telegram_state_dir() / 'messages.db'}?mode=ro", uri=True, timeout=0.2)) as conn:
+            if 'launched_turn' not in {row[1] for row in conn.execute('PRAGMA table_info(delivery_task_owners)')}:
+                return set()
+            return {row[0] for row in conn.execute(
+                "SELECT task_id FROM delivery_task_owners WHERE session_id=? AND stamp=? AND state='unowned' "
+                f"AND launched_turn IS NULL AND task_id IN ({','.join('?' * len(task_ids))})",
+                (session, stamp, *task_ids))}
+    except sqlite3.Error:
+        return set()
+
+
+def callback_task_owner(hook: dict, task_ids: list[str]) -> tuple[str | None, tuple[str, ...], bool]:
+    """Find the one older request whose callback opened this service turn.
+
+    The transcript's nearest Telegram carrier can be a newer, already answered
+    request. Only the durable callback binding can identify the native task's
+    actual owner; a chat match or a task ID in model text is insufficient.
+    """
+    session = hook.get('session_id')
+    stamp = os.environ.get('TG_DELIVERY_STAMP')
+    if not session or not stamp:
+        return None, (), True
+    if not task_ids:
+        return None, (), False
+    try:
+        with closing(sqlite3.connect(f"file:{telegram_state_dir() / 'messages.db'}?mode=ro", uri=True, timeout=0.2)) as conn:
+            rows = conn.execute(
+                'SELECT r.delivery_id,r.task_id,(r.response_turn_id=t.turn_id) FROM delivery_results r '
+                'JOIN delivery_sessions s ON s.session_id=r.session_id '
+                'JOIN delivery_turns t ON t.turn_id=(SELECT max(turn_id) FROM delivery_turns WHERE session_id=r.session_id) '
+                'WHERE r.session_id=? AND r.stamp=? AND s.stamp=r.stamp '
+                'AND t.session_id=r.session_id '
+                "AND (r.response_turn_id=t.turn_id OR (r.state='deferred' "
+                f"AND r.task_id IN ({','.join('?' * len(task_ids))}))) "
+                "AND r.state IN ('pending','deferred') AND r.acknowledged_at IS NOT NULL "
+                'AND r.request_payload IS NOT NULL',
+                (session, stamp, *task_ids),
+            ).fetchall()
+    except sqlite3.Error:
+        return None, (), True
+    # A callback can finish task A and launch B before B has a progress
+    # receipt. If B later gets its own progress receipt, that task binding is
+    # stronger than another callback sharing this turn. Otherwise use the
+    # exact response-turn owners. An unbound task remains ambiguous when
+    # callbacks for several requests share the turn. A deferral from an earlier
+    # turn still binds its task (see native_task_deferred).
+    bound = [row for row in rows if row[1] in task_ids]
+    exact = [row for row in rows if row[2]]
+    unbound = set(task_ids) - {row[1] for row in bound}
+    candidates = {row[0] for row in rows}
+    owners = (candidates if unbound and len(candidates) > 1
+              else {row[0] for row in (bound or exact or rows)})
+    if len(owners) > 1:
+        return None, tuple(sorted(owners)), False
+    return (next(iter(owners)) if owners else None), (), False
+
+
+def completed_visible_callbacks(
+    hook: dict, callbacks: list[dict], pending_launches: dict[str, int],
+) -> bool:
+    """Prove every current callback against its immutable original request.
+
+    The mutable result task_id is only the *next* task to wait for. A callback
+    may be settled by an exact final reply, or transferred to a newly launched
+    task with an exact progress receipt for that same original delivery.
+    """
+    session = hook.get('session_id')
+    stamp = os.environ.get('TG_DELIVERY_STAMP')
+    if not session or not stamp:
+        return False
+    try:
+        with closing(sqlite3.connect(f"file:{telegram_state_dir() / 'messages.db'}?mode=ro", uri=True, timeout=0.2)) as conn:
+            turn = conn.execute(
+                'SELECT turn_id,opened_at FROM delivery_turns WHERE session_id=? '
+                'ORDER BY turn_id DESC LIMIT 1', (session,),
+            ).fetchone()
+            if turn is None:
+                return False
+            previous_close = conn.execute(
+                'SELECT max(closed_at) FROM delivery_turns WHERE session_id=? AND turn_id<?',
+                (session, turn[0]),
+            ).fetchone()[0]
+            # A transcript event can be timestamped just before its Submit
+            # hook opens the SQLite turn. The previous Stop is the strict
+            # boundary when callbacks from prior turns remain in ancestry.
+            cutoff = max(turn[1] - 5000, previous_close or 0)
+            if any(callback['timestamp'] is None for callback in callbacks):
+                return False
+            current = [callback for callback in callbacks
+                       if int(callback['timestamp'] * 1000) >= cutoff]
+            # A return to a request-less obligation carries its occurrence and no request.
+            obligations = 'occurrence' in {row[1] for row in conn.execute('PRAGMA table_info(delivery_task_returns)')}
+            returns = conn.execute(
+                'SELECT task_id,prompt_hash,delivery_id,observed_at,'
+                + ('occurrence' if obligations else 'NULL') + ' FROM delivery_task_returns '
+                'WHERE session_id=? AND stamp=? AND turn_id=? ORDER BY return_id',
+                (session, stamp, turn[0]),
+            ).fetchall()
+            if not current and not returns:
+                return True
+            if len(current) != len(returns):
+                return False
+            if any((callback['task_id'], callback['prompt_hash']) != row[:2]
+                   for callback, row in zip(current, returns)):
+                return False
+            # Two identical notifications tied to different requests cannot
+            # be distinguished solely by their order in a resumed transcript.
+            by_hash: dict[str, set[str | None]] = {}
+            for _, prompt_hash, delivery_id, _, _ in returns:
+                by_hash.setdefault(prompt_hash, set()).add(delivery_id)
+            if any(len(owners) > 1 for owners in by_hash.values()):
+                return False
+            for callback, (_, _, delivery_id, observed_at, occurrence) in zip(current, returns):
+                if not delivery_id and occurrence is not None:
+                    continue  # A request-less worker returned: nothing is owed once it is read.
+                if not callback['external'] and not delivery_id:
+                    continue  # This turn's own native launch was read above.
+                if not delivery_id:
+                    return False
+                result = conn.execute(
+                    'SELECT turn_id,chat_id,thread_id,state,task_id,response_turn_id,'
+                    'updated_at,acknowledged_at,request_payload FROM delivery_results '
+                    'WHERE delivery_id=? AND session_id=? AND stamp=?',
+                    (delivery_id, session, stamp),
+                ).fetchone()
+                if result is None or result[7] is None or result[8] is None:
+                    return False
+                receipt = conn.execute(
+                    'SELECT 1 FROM delivery_receipts WHERE delivery_id=? AND turn_id=? '
+                    'AND chat_id=? AND thread_id IS ? AND stamp=? AND source=? '
+                    'AND created_at>=? LIMIT 1',
+                    (delivery_id, result[0], result[1], result[2], stamp, 'reply', observed_at),
+                ).fetchone()
+                if receipt is None:
+                    return False
+                final = result[3] == 'complete' and result[5] == turn[0]
+                # A progress receipt after the callback defers the request to a task
+                # launched after it, or to another of its obligations still running.
+                successor = (result[3] == 'deferred' and result[6] >= observed_at
+                             and (pending_launches.get(result[4], -1) > callback['index']
+                                  or (obligations and conn.execute(
+                                      "SELECT 1 FROM delivery_task_owners WHERE session_id=? AND stamp=? "
+                                      "AND task_id=? AND delivery_id=? AND state='owned'",
+                                      (session, stamp, result[4], delivery_id)).fetchone() is not None)))
+                if not (final or successor):
+                    return False
+            return True
+    except (sqlite3.Error, TypeError):
+        return False
+
+
+def current_turn_has_callback_return(hook: dict) -> bool:
+    """Check whether the current turn includes a durable native callback."""
+    session = hook.get('session_id')
+    stamp = os.environ.get('TG_DELIVERY_STAMP')
+    if not session or not stamp:
+        return False
+    try:
+        with closing(sqlite3.connect(
+                f"file:{telegram_state_dir() / 'messages.db'}?mode=ro",
+                uri=True, timeout=0.2)) as conn:
+            return conn.execute(
+                'SELECT 1 FROM delivery_task_returns WHERE session_id=? AND stamp=? '
+                'AND turn_id=(SELECT max(turn_id) FROM delivery_turns WHERE session_id=?) LIMIT 1',
+                (session, stamp, session),
+            ).fetchone() is not None
+    except sqlite3.OperationalError as error:
+        # During a rolling upgrade the old receiver has not created the table
+        # yet. Any other database failure leaves callback evidence unknown.
+        return 'no such table: delivery_task_returns' not in str(error)
+    except sqlite3.Error:
+        return True
+
+
+def recorded_callbacks_have_final_receipts(hook: dict) -> bool:
+    """Allow an invisible transcript only when every callback has its own final receipt."""
+    session = hook.get('session_id')
+    stamp = os.environ.get('TG_DELIVERY_STAMP')
+    if not session or not stamp:
+        return False
+    try:
+        with closing(sqlite3.connect(
+                f"file:{telegram_state_dir() / 'messages.db'}?mode=ro",
+                uri=True, timeout=0.2)) as conn:
+            turn = conn.execute(
+                'SELECT max(turn_id) FROM delivery_turns WHERE session_id=?',
+                (session,),
+            ).fetchone()[0]
+            returns = conn.execute(
+                'SELECT delivery_id,observed_at FROM delivery_task_returns '
+                'WHERE session_id=? AND stamp=? AND turn_id=?',
+                (session, stamp, turn),
+            ).fetchall()
+            if not returns or any(delivery_id is None for delivery_id, _ in returns):
+                return False
+            for delivery_id, observed_at in returns:
+                final = conn.execute(
+                    'SELECT 1 FROM delivery_results r JOIN delivery_receipts c '
+                    'ON c.delivery_id=r.delivery_id AND c.turn_id=r.turn_id '
+                    'AND c.chat_id=r.chat_id AND c.thread_id IS r.thread_id '
+                    'AND c.stamp=r.stamp '
+                    'WHERE r.delivery_id=? AND r.session_id=? AND r.stamp=? '
+                    "AND r.state='complete' AND r.response_turn_id=? "
+                    'AND r.acknowledged_at IS NOT NULL AND r.request_payload IS NOT NULL '
+                    "AND c.source='reply' AND c.created_at>=? LIMIT 1",
+                    (delivery_id, session, stamp, turn, observed_at),
+                ).fetchone()
+                if final is None:
+                    return False
+            return True
     except sqlite3.Error:
         return False
 
@@ -1532,7 +2412,8 @@ def delegated_turn_work(hook: dict, events: list[dict], turn_events: list[dict])
     if not possible_work:
         return {'pending': [], 'reportedAt': None}
     scope = str(uuid.UUID(hook['session_id']))
-    carrier_id = ancestry_parent_uuid(turn_events[0]) if turn_events else None
+    carrier_id = ancestry_parent_uuid(turn_events[0], {e.get('uuid') for e in turn_events},
+                                      transcript_uuid_map(events) or {}) if turn_events else None
     carrier = next((event for event in events if event.get('uuid') == carrier_id), None)
     after = event_timestamp(carrier)
     if after is None:
@@ -1682,6 +2563,21 @@ def record_unsettled_stop(hook: dict, targets: list, reason: str) -> None:
         pass  # Evidence only: a failed write must never hold the Stop.
 
 
+def carrier_already_settled(delivery_id: str | None) -> bool:
+    """The carrier's own request already has its answer or deliberate silence."""
+    if not delivery_id:
+        return False
+    try:
+        with closing(sqlite3.connect(f"file:{telegram_state_dir() / 'messages.db'}?mode=ro",
+                                     uri=True, timeout=0.2)) as connection:
+            return connection.execute(
+                "SELECT 1 FROM delivery_results WHERE delivery_id=? AND state IN ('complete','no_reply')",
+                (delivery_id,),
+            ).fetchone() is not None
+    except sqlite3.Error:
+        return False
+
+
 def complete_terminal_stop_deliveries(hook: dict) -> bool:
     """Retire independently proven terminal members, never a pending neighbour."""
     for delivery_id, _, _, terminal in current_stop_targets(hook):
@@ -1692,11 +2588,39 @@ def complete_terminal_stop_deliveries(hook: dict) -> bool:
     return True
 
 
+class StopTranscriptPending(Exception):
+    """A trusted Telegram turn is visible, but its final evidence is not."""
+
+
+def unresolved_delivery(turn_events: list[object], chat_id: str, events: list[object]) -> bool:
+    attempts = {
+        str(block.get("id"))
+        for event in turn_events if isinstance(event, dict) and event.get("type") == "assistant"
+        for block in content_blocks(event)
+        if chat_id in delivery_attempt_chat_ids(block) and block.get("id")
+    }
+    results = {
+        str(block.get("tool_use_id"))
+        for event in events for block in content_blocks(event)
+        if isinstance(block, dict) and block.get("type") == "tool_result"
+    }
+    # An explicit failure is a recorded result; it follows the normal retry path.
+    return bool(attempts - results)
+
+
+def block_pending_transcript() -> None:
+    block_delegation(
+        'The current Telegram transcript or send result has not finished recording. '
+        'Do not send the answer again or repeat completed work. Retry Stop after '
+        'the current tool result is recorded; keep this input pending until then.')
+
+
 def read_stop_turn(hook: dict, transcript_path: Path):
     """The CLI can call Stop before its last transcript append reaches disk."""
     expected = hook.get('last_assistant_message')
     expected = expected.strip() if isinstance(expected, str) else ''
     target = current_stop_target(hook)
+    trusted_pending = False
     for delay in (0, 0.05, 0.1, 0.2):
         if delay:
             time.sleep(delay)
@@ -1711,27 +2635,46 @@ def read_stop_turn(hook: dict, transcript_path: Path):
                 return events, turn  # A local/untrusted carrier stays untrusted.
             current_input = target is None or telegram_delivery_id(prompt, origin) == target[0]
             current_text = not expected or final_answer_text(turn_events).strip() == expected
-            if current_input and current_text:
+            trusted_pending = True
+            if current_input and current_text and not unresolved_delivery(turn_events, telegram_chat_id(prompt, origin), events):
                 return events, turn
-        if not expected and target is None:
-            return None
+    if trusted_pending:
+        raise StopTranscriptPending
     return None
 
 
 def evaluate_stop(hook: dict) -> None:
     stop_hook_active = hook.get("stop_hook_active") is True
     transcript_path = Path(str(hook["transcript_path"]))
-    current = read_stop_turn(hook, transcript_path)
+    pending_transcript = False
+    try:
+        current = read_stop_turn(hook, transcript_path)
+    except StopTranscriptPending:
+        current = None
+        pending_transcript = True
     targets = current_stop_targets(hook)
     target = targets[0] if len(targets) == 1 else None
-    if targets and all(item[3] for item in targets):
-        # Recovery and a new input can share a native turn. Its terminal receipts
-        # prove each member independently, even if ancestry names only one input.
-        # Never close the turn leaving another completed member at the FIFO head.
-        if not complete_terminal_stop_deliveries(hook):
-            block_cleanup()
+    terminal_targets = bool(targets) and all(item[3] for item in targets)
+    if pending_transcript and not terminal_targets:
+        if not stop_hook_active:
+            block_pending_transcript()
+        else:
+            record_unsettled_stop(hook, targets, 'transcript or send result still pending')
         return
     if current is None:
+        if current_turn_has_callback_return(hook):
+            if not recorded_callbacks_have_final_receipts(hook):
+                block_delegation(
+                    'A native callback is recorded for this turn, but its transcript '
+                    'is not visible and its original request has no exact final receipt. '
+                    'Keep Stop blocked; do not credit a newer terminal receipt to it.')
+                return
+        if terminal_targets:
+            # A confirmed terminal receipt can release a head even before the
+            # last transcript append becomes visible to Stop.
+            if not complete_terminal_stop_deliveries(hook):
+                block_cleanup()
+            return
         # Some CLI writes finish only after hooks return. Ask for one native
         # correction, without fabricating a transcript or publishing hook text.
         if target is not None and not stop_hook_active:
@@ -1751,27 +2694,140 @@ def evaluate_stop(hook: dict) -> None:
         return
     events, turn = current
     turn_events, prompt, origin, queued_carrier = turn
-    chat_id = telegram_chat_id(prompt, origin)
-    if chat_id is None:
+    scope = telegram_scope(prompt, origin)
+    if scope is None:
         return
+    chat_id, thread_id, general_topic = scope
     delivery_id = telegram_delivery_id(prompt, origin)
 
     native_work = native_background_work(events, turn_events, delivery_id)
-    if native_work['pending'] or native_work['unknown']:
-        if not native_work['unknown'] and native_task_deferred(hook, delivery_id, native_work['pending']):
-            # Release transport acceptance, while the result and original input
-            # stay deferred. Never forward a terminal promise or mark complete.
-            if not complete_started_delivery(delivery_id, allow_offered=queued_carrier,
-                    closed_by='guard_delivered', session_id=hook.get('session_id')):
-                block_cleanup()
-            return
-        task_ids = ', '.join(native_work['pending']) or 'launch result not yet confirmed'
+    request_less = request_less_tasks(hook, native_work['pending'])
+    if request_less:
+        native_work['pending'] = [task for task in native_work['pending'] if task not in request_less]
+    has_callback_return = current_turn_has_callback_return(hook)
+    if native_work['unverified_resume']:
         block_delegation(
-            f'This Telegram request still has unread native background work: {task_ids}. '
-            f'Keep the original delivery_id={delivery_id}; inspect the existing task before any continuation and do not repeat completed actions. '
-            'A launch acknowledgement or promise is not the final result. Read the existing task result, '
-            'or use the Telegram reply tool with phase=progress, this exact delivery_id and the ID of one of these tasks '
-            'to durably defer this request until its native callback. Do not use phase=final or no_reply before reading the result.')
+            'A resumed native agent has a task notification without the tool-use ID '
+            'of its current launch: ' + ', '.join(native_work['unverified_resume'])
+            + '. This could be a callback from an older round. Read TaskOutput '
+            'for the current task ID before treating it as complete; do not '
+            'send terminal text or bind it to the latest Telegram carrier.')
+        return
+    if native_work['pending'] or native_work['unknown']:
+        callback_owner, callback_conflicts, ledger_unavailable = (
+            callback_task_owner(hook, native_work['pending'])
+            if not native_work['unknown'] else (None, (), False))
+        if (native_work['unknown'] and native_work['unbound_callback']
+                or ledger_unavailable and (native_work['unbound_callback']
+                                           or (hook.get('session_id') and os.environ.get('TG_DELIVERY_STAMP')))):
+            block_delegation(
+                'The original request for this native callback cannot be verified because '
+                'its durable result binding is unavailable or its task launch is unreadable. '
+                'Do not register pending work against the latest Telegram carrier. '
+                'Keep Stop blocked until the ledger and callback origin can be checked; '
+                'do not repeat completed work or send a duplicate result.')
+            return
+        if callback_conflicts:
+            block_delegation(
+                'Several earlier requests own native callbacks in this turn: '
+                + ', '.join('delivery_id=' + owner for owner in callback_conflicts)
+                + '. The pending native work has no unique original request. '
+                'Do not register it against the latest Telegram carrier. '
+                'Read the callback context and use the exact original delivery_id for each result; '
+                'leave Stop blocked until the owner is confirmed. Do not repeat completed work.')
+            return
+        if native_work['unbound_callback'] and not callback_owner:
+            block_delegation(
+                'A native callback arrived in this turn, but no durable original request '
+                'owns the pending work. Do not attach it to the latest Telegram carrier. '
+                'Inspect the callback binding and retain the work until its exact original '
+                'delivery_id is confirmed; do not repeat completed actions.')
+            return
+        if callback_owner and callback_owner != delivery_id:
+            if native_task_deferred(hook, callback_owner, native_work['pending']):
+                record_unowned_workers(hook, callback_owner, native_work)
+                if (native_work['unbound_callback'] or has_callback_return) and not completed_visible_callbacks(
+                    hook, native_work['callback_events'], native_work['pending_launches'],
+                ):
+                    block_delegation(
+                        'Another native callback in this turn has no exact final reply '
+                        'or verified transfer to a new task under its original delivery_id. '
+                        'Keep Stop blocked; do not credit the newer Telegram carrier.')
+                    return
+                # The old transport head was released by its first progress
+                # receipt; this callback still owes a result but has no head to
+                # remove. A separate new input needs its own disposition; once
+                # every input has one, main() releases them (Руфус 26.09, 10290).
+                if not targets or terminal_targets:
+                    return
+                block_delegation(
+                    'The earlier native result is deferred under its own delivery_id. '
+                    'A newer Telegram input is still open: '
+                    + ', '.join(item[0] for item in targets if not item[3])
+                    + '. Give each open input its own exact reply or group no_reply before ending; '
+                    'do not reuse the earlier task result as its answer.')
+                return
+            else:
+                block_delegation(
+                    'This resumed native task belongs to an earlier request, '
+                    f'delivery_id={callback_owner}, not the latest Telegram carrier. '
+                    'Read its existing result, or defer it with phase=progress, '
+                    f'delivery_id={callback_owner} and task_id from the pending work. '
+                    'Do not attach this task_id to the newer request or repeat completed actions.')
+                return
+        else:
+            if not native_work['unknown'] and native_task_deferred(hook, delivery_id, native_work['pending']):
+                record_unowned_workers(hook, delivery_id, native_work)
+                if (native_work['unbound_callback'] or has_callback_return) and not completed_visible_callbacks(
+                    hook, native_work['callback_events'], native_work['pending_launches'],
+                ):
+                    block_delegation(
+                        'A native callback in this turn still needs an exact result '
+                        'under its original delivery_id. Do not close the current input.')
+                    return
+                # Release transport acceptance, while the result and original input
+                # stay deferred. Never forward a terminal promise or mark complete.
+                if not complete_started_delivery(delivery_id, allow_offered=queued_carrier,
+                        closed_by='guard_delivered', session_id=hook.get('session_id')):
+                    block_cleanup()
+                return
+            task_ids = ', '.join(native_work['pending']) or 'launch result not yet confirmed'
+            block_delegation(
+                f'This Telegram request still has unread native background work: {task_ids}. '
+                f'Keep the original delivery_id={delivery_id}; inspect the existing task before any continuation and do not repeat completed actions. '
+                'A launch acknowledgement or promise is not the final result. Read the existing task result, '
+                'or use the Telegram reply tool with phase=progress, this exact delivery_id and the ID of one of these tasks '
+                'to durably defer this request until its native callback. Do not use phase=final or no_reply before reading the result.')
+            return
+    if has_callback_return and not completed_visible_callbacks(
+            hook, native_work['callback_events'], native_work['pending_launches']):
+        block_delegation(
+            'A native callback is recorded for this turn, but its exact original '
+            'request result is not yet proven. Wait for the full transcript and '
+            'the matching receipt; do not credit another request or repeat the work.')
+        return
+    if terminal_targets:
+        # Exact terminal heads are safe to release. A visible old callback may
+        # still owe its own result, so it must be checked before Stop accepts.
+        if not complete_terminal_stop_deliveries(hook):
+            block_cleanup()
+            return
+        if not native_work['unbound_callback']:
+            return
+    if native_work['unbound_callback']:
+        callbacks_complete = completed_visible_callbacks(
+            hook, native_work['callback_events'], native_work['pending_launches'],
+        )
+        if callbacks_complete and (terminal_targets or not targets):
+            return
+        visible = ', '.join(native_work['external_callback_tasks']) or 'unidentified callback'
+        block_delegation(
+            'Native callback result(s) are visible in this turn: ' + visible
+            + '. Each must have its own exact original-request completion; a '
+            'same-chat send or one other callback receipt cannot settle them. '
+            'Do not credit the latest Telegram carrier or fallback-send terminal '
+            'text. Keep Stop blocked until the remaining callbacks and any newer '
+            'input have exact receipts; do not repeat completed work.')
         return
     if native_work['read_uuid']:
         read_index = next((index for index, event in enumerate(turn_events)
@@ -1808,16 +2864,18 @@ def evaluate_stop(hook: dict) -> None:
     if work['reportedAt'] is not None:
         # A reply sent before reading a child result is only an acknowledgement.
         turn_events = [event for event in turn_events if (event_timestamp(event) or 0) >= work['reportedAt']]
-        if not successful_delivery(turn_events, chat_id, events) and not final_answer_text(turn_events):
+        if not successful_delivery(turn_events, chat_id, events, delivery_id, thread_id) and not final_answer_text(turn_events):
             block_delegation('The delegated result was read, but no final Telegram response followed it. Deliver the actual result to this chat before ending; do not resubmit the completed work.')
             return
 
     remove_stale_cleanup_proof()
+    unconfirmed_attempt = latest_delivery_unconfirmed(turn_events, chat_id, events, delivery_id)
     native_delivery = (
-        successful_delivery(turn_events, chat_id, events)
-        and delivery_is_newer_than_last_incoming(events, chat_id)
+        not unconfirmed_attempt
+        and successful_delivery(turn_events, chat_id, events, delivery_id, thread_id)
+        and delivery_is_newer_than_last_incoming(events, chat_id, delivery_id, thread_id)
     )
-    proof_status = cleanup_proof_status(delivery_id, chat_id)
+    proof_status = cleanup_proof_status(delivery_id, chat_id, thread_id)
     fallback_delivery = stop_hook_active and proof_status == "delivered"
     if native_delivery or fallback_delivery:
         if not complete_started_delivery(
@@ -1827,9 +2885,39 @@ def evaluate_stop(hook: dict) -> None:
         ):
             block_cleanup()
         elif proof_status is not None and not remove_cleanup_proof(
-            delivery_id, chat_id
+            delivery_id, chat_id, thread_id
         ):
             block_cleanup()
+        return
+
+    current_silence = (chat_id.startswith("-") and successful_no_reply(turn_events, events, chat_id, thread_id)
+                       and silence_covers_latest_incoming(events, chat_id, delivery_id))
+    if not current_silence and any(
+            possible_delivery_attempt(block) and delivery_attempt_origin(block) is None
+            for event in turn_events for block in content_blocks(event)):
+        block_delegation(
+            'This turn may have sent a Telegram message, but its shell command does not prove '
+            'the exact chat and delivery_id. Keep this request open and inspect its existing '
+            'receipt/outbound record before sending anything else. Do not resend the earlier '
+            'text or treat an ambiguous command as completion of the current input.')
+        return
+
+    if has_callback_return and not targets and carrier_already_settled(delivery_id):
+        # Every callback's own request is complete (proved above), delegated
+        # work is read and no shell send is ambiguous, and the nearest carrier
+        # was answered or silenced in an earlier turn: nothing in this turn is
+        # open. Its reply is receipted to the callback's request, which must not
+        # be held against that carrier (Руфус 26.09, 10269's loop).
+        return
+
+    if delivery_id and not current_silence and successful_delivery(
+        turn_events, chat_id, events,
+    ) and not successful_delivery(turn_events, chat_id, events, delivery_id, thread_id):
+        block_delegation(
+            'The delivered reply was bound to another request. This input still needs its own '
+            f'disposition: answer with delivery_id={delivery_id}, or use no_reply if it is only '
+            "a group observation. Do not repeat the already delivered reply."
+        )
         return
 
     try:
@@ -1851,7 +2939,7 @@ def evaluate_stop(hook: dict) -> None:
     if chat_id.startswith("-"):
         # Only explicit sends are publishable in groups. Plain model text may
         # explain why it should stay silent; forwarding it reverses that intent.
-        silent_tool = successful_no_reply(turn_events, events)
+        silent_tool = successful_no_reply(turn_events, events, chat_id, thread_id)
         silent_text = explicit_no_reply(turn_events)
         if (silent_tool or silent_text) and not silence_covers_latest_incoming(events, chat_id, delivery_id):
             block_delegation('A newer Telegram input has no current disposition in the transcript yet. Retry Stop after its current turn is recorded; do not reuse an older silence or send a silence explanation.')
@@ -1872,10 +2960,53 @@ def evaluate_stop(hook: dict) -> None:
         block_cleanup()
         return
 
+    if unconfirmed_attempt:
+        block_delegation("A Telegram delivery attempt failed or is still unconfirmed. Do not automatically resend "
+                         "the whole response or bypass a routing rejection with another tool. Check its result, "
+                         "preserve acknowledged message IDs, and retry only confirmed-unsent parts with verified routing.")
+        return
+
+    # The answer went into another chat. The closing remark about that send is
+    # not this person's answer (Кнопа, 07.09: the remark would have been all
+    # this chat got, and the request would count as answered).
+    other_chats = {other for event in turn_events for block in content_blocks(event)
+                   for other in delivery_attempt_chat_ids(block)} - {chat_id}
+    if not stop_hook_active and any(successful_delivery(turn_events, other, events) for other in other_chats):
+        block_delegation(
+            f"The reply in this turn went to another chat, not to this input's chat {chat_id}. Answer this "
+            f"input in its own chat with mcp__plugin_telegram_telegram__reply (chat_id={chat_id}); "
+            "do not resend the message that went to the other chat.")
+        return
+
+    # A message that arrived mid-turn reaches the model as "A message arrived
+    # ... while you were working ... After completing your current task, decide
+    # whether/how to respond", so the closing text belongs to the work before it.
+    # Forwarding that text, or asking to rewrite and send it, repeated the
+    # previous reply and settled the newcomer with it (Мартин 04.09, Максимус 09.09).
+    # A resend the new message itself asks for (an empty bubble) is its answer.
+    if queued_carrier and not stop_hook_active:
+        newcomer = ", ".join(f"{name}={value}" for name, value in (
+            ("chat_id", chat_id), ("thread_id", thread_id),
+            ("message_id", (channel_attributes(prompt) or {}).get("message_id")),
+            ("delivery_id", delivery_id),
+        ) if value not in (None, ""))
+        block_delegation(
+            f"A new Telegram message arrived in this chat while you were working ({newcomer}). "
+            "Your closing text was not sent to Telegram. A reply you delivered before it arrived "
+            "is already in the chat: do not send it again unless this new message asks for it "
+            "(for example, it says a reply showed up empty). The new message comes from the person "
+            "in this chat like any <channel> message. Answer it on its own with "
+            f"mcp__plugin_telegram_telegram__reply ({newcomer}) in their language, without notes "
+            "about duplicates or timing.")
+        return
+
     if not stop_hook_active:
-        proof_prepared = write_cleanup_proof(delivery_id, chat_id, "prepared")
-        if proof_prepared and deliver_pending_answer(turn_events, chat_id):
-            proof_written = write_cleanup_proof(delivery_id, chat_id, "delivered")
+        if not delivery_ready_for_fallback(delivery_id, queued_carrier):
+            block_delegation("This Telegram delivery has not started. Do not send a queued carrier or release its queue row.")
+            return
+        proof_prepared = write_cleanup_proof(delivery_id, chat_id, "prepared", thread_id)
+        if proof_prepared and deliver_pending_answer(turn_events, chat_id, thread_id=thread_id, general_topic=general_topic):
+            proof_written = write_cleanup_proof(delivery_id, chat_id, "delivered", thread_id)
             if not proof_written:
                 block_cleanup()
                 return
@@ -1885,13 +3016,13 @@ def evaluate_stop(hook: dict) -> None:
             ):
                 block_cleanup()
             elif delivery_id is not None and not remove_cleanup_proof(
-                delivery_id, chat_id
+                delivery_id, chat_id, thread_id
             ):
                 block_cleanup()
             return
 
         if proof_prepared and delivery_id is not None:
-            remove_cleanup_proof(delivery_id, chat_id)
+            remove_cleanup_proof(delivery_id, chat_id, thread_id)
 
     if stop_hook_active:
         return
@@ -1900,8 +3031,10 @@ def evaluate_stop(hook: dict) -> None:
         "This turn arrived from Telegram, but no Telegram delivery completed successfully. "
         "Your terminal response is invisible to the user. Rewrite it as a user-facing response "
         "in the user's language, without tool names, paths, IDs, logs, or internal reasoning. Call "
-        "mcp__plugin_telegram_telegram__reply with the chat_id from the latest "
-        "<channel> tag now. Do not merely repeat the answer as terminal text."
+        "mcp__plugin_telegram_telegram__reply with the chat_id and verified thread_id "
+        "or delivery_id from this active turn's <channel> tag now. Preserve a deliberate General "
+        "destination; never choose another topic or bypass a routing rejection. "
+        "Do not merely repeat the answer as terminal text."
     )
     print(json.dumps({"decision": "block", "reason": reason, "systemMessage": reason}))
 

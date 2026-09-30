@@ -19,10 +19,10 @@ import { z } from 'zod'
 import { Bot, GrammyError, InlineKeyboard, InputFile, type Context } from 'grammy'
 import type { ReactionTypeEmoji } from 'grammy/types'
 import { randomBytes, createHash } from 'crypto'
-import { accessSync, constants, existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, lstatSync, renameSync, realpathSync, chmodSync } from 'fs'
+import { accessSync, constants, existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, lstatSync, renameSync, realpathSync, chmodSync, openSync, fsyncSync, closeSync, readSync } from 'fs'
 import { homedir } from 'os'
 import { execFile, execFileSync } from 'child_process'
-import { join, extname, sep, relative, resolve } from 'path'
+import { join, extname, sep, relative, resolve, basename } from 'path'
 import { pathToFileURL } from 'node:url'
 import { Database } from 'bun:sqlite'
 
@@ -62,11 +62,23 @@ const CORPORATE_TEMPORARILY_UNAVAILABLE =
   '⚠️ Корпоративний режим тимчасово недоступний. Спробуй трохи пізніше.'
 const CORPORATE_FILE_INSPECTION_DISABLED =
   '⚠️ Підтримуються фото та зображення JPEG/PNG/GIF/WebP до 3 МБ, голосові й аудіо, а також документи PDF, DOCX, XLSX, PPTX, TXT, MD, CSV і TSV до 20 МБ. Інші файли надішли як текст.'
+const CORPORATE_VOICE_UNRECOGNIZED = 'Не розчув запис. Надішли голосове ще раз або напиши запит текстом — і я відповім.'
+const CORPORATE_FILE_TOO_LARGE =
+  '⚠️ Файл більший за 20 МБ — Telegram не передає такі файли ботам. Надішли коротший запис, частину файлу або текст.'
+// Files a company job could not take are named in its text, so the worker says
+// so instead of answering as if nothing had been sent.
+const UNOPENED_NAMES: Record<string, string> = { video: 'відео', video_note: 'відеокружок', photo: 'фото', voice: 'запис', audio: 'запис' }
+function unopenedLine(files: { kind: string; name?: string }[]): string {
+  const names = files.map(file => UNOPENED_NAMES[file.kind] ?? (file.name ? `файл «${file.name}»` : 'файл'))
+  return `(Не відкрито: ${names.join(', ')}. ${CORPORATE_FILE_INSPECTION_DISABLED.replace(/^⚠️\s*/u, '')})`
+}
 
 function isOwnerServiceControlInput(
   chatId: string, senderId: string, chatType: string, text: string, now = Date.now(),
 ): boolean {
   if (chatType !== 'private' || chatId !== senderId) return false
+  const value = text.trim()
+  if (isOwnerLoginCode(chatId, senderId, chatType, value, now)) return true
   let ownerId = OWNER_CHAT_ID
   let guestFallback = false
   if (!ownerId) {
@@ -76,27 +88,38 @@ function isOwnerServiceControlInput(
       ownerId = String((access.admins?.length ? access.admins : access.allowFrom)?.[0] ?? '')
     } catch { return false }
   }
-  if (!ownerId || senderId !== ownerId) return false
-  const value = text.trim()
+  if (!ownerId) return false
+  const ownerDirect = senderId === ownerId
+  if (!ownerDirect) {
+    try {
+      const access = JSON.parse(readFileSync(join(STATE_DIR, 'access.json'), 'utf8'))
+      if (!Array.isArray(access.superadmins) || !Array.isArray(access.admins)
+        || !Array.isArray(access.allowFrom) || !access.superadmins.includes(senderId)
+        || !access.admins.includes(senderId) || !access.allowFrom.includes(senderId)) return false
+    } catch { return false }
+  }
   // /stop interrupts the live turn (KTD7): OWNER_CHAT_ID or admins[0] only, never
   // allowFrom[0] — on an installation without a named owner that is a guest.
-  if (/^\/stop$/iu.test(value)) return !guestFallback
+  if (/^\/stop$/iu.test(value)) return ownerDirect && !guestFallback
   if (/^\/?(relogin|релог[іи]н|перевхід)$/iu.test(value)) return true
   if (/^\/restart$/iu.test(value)) return true
   // Keep aliases identical to unstick-watch: only a whole owner command is control.
   if (/^\/?(unstick|fix|фикс|отвисни|оживи|перезапустись|розблокуйся|відвисни|перезапустися)\s*[.!]*$/iu.test(value)) return true
-  const code = /^[A-Za-z0-9_.-]{15,}#([A-Za-z0-9_-]+)$/.exec(value)
+  return false
+}
+// The code of the owner's login in progress, typed or forwarded from Saved Messages.
+function isOwnerLoginCode(chatId: string, senderId: string, chatType: string, text: string, now = Date.now()): boolean {
+  if (chatType !== 'private' || chatId !== senderId) return false
+  const code = /^[A-Za-z0-9_.-]{15,}#([A-Za-z0-9_-]+)$/.exec(text.trim())
   if (!code) return false
   try {
     const flow = JSON.parse(readFileSync(join(STATE_DIR, 'auth-input.json'), 'utf8'))
-    return flow.owner_chat_id === ownerId
+    return flow.owner_chat_id === senderId
       && Number.isSafeInteger(flow.since_ms) && Number.isSafeInteger(flow.expires_at)
       && flow.since_ms <= now && now <= flow.expires_at
       && flow.expires_at - flow.since_ms <= 600_000
       && createHash('sha256').update(code[1]!).digest('hex') === flow.state_sha256
-  } catch {
-    return false
-  }
+  } catch { return false /* Unrecognized input continues through the ordinary gate. */ }
 }
 // End owner service control input
 
@@ -282,6 +305,13 @@ if (!(MSG_DB.query(`PRAGMA table_info(delivery_turn_messages)`).all() as Array<{
     if (!(error instanceof Error) || !error.message.toLowerCase().includes('duplicate column name')) throw error
   }
 }
+// The text a turn that still owed a result closed on, and what tg-turn-end
+// found it to be (answer, promise, notes, silence, empty): B4's last resort.
+for (const name of ['final_text', 'final_text_kind']) {
+  if ((MSG_DB.query(`PRAGMA table_info(delivery_turns)`).all() as Array<{ name: string }>).some(c => c.name === name)) continue
+  try { MSG_DB.run(`ALTER TABLE delivery_turns ADD COLUMN ${name} TEXT`) }
+  catch (error) { if (!String(error).includes('duplicate column name')) throw error }
+}
 
 // ── delivery receipts (added 2026-09-19) ─────────────────────────────────────
 // A receipt is a successful send into the chat and topic of a message the
@@ -331,6 +361,12 @@ function ensureReceiptSchema(): void {
   }
 }
 ensureReceiptSchema()
+// Whether a receipt acknowledged a progress or delivered a final: the repeated
+// progress gate counts progress receipts only (Кнопа 24605). Older rows are NULL.
+if (!(MSG_DB.query(`PRAGMA table_info(delivery_receipts)`).all() as Array<{ name: string }>).some(c => c.name === 'phase')) {
+  try { MSG_DB.run(`ALTER TABLE delivery_receipts ADD COLUMN phase TEXT`) }
+  catch (error) { if (!String(error).includes('duplicate column name')) throw error }
+}
 
 // Transport acceptance and the final result are different facts. A deferred
 // result survives the parent turn ending and never holds the inbound queue.
@@ -349,7 +385,24 @@ for (const [name, definition] of [
   ['recovery_reason', 'TEXT'], ['recovery_count', 'INTEGER NOT NULL DEFAULT 0'],
   ['recovery_from_turn', 'INTEGER'],
   ['recovery_notice_at', 'INTEGER'],
+  ['recovery_notice_retry_at', 'INTEGER'],
+  ['recovery_notice_failures', 'INTEGER NOT NULL DEFAULT 0'],
+  ['result_generation', 'INTEGER NOT NULL DEFAULT 0'],
+  ['outbound_attempt_at', 'INTEGER'],
+  ['outbound_uncertain_notice_at', 'INTEGER'],
   ['verification_message_id', 'INTEGER'], ['verification_evidence', 'TEXT'],
+  // Worker obligations: the admitted final (its fence), the generation the
+  // armed outbound attempt belongs to, the launch that superseded that
+  // attempt, the ACK (`<source>:<message_id>`) that attempt got while that
+  // launch was still unresolved, the one progress resend
+  // (`<generation>:offered|closed`), and the shell sender that armed the
+  // attempt with that process's start time (NULL for the reply tool's own).
+  ['final_admitted_generation', 'INTEGER'], ['outbound_attempt_generation', 'INTEGER'],
+  ['superseded_by', 'TEXT'], ['superseded_ack', 'TEXT'], ['progress_retry', 'TEXT'],
+  ['outbound_attempt_pid', 'INTEGER'], ['outbound_attempt_pid_start', 'TEXT'],
+  // B4: when the one recovery turn for a forgotten reply also ended without an
+  // answer, and when B4 decided what the request is owed.
+  ['forgot_reply_at', 'INTEGER'], ['forgot_reply_decided_at', 'INTEGER'],
 ]) {
   if (!resultColumns.has(name!)) {
     try { MSG_DB.run(`ALTER TABLE delivery_results ADD COLUMN ${name} ${definition}`) }
@@ -357,6 +410,15 @@ for (const [name, definition] of [
     resultColumns.add(name!)
   }
 }
+// One row per message B4 owes a held request: its answer, the person's line,
+// the owner's alert. sent_at is NULL while due and negative from the moment its
+// send starts, so an unknown outcome is never sent again, across restarts too;
+// positive once Telegram took it or B4 gave up on it. A 429 is Telegram's own
+// refusal: the row waits its retry_after, three attempts in all.
+MSG_DB.run(`CREATE TABLE IF NOT EXISTS delivery_forgot_reply_sends (
+  delivery_id TEXT NOT NULL, kind TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
+  retry_at INTEGER NOT NULL DEFAULT 0, sent_at INTEGER, PRIMARY KEY (delivery_id, kind)
+)`)
 MSG_DB.run(`UPDATE delivery_results SET request_payload = (
   SELECT payload FROM pending_inbound_deliveries p WHERE p.delivery_id = delivery_results.delivery_id)
   WHERE request_payload IS NULL`)
@@ -385,6 +447,113 @@ MSG_DB.run(`CREATE TABLE IF NOT EXISTS delivery_unbound_task_returns (
   task_id TEXT NOT NULL, session_id TEXT NOT NULL, stamp TEXT NOT NULL,
   observed_at INTEGER NOT NULL, PRIMARY KEY (task_id, session_id, stamp)
 )`)
+// A native callback's original request must survive later task_id rebinding.
+// One row per received callback also distinguishes repeated agent IDs.
+MSG_DB.run(`CREATE TABLE IF NOT EXISTS delivery_task_returns (
+  return_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id TEXT NOT NULL, stamp TEXT NOT NULL, turn_id INTEGER NOT NULL,
+  task_id TEXT NOT NULL, prompt_hash TEXT NOT NULL,
+  delivery_id TEXT, observed_at INTEGER NOT NULL
+)`)
+MSG_DB.run(`CREATE INDEX IF NOT EXISTS idx_delivery_task_returns_turn
+  ON delivery_task_returns(session_id, stamp, turn_id, return_id)`)
+// A native task ID is reusable within one request, but never transferable to
+// another request, including after a service restart: a delayed callback has
+// no trustworthy occurrence ID with which to distinguish two owners.
+MSG_DB.run(`CREATE TABLE IF NOT EXISTS delivery_task_owners (
+  session_id TEXT NOT NULL, stamp TEXT NOT NULL, task_id TEXT NOT NULL,
+  delivery_id TEXT, PRIMARY KEY(session_id, stamp, task_id)
+)`)
+MSG_DB.run(`CREATE INDEX IF NOT EXISTS idx_delivery_task_owners_task
+  ON delivery_task_owners(task_id)`)
+// Worker obligations (added 2026-09-26). The launch hook tg-native-task writes
+// a `launching` intent keyed by the launching call's tool_use_id before the
+// tool runs, and its PostToolUse resolves it: a background ID makes the owner
+// row the obligation of that launch (occurrence, launch_ref, launched_turn).
+// An obligation is `unowned` (delivery_id NULL) until progress registers it,
+// then `owned`, and ends `returned` or `stopped`. launched_turn is the turn
+// whose open request it belongs to; NULL marks a launch made after every
+// request of its turn was answered (request-less). Adding `state` turns every
+// existing row into `legacy`, and so does the boot backfill of an owner that
+// only history names: nothing closes a legacy obligation by task_id alone.
+// Every other writer states its row: a task registered with no recorded
+// launch is `owned` by its request.
+MSG_DB.run(`CREATE TABLE IF NOT EXISTS delivery_task_launches (
+  launch_ref TEXT PRIMARY KEY, session_id TEXT NOT NULL, stamp TEXT NOT NULL,
+  launched_turn INTEGER, tool_name TEXT NOT NULL, state TEXT NOT NULL,
+  task_id TEXT, created_at INTEGER NOT NULL, resolved_at INTEGER
+)`)
+for (const [table, name, definition] of [
+  ['delivery_task_owners', 'occurrence', 'INTEGER NOT NULL DEFAULT 1'],
+  ['delivery_task_owners', 'state', "TEXT NOT NULL DEFAULT 'legacy'"],
+  ['delivery_task_owners', 'launch_ref', 'TEXT'],
+  ['delivery_task_owners', 'launched_turn', 'INTEGER'],
+  ['delivery_task_owners', 'silent_notified_at', 'INTEGER'],
+  ['delivery_task_owners', 'final_refusals', 'INTEGER NOT NULL DEFAULT 0'],
+  ['delivery_task_launches', 'silent_notified_at', 'INTEGER'],
+  ['delivery_task_launches', 'final_refusals', 'INTEGER NOT NULL DEFAULT 0'],
+  ['delivery_task_returns', 'occurrence', 'INTEGER'],
+]) {
+  const columns = (MSG_DB.query(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map(column => column.name)
+  if (columns.includes(name!)) continue
+  try { MSG_DB.run(`ALTER TABLE ${table} ADD COLUMN ${name} ${definition}`) }
+  catch (error) { if (!String(error).includes('duplicate column name')) throw error }
+}
+// A terminal receipt exists only after the entire final reply was accepted by
+// Telegram and the same result generation was atomically marked complete.
+// Unlike a transport receipt, it identifies the exact native callback (when
+// there is one) and survives a restart without guessing from timestamps.
+MSG_DB.run(`CREATE TABLE IF NOT EXISTS delivery_terminal_receipts (
+  terminal_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  delivery_id TEXT NOT NULL, turn_id INTEGER NOT NULL, session_id TEXT NOT NULL,
+  stamp TEXT NOT NULL, chat_id TEXT NOT NULL, thread_id TEXT,
+  result_generation INTEGER NOT NULL, task_return_id INTEGER,
+  source TEXT NOT NULL, message_id INTEGER NOT NULL, created_at INTEGER NOT NULL,
+  UNIQUE(delivery_id,turn_id,stamp,source,message_id)
+)`)
+MSG_DB.run(`CREATE INDEX IF NOT EXISTS idx_delivery_terminal_request
+  ON delivery_terminal_receipts(delivery_id,result_generation)`)
+// Preserve native-session migration risk before a retained request is rebound
+// to a fresh service stamp/session. request.created_at is the original user
+// input time, not evidence that the *new* native session predates this ledger.
+MSG_DB.run(`CREATE TABLE IF NOT EXISTS delivery_legacy_native_sessions (
+  session_id TEXT PRIMARY KEY, marked_at INTEGER NOT NULL
+)`)
+MSG_DB.run(`CREATE TABLE IF NOT EXISTS delivery_native_session_origins (
+  session_id TEXT PRIMARY KEY, started_at INTEGER NOT NULL,
+  stamp TEXT, source TEXT, inherited INTEGER NOT NULL
+)`)
+// The boot backfill only adds owners that history names and the ledger lacks,
+// as legacy obligations.
+// It never changes or clears an existing owner: a conflicting historical row is
+// left as it is and logged for manual reconciliation once per database, though
+// every start of every copy runs this. It reads before it writes, so it takes
+// the write lock first: another receiver starting at the same time cannot
+// invalidate its snapshot.
+ensureAuthoritySchema()
+MSG_DB.transaction(() => {
+  for (const source of [
+    `SELECT session_id, stamp, task_id, delivery_id FROM delivery_results
+      WHERE task_id IS NOT NULL AND stamp IS NOT NULL AND stamp<>''`,
+    `SELECT session_id, stamp, task_id, delivery_id FROM delivery_task_returns
+      WHERE delivery_id IS NOT NULL AND stamp<>''`,
+  ]) {
+    for (const conflict of MSG_DB.query(`SELECT history.session_id, history.stamp, history.task_id,
+        history.delivery_id, owner.delivery_id AS owner
+      FROM (${source}) history JOIN delivery_task_owners owner ON owner.session_id=history.session_id
+        AND owner.stamp=history.stamp AND owner.task_id=history.task_id
+      WHERE owner.state='legacy' AND owner.delivery_id IS NOT history.delivery_id`).all() as
+      Array<{ session_id: string; stamp: string; task_id: string; delivery_id: string; owner: string | null }>) {
+      if (!MSG_DB.query(`INSERT INTO delivery_runtime (key,value,updated_at) VALUES (?,?,?)
+        ON CONFLICT(key) DO NOTHING`).run(`owner_conflict:${conflict.session_id}:${conflict.stamp}:`
+          + `${conflict.task_id}:${conflict.delivery_id}`, conflict.owner ?? '', Date.now()).changes) continue
+      process.stderr.write(`telegram channel: task ${conflict.task_id} keeps owner ${conflict.owner ?? 'none'}; `
+        + `history also names ${conflict.delivery_id}: reconcile manually\n`)
+    }
+    MSG_DB.run(`INSERT INTO delivery_task_owners (session_id,stamp,task_id,delivery_id,state)
+      SELECT *, 'legacy' FROM (${source}) WHERE true ON CONFLICT(session_id,stamp,task_id) DO NOTHING`)
+  }
+}).immediate()
 
 // ── delivery authority and shadow records (added 2026-09-19, KTD8, KTD9) ─────
 // delivery_runtime keeps the authority the poller started with: the cron
@@ -412,6 +581,28 @@ function ensureAuthoritySchema(): void {
     `CREATE UNIQUE INDEX IF NOT EXISTS idx_delivery_shadow_once
       ON delivery_shadow(class, COALESCE(delivery_id, ''), COALESCE(turn_id, -1))`,
     `CREATE INDEX IF NOT EXISTS idx_delivery_shadow_created ON delivery_shadow(created_at)`,
+    `CREATE TABLE IF NOT EXISTS delivery_shadow_departures (
+      delivery_id TEXT PRIMARY KEY,
+      observed_at INTEGER NOT NULL,
+      chat_id TEXT NOT NULL,
+      thread_id TEXT
+    )`,
+    `CREATE TRIGGER IF NOT EXISTS delivery_shadow_taken_departure
+      AFTER DELETE ON pending_inbound_deliveries
+      WHEN OLD.state IN ('started', 'recovering')
+        AND (SELECT value FROM delivery_runtime WHERE key = 'authority') = 'shadow'
+        AND NOT EXISTS (SELECT 1 FROM delivery_turn_messages WHERE delivery_id = OLD.delivery_id)
+        AND NOT EXISTS (SELECT 1 FROM delivery_receipts WHERE delivery_id = OLD.delivery_id)
+      BEGIN
+        INSERT OR REPLACE INTO delivery_shadow_departures (delivery_id, observed_at, chat_id, thread_id)
+        VALUES (
+          OLD.delivery_id,
+          CAST(strftime('%s','now') AS INTEGER) * 1000 + CAST(substr(strftime('%f','now'),4,3) AS INTEGER),
+          COALESCE(CASE WHEN json_valid(OLD.payload) THEN json_extract(OLD.payload, '$.params.meta.chat_id') END,
+            substr(OLD.delivery_id, 1, instr(OLD.delivery_id, ':') - 1)),
+          CASE WHEN json_valid(OLD.payload) THEN json_extract(OLD.payload, '$.params.meta.thread_id') END
+        );
+      END`,
   ]
   for (const statement of statements) {
     try {
@@ -422,12 +613,24 @@ function ensureAuthoritySchema(): void {
     }
   }
 }
-ensureAuthoritySchema()
 const msgInsert = MSG_DB.prepare(
   `INSERT OR IGNORE INTO messages
    (chat_id,user_id,username,direction,text,ts,message_id,attachment_kind,attachment_file_id,thread_id,conversation_key)
    VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
 )
+// A failed corporate intake must not hold Telegram's polling offset forever.
+// Save only its address in the existing runtime table: setup input may contain a credential.
+const corporateIntakeFailureInsert = MSG_DB.prepare(
+  `INSERT OR IGNORE INTO delivery_runtime (key, value, updated_at)
+   VALUES (?, ?, ?)`,
+)
+const corporateIntakeAlertClaim = MSG_DB.prepare(
+  `INSERT INTO delivery_runtime (key, value, updated_at)
+   VALUES ('corporate_intake_alert', ?, ?)
+   ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
+   WHERE delivery_runtime.updated_at <= ?`,
+)
+const CORPORATE_INTAKE_ALERT_INTERVAL_MS = 5 * 60_000
 type MessageLogRecord = {
   chat_id: string
   user_id: string
@@ -465,6 +668,113 @@ function logMsg(r: MessageLogRecord): void {
   }
   catch (e) { process.stderr.write(`telegram channel: msg-log: ${e}\n`) }
 }
+
+// A repair file is only a write-ahead receipt for messages, never a second
+// routing lookup. Repairing an acknowledged send must not send it again.
+const OUTGOING_REPAIR_DIR = join(STATE_DIR, 'outgoing-receipt-repairs')
+class OutgoingReceiptConflict extends Error {}
+function confirmOutgoingMessageLog(r: MessageLogRecord): void {
+  if (insertMessageLog(r) === 1) return
+  const existing = MSG_DB.query(`SELECT * FROM messages
+    WHERE chat_id=? AND direction='out' AND message_id=?`).get(r.chat_id, r.message_id!) as MessageLogRecord | null
+  const fields = ['chat_id', 'user_id', 'username', 'direction', 'text', 'ts',
+    'message_id', 'attachment_kind', 'attachment_file_id', 'thread_id', 'conversation_key'] as const
+  if (!existing || !fields.every(key => (existing[key] ?? null) === (r[key] ?? null))) {
+    throw new OutgoingReceiptConflict('outgoing message log identity conflict; not retried')
+  }
+}
+
+function syncDirectory(path: string): void {
+  const fd = openSync(path, 'r')
+  try { fsyncSync(fd) } finally { closeSync(fd) }
+}
+
+function saveOutgoingRepair(r: MessageLogRecord): void {
+  mkdirSync(OUTGOING_REPAIR_DIR, { recursive: true, mode: 0o700 })
+  if (!lstatSync(OUTGOING_REPAIR_DIR).isDirectory()) throw new Error('invalid repair directory')
+  chmodSync(OUTGOING_REPAIR_DIR, 0o700)
+  syncDirectory(STATE_DIR)
+  const target = join(OUTGOING_REPAIR_DIR, `${r.chat_id}.${r.message_id}.json`)
+  const temporary = `${target}.${randomBytes(8).toString('hex')}.tmp`
+  try {
+    const fd = openSync(temporary, 'wx', 0o600)
+    try {
+      writeFileSync(fd, JSON.stringify(r))
+      fsyncSync(fd)
+    } finally { closeSync(fd) }
+    renameSync(temporary, target)
+    syncDirectory(OUTGOING_REPAIR_DIR)
+  } finally {
+    if (existsSync(temporary)) rmSync(temporary)
+  }
+}
+
+function replayOutgoingMessageRepairs(): void {
+  if (!existsSync(OUTGOING_REPAIR_DIR)) return
+  try {
+    if (!lstatSync(OUTGOING_REPAIR_DIR).isDirectory()) throw new Error('invalid repair directory')
+    for (const name of readdirSync(OUTGOING_REPAIR_DIR)) {
+      if (!/^-?[1-9][0-9]*\.[1-9][0-9]*\.json$/.test(name)) continue
+      try {
+        const path = join(OUTGOING_REPAIR_DIR, name)
+        const st = lstatSync(path)
+        if (!st.isFile() || st.size > 65536) throw new Error('invalid repair file')
+        const r = JSON.parse(readFileSync(path, 'utf8')) as MessageLogRecord
+        const topic = r.thread_id
+        if (r.direction !== 'out' || r.user_id !== '' || typeof r.username !== 'string'
+          || typeof r.chat_id !== 'string' || !/^-?[1-9][0-9]*$/.test(r.chat_id)
+          || !Number.isSafeInteger(Number(r.chat_id))
+          || !Number.isSafeInteger(r.message_id) || r.message_id! <= 0
+          || !Number.isSafeInteger(r.ts) || r.ts <= 0 || typeof r.text !== 'string'
+          || name !== `${r.chat_id}.${r.message_id}.json`
+          || (topic !== undefined && (!Number.isSafeInteger(topic) || topic <= 0))
+          || r.conversation_key !== (topic !== undefined ? `topic:${r.chat_id}:${topic}`
+            : `${r.chat_id.startsWith('-') ? 'group' : 'user'}:${r.chat_id}`)) {
+          throw new Error('invalid outgoing repair identity')
+        }
+        confirmOutgoingMessageLog(r)
+        rmSync(path)
+        syncDirectory(OUTGOING_REPAIR_DIR)
+      } catch (error) {
+        process.stderr.write(`telegram channel: outgoing receipt repair deferred: ${error}\n`)
+      }
+    }
+  } catch (error) {
+    process.stderr.write(`telegram channel: outgoing receipt repairs unavailable: ${error}\n`)
+  }
+}
+
+function recordOutgoingReceipt(
+  sent: unknown, chatId: string, threadId: number | undefined,
+  text: string, attachmentKind: 'photo' | 'document' | undefined, sentIds: number[],
+  onAcknowledged?: (messageId: number) => void,
+): void {
+  const ack = sent as { message_id?: number, chat?: { id?: number },
+    is_topic_message?: boolean, message_thread_id?: number } | null
+  if (!ack || !Number.isSafeInteger(ack.message_id) || ack.message_id! <= 0
+    || !Number.isSafeInteger(ack.chat?.id) || String(ack.chat!.id) !== chatId
+    || (threadId !== undefined
+      ? ack.is_topic_message !== true || ack.message_thread_id !== threadId
+      : ack.is_topic_message !== undefined && ack.is_topic_message !== false)) {
+    throw new Error('Telegram acknowledgement has an invalid chat/message/topic identity; not retried')
+  }
+  if (onAcknowledged) onAcknowledged(ack.message_id!)
+  else sentIds.push(ack.message_id!)
+  const r: MessageLogRecord = {
+    chat_id: chatId, user_id: '', username: botUsername || 'bot', direction: 'out',
+    text, ts: Date.now(), message_id: ack.message_id, attachment_kind: attachmentKind,
+    thread_id: threadId,
+    conversation_key: threadId !== undefined ? `topic:${chatId}:${threadId}`
+      : `${chatId.startsWith('-') ? 'group' : 'user'}:${chatId}`,
+  }
+  try { confirmOutgoingMessageLog(r) } catch (error) {
+    if (error instanceof OutgoingReceiptConflict) throw error
+    try { saveOutgoingRepair(r) } catch {
+      throw new Error('outgoing receipt persistence failed in both database and repair storage; do not resend acknowledged IDs')
+    }
+  }
+}
+replayOutgoingMessageRepairs()
 
 const pendingInboundInsert = MSG_DB.prepare(
   `INSERT OR IGNORE INTO pending_inbound_deliveries
@@ -506,7 +816,7 @@ const pendingInboundCount = MSG_DB.prepare(
   `SELECT COUNT(*) AS count FROM pending_inbound_deliveries`,
 )
 const MAX_PENDING_INBOUND_DELIVERIES = 1000
-const INBOUND_OFFER_RETRY_MS = 120000
+const INBOUND_OFFER_RETRY_MS = envNumber('TG_INBOUND_OFFER_RETRY_MS', 120000)
 const MAX_INBOUND_DELIVERY_ATTEMPTS = 2
 // Telegram delivers a caption and its file, an album, or a person typing three
 // thoughts in a row, as separate updates, and each one started its own turn:
@@ -520,11 +830,38 @@ const MAX_INBOUND_DELIVERY_ATTEMPTS = 2
 // offered the moment it is queued, before its siblings exist, and the model
 // would answer half the message: «другий скрін до мене не дійшов». A queued
 // album head waits this long so coalesceInboundBurst folds the whole set into
-// one turn. Only a message that Telegram itself marked as part of an album
-// waits, and only before its first offer.
-const INBOUND_BURST_WINDOW_MS = 1500
+// one turn. Every head uses the same short window, so a caption sent just
+// before a photo reaches the model with it, in a group as in a private chat.
+// The deadline never slides; it counts arrival, not download: a photo of the
+// same person that arrived in time but is still downloading is waited for,
+// up to INBOUND_BURST_MAX_WAIT_MS (Cash, 20.09: text and photo 255 ms apart,
+// «no attachment»).
+const INBOUND_BURST_WINDOW_MS = 2000
+// Every chat waits behind a head that waits, so the extra wait stays short.
+const INBOUND_BURST_MAX_WAIT_MS = 5_000
 const MAX_COALESCED_INBOUND_MESSAGES = 10
 const MAX_COALESCED_INBOUND_BYTES = 8000
+// One person in one conversation: what a burst folds and a late file binds to.
+const inboundSenderKey = (chatId: string, threadId: number | string | undefined, userId: string) => `${chatId}|${threadId ?? ''}|${userId}`
+// Updates of each person taken from Telegram and not queued yet.
+const inboundArriving = new Map<string, number>()
+// The head the drain is waiting on before its first offer (merge window or a
+// photo still downloading). It keeps its turn while it waits: a request
+// re-queued meanwhile for continuation sorts by its original arrival and was
+// offered in its place, so the waiting message sat behind a re-offer (Rufus
+// replay, 27.09: the head released at the first Stop, then nothing moved).
+// Once offered it holds the queue like any head until it is taken, so the two
+// never reach one turn together; a provider pause or an open turn ends its
+// claim, and the oldest request leads again (review of 27.09, M1 and L1).
+let inboundBurstHead = ''
+async function takingIn<T>(sender: string, work: () => Promise<T>): Promise<T> {
+  inboundArriving.set(sender, (inboundArriving.get(sender) ?? 0) + 1)
+  try { return await work() } finally {
+    const left = (inboundArriving.get(sender) ?? 1) - 1
+    if (left > 0) inboundArriving.set(sender, left)
+    else inboundArriving.delete(sender)
+  }
+}
 
 type InboundNotification = {
   method: 'notifications/claude/channel'
@@ -571,12 +908,33 @@ type CorporateGatewayRuntime = {
     threadId?: number
     messageId: number
     text: string
+    addressed?: false
     images?: Array<{ mediaType: 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp'; data: string }>
+    albumId?: string
     createdAt: number
   }): Promise<{ jobId: string; duplicate: boolean }>
   health(conversationKey?: string): CorporateGatewayHealth
+  albumWaiting?(input: { chatType: 'private' | 'group' | 'supergroup'; chatId: string; userId: string
+    isTopicMessage?: boolean; threadId?: number; albumId: string }): boolean
+  joinAlbum?(input: {
+    deliveryId: string
+    chatType: 'private' | 'group' | 'supergroup'
+    chatId: string
+    userId: string
+    username: string
+    isTopicMessage?: boolean
+    threadId?: number
+    messageId: number
+    text: string
+    images?: Array<{ mediaType: 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp'; data: string }>
+    documents?: unknown[]
+    albumId: string
+    createdAt: number
+  }): boolean
   unstick(conversationKey: string): Promise<'cancelled' | 'released' | 'idle'>
-  releaseBlockedJob?(conversationKey: string, jobId: string): Promise<'released' | 'idle'>
+  releaseBlockedJob?(conversationKey: string, jobId: string, actorUserId?: string, outcome?: 'happened'): Promise<'released' | 'idle' | 'owner_only' | 'no_unknown_action'>
+  releaseOutcomes?: readonly string[]
+  closeBlockedJob?(conversationKey: string, jobId: string, actorUserId?: string): Promise<'closed' | 'idle' | 'owner_only'>
   confirmAction(
     token: string,
     context: CorporateGatewayCallbackContext,
@@ -622,7 +980,7 @@ type CorporateGatewayActionResult =
 type CorporateGatewayPolicyResult =
   | { ok: true; version: number }
   | { ok: true; resourceId: string; admissionState: 'active' | 'paused' | 'legacy' }
-  | { ok: true; state: 'cancelled' }
+  | { ok: true; state: 'cancelled' | 'applied' }
   | { ok: false; reason: string }
 
 type CorporateGatewayPolicyPreviewResult =
@@ -663,9 +1021,11 @@ function inboundBurstWaitMs(row: PendingInboundRow, now: number): number {
   let meta: Record<string, string> | undefined
   try { meta = (JSON.parse(row.payload) as InboundNotification).params?.meta }
   catch { return 0 }
-  if (!meta?.media_group_id) return 0
+  if (!meta || meta.sender_chat_id) return 0
   const waited = now - row.created_at
-  return waited < INBOUND_BURST_WINDOW_MS ? Math.min(INBOUND_BURST_WINDOW_MS, INBOUND_BURST_WINDOW_MS - waited) : 0
+  if (waited < INBOUND_BURST_WINDOW_MS) return Math.min(INBOUND_BURST_WINDOW_MS, INBOUND_BURST_WINDOW_MS - waited)
+  return waited < INBOUND_BURST_MAX_WAIT_MS
+    && inboundArriving.has(inboundSenderKey(meta.chat_id ?? '', meta.thread_id, meta.user_id ?? '')) ? 100 : 0
 }
 
 function coalesceInboundBurst(row: PendingInboundRow): PendingInboundRow {
@@ -675,7 +1035,8 @@ function coalesceInboundBurst(row: PendingInboundRow): PendingInboundRow {
   catch { return row }
   if (head.method !== 'notifications/claude/channel') return row
   const meta = head.params?.meta
-  if (!meta || meta.delivery_id !== row.delivery_id || meta.recovery_attempt) return row
+  // Anonymous admins and channels post under one shared sender: never folded.
+  if (!meta || meta.delivery_id !== row.delivery_id || meta.recovery_attempt || meta.sender_chat_id) return row
   // Once offered, a request owns its original payload. Recovery and later
   // messages must remain separate obligations even when the author is the same.
   const obligation = MSG_DB.query(`SELECT state FROM delivery_results WHERE delivery_id = ?`).get(row.delivery_id) as { state: string } | null
@@ -717,11 +1078,17 @@ function coalesceInboundBurst(row: PendingInboundRow): PendingInboundRow {
     if (!nextMeta || nextMeta.delivery_id !== next.delivery_id || nextMeta.recovery_attempt) break
     const follower = MSG_DB.query(`SELECT state FROM delivery_results WHERE delivery_id = ?`).get(next.delivery_id) as { state: string } | null
     if (follower && follower.state !== 'queued') break
+    // Another chat or topic in between keeps its own place and turn and does
+    // not split this person's burst (an owner's private message between a group
+    // mention and its photo had answered the person twice).
+    if (nextMeta.chat_id !== meta.chat_id || nextMeta.thread_id !== meta.thread_id) continue
     // One person, one chat, one topic: a group must never merge two people, and
     // a reply that names a different message keeps its own turn.
-    if (nextMeta.chat_id !== meta.chat_id || nextMeta.thread_id !== meta.thread_id
-      || nextMeta.user_id !== meta.user_id || nextMeta.conversation_key !== meta.conversation_key) break
+    if (nextMeta.user_id !== meta.user_id || nextMeta.conversation_key !== meta.conversation_key) break
     if (nextMeta.reply_to_message_id !== undefined) break
+    // A forward's tag names whose words the turn carries: a quote and the
+    // sender's own words, or two authors' quotes, never share one turn.
+    if (nextMeta.forward_from !== meta.forward_from) break
     // Every file of the burst travels with it, and the same cap applies to the
     // files as to the messages: an album of forty photos is not one prompt.
     if (images.length + fileIds.length >= MAX_COALESCED_INBOUND_MESSAGES) break
@@ -746,6 +1113,8 @@ function coalesceInboundBurst(row: PendingInboundRow): PendingInboundRow {
   if (images.length > 1) mergedMeta.image_paths = images.join(',')
   if (fileIds.length > 1) mergedMeta.attachment_file_ids = fileIds.join(',')
   if (fileNames.length > 1) mergedMeta.attachment_names = fileNames.join(', ')
+  // One message of the burst that addressed the bot makes the whole turn a request.
+  if (folded.some(item => item.meta.addressed !== 'false')) delete mergedMeta.addressed
   mergedMeta.coalesced_messages = String(folded.length + 1)
   mergedMeta.coalesced_delivery_ids = [row.delivery_id, ...folded.map(item => item.row.delivery_id)].join(',')
   const payload = JSON.stringify({ ...head, params: { content, meta: mergedMeta } })
@@ -884,8 +1253,24 @@ async function updateAccess(args: string[]): Promise<void> {
 const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
 
 const bot = new Bot(TOKEN)
+// grammY's stop() confirms its last tried update without waiting for middleware.
+// Track the current handler so shutdown cannot acknowledge an update before it
+// reaches durable inbound storage. A rejected handler stays tracked until the
+// next attempt; the failed update must remain replayable.
+let currentBotUpdate: Promise<void> | null = null
+const handleBotUpdate = bot.handleUpdate.bind(bot)
+bot.handleUpdate = async (...args: Parameters<typeof bot.handleUpdate>): Promise<void> => {
+  const work = shuttingDown
+    ? Promise.reject(new RetryableInboundDeliveryError(new Error('Telegram receiver is stopping')))
+    : handleBotUpdate(...args)
+  currentBotUpdate = work
+  await work
+  if (currentBotUpdate === work) currentBotUpdate = null
+}
 // Consume GitHub credentials before every command, archive and model route.
 const backupChatPath = join(homedir(), 'bin', 'telegram-backup-chat.ts')
+// A GitHub token is a word of its own: «highs_and_lows.csv» or «laughs_count» is not one.
+const GITHUB_TOKEN = /(?<![A-Za-z0-9_])(?:github_pat_|gh[pousr]_)[A-Za-z0-9_]{20,}/gu
 // Telegram 10.1+ delivers rich messages: the classic `text` arrives EMPTY and the
 // words live in `rich_message.blocks`. Nothing downstream matched such an update,
 // so the agent stayed silent and never even marked the message read — the owner
@@ -940,25 +1325,94 @@ function sharedPlaceOrContactText(message: unknown): string {
   return ''
 }
 
+// A poll, a die, a checklist or a forwarded story has no text field either and
+// fell through every handler. A story's content never reaches a bot: say so.
+function sharedPollOrStoryText(message: unknown): string {
+  const m = message as {
+    poll?: { question?: string; options?: { text?: string }[] }
+    dice?: { emoji?: string; value?: number }
+    checklist?: { title?: string; tasks?: { text?: string }[] }
+    story?: { chat?: { title?: string; username?: string; first_name?: string } }
+  } | null | undefined
+  const items = (list?: { text?: string }[]) => (list ?? []).map(item => item.text).filter(Boolean).join(' / ')
+  if (m?.poll?.question) return `📊 Опитування: ${m.poll.question} — ${items(m.poll.options)}`
+  if (m?.checklist?.title) return `☑️ Список: ${m.checklist.title} — ${items(m.checklist.tasks)}`
+  if (m?.dice && Number.isFinite(m.dice.value)) return `${m.dice.emoji ?? '🎲'} Випало: ${m.dice.value}`
+  if (m?.story) {
+    const who = m.story.chat?.title ?? m.story.chat?.username ?? m.story.chat?.first_name
+    return `📖 Історія${who ? ` від ${who}` : ''}: боти Telegram не бачать вмісту історій`
+  }
+  return ''
+}
+
+// Who a forwarded message came from, the way Telegram names it above the text.
+function forwardOrigin(origin: unknown): string {
+  const o = origin as {
+    type?: string; sender_user_name?: string; author_signature?: string
+    sender_user?: { first_name?: string; last_name?: string; username?: string }
+    sender_chat?: { title?: string }; chat?: { title?: string }
+  }
+  const user = o.sender_user
+  const name = o.type === 'user'
+    ? [user?.first_name, user?.last_name].filter(Boolean).join(' ') + (user?.username ? ` (@${user.username})` : '')
+    : o.type === 'hidden_user' ? o.sender_user_name ?? ''
+    : o.type === 'chat' ? `групи «${o.sender_chat?.title ?? ''}»`
+    : o.type === 'channel' ? `каналу «${o.chat?.title ?? ''}»` : ''
+  return (name || 'невідомого відправника') + (o.author_signature ? ` (${o.author_signature})` : '')
+}
+
+// A link hidden under words («тут») keeps its address, written after the words.
+function withHiddenLinks(message: unknown, text: string): string {
+  type Entity = { type: string; offset: number; length: number; url?: string }
+  const m = message as { text?: string; caption?: string; entities?: Entity[]; caption_entities?: Entity[] } | null | undefined
+  const [source, entities] = m?.text != null ? [m.text, m.entities] : [m?.caption, m?.caption_entities]
+  if (!source || source !== text || !entities?.length) return text
+  let out = ''
+  let at = 0
+  for (const e of [...entities].sort((a, b) => a.offset - b.offset)) {
+    const end = e.offset + e.length
+    if (e.type !== 'text_link' || !e.url || e.offset < at || source.slice(e.offset, end) === e.url) continue
+    out += `${source.slice(at, end)} (${e.url.replace(GITHUB_TOKEN, '(токен GitHub приховано)')})`
+    at = end
+  }
+  return out + source.slice(at)
+}
+
 function plainOrRichText(message: unknown): string {
   const plain = (message as { text?: string; caption?: string } | null | undefined)
-  return plain?.text || plain?.caption || richMessageText(message) || sharedPlaceOrContactText(message) || ''
+  return plain?.text || plain?.caption || richMessageText(message) || sharedPlaceOrContactText(message)
+    || sharedPollOrStoryText(message) || ''
 }
 
 bot.use(async (ctx, next) => {
   const message = ctx.message ?? ctx.editedMessage
-  if (message) {
-    const text = plainOrRichText(message)
+  const text = message ? plainOrRichText(message) : ''
+  // A forward or an edit is not the owner answering the backup setup; only a
+  // GitHub token in it is still taken away.
+  const quoted = ctx.editedMessage != null || ctx.message?.forward_origin != null
+  if (message && (!quoted || text.search(GITHUB_TOKEN) >= 0)) {
     try {
       const { handleBackupMessage } = await import(pathToFileURL(backupChatPath).href)
-      if (await handleBackupMessage({ home: homedir(), ownerChatId: OWNER_CHAT_ID, botToken: TOKEN, message })) return
+      if (await handleBackupMessage({ home: homedir(), ownerChatId: OWNER_CHAT_ID, botToken: TOKEN, message, text })) return
     } catch {
       // A missing helper must never send a pasted token to the model.
-      if (/(?:github_pat_|gh[pousr]_)[A-Za-z0-9_]*/.test(text)) {
+      if (text.search(GITHUB_TOKEN) >= 0) {
         await ctx.deleteMessage().catch(() => {})
         return
       }
     }
+  }
+  await next()
+})
+
+// A forwarded «/health» is a quote: its command marks are dropped, so no command
+// handler answers it and it reaches the agent with the author line.
+bot.use(async (ctx, next) => {
+  const message = ctx.message
+  if (message?.forward_origin) {
+    const quoted = message as { entities?: { type: string }[]; caption_entities?: { type: string }[] }
+    quoted.entities = quoted.entities?.filter(entity => entity.type !== 'bot_command')
+    quoted.caption_entities = quoted.caption_entities?.filter(entity => entity.type !== 'bot_command')
   }
   await next()
 })
@@ -975,6 +1429,7 @@ type PendingEntry = {
 
 type GroupPolicy = {
   requireMention: boolean
+  admissionMode?: 'all' | 'allowlist'
   allowFrom: string[]
   observeEnabled?: boolean
   name?: string
@@ -1187,7 +1642,7 @@ async function sendCorporateText(
   threadId: number | null,
   replyTo: number | null,
   text: string,
-  options?: { actionToken?: string; policyToken?: string; resourceToken?: string },
+  options?: { actionToken?: string; policyToken?: string; resourceToken?: string; teamToken?: string; settingsToken?: string },
 ): Promise<number> {
   assertAllowedChat(chatId)
   const keyboard = options?.actionToken
@@ -1202,6 +1657,14 @@ async function sendCorporateText(
         ? new InlineKeyboard()
           .text('✅ Підтвердити', `corp-resource:approve:${options.resourceToken}`)
           .text('❌ Скасувати', `corp-resource:cancel:${options.resourceToken}`)
+        : options?.teamToken
+          ? new InlineKeyboard()
+            .text('✅ Підтвердити', `corp-team:approve:${options.teamToken}`)
+            .text('❌ Скасувати', `corp-team:cancel:${options.teamToken}`)
+        : options?.settingsToken
+          ? new InlineKeyboard()
+            .text('✅ Підтвердити', `corp-settings:approve:${options.settingsToken}`)
+            .text('❌ Скасувати', `corp-settings:cancel:${options.settingsToken}`)
         : undefined
   const sent = await bot.api.sendMessage(chatId, text, {
     ...(threadId != null ? { message_thread_id: threadId } : {}),
@@ -1285,11 +1748,77 @@ async function loadCorporateRuntime(): Promise<CorporateGatewayRuntime | null> {
 }
 
 async function corporateRuntimeReady(): Promise<CorporateGatewayRuntime | null> {
-  corporateRuntimePromise ??= loadCorporateRuntime().catch(() => {
-    process.stderr.write('telegram channel: corporate runtime unavailable\n')
+  const pending = corporateRuntimePromise ??= loadCorporateRuntime()
+  try {
+    return await pending
+  } catch {
+    if (corporateRuntimePromise === pending) {
+      corporateRuntimePromise = undefined
+      process.stderr.write('telegram channel: corporate runtime unavailable\n')
+    }
     return null
-  })
-  return corporateRuntimePromise
+  }
+}
+
+async function corporateRuntimeForIntake(): Promise<CorporateGatewayRuntime | null> {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (shuttingDown) throw new RetryableInboundDeliveryError(new Error('Telegram receiver is stopping'))
+    const runtime = await corporateRuntimeReady()
+    if (shuttingDown) throw new RetryableInboundDeliveryError(new Error('Telegram receiver is stopping'))
+    if (runtime) return runtime
+    if (!CORPORATE_ENABLED) break
+    if (attempt < 2) {
+      await new Promise(r => setTimeout(r, 50))
+      if (shuttingDown) throw new RetryableInboundDeliveryError(new Error('Telegram receiver is stopping'))
+    }
+  }
+  return null
+}
+
+function recordCorporateIntakeFailure(ctx: Context, messageId: number, replyToSender: boolean): void {
+  const deliveryId = `${ctx.chat!.id}:${messageId}`
+  let inserted: boolean
+  try {
+    inserted = corporateIntakeFailureInsert.run(
+      `corporate_intake_failure:${deliveryId}`, 'runtime_unavailable', Date.now()).changes === 1
+  } catch {
+    // A failed durable write is still retryable; acknowledging here loses the
+    // only record of a possibly sensitive, unprocessed message.
+    throw new RetryableInboundDeliveryError(new Error('corporate intake failure not persisted'))
+  }
+  if (inserted && OWNER_CHAT_ID) {
+    try {
+      const now = Date.now()
+      if (corporateIntakeAlertClaim.run(deliveryId, now, now - CORPORATE_INTAKE_ALERT_INTERVAL_MS).changes === 1) {
+        void bot.api.sendMessage(OWNER_CHAT_ID,
+          `⚠️ Корпоративне повідомлення ${deliveryId} не оброблено. Номер збережено для перевірки, вміст не зберігався. Перевір підключення агента й попроси людину повторити повідомлення.`,
+          undefined, AbortSignal.timeout(5000)).catch(() => {
+          process.stderr.write('telegram channel: corporate intake owner alert unavailable\n')
+        })
+      }
+    } catch {
+      process.stderr.write('telegram channel: corporate intake owner alert unavailable\n')
+    }
+  }
+  if (!replyToSender) return
+  try {
+    void ctx.reply(CORPORATE_TEMPORARILY_UNAVAILABLE, inboundTopicOptions(ctx), AbortSignal.timeout(5000)).catch(() => {
+      process.stderr.write('telegram channel: corporate intake failure reply unavailable\n')
+    })
+  } catch {
+    process.stderr.write('telegram channel: corporate intake failure reply unavailable\n')
+  }
+}
+
+// A company message refused at intake leaves one reason-only row, never its content
+// (parity G12). A failed write is logged; the person still gets the refusal line.
+function recordCorporateIntakeRefusal(ctx: Context, messageId: number | undefined, reason: string): void {
+  if (messageId == null) return
+  try {
+    corporateIntakeFailureInsert.run(`corporate_intake_refused:${ctx.chat!.id}:${messageId}`, reason, Date.now())
+  } catch {
+    process.stderr.write('telegram channel: corporate intake refusal not recorded\n')
+  }
 }
 
 function saveAccess(a: Access): void {
@@ -1313,7 +1842,7 @@ function pruneExpired(a: Access): boolean {
 }
 
 type GateResult =
-  | { action: 'deliver'; access: Access }
+  | { action: 'deliver'; access: Access; continues?: number }
   | { action: 'observe'; access: Access }
   | { action: 'drop' }
   | { action: 'pair'; code: string; isResend: boolean }
@@ -1363,29 +1892,60 @@ function gate(ctx: Context): GateResult {
   if (chatType === 'group' || chatType === 'supergroup') {
     const groupId = String(ctx.chat!.id)
     const policy = access.groups[groupId]
-    if (!policy) return { action: 'drop' }
+    if (!policy) {
+      logUnconnectedChat(ctx.chat!.type, groupId)
+      return { action: 'drop' }
+    }
+    const groupAllowFrom = policy.allowFrom ?? []
+    const groupRestricted = policy.admissionMode === 'allowlist'
+      || (policy.admissionMode !== 'all' && groupAllowFrom.length > 0)
+    if (groupRestricted && !groupAllowFrom.includes(senderId)) return { action: 'drop' }
     if (policy.observeEnabled === false) {
       if (access.admins.includes(senderId) && isMentioned(ctx, access.mentionPatterns)) {
         return { action: 'deliver', access }
       }
       return { action: 'drop' }
     }
-    const groupAllowFrom = policy.allowFrom ?? []
     const requireMention = policy.requireMention ?? true
-    if (groupAllowFrom.length > 0 && !groupAllowFrom.includes(senderId)) {
-      return { action: 'drop' }
-    }
     if (
       requireMention
       && !isMentioned(ctx, access.mentionPatterns)
       && !matchesAutoAnswer(ctx, policy.autoAnswerPatterns)
     ) {
+      const continues = continuesOwnMention(ctx)
+      if (continues != null) return { action: 'deliver', access, continues }
       return { action: 'observe', access }
     }
     return { action: 'deliver', access }
   }
 
   return { action: 'drop' }
+}
+
+// A photo, file or video its author posts within a minute of their own mention in the
+// same topic belongs to that request — the mention simply came first (Mani,
+// 14.09: «the screenshot never arrived»). It is delivered: the burst folds it
+// into the mention while that turn is still waiting, otherwise it is a turn of
+// its own marked as the mention's continuation. A mention is noted only when it
+// enters this bot's own queue, the one that folds; a company session keeps
+// binding such files to the next mention instead of answering each photo.
+const CONTINUATION_WINDOW_MS = 60_000
+const lastAddressed = new Map<string, { at: number, messageId: number }>()
+function continuesOwnMention(ctx: Context, now = Date.now()): number | undefined {
+  const message = ctx.message
+  if ((!message?.photo && !message?.document && !message?.video && !message?.video_note)
+    || message.sender_chat) return undefined
+  const threadId = message.is_topic_message === true ? message.message_thread_id : undefined
+  const last = lastAddressed.get(inboundSenderKey(String(ctx.chat!.id), threadId, String(ctx.from!.id)))
+  return last && now - last.at < CONTINUATION_WINDOW_MS ? last.messageId : undefined
+}
+
+// A group that hands the bot every message (requireMention false) hands it people's chatter
+// too: only a message that mentions the bot or matches an auto-answer hears a service line
+// (Codex, 28.09), as in handleInbound and for an edit.
+function addressesBot(ctx: Context, access: Access): boolean {
+  return ctx.chat?.type === 'private' || isMentioned(ctx, access.mentionPatterns)
+    || matchesAutoAnswer(ctx, access.groups[String(ctx.chat!.id)]?.autoAnswerPatterns)
 }
 
 // Like gate() but for bot commands: no pairing side effects, just allow/drop.
@@ -1430,7 +1990,8 @@ function corporateCommandGate(ctx: Context): {
   const policy = access.groups[chatId]
   if (!policy) return null
   if (policy.observeEnabled === false && !access.admins.includes(senderId)) return null
-  if (policy.allowFrom?.length && !policy.allowFrom.includes(senderId)) return null
+  if ((policy.admissionMode === 'allowlist' || (policy.admissionMode !== 'all' && policy.allowFrom?.length))
+    && !policy.allowFrom?.includes(senderId)) return null
   const messageThreadId = ctx.message?.message_thread_id
   const threadId = ctx.chat.type === 'supergroup'
     && ctx.message?.is_topic_message === true
@@ -1584,40 +2145,89 @@ function chunk(text: string, limit: number, mode: 'length' | 'newline'): string[
 // everything else goes as documents (raw file, no compression).
 const PHOTO_EXTS = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp'])
 
-function resolveReplyThreadId(
+async function resolveReplyThreadId(
   chatId: string, requested: unknown, replyTo: number | undefined,
-): number | undefined {
+  deliveryId: unknown, generalTopic: unknown,
+): Promise<number | undefined> {
   if (requested !== undefined && (
     typeof requested !== 'number' || !Number.isSafeInteger(requested) || requested <= 0
   )) throw new Error('thread_id must be a positive safe integer')
-  const explicit = requested as number | undefined
-  if (replyTo === undefined) return explicit
+  if (generalTopic !== undefined && typeof generalTopic !== 'boolean') {
+    throw new Error('general_topic must be a boolean')
+  }
+  let derived = requested as number | undefined
+  let verified = requested !== undefined
+  const accept = (candidate: number | undefined, source: string): void => {
+    if (verified && derived !== candidate) throw new Error(`${source} conflicts with reply topic`)
+    derived = candidate
+    verified = true
+  }
+  if (generalTopic === true) accept(undefined, 'general_topic')
+  replayOutgoingMessageRepairs()
 
   // A message ID is only meaningful inside its own chat. Never infer from the
   // latest chat/topic or from quoted text supplied by the model.
-  const rows = MSG_DB.query(`SELECT thread_id, conversation_key FROM messages
+  const rows = replyTo === undefined ? [] : MSG_DB.query(`SELECT thread_id, conversation_key FROM messages
     WHERE chat_id = ? AND message_id = ?`).all(chatId, replyTo) as {
       thread_id: number | null, conversation_key: string | null
     }[]
-  let derived: number | undefined
-  let verified = false
   for (const row of rows) {
     const topic = row.thread_id
     const validTopic = topic != null && Number.isSafeInteger(topic) && topic > 0
       && row.conversation_key === `topic:${chatId}:${topic}`
-    const validRoot = topic === null && (
-      row.conversation_key === `group:${chatId}` || row.conversation_key === `user:${chatId}`
-    )
+    const validRoot = topic === null
+      && row.conversation_key === `${chatId.startsWith('-') ? 'group' : 'user'}:${chatId}`
     if (!validTopic && !validRoot) continue // old or unverified history is not routing authority
-    const candidate = validTopic ? topic! : undefined
-    if (verified && derived !== candidate) throw new Error('reply_to has conflicting topic history')
-    derived = candidate
-    verified = true
+    accept(validTopic ? topic! : undefined, 'reply_to')
   }
-  if (verified && explicit !== undefined && explicit !== derived) {
-    throw new Error('thread_id conflicts with reply_to topic')
+  if (deliveryId !== undefined) {
+    const identity = typeof deliveryId === 'string'
+      ? /^(-?[1-9][0-9]*):([1-9][0-9]*)$/.exec(deliveryId) : null
+    if (!identity || identity[1] !== chatId || !Number.isSafeInteger(Number(identity[2]))) {
+      throw new Error('delivery_id must identify the exact inbound chat and message')
+    }
+    // The model reference is routing evidence, not session identity or an ACL
+    // grant. Never substitute pendingInboundHead() or the newest chat activity.
+    const row = MSG_DB.query(`SELECT delivery_id, payload, state
+      FROM pending_inbound_deliveries WHERE delivery_id=?`).get(deliveryId) as PendingInboundRow | null
+    const offered = row?.state === 'offered' || row?.state === 'started' ? row : null
+    // A progress receipt can retire or requeue the transport row. Its admitted
+    // request survives in delivery_results for the native callback, including
+    // when the receiver has already staged a recovery offer. This is routing
+    // evidence only; receiptContext checks the live service session before send.
+    const durable = offered ? null : MSG_DB.query(`SELECT request_payload, thread_id
+      FROM delivery_results WHERE delivery_id=? AND chat_id=? AND request_payload IS NOT NULL`)
+      .get(deliveryId, chatId) as { request_payload: string; thread_id: string | null } | null
+    const payload = offered?.payload ?? durable?.request_payload
+    if (!payload || (offered && pendingInboundOrigin(offered) !== chatId)) {
+      throw new Error('delivery_id is unavailable or not an offered/started inbound delivery')
+    }
+    const routingRow = { payload }
+    const notification = JSON.parse(payload) as InboundNotification
+    const meta = notification.params.meta
+    const thread = pendingInboundThreadId(routingRow, chatId)
+    if (typeof notification.params.content !== 'string' || meta.chat_id !== chatId
+      || meta.delivery_id !== deliveryId || meta.message_id !== identity[2]
+      || meta.conversation_key !== pendingInboundConversationKey(routingRow, chatId)
+      || (durable && durable.thread_id !== (thread == null ? null : String(thread)))) {
+      throw new Error('delivery_id has invalid inbound message/topic identity')
+    }
+    accept(thread, 'delivery_id')
   }
-  return explicit ?? derived
+  if (verified || !chatId.startsWith('-')) return derived
+
+  // Only this request's matching Telegram classification can preserve legacy
+  // unthreaded group sends. Missing/ambiguous evidence must not select General.
+  let chat: Awaited<ReturnType<typeof bot.api.getChat>>
+  try { chat = await bot.api.getChat(chatId, AbortSignal.timeout(TELEGRAM_FETCH_TIMEOUT_MS)) } catch {
+    throw new Error('reply routing unavailable: cannot classify this group; provide verified topic or deliberate general_topic')
+  }
+  if (!chat || !Number.isSafeInteger(chat.id) || String(chat.id) !== chatId
+    || (chat.type !== 'group' && chat.type !== 'supergroup')
+    || ('is_forum' in chat && chat.is_forum !== false)) {
+    throw new Error('reply routing unresolved: forum or invalid group classification; provide thread_id, verified reply_to/delivery_id, or deliberate general_topic: true')
+  }
+  return undefined
 }
 
 const mcp = new Server(
@@ -1638,11 +2248,12 @@ const mcp = new Server(
     instructions: [
       'The sender reads Telegram, not this session. Anything you want them to see must go through the reply tool — your transcript output never reaches their chat.',
       '',
-      'Messages from Telegram arrive as <channel source="telegram" chat_id="..." message_id="..." user="..." ts="...">. If the tag has an image_path attribute, Read that file — it is a photo the sender attached. If the tag has attachment_file_id, call download_attachment with that file_id to fetch the file, then Read the returned path. One tag can carry a whole burst: image_paths lists every photo of it, comma-separated, and attachment_file_ids every file — Read or download all of them, and answer the burst once instead of replying per message. image_paths also carries photos posted in this chat shortly before the message without mentioning you, newest first — Read the ones the message refers to, and attachment_file_ids does the same for files posted that way. A voice message posted without a mention arrives already transcribed inside the text, labelled "Голосове від …". Reply with the reply tool — pass chat_id back. For a forum topic, also pass the inbound thread_id as an integer independently of reply_to, even for the latest message and every follow-up. thread_id selects the topic; reply_to only adds a quote. Use reply_to (set to a message_id) only when quoting an earlier message; omit reply_to for normal responses, never omit an inbound thread_id. Do not guess a topic from the latest activity in another conversation.',
+      'Messages from Telegram arrive as <channel source="telegram" chat_id="..." message_id="..." user="..." ts="...">. If the tag has an image_path attribute, Read that file — it is a photo the sender attached. If the tag has attachment_file_id, call download_attachment with that file_id to fetch the file, then Read the returned path. One tag can carry a whole burst: image_paths lists every photo of it, comma-separated, and attachment_file_ids every file — Read or download all of them, and answer the burst once instead of replying per message. image_paths also carries photos posted in this chat shortly before the message without mentioning you, newest first — Read the ones the message refers to, and attachment_file_ids does the same for files posted that way. A voice message posted without a mention arrives already transcribed inside the text, labelled "Голосове від …". A tag with continues_message_id carries a photo or file its author posted without a mention right after their own message with that id: treat it as part of that request, and if it has nothing to do with that request, call no_reply instead of answering. A reply to a message with a photo or a file carries that photo or file first in image_path or attachment_file_id, whoever posted it. A tag with forward_from carries a forwarded message: its first line names who wrote it, and those words are theirs, not a request from the sender. Reply with the reply tool — pass chat_id back. For a forum topic, also pass the inbound thread_id as an integer independently of reply_to, even for the latest message and every follow-up. thread_id selects the topic; reply_to only adds a quote. Use reply_to (set to a message_id) only when quoting an earlier message; omit reply_to for normal responses, never omit an inbound thread_id. Do not guess a topic from the latest activity in another conversation.',
+      'Pass delivery_id from the exact inbound notification when available: a persisted offered/started reference or verified same-chat reply_to can prove the topic if thread_id is omitted. These references do not grant access. Use general_topic: true only when General is deliberately intended and no topic evidence conflicts. An unresolved forum or conflicting reference is a routing rejection, not a transport outage: correct the routing evidence; never bypass it through another sender or retry acknowledged message IDs.',
       '',
       `reply accepts files staged inside ${ATTACHMENT_OUTBOX} for attachments. Pass an absolute path, not ~. Use react to add emoji reactions, and edit_message for interim progress updates. Edits don\'t trigger push notifications — when a long task completes, send a new reply so the user\'s device pings.`,
       '',
-      'In a group or forum topic where no answer is needed — people talking to each other, someone else was addressed, nothing was asked of you — call no_reply with that chat_id (and the topic thread_id) instead of writing anything: it closes that inbound message as observed and nothing reaches the chat. In a private chat always answer with reply — a refusal or a clarifying question is also an answer; no_reply is not available there.',
+      'In a group or forum topic where no answer is needed — people talking to each other, someone else was addressed, nothing was asked of you — call no_reply with that chat_id (and the topic thread_id) instead of writing anything: it closes that inbound message as observed and nothing reaches the chat. A group tag with addressed="false" came only because the group hands you every message: it neither mentioned you nor replied to you, so treat it as observation and call no_reply unless it is plainly meant for you. In a private chat always answer with reply — a refusal or a clarifying question is also an answer; no_reply is not available there.',
       '',
       "Telegram's Bot API exposes no history or search — you only see messages as they arrive. If you need earlier context, ask the user to paste it or summarize.",
       '',
@@ -1677,24 +2288,81 @@ const DELIVERY_STAMP = process.env.TG_DELIVERY_STAMP || null
 // never overwrite it. updated_at is the start at which the value took effect.
 const REQUESTED_AUTHORITY = process.env.TG_DELIVERY_AUTHORITY || 'guard'
 const DELIVERY_AUTHORITY = ['guard', 'shadow', 'receiver'].includes(REQUESTED_AUTHORITY) ? REQUESTED_AUTHORITY : 'guard'
+// The worker-obligation gates (a final's admission, a launch superseding an
+// admitted final, the repair of a superseded final, the fences and the
+// in-process quarantine) act only when the receiver settles delivery. In
+// shadow mode they record what they would have done; guard records nothing.
+const WORKER_GATES = DELIVERY_AUTHORITY === 'receiver'
 if (DELIVERY_AUTHORITY !== REQUESTED_AUTHORITY) {
   process.stderr.write(`telegram channel: TG_DELIVERY_AUTHORITY=${JSON.stringify(REQUESTED_AUTHORITY)} is not guard, shadow or receiver; running as guard\n`)
 }
+// It reads the contract before it writes, so it takes the write lock first:
+// another copy starting at the same time cannot invalidate that read.
 if (!SUPPRESS) {
   MSG_DB.transaction(() => {
     const contract = MSG_DB.query(`SELECT value FROM delivery_runtime WHERE key = 'receipt_contract'`).get() as { value: string } | null
-    // Corrected origin binding and shadow classification need their own soak.
+    // Callback-specific terminal proof changes which aged heads the sweep may
+    // retire. Start a fresh shadow observation window for this contract.
     // Ordinary restarts on the same contract retain the observation window.
-    const changed = contract?.value !== '3'
+    const changed = contract?.value !== '6'
     MSG_DB.query(
     `INSERT INTO delivery_runtime (key, value, updated_at) VALUES ('authority', ?, ?)
      ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
      WHERE value != excluded.value OR ?`,
     ).run(DELIVERY_AUTHORITY, Date.now(), changed ? 1 : 0)
-    MSG_DB.query(`INSERT INTO delivery_runtime (key, value, updated_at) VALUES ('receipt_contract', '3', ?)
+    MSG_DB.query(`INSERT INTO delivery_runtime (key, value, updated_at) VALUES ('receipt_contract', '6', ?)
       ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
       WHERE value != excluded.value`).run(Date.now())
-  })()
+    // The drain that holds the queue through a usage limit tells the waiting
+    // chats itself; without it (daemon transport) the limit watcher does.
+    if (process.env.TG_TRANSPORT === 'daemon') {
+      MSG_DB.query(`DELETE FROM delivery_runtime WHERE key = 'limit_notice_owner'`).run()
+    } else {
+      MSG_DB.query(`INSERT INTO delivery_runtime (key, value, updated_at) VALUES ('limit_notice_owner', 'receiver', ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`).run(Date.now())
+    }
+    // An older receiver had no immutable callback ledger. Keep the first
+    // ledger-enabled startup for this stamp so old sessions can fail closed.
+    if (process.env.TG_TRANSPORT !== 'daemon' && DELIVERY_STAMP) {
+      const now = Date.now()
+      MSG_DB.query(`INSERT INTO delivery_runtime (key,value,updated_at) VALUES (?,?,?)
+        ON CONFLICT(key) DO NOTHING`)
+        .run(`callback_ledger_epoch:${DELIVERY_STAMP}`, String(now), now)
+      // Snapshot unsafe native sessions before the recovery hook can rebind
+      // their old result rows. The turn's claim time, not the user's original
+      // message time, identifies whether this session ran without the ledger.
+      // A terminal result may outlive its closed turn after the 14-day prune.
+      MSG_DB.query(`INSERT OR IGNORE INTO delivery_legacy_native_sessions (session_id,marked_at)
+        SELECT DISTINCT r.session_id, ? FROM delivery_results r
+        LEFT JOIN delivery_runtime e ON e.key='callback_ledger_epoch:' || r.stamp
+        LEFT JOIN delivery_turns t ON t.turn_id=r.turn_id AND t.session_id=r.session_id
+        WHERE r.session_id<>'' AND (r.stamp IS NULL OR e.value IS NULL
+          OR CAST(e.value AS INTEGER)<=0
+          OR (t.turn_id IS NULL AND r.state NOT IN ('complete','no_reply','cancelled','failed'))
+          OR (t.turn_id IS NOT NULL AND (t.opened_at IS NULL
+            OR t.opened_at<=CAST(e.value AS INTEGER))))`).run(now)
+      // The SessionStart hook preserves the first known native-session row
+      // before --resume replaces its mutable stamp/start time. If receiver
+      // starts first, capture the old row here instead. A fresh
+      // startup may precede this receiver by milliseconds and is exempt only
+      // when the hook saw no prior row. Preserve that proof across later
+      // service stamps; an unknown resumed ID stays closed.
+      MSG_DB.query(`INSERT OR IGNORE INTO delivery_native_session_origins
+        (session_id,started_at,stamp,source,inherited)
+        SELECT session_id,started_at,stamp,source,1 FROM delivery_sessions
+        WHERE session_id<>''`).run()
+      MSG_DB.query(`INSERT OR IGNORE INTO delivery_legacy_native_sessions (session_id,marked_at)
+        SELECT origin.session_id, ? FROM delivery_native_session_origins origin
+        LEFT JOIN delivery_runtime e ON e.key='callback_ledger_epoch:' || origin.stamp
+        WHERE origin.session_id<>'' AND (
+          (origin.source IN ('resume','compact') AND origin.inherited=0)
+          OR (NOT (origin.source IS 'startup' AND origin.inherited=0
+              AND e.value IS NOT NULL AND CAST(e.value AS INTEGER)>0)
+            AND (origin.stamp IS NULL OR e.value IS NULL
+              OR CAST(e.value AS INTEGER)<=0 OR origin.started_at IS NULL
+              OR origin.started_at<=CAST(e.value AS INTEGER))))`).run(now)
+    }
+  }).immediate()
   process.stderr.write(`telegram channel: delivery authority ${DELIVERY_AUTHORITY}\n`)
 }
 if (!SUPPRESS && !DELIVERY_STAMP) {
@@ -1708,12 +2376,294 @@ type Receipt = {
   source_row: number | null
   targets: Array<{ turn_id: number; delivery_id: string }>
   offered_id: string | null
+  // The result generation each target's send belongs to, when it is known.
+  generations?: Array<number | null>
+  phase?: 'progress' | 'final' | null
 }
 const receiptRetries: Receipt[] = []
 type ResultDelivery = Pick<Receipt, 'chat_id' | 'thread_id' | 'targets'> & {
   phase: 'progress' | 'final'; task_id: string | null; offered_id?: string | null
+  generations: Array<number | null>; first_message_id?: number; terminal_message_id?: number
 }
 const resultRetries: ResultDelivery[] = []
+// A definite file rejection after acknowledged text may be continued in this
+// process. The database fence stays armed; a restart or uncertain send cannot
+// turn that permission into an automatic replay. The continuation completes
+// the same notice, so a progress notice's task is registered with its ACK (B0-a).
+const partialFileContinuations = new Map<string, {
+  messageId: number; phase: ResultDelivery['phase']; task_id: string | null
+}>()
+
+type ScopedRequest = {
+  delivery_id: string; session_id: string; stamp: string | null; turn_id: number; response_turn_id: number | null
+}
+// Background work still open in a request's scope, of its own service stamp:
+// its owned or legacy obligations, and every unowned obligation and unresolved
+// launch of its claim turn or response turn. A final is admitted, and a
+// superseded final may complete its request, only while this list is empty.
+// A worker the owner was told about (silent_notified_at, NOVSKY 27.09) no
+// longer counts: it stops blocking, and its late callback still binds.
+function scopeWork(request: ScopedRequest): string[] {
+  return (MSG_DB.query(`SELECT 'launch ' || launch_ref AS work FROM delivery_task_launches
+      WHERE session_id=? AND stamp=? AND state='launching' AND launched_turn IN (?, ?)
+        AND silent_notified_at IS NULL
+    UNION ALL SELECT 'task ' || task_id FROM delivery_task_owners
+      WHERE session_id=? AND stamp=? AND ((state IN ('owned','legacy') AND delivery_id=?)
+        OR (state='unowned' AND launched_turn IN (?, ?))) AND silent_notified_at IS NULL`)
+    .all(request.session_id, request.stamp, request.turn_id, request.response_turn_id,
+      request.session_id, request.stamp, request.delivery_id, request.turn_id, request.response_turn_id) as
+      Array<{ work: string }>).map(row => row.work)
+}
+
+// A network send cannot be rolled back with SQLite. Fence the exact retained
+// request before calling Telegram, so a crash after its ACK cannot reoffer it.
+// For a final this is its admission, one write transaction with the check of
+// its scope: under the receiver it is refused before the network while
+// background work is open. The attempt's generation and the admission are
+// recorded in every mode; the shell senders arm the same fence.
+class OpenWorkRefusal extends Error {
+  constructor(message: string, readonly request: ScopedRequest, readonly work: string[]) { super(message) }
+}
+
+// A final refused because of open work: each worker named gets one refusal more.
+// The third makes it due for the owner's notice and releases it (NOVSKY 27.09),
+// so a model that cannot account for a worker does not loop on it. tg-send's
+// count_final_refusal() is the same rule.
+function countFinalRefusal(refusal: OpenWorkRefusal): void {
+  try {
+    MSG_DB.transaction(() => {
+      for (const item of refusal.work) {
+        const [kind, name] = [item.slice(0, item.indexOf(' ')), item.slice(item.indexOf(' ') + 1)]
+        const release = `final_refusals=final_refusals+1, silent_notified_at=CASE
+          WHEN final_refusals+1>=3 AND silent_notified_at IS NULL THEN 0 ELSE silent_notified_at END`
+        if (kind === 'task') MSG_DB.query(`UPDATE delivery_task_owners SET ${release}
+          WHERE session_id=? AND stamp=? AND task_id=?`).run(refusal.request.session_id, refusal.request.stamp, name)
+        else MSG_DB.query(`UPDATE delivery_task_launches SET ${release} WHERE launch_ref=?`).run(name)
+      }
+    }).immediate()
+  } catch (error) {
+    process.stderr.write(`telegram channel: refused final not counted: ${error}\n`)
+  }
+}
+
+function armOutboundAttempt(delivery: ResultDelivery, partialReceiptId?: number): void {
+  try { armOutboundTransaction(delivery, partialReceiptId) } catch (error) {
+    if (error instanceof OpenWorkRefusal) countFinalRefusal(error)
+    throw error
+  }
+}
+
+function armOutboundTransaction(delivery: ResultDelivery, partialReceiptId?: number): void {
+  MSG_DB.transaction(() => {
+    const now = Date.now()
+    if (partialReceiptId != null) {
+      const target = delivery.targets[0]
+      if (delivery.targets.length !== 1 || !target || delivery.offered_id ||
+        !MSG_DB.query(`SELECT 1 FROM delivery_results r JOIN delivery_receipts receipt
+          ON receipt.delivery_id=r.delivery_id AND receipt.chat_id=r.chat_id
+            AND receipt.thread_id IS r.thread_id AND receipt.stamp IS r.stamp
+          WHERE r.delivery_id=? AND r.turn_id=? AND r.chat_id=? AND r.thread_id IS ?
+            AND r.stamp IS ? AND r.result_generation=? AND r.outbound_attempt_at IS NOT NULL
+            AND r.state IN ('pending','deferred','paused','resume_pending')
+            AND receipt.source='reply' AND receipt.message_id=? LIMIT 1`)
+          .get(target.delivery_id, target.turn_id, delivery.chat_id, delivery.thread_id,
+            DELIVERY_STAMP, delivery.generations[0], partialReceiptId)) {
+        throw new Error('Acknowledged reply can no longer continue; nothing was sent')
+      }
+      return
+    }
+    if (!delivery.targets.length && delivery.offered_id) {
+      const changed = MSG_DB.query(`UPDATE delivery_results SET outbound_attempt_at=?, updated_at=?
+        WHERE delivery_id=? AND turn_id=0 AND chat_id=? AND thread_id IS ?
+          AND state='queued' AND outbound_attempt_at IS NULL`)
+        .run(now, now, delivery.offered_id, delivery.chat_id, delivery.thread_id).changes
+      if (changed !== 1) throw new Error('Outbound request changed before send; nothing was sent')
+    }
+    for (const [index, target] of delivery.targets.entries()) {
+      const current = MSG_DB.query(`SELECT delivery_id, session_id, stamp, turn_id, response_turn_id, state
+        FROM delivery_results WHERE delivery_id=? AND turn_id=? AND chat_id=? AND thread_id IS ? AND stamp IS ?`)
+        .get(target.delivery_id, target.turn_id, delivery.chat_id, delivery.thread_id, DELIVERY_STAMP) as
+        (ScopedRequest & { state: string }) | null
+      if (current?.state === 'complete') continue // another reply in the same completed turn
+      const open = delivery.phase === 'final' && current ? scopeWork(current) : []
+      if (open.length && WORKER_GATES) {
+        throw new OpenWorkRefusal(`Background work of this request is still open (${open.join(', ')}); nothing was sent. `
+          + 'Send a progress reply with its task_id now and the final answer after its callback, or stop that task first',
+          current!, open)
+      }
+      if (open.length) recordShadow('would_refuse_final', { chat_id: delivery.chat_id, thread_id: delivery.thread_id,
+        delivery_id: target.delivery_id, turn_id: target.turn_id, detail: open.join(', ') })
+      // A new attempt ends the link of a superseded one: something was sent after that final.
+      // The one resend a failed task notice was offered is used up once it is armed (R4-7).
+      const changed = MSG_DB.query(`UPDATE delivery_results SET outbound_attempt_at=?, updated_at=?,
+          outbound_attempt_generation=result_generation, outbound_attempt_pid=NULL, outbound_attempt_pid_start=NULL,
+          superseded_by=NULL, superseded_ack=NULL,
+          final_admitted_generation=CASE WHEN ? THEN result_generation ELSE final_admitted_generation END,
+          progress_retry=CASE WHEN ? AND progress_retry=result_generation || ':offered'
+            THEN result_generation || ':closed' ELSE progress_retry END
+        WHERE delivery_id=? AND turn_id=? AND chat_id=? AND thread_id IS ? AND stamp IS ?
+          AND state IN ('pending','deferred','paused','resume_pending')
+          AND result_generation=? AND outbound_attempt_at IS NULL`)
+        .run(now, now, delivery.phase === 'final' ? 1 : 0, delivery.task_id && WORKER_GATES ? 1 : 0,
+          target.delivery_id, target.turn_id, delivery.chat_id,
+          delivery.thread_id, DELIVERY_STAMP, delivery.generations[index]).changes
+      if (changed !== 1) throw new Error('Outbound request changed before send; nothing was sent')
+    }
+  }).immediate()
+}
+
+// A Bot API error response proves that no first part was accepted. A timeout
+// or broken acknowledgement does not, so those keep the crash fence.
+function disarmRejectedOutbound(delivery: ResultDelivery): void {
+  MSG_DB.transaction(() => {
+    if (!delivery.targets.length && delivery.offered_id) {
+      MSG_DB.query(`UPDATE delivery_results SET outbound_attempt_at=NULL WHERE delivery_id=?
+        AND turn_id=0 AND chat_id=? AND thread_id IS ? AND state='queued'`)
+        .run(delivery.offered_id, delivery.chat_id, delivery.thread_id)
+    }
+    // Nothing was delivered, so the admission and any link go too. Under the
+    // receiver this is the attempt's own generation, which a launch may have
+    // superseded since; the other modes keep today's exact-generation match.
+    for (const [index, target] of delivery.targets.entries()) {
+      MSG_DB.query(`UPDATE delivery_results SET outbound_attempt_at=NULL, outbound_attempt_generation=NULL,
+          final_admitted_generation=NULL, superseded_by=NULL, superseded_ack=NULL
+        WHERE delivery_id=? AND turn_id=? AND chat_id=? AND thread_id IS ? AND stamp IS ?
+          AND outbound_attempt_generation IS ? AND (? OR result_generation=outbound_attempt_generation)
+          AND state IN ('pending','deferred','paused','resume_pending')`)
+        .run(target.delivery_id, target.turn_id, delivery.chat_id, delivery.thread_id,
+          DELIVERY_STAMP, delivery.generations[index], WORKER_GATES ? 1 : 0)
+    }
+  })()
+}
+
+// R4-7, under the receiver: a task notice that failed short of its whole
+// acknowledgement may be sent once more only when repeating it is safe, one
+// text part with nothing delivered, and only once per generation, durably:
+// `<generation>:offered`. Any other failure, and the failure of that resend,
+// closes the retry: `<generation>:closed`, and admission refuses the next task
+// notice at that generation. True when the resend is offered.
+function recordProgressRetry(delivery: ResultDelivery, safe: boolean): boolean {
+  let offered = false
+  try {
+    MSG_DB.transaction(() => {
+      for (const [index, target] of delivery.targets.entries()) {
+        MSG_DB.query(`UPDATE delivery_results SET progress_retry=CASE WHEN ? AND (progress_retry IS NULL
+            OR progress_retry NOT LIKE result_generation || ':%') THEN result_generation || ':offered'
+            ELSE result_generation || ':closed' END, updated_at=?
+          WHERE delivery_id=? AND turn_id=? AND result_generation=?`)
+          .run(safe ? 1 : 0, Date.now(), target.delivery_id, target.turn_id, delivery.generations[index])
+        const row = MSG_DB.query(`SELECT progress_retry FROM delivery_results WHERE delivery_id=? AND turn_id=?`)
+          .get(target.delivery_id, target.turn_id) as { progress_retry: string | null } | null
+        offered = row?.progress_retry?.endsWith(':offered') ?? false
+      }
+    }).immediate()
+  } catch (error) {
+    process.stderr.write(`telegram channel: progress retry not recorded; no resend offered: ${error}\n`)
+    return false
+  }
+  return offered
+}
+
+// Under the receiver a final whose outcome is unknown, or whose later part
+// failed, is quarantined at once and exactly: its own request at its
+// attempt's generation, never another send in flight (R4-5). Its messages
+// close as outbound_uncertain and its carrier is retired while the request
+// payload survives; nothing is resent, /health counts it and the next tick
+// tells the owner (B0-b). If this write fails, the armed fence stays and the
+// startup sweep quarantines it instead. The other modes keep the fence until then.
+function quarantineUncertainFinal(delivery: ResultDelivery): void {
+  if (!WORKER_GATES) {
+    for (const target of delivery.targets) recordShadow('would_quarantine', { chat_id: delivery.chat_id,
+      thread_id: delivery.thread_id, delivery_id: target.delivery_id, turn_id: target.turn_id })
+    return
+  }
+  try {
+    MSG_DB.transaction(() => {
+      const now = Date.now()
+      const own: string[] = []
+      const block = `UPDATE delivery_results SET state='blocked', recovery_reason='outbound_uncertain',
+        finished_at=NULL, updated_at=? WHERE delivery_id=? AND turn_id=? AND outbound_attempt_at IS NOT NULL`
+      if (!delivery.targets.length && delivery.offered_id
+        && MSG_DB.query(`${block} AND state='queued'`).run(now, delivery.offered_id, 0).changes) {
+        own.push(delivery.offered_id)
+      }
+      for (const [index, target] of delivery.targets.entries()) {
+        if (MSG_DB.query(`${block} AND outbound_attempt_generation IS ?
+          AND state IN ('pending','deferred','paused','resume_pending')`)
+          .run(now, target.delivery_id, target.turn_id, delivery.generations[index]).changes) own.push(target.delivery_id)
+      }
+      for (const deliveryId of own) {
+        MSG_DB.query(`UPDATE delivery_turn_messages SET closed_by='outbound_uncertain', closed_at=?
+          WHERE delivery_id=? AND closed_at IS NULL`).run(now, deliveryId)
+        MSG_DB.query(`DELETE FROM pending_inbound_deliveries WHERE delivery_id=? AND EXISTS (
+          SELECT 1 FROM delivery_results WHERE delivery_id=? AND request_payload IS NOT NULL)`).run(deliveryId, deliveryId)
+      }
+      if (own.length) process.stderr.write(`telegram channel: uncertain final of ${own.join(', ')} retained without replay\n`)
+    }).immediate()
+  } catch (error) {
+    process.stderr.write(`telegram channel: uncertain final left fenced for the startup quarantine: ${error}\n`)
+  }
+}
+
+// The kernel's start time of a process, which a later process given the same
+// PID does not share: field 22 of /proc/<pid>/stat, or ps's lstart where there
+// is no /proc. tg-send's process_start() reads it the same way. Null if unknown.
+function processStart(pid: number): string | null {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, 'utf8')
+    return stat.slice(stat.lastIndexOf(')') + 1).trim().split(/\s+/)[19] ?? null
+  } catch {}
+  try {
+    return execFileSync('ps', ['-o', 'lstart=', '-p', String(pid)], { encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'], env: { ...process.env, TZ: 'UTC', LC_ALL: 'C' } }).trim() || null
+  } catch { return null }
+}
+
+// A shell sender killed on its way to Telegram by a hard kill, or before it
+// could settle a signal, leaves its attempt armed under its PID and that
+// process's start time. On the tick an attempt whose sender is gone ends as an
+// unknown outcome: a final, or a final a launch superseded, is quarantined
+// exactly (R4-5); a progress notice's fence clears. A PID that now names
+// another process, with another start time, counts as gone. The senders settle
+// SIGTERM and SIGINT themselves.
+// An attempt with no sender PID (one delivered but not recorded, R4-7, or an in-process send
+// left armed) outlives every sender's timeout only if nothing will settle it: past that bound
+// the tick settles it as the startup check does (U3 review P2-2, 27.09), instead of holding
+// its request and every chat behind it until a restart.
+const DETACHED_ATTEMPT_MS = envNumber('TG_DETACHED_ATTEMPT_MS', 15 * 60_000)
+function settleOrphanedShellAttempts(): void {
+  const armed = MSG_DB.query(`SELECT delivery_id, turn_id, chat_id, thread_id, outbound_attempt_at AS at,
+      outbound_attempt_pid AS pid, outbound_attempt_pid_start AS started, outbound_attempt_generation AS generation,
+      (final_admitted_generation IS outbound_attempt_generation OR superseded_by IS NOT NULL) AS final
+    FROM delivery_results WHERE outbound_attempt_at IS NOT NULL
+      AND (outbound_attempt_pid IS NOT NULL OR outbound_attempt_at <= ?)
+      AND state IN ('pending','deferred','paused','resume_pending')`).all(Date.now() - DETACHED_ATTEMPT_MS) as Array<{
+      delivery_id: string; turn_id: number; chat_id: string; thread_id: string | null; at: number
+      pid: number | null; started: string | null; generation: number | null; final: number }>
+  for (const row of armed) {
+    if (row.pid !== null) {
+      let gone = false
+      try { process.kill(row.pid, 0) } catch (error) {
+        gone = (error as { code?: string }).code === 'ESRCH' // EPERM: it exists, only not ours to signal
+      }
+      if (!gone) {
+        const started = row.started === null ? null : processStart(row.pid)
+        if (started === null || started === row.started) continue
+      }
+    }
+    if (row.final) {
+      quarantineUncertainFinal({ chat_id: row.chat_id, thread_id: row.thread_id, phase: 'final', task_id: null,
+        targets: [{ turn_id: row.turn_id, delivery_id: row.delivery_id }], generations: [row.generation] })
+    } else {
+      MSG_DB.query(`UPDATE delivery_results SET outbound_attempt_at=NULL, outbound_attempt_generation=NULL
+        WHERE delivery_id=? AND turn_id=? AND outbound_attempt_at=? AND outbound_attempt_pid IS ?`)
+        .run(row.delivery_id, row.turn_id, row.at, row.pid)
+    }
+    process.stderr.write(`telegram channel: ${row.pid === null ? 'the detached send' : 'the shell sender'} of `
+      + `${row.delivery_id} is ${row.pid === null ? 'past every sender\'s timeout' : 'gone'}; `
+      + `${row.final ? 'its final is quarantined' : 'its progress fence is cleared'}\n`)
+  }
+}
 
 // Open messages of open turns in this chat and topic, closed by a receipt or a
 // declared silence; in receiver mode their queue rows go with them.
@@ -1751,14 +2701,32 @@ function offeredHeadForReceipt(chat_id: string, thread_id: string | null): strin
     `SELECT 1 FROM delivery_turns t LEFT JOIN delivery_sessions s ON s.session_id = t.session_id
      WHERE t.closed_at IS NULL AND (s.session_id IS NULL OR ? IS NULL OR s.stamp = ?) LIMIT 1`,
   ).get(DELIVERY_STAMP, DELIVERY_STAMP)
-  if (ownTurnOpen) return null
-  const head = pendingInboundHead()
-  if (!head || head.state !== 'offered') return null
-  const chat = pendingInboundOrigin(head)
-  if (chat !== chat_id) return null
-  let thread: number | undefined
-  try { thread = pendingInboundThreadId(head, chat) } catch { return null }
-  if ((thread == null ? null : String(thread)) !== thread_id) return null
+  // The row actually offered, not whichever sorts first: a held head is offered while an
+  // older retained request waits behind it (Codex, 28.09, P1 3). Two offered rows are never
+  // guessed between: the send is refused before it reaches Telegram. All of them are read, so
+  // a matching one behind others left by earlier restarts is seen too (Codex, 28.09).
+  const offered = MSG_DB.query(
+    `SELECT p.rowid, p.delivery_id, p.payload, p.created_at, p.state, p.attempts, p.next_attempt_at
+     FROM pending_inbound_deliveries p WHERE p.state = 'offered'
+       AND NOT EXISTS (SELECT 1 FROM delivery_results b WHERE b.state = 'blocked' AND b.delivery_id = p.delivery_id)
+     ORDER BY p.created_at ASC, p.rowid ASC`,
+  ).all() as PendingInboundRow[]
+  const here = (row: PendingInboundRow): boolean => {
+    if (pendingInboundOrigin(row) !== chat_id) return false
+    try {
+      const thread = pendingInboundThreadId(row, chat_id)
+      return (thread == null ? null : String(thread)) === thread_id
+    } catch { return false }
+  }
+  if (ownTurnOpen) {
+    // An unrelated open turn makes crediting the head unsafe, and an unbound final would leave
+    // it offered for a second answer (Codex, 28.09): the send is refused before Telegram.
+    if (offered.some(here)) throw new Error('A request in this chat is offered and not taken yet: pass its delivery_id for this reply')
+    return null
+  }
+  if (offered.length > 1) throw new Error('Several requests are offered at once: pass the original delivery_id for this reply')
+  const head = offered[0]
+  if (!head || !here(head)) return null
   const lastStop = MSG_DB.query(
     `SELECT max(last_stop_at) AS at FROM delivery_sessions WHERE ? IS NULL OR stamp = ?`,
   ).get(DELIVERY_STAMP, DELIVERY_STAMP) as { at: number | null }
@@ -1808,14 +2776,42 @@ function adoptRecoveredCallback(chat_id: string, thread_id: string | null, deliv
 function receiptContext(chat_id: string, thread_id: string | null, delivery_id?: unknown): Pick<Receipt, 'targets' | 'offered_id'> {
   if (delivery_id != null) {
     if (typeof delivery_id !== 'string') throw new Error('delivery_id must be the original inbound delivery_id')
-    const target = (MSG_DB.query(`SELECT r.turn_id, r.delivery_id FROM delivery_results r
+    type ExplicitTarget = Receipt['targets'][number] & { session_id: string; state: string; response_turn_id: number | null }
+    const findTarget = () => MSG_DB.query(`SELECT r.turn_id, r.delivery_id, r.session_id, r.state, r.response_turn_id FROM delivery_results r
       JOIN delivery_sessions s ON s.session_id=r.session_id AND s.stamp IS r.stamp
       WHERE r.delivery_id = ? AND r.chat_id = ? AND r.thread_id IS ? AND r.stamp IS ?`)
-      .get(delivery_id, chat_id, thread_id, DELIVERY_STAMP) as Receipt['targets'][number] | null)
-      ?? adoptRecoveredCallback(chat_id, thread_id, delivery_id)
+      .get(delivery_id, chat_id, thread_id, DELIVERY_STAMP) as ExplicitTarget | null
+    let target = findTarget()
+    if (!target && adoptRecoveredCallback(chat_id, thread_id, delivery_id)) target = findTarget()
     if (!target) throw new Error('delivery_id does not belong to this chat, topic and service session')
-    return { targets: [target], offered_id: null }
+    const current = MSG_DB.query(`SELECT turn_id FROM delivery_turns WHERE session_id=? AND closed_at IS NULL
+      ORDER BY turn_id DESC LIMIT 1`).get(target.session_id) as { turn_id: number } | null
+    const ownsCurrent = current != null && (target.turn_id === current.turn_id || target.response_turn_id === current.turn_id)
+    if (['no_reply', 'cancelled', 'failed', 'blocked'].includes(target.state) || (target.state === 'complete' && !ownsCurrent)) {
+      throw new Error('delivery_id has no unfinished result in this turn')
+    }
+    // A still-open deferred result may finish while another input from this
+    // chat is active. Its exact receipt belongs to the old result only; the
+    // current input keeps its own transport head and result obligation.
+    return { targets: [{ turn_id: target.turn_id, delivery_id: target.delivery_id }], offered_id: null }
   }
+  // A native return without an origin blocks implicit credit only in its
+  // open turn's chat/topic. The historical row stops blocking once it closes.
+  const unboundCallback = MSG_DB.query(`SELECT 1 FROM delivery_task_returns ret
+    JOIN delivery_turns t ON t.turn_id=ret.turn_id AND t.session_id=ret.session_id
+    JOIN delivery_sessions s ON s.session_id=ret.session_id
+    WHERE t.closed_at IS NULL AND s.stamp IS ? AND ret.stamp IS s.stamp
+      AND ret.delivery_id IS NULL AND (
+        EXISTS (SELECT 1 FROM delivery_turn_messages m WHERE m.turn_id=t.turn_id
+          AND m.chat_id=? AND m.thread_id IS ?)
+        OR EXISTS (SELECT 1 FROM delivery_results r WHERE r.response_turn_id=t.turn_id
+          AND r.session_id=t.session_id AND r.stamp IS s.stamp
+          AND r.chat_id=? AND r.thread_id IS ?)
+        OR EXISTS (SELECT 1 FROM delivery_results r WHERE r.session_id=t.session_id
+          AND r.stamp IS s.stamp AND r.task_id=ret.task_id AND r.state='deferred'
+          AND r.chat_id=? AND r.thread_id IS ?)) LIMIT 1`)
+    .get(DELIVERY_STAMP, chat_id, thread_id, chat_id, thread_id, chat_id, thread_id)
+  if (unboundCallback) throw new Error('An unbound native callback is active: pass its exact original delivery_id')
   const targets = MSG_DB.query(
     `SELECT m.turn_id, m.delivery_id FROM delivery_turn_messages m
      JOIN delivery_turns t ON t.turn_id = m.turn_id
@@ -1841,7 +2837,8 @@ function receiptContext(chat_id: string, thread_id: string | null, delivery_id?:
   return { targets, offered_id }
 }
 
-function resultDelivery(chat_id: string, thread_id: string | null, targets: Receipt['targets'], phase: unknown, task_id: unknown): ResultDelivery {
+function resultDelivery(chat_id: string, thread_id: string | null, targets: Receipt['targets'], phase: unknown, task_id: unknown,
+  storedContext = false): ResultDelivery {
   // Compatibility for saved prompts; clarification is an ordinary final answer.
   if (phase === 'verification') phase = 'final'
   if (phase !== 'progress' && phase !== 'final') throw new Error('phase must be progress or final')
@@ -1850,13 +2847,88 @@ function resultDelivery(chat_id: string, thread_id: string | null, targets: Rece
       throw new Error('task_id requires a progress reply bound to an inbound request; use the exact launched background task ID')
     }
   }
-  return { chat_id, thread_id, targets, phase, task_id: task_id as string | null ?? null }
+  const generations = targets.map(target => {
+    if (storedContext) {
+      const captured = (target as typeof target & { result_generation?: unknown }).result_generation
+      return Number.isSafeInteger(captured) && Number(captured) >= 0 ? Number(captured) : null
+    }
+    const row = MSG_DB.query(`SELECT result_generation FROM delivery_results
+      WHERE delivery_id=? AND turn_id=? AND chat_id=? AND thread_id IS ? AND stamp IS ?`)
+      .get(target.delivery_id, target.turn_id, chat_id, thread_id, DELIVERY_STAMP) as
+      { result_generation: number } | null
+    return row?.result_generation ?? null
+  })
+  return { chat_id, thread_id, targets, phase, task_id: task_id as string | null ?? null, generations }
+}
+
+// A progress notice with a task_id registers its task. Guard and shadow bind it
+// before the network, as before. Under the receiver only the checks run here,
+// together with the progress retry of R4-7: the registration itself is written
+// by the transaction that records Telegram's acknowledgement of the whole
+// notice (registerAcknowledged, B0-a), so a notice short of that registers
+// nothing.
+// Кнопа 24605 (27.09; NOVSKY 28.09): a second acknowledgement of a request tells
+// the person nothing new. Under the receiver a progress for a request whose last
+// receipted acknowledgement is younger than this window is refused before the
+// network; shadow records what it would do and sends. After the window a real
+// «still working» update goes through; a final is never held; a progress whose
+// outcome was unknown has no receipt, so its one resend stays as B0-a allows it.
+const PROGRESS_REPEAT_WINDOW_MS = envNumber('TG_PROGRESS_REPEAT_WINDOW_MS', 600_000)
+
+// The last receipt of every target of a progress, when each is younger than the window.
+function repeatedAcknowledgement(delivery: ResultDelivery): number | null {
+  if (delivery.phase !== 'progress' || !delivery.targets.length) return null
+  let last = 0
+  for (const target of delivery.targets) {
+    const at = (MSG_DB.query(`SELECT max(created_at) AS at FROM delivery_receipts WHERE delivery_id=? AND phase='progress'`)
+      .get(target.delivery_id) as { at: number | null }).at
+    if (at == null || Date.now() - at >= PROGRESS_REPEAT_WINDOW_MS) return null
+    last = Math.max(last, at)
+  }
+  return last
+}
+
+// A progress repeating an acknowledgement younger than the window. Guard and
+// shadow send it as today and only log what the receiver would do; shadow also
+// records it. Under the receiver a plain progress is refused before the network.
+// One that names a task is not sent either and is no failure (NOVSKY 28.09, b):
+// the earlier acknowledgement proves the person was told, so the task is
+// registered in its own transaction as B0-a registers it after Telegram's ACK,
+// with no receipt, no outbound row and no fence. Returns what the tool answers.
+function refuseRepeatedAcknowledgement(delivery: ResultDelivery): string | null {
+  const acknowledged = repeatedAcknowledgement(delivery)
+  if (acknowledged == null) return null
+  const since = `${Math.floor((Date.now() - acknowledged) / 1000)} s since the receipted acknowledgement`
+  if (!WORKER_GATES) {
+    process.stderr.write(`telegram channel: the receiver would refuse a repeated progress of `
+      + `${delivery.targets.map(target => target.delivery_id).join(', ')} (${since})\n`)
+    for (const target of delivery.targets) recordShadow('would_refuse_repeat_progress', { chat_id: delivery.chat_id,
+      thread_id: delivery.thread_id, delivery_id: target.delivery_id, turn_id: target.turn_id, detail: since })
+    return null
+  }
+  const at = `${new Date(acknowledged).toISOString().slice(11, 16)} UTC`
+  const refusal = `вже підтверджено о ${at}, продовжуй роботу і відповідай результатом`
+  if (delivery.task_id == null) throw new Error(refusal)
+  // All targets register or none: a refused one rolls back the ones before it (B4 review P1).
+  const generations = [...delivery.generations]
+  try {
+    MSG_DB.transaction(() => {
+      for (const index of delivery.targets.keys()) {
+        if (!registerAcknowledged(delivery, index, Date.now())) throw new Error('not registered')
+      }
+    }).immediate()
+  } catch (error) {
+    if (!(error instanceof Error && error.message === 'not registered')) {
+      process.stderr.write(`telegram channel: repeated progress registration rolled back: ${error}\n`)
+    }
+    delivery.generations = generations
+    throw new Error(`${refusal}; the task ${delivery.task_id} was not registered`)
+  }
+  return `registered; not sent — the author was already acknowledged at ${at}; put anything new in the final`
 }
 
 function registerBackgroundResult(delivery: ResultDelivery): void {
   if (!delivery.task_id) return
-  // The task already exists. Bind it durably before acknowledging it on the
-  // network, so even an immediate callback can find its original request.
   MSG_DB.transaction(() => {
     // SendMessage reuses the agent ID. Release its previous owner only after
     // both the native callback and the final disposition, not a terminal ACK
@@ -1868,49 +2940,371 @@ function registerBackgroundResult(delivery: ResultDelivery): void {
       throw new Error('Another request still owns this task_id; use its original delivery_id until its native callback is read, or start a separate task')
     }
     for (const target of delivery.targets) {
-      const returned = MSG_DB.query(`SELECT 1 FROM delivery_unbound_task_returns u
-        JOIN delivery_results r ON r.session_id = u.session_id AND r.stamp = u.stamp
-        LEFT JOIN delivery_turn_messages m ON m.turn_id = r.turn_id AND m.delivery_id = r.delivery_id
-        WHERE u.task_id = ? AND r.delivery_id = ? AND r.turn_id = ? AND r.stamp IS ?
-          AND u.observed_at >= coalesce(m.taken_at, r.created_at)`)
-        .get(delivery.task_id, target.delivery_id, target.turn_id, DELIVERY_STAMP)
-      if (returned) {
-        throw new Error('This task already returned before registration; send its final result with the original delivery_id, or start a fresh background task')
+      const session = MSG_DB.query(`SELECT session_id, turn_id, response_turn_id, result_generation,
+        final_admitted_generation, outbound_attempt_at, state FROM delivery_results
+        WHERE delivery_id=? AND turn_id=? AND chat_id=? AND thread_id IS ? AND stamp IS ?`)
+        .get(target.delivery_id, target.turn_id, delivery.chat_id, delivery.thread_id, DELIVERY_STAMP) as
+        { session_id: string; turn_id: number; response_turn_id: number | null; result_generation: number;
+          final_admitted_generation: number | null; outbound_attempt_at: number | null; state: string } | null
+      if (!session) throw new Error('Background task origin is unavailable; no acknowledgement was sent')
+      // The fence: a final admitted at this generation may already be on the
+      // network, and no send of the request overlaps another.
+      const underFinal = session.final_admitted_generation != null
+        && session.final_admitted_generation === session.result_generation
+      if (underFinal && WORKER_GATES) {
+        throw new Error('A final answer of this request is already admitted and may be on its way; this task cannot be registered under it. Read its result or stop the task; do not resend the final')
+      }
+      if (underFinal) recordShadow('would_refuse_registration', { chat_id: delivery.chat_id,
+        thread_id: delivery.thread_id, delivery_id: target.delivery_id, turn_id: target.turn_id, detail: delivery.task_id })
+      if (session.outbound_attempt_at != null && WORKER_GATES) {
+        throw new Error('Another send of this request is still on its way; nothing was sent')
+      }
+      // The old schema retained only the *latest* task_id for each result.
+      // After an upgrade, another task ID from that same historical session
+      // could be forgotten and its delayed callback could steal a new request.
+      const epoch = MSG_DB.query(`SELECT value FROM delivery_runtime WHERE key=?`)
+        .get(`callback_ledger_epoch:${DELIVERY_STAMP}`) as { value: string } | null
+      const epochMs = Number(epoch?.value)
+      if (!Number.isSafeInteger(epochMs) || epochMs <= 0) {
+        // Codex, task 46: the ledger's safety refusals belong to the receiver. Under guard and
+        // shadow the request goes to its worker as it did before K; shadow records the refusal.
+        if (WORKER_GATES) throw new Error('Native callback ledger epoch is unavailable; no background task was registered')
+        recordShadow('would_refuse_registration', { chat_id: delivery.chat_id, thread_id: delivery.thread_id,
+          delivery_id: target.delivery_id, turn_id: target.turn_id, detail: `no callback epoch: ${delivery.task_id}` })
+      }
+      // The startup snapshot survives --resume and a retained request moving
+      // into a truly fresh native session. A known worker may still continue
+      // its original delivery, but an unknown old ID cannot change owners.
+      const legacySession = MSG_DB.query(`SELECT 1 FROM delivery_legacy_native_sessions
+        WHERE session_id=? LIMIT 1`)
+        .get(session.session_id)
+      const knownSameOwner = MSG_DB.query(`SELECT 1 FROM delivery_task_owners
+        WHERE task_id=? AND delivery_id=? LIMIT 1`)
+        .get(delivery.task_id, target.delivery_id)
+      if (legacySession && !knownSameOwner) {
+        // Knopa, 29.09: a session resumed across the upgrade is refused only where the receiver
+        // owns delivery. Under guard and shadow the refusal kept every request in the foreground
+        // and held the queue behind it; there the session keeps its background work, as before.
+        if (WORKER_GATES) throw new Error('This native session predates callback tracking; start a fresh agent session for background work')
+        recordShadow('would_refuse_registration', { chat_id: delivery.chat_id, thread_id: delivery.thread_id,
+          delivery_id: target.delivery_id, turn_id: target.turn_id, detail: `legacy session: ${delivery.task_id}` })
+      }
+      const earlierOwner = MSG_DB.query(`SELECT 1 FROM delivery_task_owners
+        WHERE task_id=? AND delivery_id IS NOT ? AND NOT (session_id=? AND stamp=?) LIMIT 1`)
+        .get(delivery.task_id, target.delivery_id, session.session_id, DELIVERY_STAMP)
+      if (earlierOwner) {
+        if (WORKER_GATES) throw new Error('This native task_id belonged to another request, including a previous service session; start a fresh background task')
+        recordShadow('would_refuse_registration', { chat_id: delivery.chat_id, thread_id: delivery.thread_id,
+          delivery_id: target.delivery_id, turn_id: target.turn_id, detail: `earlier owner: ${delivery.task_id}` })
+      }
+      // The launch hook wrote this launch's obligation, unowned. Progress makes
+      // it this request's own, at the same occurrence and launch. Under the
+      // receiver only the launch of the request's own turns is its to claim; a
+      // launch made after every request of its turn was answered belongs to no
+      // request. A task with no recorded launch is owned by its request.
+      const owner = registrationOwner(delivery.task_id, target, session)
+      if (!WORKER_GATES && owner && owner.state !== 'unowned' && owner.delivery_id !== target.delivery_id) {
+        recordShadow('would_refuse_registration', { chat_id: delivery.chat_id, thread_id: delivery.thread_id,
+          delivery_id: target.delivery_id, turn_id: target.turn_id, detail: `owned by ${owner.delivery_id}: ${delivery.task_id}` })
+      }
+      if (WORKER_GATES) {
+        // R4-7: after a failed notice at this generation that may not be repeated, or
+        // after its one resend, no further notice with a task_id goes out.
+        const retry = MSG_DB.query(`SELECT progress_retry FROM delivery_results WHERE delivery_id=? AND turn_id=?`)
+          .get(target.delivery_id, target.turn_id) as { progress_retry: string | null } | null
+        if (retry?.progress_retry === `${session.result_generation}:closed`) {
+          throw new Error('A progress notice of this request already failed and may not be repeated; nothing was sent. The request waits for its background task: send its final result after the callback, or stop the task')
+        }
+        continue
+      }
+      if (!owner) {
+        MSG_DB.query(`INSERT INTO delivery_task_owners (session_id,stamp,task_id,delivery_id,state)
+          VALUES (?,?,?,?,'owned')`).run(session.session_id, DELIVERY_STAMP, delivery.task_id, target.delivery_id)
+        process.stderr.write(`telegram channel: task ${delivery.task_id} has no recorded launch; `
+          + `it is owned by request ${target.delivery_id}\n`)
+      } else if (owner.state === 'unowned') {
+        MSG_DB.query(`UPDATE delivery_task_owners SET state='owned', delivery_id=?
+          WHERE session_id=? AND stamp=? AND task_id=? AND state='unowned'`)
+          .run(target.delivery_id, session.session_id, DELIVERY_STAMP, delivery.task_id)
+      } else if (owner.state === 'returned' || owner.state === 'stopped'
+          || ((owner.state === 'owned' || owner.state === 'legacy') && owner.delivery_id !== target.delivery_id)) {
+        // Codex, task 46 rounds 2-3 P0: under guard and shadow a worker another request owned, or
+        // that the startup backfill rebuilt for another request (legacy, which callbacks never bind
+        // to), goes to the request that registered it, and its callback answers that one, as before
+        // K. An unread callback of an open or answered request refused this above (`previous`).
+        // A request's own legacy obligation still waits for exact proof of its launch.
+        ownAgain(session.session_id, delivery.task_id, owner.state, target.delivery_id)
       }
       const changed = MSG_DB.query(`UPDATE delivery_results SET state = 'deferred', task_id = ?,
-        response_turn_id = NULL, updated_at = ? WHERE delivery_id = ? AND turn_id = ?
+        response_turn_id = NULL, result_generation=result_generation+1, updated_at = ? WHERE delivery_id = ? AND turn_id = ?
         AND chat_id = ? AND thread_id IS ? AND stamp IS ? AND state IN ('pending', 'deferred')`)
         .run(delivery.task_id, Date.now(), target.delivery_id, target.turn_id,
           delivery.chat_id, delivery.thread_id, DELIVERY_STAMP).changes
       if (changed !== 1) throw new Error('Background task registration failed; no acknowledgement was sent')
     }
   })()
+  if (!WORKER_GATES) delivery.generations = delivery.generations.map(generation => generation == null ? null : generation + 1)
+}
+
+// A task of this request that returned or was stopped, registered again with
+// no recorded new launch (a resume the launch hook did not see): the request
+// owns its next round, as a task with no recorded launch. Under guard and shadow
+// this is also how another request's worker, owned or legacy, moves to the one registering it.
+function ownAgain(session: string, task: string, state: string, delivery: string): void {
+  MSG_DB.query(`UPDATE delivery_task_owners SET state='owned', delivery_id=?, occurrence=occurrence+1,
+      launch_ref=NULL, launched_turn=NULL, silent_notified_at=NULL, final_refusals=0
+    WHERE session_id=? AND stamp=? AND task_id=? AND state=?`).run(delivery, session, DELIVERY_STAMP, task, state)
+  process.stderr.write(`telegram channel: task ${task} has no recorded launch; it is owned by request ${delivery}\n`)
+}
+
+// The owner row a registration of `task` by this request takes over, after the
+// checks that belong to it: under the receiver a launch of the request's own
+// turns is its to claim, and a launch made after every request of its turn was
+// answered belongs to no request. A deferred request may also claim a launch of
+// another turn by this explicit notice (the coordinator's decision (a), 26.09):
+// its worker's callback turn launched work for it. A task with no recorded
+// launch has no owner row.
+function registrationOwner(task: string, target: Receipt['targets'][number],
+  session: { session_id: string; turn_id: number; response_turn_id: number | null; state: string }):
+  { delivery_id: string | null; state: string; launched_turn: number | null } | null {
+  const owner = MSG_DB.query(`SELECT delivery_id, state, launched_turn FROM delivery_task_owners
+    WHERE session_id=? AND stamp=? AND task_id=?`)
+    .get(session.session_id, DELIVERY_STAMP, task) as
+    { delivery_id: string | null; state: string; launched_turn: number | null } | null
+  if (owner?.state === 'unowned' && session.state !== 'deferred') {
+    if (WORKER_GATES && owner.launched_turn == null) {
+      throw new Error('This task was launched after its request was answered, so it belongs to no request and progress cannot register it. Read its result when it returns, or stop it')
+    }
+    if (WORKER_GATES && owner.launched_turn !== session.turn_id && owner.launched_turn !== session.response_turn_id) {
+      throw new Error("This task was launched in another request's turn; register it with that request's delivery_id, or stop it")
+    }
+  } else if (WORKER_GATES && owner && owner.state !== 'unowned' && owner.delivery_id !== target.delivery_id) {
+    throw new Error('This native task_id belonged to another request in this session; start a fresh background task')
+  }
+  const returned = MSG_DB.query(`SELECT 1 FROM delivery_unbound_task_returns u
+    JOIN delivery_results r ON r.session_id = u.session_id AND r.stamp = u.stamp
+    LEFT JOIN delivery_turn_messages m ON m.turn_id = r.turn_id AND m.delivery_id = r.delivery_id
+    WHERE u.task_id = ? AND r.delivery_id = ? AND r.turn_id = ? AND r.stamp IS ?
+      AND u.observed_at >= coalesce(m.taken_at, r.created_at)`)
+    .get(task, target.delivery_id, target.turn_id, DELIVERY_STAMP)
+  if (returned) {
+    throw new Error('This task already returned before registration; send its final result with the original delivery_id, or start a fresh background task')
+  }
+  return owner
+}
+
+// Under the receiver, in the transaction that records Telegram's
+// acknowledgement of a whole progress notice with a task_id: the checks run
+// again and the registration is written (B0-a). The task becomes the
+// request's own, the request is deferred to it at the next generation, and the
+// proven deferral is the head's own proof, so the head leaves the queue (B0-b,
+// v6.3). A registration in a callback turn keeps that open turn in the
+// request's scope, so the turn's other launches stay the request's (U2 review
+// P1-2). If a check no longer holds, the notice stays an acknowledged plain
+// progress and the reason goes to the log. False when nothing was registered.
+function registerAcknowledged(delivery: ResultDelivery, index: number, now: number): boolean {
+  const target = delivery.targets[index]!
+  const session = MSG_DB.query(`SELECT session_id, turn_id, response_turn_id, result_generation,
+    final_admitted_generation, state FROM delivery_results WHERE delivery_id=? AND turn_id=? AND chat_id=? AND thread_id IS ?
+      AND stamp IS ? AND state IN ('pending','deferred') AND result_generation=?`)
+    .get(target.delivery_id, target.turn_id, delivery.chat_id, delivery.thread_id, DELIVERY_STAMP,
+      delivery.generations[index]) as { session_id: string; turn_id: number; response_turn_id: number | null;
+      result_generation: number; final_admitted_generation: number | null; state: string } | null
+  if (!session) return false // registered already, or moved on by a callback or a recovery
+  try {
+    if (session.final_admitted_generation === session.result_generation) {
+      throw new Error('a final of this request was admitted meanwhile')
+    }
+    const owner = registrationOwner(delivery.task_id!, target, session)
+    if (!owner) {
+      MSG_DB.query(`INSERT INTO delivery_task_owners (session_id,stamp,task_id,delivery_id,state)
+        VALUES (?,?,?,?,'owned')`).run(session.session_id, DELIVERY_STAMP, delivery.task_id, target.delivery_id)
+      process.stderr.write(`telegram channel: task ${delivery.task_id} has no recorded launch; `
+        + `it is owned by request ${target.delivery_id}\n`)
+    } else if (owner.state === 'unowned') {
+      MSG_DB.query(`UPDATE delivery_task_owners SET state='owned', delivery_id=?
+        WHERE session_id=? AND stamp=? AND task_id=? AND state='unowned'`)
+        .run(target.delivery_id, session.session_id, DELIVERY_STAMP, delivery.task_id)
+    } else if (owner.state === 'returned' || owner.state === 'stopped') {
+      ownAgain(session.session_id, delivery.task_id!, owner.state, target.delivery_id)
+    }
+  } catch (error) {
+    process.stderr.write(`telegram channel: progress of ${target.delivery_id} registers nothing: ${error}\n`)
+    return false
+  }
+  MSG_DB.query(`UPDATE delivery_results SET state='deferred', task_id=?,
+      response_turn_id=CASE WHEN EXISTS (SELECT 1 FROM delivery_turns t WHERE t.turn_id=delivery_results.response_turn_id
+        AND t.closed_at IS NULL) THEN response_turn_id ELSE NULL END,
+      result_generation=result_generation+1, acknowledged_at=coalesce(acknowledged_at,?), updated_at=?,
+      outbound_attempt_at=NULL, outbound_attempt_generation=NULL
+    WHERE delivery_id=? AND turn_id=? AND result_generation=?`)
+    .run(delivery.task_id, now, now, target.delivery_id, target.turn_id, session.result_generation)
+  settleHead(target, delivery.chat_id, delivery.thread_id, now)
+  delivery.generations[index] = session.result_generation + 1
+  return true
+}
+
+// Under the receiver a head leaves only by its own proof (B0-b): its final's
+// terminal receipt or its proven deferral, recorded in the same transaction.
+function settleHead(target: Receipt['targets'][number], chat_id: string, thread_id: string | null, now: number): void {
+  MSG_DB.query(`UPDATE delivery_turn_messages SET closed_by='receipt', closed_at=?
+    WHERE turn_id=? AND delivery_id=? AND chat_id=? AND thread_id IS ? AND closed_at IS NULL`)
+    .run(now, target.turn_id, target.delivery_id, chat_id, thread_id)
+  MSG_DB.query(`DELETE FROM pending_inbound_deliveries WHERE delivery_id=? AND state IN ('started','recovering')`)
+    .run(target.delivery_id)
+}
+
+// The terminal receipt of a request its final completed, at its current
+// generation, naming the exact native callback it answered.
+function writeTerminalReceipt(target: Receipt['targets'][number], chat_id: string, thread_id: string | null,
+  source: string, message_id: number, now: number): void {
+  const result = MSG_DB.query(`SELECT session_id, stamp, task_id, response_turn_id, result_generation
+    FROM delivery_results WHERE delivery_id=? AND turn_id=?`)
+    .get(target.delivery_id, target.turn_id) as {
+      session_id: string; stamp: string; task_id: string | null;
+      response_turn_id: number | null; result_generation: number
+    } | null
+  if (!result?.stamp) return
+  const returned = result.task_id && result.response_turn_id != null
+    ? MSG_DB.query(`SELECT return_id FROM delivery_task_returns WHERE session_id=? AND stamp=?
+        AND delivery_id=? AND turn_id=? AND task_id=? ORDER BY return_id DESC LIMIT 1`)
+      .get(result.session_id, result.stamp, target.delivery_id, result.response_turn_id, result.task_id) as
+        { return_id: number } | null
+    : null
+  MSG_DB.query(`INSERT OR IGNORE INTO delivery_terminal_receipts
+    (delivery_id,turn_id,session_id,stamp,chat_id,thread_id,result_generation,
+     task_return_id,source,message_id,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
+    .run(target.delivery_id, target.turn_id, result.session_id, result.stamp, chat_id, thread_id,
+      result.result_generation, returned?.return_id ?? null, source, message_id, now)
+}
+
+// What the ACK of a superseded final proves now (v6): 'complete' once no work
+// of its scope is open; 'keep' while the only open work is calls not resolved
+// yet, which may still launch nothing; 'evidence' once a worker of its scope
+// was launched after that final, so the request waits for it. tg-send's
+// ack_verdict() is the same rule.
+function ackVerdict(request: ScopedRequest): 'complete' | 'keep' | 'evidence' {
+  const work = scopeWork(request)
+  if (work.some(item => item.startsWith('task '))) return 'evidence'
+  return work.length ? 'keep' : 'complete'
+}
+
+// Under the receiver, the ACK of a final whose generation a later launch
+// moved on (v3 B1, R4-1). Its outcome is known, so its fence clears. By
+// ackVerdict(): while calls of its scope are unresolved, the ACK is kept, and
+// each later PostToolUse in that scope decides (settle_superseded_at_post);
+// with no work open, the request completes with this final, in this
+// transaction; once the superseding call or another call of its scope launched
+// a worker, the answer is acknowledged, non-terminal evidence: the request
+// waits for that worker. The shell senders' settle_superseded() is the same
+// transition.
+function settleSupersededFinal(target: Receipt['targets'][number], delivery: ResultDelivery,
+  generation: number | null, source: string, message_id: number, now: number): void {
+  const row = MSG_DB.query(`SELECT r.delivery_id, r.session_id, r.stamp, r.turn_id, r.response_turn_id,
+      l.state AS launch FROM delivery_results r LEFT JOIN delivery_task_launches l ON l.launch_ref=r.superseded_by
+    WHERE r.delivery_id=? AND r.turn_id=? AND r.chat_id=? AND r.thread_id IS ? AND r.stamp IS ?
+      AND r.state IN ('pending','deferred') AND r.outbound_attempt_at IS NOT NULL AND r.outbound_attempt_generation IS ?`)
+    .get(target.delivery_id, target.turn_id, delivery.chat_id, delivery.thread_id, DELIVERY_STAMP, generation) as
+    (ScopedRequest & { launch: string | null }) | null
+  if (!row) return
+  // With no superseding call on record, a callback or a recovery moved the
+  // generation on: the answer it now owes is not this one.
+  const verdict = row.launch == null || row.launch === 'resolved' ? 'evidence' : ackVerdict(row)
+  if (verdict === 'keep') {
+    MSG_DB.query(`UPDATE delivery_results SET outbound_attempt_at=NULL, outbound_attempt_generation=NULL,
+      superseded_ack=?, acknowledged_at=coalesce(acknowledged_at,?), updated_at=? WHERE delivery_id=? AND turn_id=?`)
+      .run(`${source}:${message_id}`, now, now, target.delivery_id, target.turn_id)
+    return
+  }
+  const complete = verdict === 'complete'
+  MSG_DB.query(`UPDATE delivery_results SET outbound_attempt_at=NULL, outbound_attempt_generation=NULL,
+      superseded_by=NULL, superseded_ack=NULL, acknowledged_at=coalesce(acknowledged_at,?), updated_at=?,
+      state=CASE WHEN ? THEN 'complete' ELSE state END, finished_at=CASE WHEN ? THEN ? ELSE finished_at END
+    WHERE delivery_id=? AND turn_id=?`)
+    .run(now, now, complete ? 1 : 0, complete ? 1 : 0, now, target.delivery_id, target.turn_id)
+  if (complete) writeTerminalReceipt(target, delivery.chat_id, delivery.thread_id, source, message_id, now)
+}
+
+// A new service stamp: every call of an older stamp died unresolved, with the
+// session that made it, so no Post will decide a recorded ACK of that stamp
+// (P2-2). It completes its request with the final it acknowledges, unless a
+// worker of its scope was launched, which leaves the answer as evidence for the
+// recovery of that request. Without this the recovery would answer again.
+function settleAcksOfEndedStamps(): void {
+  const acked = MSG_DB.query(`SELECT delivery_id, session_id, stamp, turn_id, response_turn_id, chat_id,
+      thread_id, superseded_ack AS ack FROM delivery_results
+    WHERE superseded_ack IS NOT NULL AND stamp IS NOT ? AND state IN ('pending','deferred')
+      AND outbound_attempt_at IS NULL`).all(DELIVERY_STAMP) as Array<ScopedRequest & {
+      chat_id: string; thread_id: string | null; ack: string }>
+  for (const row of acked) {
+    MSG_DB.transaction(() => {
+      const now = Date.now()
+      const [source, message] = row.ack.split(':')
+      const complete = /^[0-9]+$/.test(message ?? '') && !scopeWork(row).some(item => item.startsWith('task '))
+      const changed = MSG_DB.query(`UPDATE delivery_results SET superseded_by=NULL, superseded_ack=NULL,
+          updated_at=?, state=CASE WHEN ? THEN 'complete' ELSE state END,
+          finished_at=CASE WHEN ? THEN ? ELSE finished_at END
+        WHERE delivery_id=? AND turn_id=? AND superseded_ack=? AND state IN ('pending','deferred')
+          AND outbound_attempt_at IS NULL`)
+        .run(now, complete ? 1 : 0, complete ? 1 : 0, now, row.delivery_id, row.turn_id, row.ack).changes
+      if (changed && complete) {
+        writeTerminalReceipt(row, row.chat_id, row.thread_id, source!, Number(message), now)
+      }
+    }).immediate()
+  }
 }
 
 function recordResult(delivery: ResultDelivery): void {
   try {
+    const boundReply = (delivery.targets.length > 0 || delivery.offered_id != null)
+      && delivery.first_message_id != null
+    if (boundReply && !MSG_DB.query(`SELECT 1 FROM delivery_receipts WHERE source='reply'
+      AND message_id=? AND chat_id=? AND thread_id IS ? AND stamp IS ? AND delivery_id=? LIMIT 1`)
+      .get(delivery.first_message_id, delivery.chat_id, delivery.thread_id, DELIVERY_STAMP,
+        delivery.targets[0]?.delivery_id ?? delivery.offered_id)) {
+      throw new Error('reply receipt is not durable yet')
+    }
     MSG_DB.transaction(() => {
       const now = Date.now()
       if (!delivery.targets.length && delivery.offered_id) {
         const changed = MSG_DB.query(`UPDATE delivery_results SET state=coalesce(?,state),
-          acknowledged_at=coalesce(acknowledged_at,?), finished_at=?, updated_at=?
+          acknowledged_at=coalesce(acknowledged_at,?), finished_at=?, updated_at=?,
+          outbound_attempt_at=CASE WHEN ? THEN NULL ELSE outbound_attempt_at END
           WHERE delivery_id=? AND turn_id=0 AND state='queued' AND chat_id=? AND thread_id IS ?`)
           .run(delivery.phase === 'final' ? 'complete' : null, now, delivery.phase === 'final' ? now : null,
-            now, delivery.offered_id, delivery.chat_id, delivery.thread_id).changes
+            now, boundReply ? 1 : 0, delivery.offered_id, delivery.chat_id, delivery.thread_id).changes
         if (changed && delivery.phase === 'final') MSG_DB.query(`DELETE FROM pending_inbound_deliveries
           WHERE delivery_id=? AND state='offered'`).run(delivery.offered_id)
       }
-      for (const target of delivery.targets) {
-        MSG_DB.query(`UPDATE delivery_results SET state = coalesce(?, state),
-          acknowledged_at = coalesce(acknowledged_at, ?), updated_at = ?, finished_at = ? WHERE delivery_id = ? AND turn_id = ?
-          AND chat_id = ? AND thread_id IS ? AND stamp IS ? AND state IN ('pending', 'deferred', 'paused', 'resume_pending')`)
-          // A task callback may already have changed deferred back to pending.
-          // A delayed ACK write must not rewind that callback's ownership.
-          .run(delivery.phase === 'final' ? 'complete' : null,
-            now, now, delivery.phase === 'final' ? now : null,
-            target.delivery_id, target.turn_id, delivery.chat_id, delivery.thread_id, DELIVERY_STAMP)
+      for (const [index, target] of delivery.targets.entries()) {
+        const final = delivery.phase === 'final'
+        if (!final && delivery.task_id && boundReply && WORKER_GATES && registerAcknowledged(delivery, index, now)) continue
+        // Completion clears the admission and, for this reply's own attempt, the fence.
+        const changed = MSG_DB.query(`UPDATE delivery_results SET state = coalesce(?, state),
+          acknowledged_at = coalesce(acknowledged_at, ?), updated_at = ?, finished_at = ?,
+          outbound_attempt_at=CASE WHEN ? THEN NULL ELSE outbound_attempt_at END,
+          outbound_attempt_generation=CASE WHEN ? THEN NULL ELSE outbound_attempt_generation END,
+          final_admitted_generation=CASE WHEN ? THEN NULL ELSE final_admitted_generation END
+          WHERE delivery_id = ? AND turn_id = ?
+          AND chat_id = ? AND thread_id IS ? AND stamp IS ? AND state IN ('pending', 'deferred', 'paused', 'resume_pending')
+          AND (? = 'progress' OR result_generation = ?)`)
+          // A newer background registration, callback, or recovery claim
+          // increments the generation. A delayed final-status retry for an
+          // older send cannot complete that newer obligation.
+          .run(final ? 'complete' : null, now, now, final ? now : null, boundReply ? 1 : 0, boundReply ? 1 : 0,
+            final ? 1 : 0, target.delivery_id, target.turn_id, delivery.chat_id, delivery.thread_id, DELIVERY_STAMP,
+            delivery.phase, delivery.generations[index]).changes
+        const terminal = final && Number.isSafeInteger(delivery.terminal_message_id)
+          && delivery.terminal_message_id! > 0 ? delivery.terminal_message_id! : null
+        if (terminal == null) continue
+        if (changed === 1) {
+          writeTerminalReceipt(target, delivery.chat_id, delivery.thread_id, 'reply', terminal, now)
+          if (WORKER_GATES) settleHead(target, delivery.chat_id, delivery.thread_id, now)
+        } else if (boundReply && WORKER_GATES) {
+          settleSupersededFinal(target, delivery, delivery.generations[index], 'reply', terminal, now)
+        }
       }
-    })()
+    }).immediate()
   } catch (error) {
     resultRetries.push(delivery)
     process.stderr.write(`telegram channel: result status not recorded; retrying without resending: ${error}\n`)
@@ -1920,10 +3314,28 @@ function recordResult(delivery: ResultDelivery): void {
 const applyReceipt = MSG_DB.transaction((receipt: Receipt) => {
   const now = Date.now()
   const closed = receipt.targets
-  for (const target of closed) {
+  const kept: string[] = []
+  for (const [index, target] of closed.entries()) {
     MSG_DB.query(`UPDATE delivery_results SET acknowledged_at = coalesce(acknowledged_at, ?), updated_at = ?
       WHERE delivery_id = ? AND turn_id = ? AND chat_id = ? AND thread_id IS ? AND stamp IS ?`)
       .run(now, now, target.delivery_id, target.turn_id, receipt.chat_id, receipt.thread_id, DELIVERY_STAMP)
+    // Under the receiver the receipt of a send whose request has moved to a
+    // newer generation since, a final that a later launch superseded above
+    // all, is non-terminal evidence: it closes no message and keeps the head.
+    const generation = receipt.generations?.[index]
+    if (WORKER_GATES && generation != null && MSG_DB.query(`SELECT 1 FROM delivery_results
+      WHERE delivery_id=? AND turn_id=? AND result_generation<>?`).get(target.delivery_id, target.turn_id, generation)) {
+      kept.push(target.delivery_id)
+      continue
+    }
+    // Under the receiver a request with a result settles only in the transaction
+    // that records its whole notice (R4-4): the first acknowledged part closes
+    // none of its messages and keeps its head.
+    if (WORKER_GATES && MSG_DB.query(`SELECT 1 FROM delivery_results WHERE delivery_id=? AND turn_id=?`)
+      .get(target.delivery_id, target.turn_id)) {
+      kept.push(target.delivery_id)
+      continue
+    }
     // Exact origin plus state guard: an interrupted or settled message is never
     // resurrected by a late acknowledgement.
     const changed = MSG_DB.query(
@@ -1938,7 +3350,8 @@ const applyReceipt = MSG_DB.transaction((receipt: Receipt) => {
   const turnId: number | null = closed[0]?.turn_id ?? null
   let deliveryId: string | null = closed[0]?.delivery_id ?? null
   let note = closed.length
-    ? `closed ${closed.map(c => c.delivery_id).join(', ')}`
+    ? `closed ${closed.map(c => c.delivery_id).filter(id => !kept.includes(id)).join(', ') || 'nothing'}`
+      + (kept.length ? `; kept ${kept.join(', ')} until its whole result is recorded` : '')
     : 'matched no open message'
   if (!closed.length && receipt.source === 'reply') {
     const head = receipt.offered_id
@@ -1953,10 +3366,10 @@ const applyReceipt = MSG_DB.transaction((receipt: Receipt) => {
   }
   MSG_DB.query(
     `INSERT INTO delivery_receipts
-     (chat_id, thread_id, message_id, source, stamp, turn_id, delivery_id, source_row, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+     (chat_id, thread_id, message_id, source, stamp, turn_id, delivery_id, source_row, created_at, phase)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(receipt.chat_id, receipt.thread_id, receipt.message_id, receipt.source, DELIVERY_STAMP,
-    turnId, deliveryId, receipt.source_row, now)
+    turnId, deliveryId, receipt.source_row, now, receipt.phase ?? null)
   process.stderr.write(`telegram channel: receipt ${receipt.source} chat=${receipt.chat_id} thread=${receipt.thread_id ?? '-'}: ${note}\n`)
 })
 
@@ -1996,7 +3409,7 @@ function settleReceipts(): void {
           targets = context.targets
           if (context.phase === 'progress' || context.phase === 'final') {
             completion = resultDelivery(row.chat_id, row.thread_id == null ? null : String(row.thread_id),
-              targets, context.phase, context.task_id)
+              targets, context.phase, context.task_id, true)
           }
         }
       } catch { /* malformed provenance closes nothing */ }
@@ -2008,6 +3421,8 @@ function settleReceipts(): void {
         source_row: row.id,
         targets,
         offered_id: null,
+        generations: completion?.generations,
+        phase: completion?.phase ?? null,
       })
       if (completion) recordResult(completion)
     }
@@ -2028,6 +3443,17 @@ const declareSilence = MSG_DB.transaction((chat_id: string, thread_id: string | 
       AND r.state IN ('pending', 'deferred') AND (r.acknowledged_at IS NOT NULL OR r.task_id IS NOT NULL) LIMIT 1`)
     .get(chat_id, thread_id)
   if (accepted) throw new Error('Already acknowledged work needs a final reply, not no_reply')
+  const held = (MSG_DB.query(`SELECT r.delivery_id, r.session_id, r.stamp, r.turn_id, r.response_turn_id
+    FROM delivery_results r JOIN delivery_turns t ON t.turn_id = coalesce(r.response_turn_id, r.turn_id)
+    WHERE t.closed_at IS NULL AND r.chat_id=? AND r.thread_id IS ? AND r.state IN ('pending','deferred')`)
+    .all(chat_id, thread_id) as ScopedRequest[]).filter(request => scopeWork(request).length)
+  if (held.length && WORKER_GATES) {
+    throw new Error(`Background work of this request is still open (${held.flatMap(scopeWork).join(', ')}); no_reply cannot end it. `
+      + 'Read its result when it returns, register it with a progress reply and its task_id, or stop the task')
+  }
+  // The shadow window sees how often the receiver would refuse this silence (U3 review P3-3).
+  for (const request of held) recordShadow('would_refuse_no_reply', { chat_id, thread_id,
+    delivery_id: request.delivery_id, turn_id: request.turn_id, detail: scopeWork(request).join(', ') })
   const closed = closeOpenMessages(chat_id, thread_id, 'no_reply', now)
   for (const target of closed) MSG_DB.query(`UPDATE delivery_results SET state = 'no_reply', finished_at = ?, updated_at = ?
     WHERE delivery_id = ? AND turn_id = ? AND state = 'pending'`)
@@ -2192,10 +3618,48 @@ function providerResetAt(now = Date.now()): number {
   } catch { return 0 }
 }
 
+// A refused login (AUTH_ERROR_CLASS) holds the queue from its failure until
+// the login works again: a new login (claude-auth-rescue — the automatic link,
+// /relogin, an account switch — and claude-login mark it in
+// .claude/auth-established), a reply the main session sent after the failure
+// (a stamped shell send may come from a background script), or a process
+// started after it (every rescue ends with a service restart). A few minutes
+// after a failure the oldest paused request gets one try: a login another
+// process refreshed (a cron claude -p, a corporate worker) works by then, and
+// a second refusal is what makes the health check restart a bot whose login
+// on disk is valid. After a refused try the queue waits for a login or a
+// restart; the paused requests then resume once, oldest first.
+const RECEIVER_STARTED_AT = Date.now()
+const AUTH_TRY_AFTER_MS = envNumber('TG_AUTH_PROBE_AFTER_MS', 5 * 60_000)
+function runtimeNumber(key: string): number {
+  return Number((MSG_DB.query(`SELECT value FROM delivery_runtime WHERE key = ?`)
+    .get(key) as { value: string } | null)?.value) || 0
+}
+function loginWorkedAt(): number {
+  let marked = 0
+  try { marked = lstatSync(join(process.env.AGENT_ROOT ?? homedir(), '.claude', 'auth-established')).mtimeMs }
+  catch { /* no login recorded yet */ }
+  const answered = MSG_DB.query(`SELECT max(created_at) AS at FROM delivery_receipts WHERE source = 'reply'`)
+    .get() as { at: number | null }
+  return Math.max(marked, answered.at ?? 0)
+}
+function authHoldsDrain(now = Date.now()): boolean {
+  const failed = runtimeNumber('provider_auth_pause')
+  if (failed <= RECEIVER_STARTED_AT) return false
+  const worked = loginWorkedAt()
+  if (failed <= worked) return false
+  const tried = runtimeNumber('provider_auth_probe') // the failure that got its one try
+  if (tried === failed) return false
+  if (tried > Math.max(RECEIVER_STARTED_AT, worked) || now < failed + AUTH_TRY_AFTER_MS) return true
+  MSG_DB.query(`INSERT INTO delivery_runtime (key, value, updated_at) VALUES ('provider_auth_probe', ?, ?)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`).run(String(failed), now)
+  return false
+}
+
 function providerHoldsDrain(now = Date.now()): boolean {
   const stored = MSG_DB.query(`SELECT value FROM delivery_runtime WHERE key = 'provider_pause_until'`)
     .get() as { value: string } | null
-  return (Number(stored?.value) || 0) > now || providerResetAt(now) > now
+  return (Number(stored?.value) || 0) > now || providerResetAt(now) > now || authHoldsDrain(now)
 }
 
 type DurableResult = {
@@ -2204,6 +3668,7 @@ type DurableResult = {
   created_at: number; resume_after: number; recovery_count: number; response_turn_id: number | null;
   updated_at: number;
   recovery_reason: string | null; task_id: string | null; recovery_from_turn: number | null;
+  result_generation: number;
 }
 
 function retainRequest(row: PendingInboundRow): void {
@@ -2246,13 +3711,21 @@ function retainLegacyRequests(): void {
   // only real archived input, never manufacture the user's missing request.
   const missing = MSG_DB.query(`SELECT * FROM delivery_results
     WHERE request_payload IS NULL AND state IN ('pending','deferred','paused','resume_pending')`).all() as DurableResult[]
+  const lost: string[] = []
   for (const result of missing) {
     const messageId = result.delivery_id.split(':')[1]
     const archived = MSG_DB.query(`SELECT text, user_id, username, attachment_file_id, attachment_kind
       FROM messages WHERE direction = 'in' AND chat_id = ? AND message_id = ?`).get(result.chat_id, Number(messageId)) as {
         text: string; user_id: string; username: string; attachment_file_id: string | null; attachment_kind: string | null
       } | null
-    if (!archived) continue
+    if (!archived) {
+      // Nothing to resume from: say so once instead of dropping it in silence.
+      MSG_DB.query(`UPDATE delivery_results SET state='blocked', recovery_reason='missing_original_payload',
+        updated_at=? WHERE delivery_id=? AND request_payload IS NULL`).run(Date.now(), result.delivery_id)
+      process.stderr.write(`telegram channel: request ${result.delivery_id} has no saved text; it cannot be resumed\n`)
+      lost.push(result.delivery_id)
+      continue
+    }
     const meta: Record<string, string> = { chat_id: result.chat_id, message_id: messageId!,
       delivery_id: result.delivery_id, user_id: archived.user_id, user: archived.username,
       conversation_key: result.thread_id ? `topic:${result.chat_id}:${result.thread_id}`
@@ -2263,10 +3736,133 @@ function retainLegacyRequests(): void {
     MSG_DB.query(`UPDATE delivery_results SET request_payload = ? WHERE delivery_id = ? AND request_payload IS NULL`)
       .run(JSON.stringify({ method: 'notifications/claude/channel', params: { content: archived.text, meta } }), result.delivery_id)
   }
+  if (lost.length && /^[1-9][0-9]*$/.test(OWNER_CHAT_ID)) {
+    // Blocked above, so the next start does not report them again.
+    void bot.api.sendMessage(OWNER_CHAT_ID,
+      `⚠️ Після перезапуску не вдалося продовжити запити без збереженого тексту: ${lost.join(', ')} (чат:повідомлення). `
+      + 'Перевір ці чати.', undefined, AbortSignal.timeout(5000)).catch(() => {
+      process.stderr.write('telegram channel: owner notice for requests without saved text unavailable\n')
+    })
+  }
+}
+
+function fenceUncertainOutbounds(): void {
+  const fenced = MSG_DB.transaction(() => {
+    const now = Date.now()
+    const count = MSG_DB.query(`UPDATE delivery_results SET state='blocked', recovery_reason='outbound_uncertain',
+      finished_at=NULL, updated_at=? WHERE outbound_attempt_at IS NOT NULL
+        AND state IN ('queued','pending','deferred','paused','resume_pending')`).run(now).changes
+    MSG_DB.query(`UPDATE delivery_turn_messages SET closed_by='outbound_uncertain', closed_at=?
+      WHERE closed_at IS NULL AND EXISTS (SELECT 1 FROM delivery_results r
+        WHERE r.delivery_id=delivery_turn_messages.delivery_id
+          AND r.turn_id=delivery_turn_messages.turn_id AND r.state='blocked'
+          AND r.recovery_reason='outbound_uncertain' AND r.outbound_attempt_at IS NOT NULL)`).run(now)
+    // A previous service turn cannot keep the new receiver's FIFO paused.
+    // A same-stamp MCP respawn may still have a live native turn, so leave it.
+    MSG_DB.query(`UPDATE delivery_turns SET closed_at=?, close_kind='outbound_uncertain'
+      WHERE closed_at IS NULL AND EXISTS (SELECT 1 FROM delivery_results r
+        WHERE (r.turn_id=delivery_turns.turn_id OR r.response_turn_id=delivery_turns.turn_id)
+          AND r.session_id=delivery_turns.session_id AND r.state='blocked'
+          AND r.recovery_reason='outbound_uncertain' AND r.outbound_attempt_at IS NOT NULL
+          AND r.stamp IS NOT ?)
+        AND NOT EXISTS (SELECT 1 FROM delivery_turn_messages m
+          WHERE m.turn_id=delivery_turns.turn_id AND m.closed_at IS NULL)`).run(now, DELIVERY_STAMP)
+    // This is an uncertain-send quarantine, not normal receipt authority.
+    // Retire the carrier only when the original payload survives in the result,
+    // allowing FIFO and the guard's stale-head sweep to move past it.
+    MSG_DB.query(`DELETE FROM pending_inbound_deliveries WHERE delivery_id IN (
+      SELECT delivery_id FROM delivery_results WHERE state='blocked'
+        AND recovery_reason='outbound_uncertain' AND outbound_attempt_at IS NOT NULL
+        AND request_payload IS NOT NULL)`).run()
+    return count
+  })()
+  if (fenced) process.stderr.write(`telegram channel: ${fenced} uncertain outbound request(s) retained without replay\n`)
+}
+
+function uncertainOutboundCount(): number {
+  const row = MSG_DB.query(`SELECT count(*) AS count FROM delivery_results
+    WHERE state='blocked' AND recovery_reason='outbound_uncertain'`)
+    .get() as { count: number }
+  return row.count
+}
+
+function corporateIntakeFailureCount(): number {
+  const row = MSG_DB.query(`SELECT count(*) AS count FROM delivery_runtime
+    WHERE key LIKE 'corporate_intake_failure:%'`).get() as { count: number }
+  return row.count
+}
+
+let uncertainOwnerNoticeFailures = 0
+// Telegram's 429 wait: the tick does not retry the notice before it ends.
+let uncertainOwnerNoticeRetryAt = 0
+
+async function notifyOwnerOfUncertainOutbounds(): Promise<void> {
+  if (!/^[1-9][0-9]*$/.test(OWNER_CHAT_ID) || Date.now() < uncertainOwnerNoticeRetryAt) return
+  // Reserve every unreported case before the Bot API call. A timeout or crash
+  // cannot safely be retried: Telegram may already have delivered this notice.
+  const reservation = -Date.now()
+  const count = MSG_DB.query(`UPDATE delivery_results SET outbound_uncertain_notice_at=?
+    WHERE state='blocked' AND recovery_reason='outbound_uncertain'
+      AND outbound_uncertain_notice_at IS NULL`).run(reservation).changes
+  if (!count) return
+  try {
+    await bot.api.sendMessage(OWNER_CHAT_ID,
+      `Є відповіді, доставку яких не вдалося підтвердити: ${count}. ` +
+      'Запити збережені. Щоб не надіслати дубль, я не повторюватиму ці відповіді автоматично. ' +
+      'Перевір чат; поточну кількість видно в /health.',
+      undefined, AbortSignal.timeout(5000))
+    MSG_DB.query(`UPDATE delivery_results SET outbound_uncertain_notice_at=?
+      WHERE outbound_uncertain_notice_at=?`).run(Date.now(), reservation)
+    uncertainOwnerNoticeFailures = 0
+  } catch (error) {
+    if (error instanceof GrammyError && error.error_code === 429) {
+      // Telegram rejected the request, so this reservation cannot hide a
+      // delivered notice. A network timeout stays reserved: its result is unknown.
+      const released = MSG_DB.query(`UPDATE delivery_results SET outbound_uncertain_notice_at=NULL
+        WHERE outbound_uncertain_notice_at=?`).run(reservation).changes
+      if (released) {
+        const fallbackMs = Math.min(60_000, 5_000 * 2 ** Math.min(uncertainOwnerNoticeFailures++, 4))
+        const retryAfter = error.parameters?.retry_after
+        const delayMs = typeof retryAfter === 'number' && Number.isSafeInteger(retryAfter) && retryAfter > 0
+          ? Math.min(retryAfter, 3_600) * 1_000 : fallbackMs
+        uncertainOwnerNoticeRetryAt = Date.now() + delayMs
+        setTimeout(() => {
+          uncertainOwnerNoticeRetryAt = 0
+          void notifyOwnerOfUncertainOutbounds().catch(() => {
+            process.stderr.write('telegram channel: owner notice retry unavailable; saved work retained\n')
+          })
+        }, delayMs).unref()
+        process.stderr.write('telegram channel: owner notice rate limited; retry scheduled\n')
+      }
+    } else {
+      process.stderr.write('telegram channel: owner notice for uncertain outbound unconfirmed; no duplicate attempted\n')
+    }
+  }
 }
 
 function providerBackoffMs(recoveryCount: number): number {
   return Math.min(3_600_000, 900_000 * 2 ** Math.min(recoveryCount, 2))
+}
+
+// Every StopFailure attempt spends the model limit and may show the person
+// partial work again. Consecutive failures of one request wait longer; a
+// receipt for it or an attempt that ended any other way starts over.
+const STOP_FAILURE_RETRY_MS = envNumber('TG_STOP_FAILURE_RETRY_MS', 60_000)
+const STOP_FAILURE_RETRY_MAX_MS = envNumber('TG_STOP_FAILURE_RETRY_MAX_MS', 10 * 60_000)
+
+function stopFailureBackoffMs(result: DurableResult): number {
+  const receipt = MSG_DB.query(`SELECT max(created_at) AS at FROM delivery_receipts WHERE delivery_id=?`)
+    .get(result.delivery_id) as { at: number | null }
+  const attempts = MSG_DB.query(`SELECT opened_at, close_kind FROM delivery_turns WHERE turn_id=?
+    OR turn_id IN (SELECT turn_id FROM delivery_turn_messages WHERE delivery_id=?) ORDER BY turn_id DESC`)
+    .all(result.response_turn_id ?? result.turn_id, result.delivery_id) as Array<{ opened_at: number; close_kind: string | null }>
+  let failures = 0
+  for (const attempt of attempts) {
+    if (attempt.close_kind !== 'stop_failure' || attempt.opened_at <= (receipt.at ?? 0)) break
+    failures++
+  }
+  // A single failure keeps the ordinary retry.
+  return failures < 2 ? 0 : Math.min(STOP_FAILURE_RETRY_MAX_MS, STOP_FAILURE_RETRY_MS * 2 ** (failures - 2))
 }
 
 function reconcileHistoricalProviderPauses(now = Date.now()): void {
@@ -2308,25 +3904,40 @@ function reconcileHistoricalProviderPauses(now = Date.now()): void {
   })()
 }
 
-function pauseRequest(result: DurableResult, reason: string, limit = false, failedAt = Date.now()): void {
+// detail: the provider's error class of a failed turn (StopFailure).
+function pauseRequest(result: DurableResult, reason: string, limit = false, failedAt = Date.now(),
+  detail: string | null = null): void {
+  // A refused login is not retried on a timer: the request waits for the next
+  // login (authHoldsDrain) the way a limit waits for its reset. Its
+  // resume_after is the failure time, so the limit's notice never matches it.
+  const auth = !limit && reason === 'stop_failure' && AUTH_ERROR_CLASS.test(detail ?? '')
+  if (auth) reason = 'provider_auth'
   const now = Date.now()
-  const after = limit ? (providerResetAt(now) || failedAt + providerBackoffMs(result.recovery_count))
-    : now + (result.recovery_count ? Math.min(300_000, 5_000 * 2 ** Math.min(result.recovery_count, 6)) : 0)
+  const after = auth ? failedAt : limit ? (providerResetAt(now) || failedAt + providerBackoffMs(result.recovery_count))
+    : now + Math.max(result.recovery_count ? Math.min(300_000, 5_000 * 2 ** Math.min(result.recovery_count, 6)) : 0,
+      reason === 'stop_failure' ? stopFailureBackoffMs(result) : 0)
   MSG_DB.transaction(() => {
     const changed = MSG_DB.query(`UPDATE delivery_results SET state = ?, recovery_reason = ?,
-      resume_after = ?, recovery_from_turn = coalesce(response_turn_id, turn_id), updated_at = ?, finished_at = NULL
+      resume_after = ?, recovery_from_turn = coalesce(response_turn_id, turn_id), updated_at = ?, finished_at = NULL,
+      recovery_notice_at = CASE WHEN ?=1 AND recovery_notice_at IS NOT NULL AND EXISTS (
+        SELECT 1 FROM delivery_receipts c WHERE c.delivery_id=delivery_results.delivery_id
+          AND c.turn_id=delivery_results.turn_id AND c.chat_id=delivery_results.chat_id
+          AND c.thread_id IS delivery_results.thread_id AND c.stamp IS delivery_results.stamp
+          AND c.source IN ('reply','shell') AND c.created_at>abs(delivery_results.recovery_notice_at)
+      ) THEN NULL ELSE recovery_notice_at END
       WHERE delivery_id = ? AND turn_id = ? AND state IN ('queued','pending','deferred')`)
-      .run(result.request_payload ? (limit ? 'paused' : 'resume_pending') : 'blocked',
-        result.request_payload ? reason : 'missing_original_payload', after, now, result.delivery_id, result.turn_id).changes
+      .run(result.request_payload ? (limit || auth ? 'paused' : 'resume_pending') : 'blocked',
+        result.request_payload ? reason : 'missing_original_payload', after, now, limit ? 1 : 0,
+        result.delivery_id, result.turn_id).changes
     if (!changed) return
     MSG_DB.query(`UPDATE pending_inbound_deliveries SET state = 'recovering', next_attempt_at = ? WHERE delivery_id = ?`)
       .run(after, result.delivery_id)
     MSG_DB.query(`UPDATE delivery_turn_messages SET closed_by = 'recovery', closed_at = ?
       WHERE turn_id = ? AND delivery_id = ? AND closed_at IS NULL`).run(now, result.turn_id, result.delivery_id)
-    if (limit) MSG_DB.query(`INSERT INTO delivery_runtime (key, value, updated_at) VALUES ('provider_pause_until', ?, ?)
+    if (limit || auth) MSG_DB.query(`INSERT INTO delivery_runtime (key, value, updated_at) VALUES (?, ?, ?)
       ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
       WHERE CAST(excluded.value AS INTEGER) > CAST(delivery_runtime.value AS INTEGER)`)
-      .run(String(after), now)
+      .run(limit ? 'provider_pause_until' : 'provider_auth_pause', String(after), now)
   })()
   if (!limit && ['stop','stop_failure'].includes(reason)) recordShadow('incomplete_result', {
     turn_id: result.turn_id, delivery_id: result.delivery_id, chat_id: result.chat_id,
@@ -2337,7 +3948,7 @@ function pauseRequest(result: DurableResult, reason: string, limit = false, fail
 function scheduleRecoveredRequests(now = Date.now(), providerAvailable = false): void {
   if (!providerAvailable && providerHoldsDrain(now)) return
   const waiting = MSG_DB.query(`SELECT * FROM delivery_results WHERE state IN ('paused','resume_pending')
-    AND resume_after <= ? ORDER BY created_at, delivery_id`).all(now) as DurableResult[]
+    AND outbound_attempt_at IS NULL AND resume_after <= ? ORDER BY created_at, delivery_id`).all(now) as DurableResult[]
   for (const result of waiting) {
     // An already scheduled recovery must not reserve a second attempt.
     const pending = MSG_DB.query(`SELECT state FROM pending_inbound_deliveries WHERE delivery_id = ?`)
@@ -2371,27 +3982,486 @@ function scheduleRecoveredRequests(now = Date.now(), providerAvailable = false):
   }
 }
 
-async function notifyPausedBackgroundResults(): Promise<void> {
+// Owner-facing notices are Ukrainian unless the agent profile opts into
+// Russian. The Russian copy, and the profile rule that picks it, live in the
+// kit's shared table bin/agent_notice_locale.py, loaded here the way the shell
+// workers load it (cash-reminder-tick). Ukrainian goes out whenever the table
+// cannot be read.
+function ownerNotice(key: string, ukrainian: string): Promise<string> {
+  const load = 'import importlib.util, sys\nfrom pathlib import Path\n'
+    + 'spec = importlib.util.spec_from_file_location("agent_notice_locale", sys.argv[1])\n'
+    + 'module = importlib.util.module_from_spec(spec)\nspec.loader.exec_module(module)\n'
+    + 'print(module.notice_text(sys.argv[3], sys.argv[4], home=Path(sys.argv[2])), end="")\n'
+  return new Promise(resolve => {
+    execFile('python3', ['-c', load, join(homedir(), 'bin', 'agent_notice_locale.py'),
+      process.env.AGENT_ROOT || homedir(), key, ukrainian], { timeout: 5_000 },
+      (error, stdout) => resolve(!error && stdout ? stdout : ukrainian))
+  })
+}
+
+// ── usage limit notices (added 2026-09-26) ───────────────────────────────────
+// A usage limit holds the whole queue, so every conversation with a waiting
+// request hears once per limit period: the request that hit it, the messages
+// queued behind it, other chats and groups. The notice names the reset once the
+// limit watcher has read it from the transcript, which takes up to a minute.
+// A conversation's period ends when the model has answered anything since its
+// notice, or when the pause outlasts the deadline it was told (the limit hit
+// again after the reset). Group talk marked as addressed to nobody is not a
+// request, and a request paused for a login problem does not wait on the limit.
+const LIMIT_NOTICE_RESET_WAIT_MS = envNumber('TG_LIMIT_NOTICE_RESET_WAIT_MS', 90_000)
+
+function limitNoticeText(resetAt: number): string {
+  let russian = false
+  let zone = 'UTC'
+  try {
+    // The per-agent profile, not VAULT_LOCALE or the process environment,
+    // selects owner-facing notices in the rest of the kit.
+    const profile = join(process.env.AGENT_ROOT || homedir(), '.agent-profile.env')
+    const metadata = lstatSync(profile)
+    if (metadata.isFile() && metadata.nlink === 1 && metadata.size <= 64 * 1024) {
+      const lines = readFileSync(profile, 'utf8').split(/\r?\n/)
+      const setting = (name: string) => {
+        const found = lines.filter(line => line.startsWith(`${name}=`))
+        return found.length === 1 ? found[0]!.trim() : ''
+      }
+      russian = /^OWNER_NOTICE_LOCALE=(?:ru|'ru'|"ru")$/.test(setting('OWNER_NOTICE_LOCALE'))
+      zone = /^TIMEZONE=(['"]?)([A-Za-z0-9_+\/-]+)\1$/.exec(setting('TIMEZONE'))?.[2] ?? zone
+    }
+  } catch { /* Existing agents keep Ukrainian notices without a valid profile. */ }
+  // The owner's line (27.09), the same as the corporate runtime's: the reset in the
+  // agent's zone, its date only when that is not today there.
+  if (!resetAt) return russian ? 'Принял, отвечу чуть позже' : 'Прийняв, відповім трохи згодом'
+  const format = (at: number, options: Intl.DateTimeFormatOptions) =>
+    new Intl.DateTimeFormat(russian ? 'ru-RU' : 'uk-UA', { timeZone: zone, ...options }).format(at)
+  try { format(resetAt, {}) } catch { zone = 'UTC' }
+  const day = format(resetAt, { day: 'numeric', month: 'long' })
+  const at = format(resetAt, { hour: '2-digit', minute: '2-digit', hourCycle: 'h23' })
+    + (day === format(Date.now(), { day: 'numeric', month: 'long' }) ? '' : ` ${day}`)
+  const where = zone === 'Europe/Kyiv' || zone === 'Europe/Kiev'
+    ? (russian ? 'по киевскому времени' : 'за київським часом') : `(${zone})`
+  return `${russian ? 'Принял, отвечу после' : 'Прийняв, відповім після'} ${at} ${where}`
+}
+
+function modelAnsweredSince(at: number): boolean {
+  return MSG_DB.query(`SELECT 1 FROM delivery_receipts WHERE created_at > ?
+    UNION ALL SELECT 1 FROM delivery_turns WHERE close_kind = 'stop' AND closed_at > ? LIMIT 1`).get(at, at) != null
+}
+
+// A request that hung more often than it may be offered again: the person
+// hears once that it was stopped, in the agent's language, and why; never a
+// bare «не вдалося» (owner, 27.09). The cap acts in every mode: it releases a
+// queue a hung request would hold for good (28G1; NOVSKY's decision on Codex
+// U4 review P0-3, 28.09).
+function hungRequestNoticeText(): Promise<string> {
+  return ownerNotice('queue.hung_stopped',
+    '⚠️ Робота над цим запитом зависала тричі, тому я її зупинив, щоб не затримувати інші повідомлення. Надішли його знову, якщо він ще потрібен.')
+}
+
+// The hang cap's notice goes out whether or not a limit holds the queue (U, 27.09).
+async function notifyHungRequests(): Promise<void> {
   const rows = MSG_DB.query(`SELECT delivery_id, chat_id, thread_id FROM delivery_results
-    WHERE state='paused' AND resume_after > ? AND response_turn_id IS NOT NULL AND recovery_notice_at IS NULL`)
+    WHERE state='failed' AND recovery_reason='hung_repeatedly'
+      AND recovery_notice_at IS NULL AND (recovery_notice_retry_at IS NULL OR recovery_notice_retry_at<=?)`)
     .all(Date.now()) as Array<{ delivery_id: string; chat_id: string; thread_id: string | null }>
   for (const row of rows) {
     // A negative timestamp reserves the attempt durably. An unknown network
     // outcome must not produce repeated alerts on every tick/restart.
-    const reserved = MSG_DB.query(`UPDATE delivery_results SET recovery_notice_at=?
-      WHERE delivery_id=? AND state='paused' AND recovery_notice_at IS NULL`)
-      .run(-Date.now(), row.delivery_id).changes
-    if (!reserved) continue
+    const reservation = -Date.now()
+    if (!MSG_DB.query(`UPDATE delivery_results SET recovery_notice_at=?
+      WHERE delivery_id=? AND state='failed' AND recovery_notice_at IS NULL
+        AND (recovery_notice_retry_at IS NULL OR recovery_notice_retry_at<=?)`)
+      .run(reservation, row.delivery_id, Date.now()).changes) continue
     try {
-      await bot.api.sendMessage(row.chat_id,
-        '⏳ Ліміт Claude призупинив завдання. Запит і контекст збережено; продовжу після відновлення доступу.',
+      await bot.api.sendMessage(row.chat_id, await hungRequestNoticeText(),
         row.thread_id ? { message_thread_id: Number(row.thread_id) } : {})
-      MSG_DB.query(`UPDATE delivery_results SET recovery_notice_at=? WHERE delivery_id=?`)
-        .run(Date.now(), row.delivery_id)
+      MSG_DB.query(`UPDATE delivery_results SET recovery_notice_at=?, recovery_notice_retry_at=NULL,
+        recovery_notice_failures=0 WHERE delivery_id=? AND recovery_notice_at=?`)
+        .run(Date.now(), row.delivery_id, reservation)
     } catch (error) {
-      // The request remains recoverable even when its one-time notice fails.
-      process.stderr.write('telegram channel: background pause notice unconfirmed; saved work retained\n')
+      if (error instanceof GrammyError && error.error_code === 429) {
+        // Telegram refused it, so it never arrived: owed again after a bounded backoff.
+        const prior = MSG_DB.query(`SELECT recovery_notice_failures FROM delivery_results
+          WHERE delivery_id=? AND recovery_notice_at=?`)
+          .get(row.delivery_id, reservation) as { recovery_notice_failures: number } | null
+        const backoff = Math.min(60_000, 5_000 * 2 ** Math.min(prior?.recovery_notice_failures ?? 0, 4))
+        MSG_DB.query(`UPDATE delivery_results SET recovery_notice_at=NULL,
+          recovery_notice_retry_at=?, recovery_notice_failures=recovery_notice_failures+1
+          WHERE delivery_id=? AND recovery_notice_at=?`)
+          .run(Date.now() + backoff, row.delivery_id, reservation)
+      } else {
+        process.stderr.write('telegram channel: hung-request notice unconfirmed; not repeated\n')
+      }
     }
+  }
+}
+
+// One notice per request: to a request paused by the provider's limit, and to
+// one closed after it hung too often (failHungRequest).
+async function notifyPausedBackgroundResults(): Promise<void> {
+  await notifyHungRequests()
+  const now = Date.now()
+  const pause = MSG_DB.query(`SELECT value, updated_at FROM delivery_runtime WHERE key = 'provider_pause_until'`)
+    .get() as { value: string; updated_at: number } | null
+  const reset = providerResetAt(now)
+  const deadline = Math.max(Number(pause?.value) || 0, reset)
+  if (deadline <= now) return
+  if (!reset && now < (pause?.updated_at ?? 0) + LIMIT_NOTICE_RESET_WAIT_MS
+    && existsSync(join(process.env.AGENT_ROOT ?? homedir(), 'logs', 'claude-limit-recovery.json'))) return
+  const waiting = MSG_DB.query(`SELECT r.delivery_id, r.chat_id, r.thread_id, r.recovery_notice_at,
+      r.recovery_notice_retry_at FROM delivery_results r
+    WHERE ((r.state IN ('paused','resume_pending') AND r.recovery_reason IS NOT 'provider_auth')
+      OR (r.state = 'queued' AND EXISTS (SELECT 1 FROM pending_inbound_deliveries p
+          WHERE p.delivery_id = r.delivery_id AND p.state IN ('queued','offered'))))
+      -- Group talk that addressed nobody here waits for no one (Кнопа 15.09).
+      AND coalesce(CASE WHEN json_valid(r.request_payload)
+        THEN json_extract(r.request_payload, '$.params.meta.addressed') END, '') <> 'false'
+    ORDER BY r.created_at, r.delivery_id`).all() as Array<{ delivery_id: string; chat_id: string;
+      thread_id: string | null; recovery_notice_at: number | null; recovery_notice_retry_at: number | null }>
+  const conversations = new Map<string, typeof waiting>()
+  for (const row of waiting) {
+    const key = `${row.chat_id}:${row.thread_id ?? ''}`
+    conversations.set(key, [...(conversations.get(key) ?? []), row])
+  }
+  for (const [key, rows] of conversations) {
+    // A notice Telegram rejected with 429 waits for its own retry time.
+    if (rows.some(row => (row.recovery_notice_retry_at ?? 0) > now)) continue
+    const carrier = rows[0]!
+    const marker = MSG_DB.query(`SELECT value, updated_at FROM delivery_runtime WHERE key = ?`)
+      .get(`limit_notice:${key}`) as { value: string; updated_at: number } | null
+    const told = Number(marker?.value) || 0
+    const last = Math.max(Math.abs(marker?.updated_at ?? 0), ...rows.map(row => Math.abs(row.recovery_notice_at ?? 0)))
+    if (last && !modelAnsweredSince(last) && !(told && deadline > told)) continue
+    // A negative timestamp reserves the attempt durably. An unknown network
+    // outcome must not produce repeated alerts on every tick/restart.
+    const reservation = -Date.now()
+    if (!MSG_DB.query(`UPDATE delivery_results SET recovery_notice_at = ? WHERE delivery_id = ? AND recovery_notice_at IS ?`)
+      .run(reservation, carrier.delivery_id, carrier.recovery_notice_at).changes) continue
+    // The deadline told counts only when it named the provider's reset.
+    const remember = () => MSG_DB.query(`INSERT INTO delivery_runtime (key, value, updated_at) VALUES (?, ?, ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`)
+      .run(`limit_notice:${key}`, String(reset ? deadline : 0), Date.now())
+    try {
+      // providerResetAt adds the two-minute margin; people see the provider's reset.
+      await bot.api.sendMessage(carrier.chat_id, limitNoticeText(reset && reset - 120_000),
+        carrier.thread_id ? { message_thread_id: Number(carrier.thread_id) } : {})
+      MSG_DB.query(`UPDATE delivery_results SET recovery_notice_at=?,
+        recovery_notice_retry_at=NULL, recovery_notice_failures=0
+        WHERE delivery_id=? AND recovery_notice_at=?`)
+        .run(Date.now(), carrier.delivery_id, reservation)
+      remember()
+    } catch (error) {
+      if (error instanceof GrammyError && error.error_code === 429) {
+        // Telegram explicitly rejected the request, so it cannot create a
+        // duplicate. Retry after a durable bounded backoff. A network error
+        // leaves the negative reservation in place because delivery is unknown.
+        const prior = MSG_DB.query(`SELECT recovery_notice_failures FROM delivery_results
+          WHERE delivery_id=? AND recovery_notice_at=?`)
+          .get(carrier.delivery_id, reservation) as { recovery_notice_failures: number } | null
+        const backoff = Math.min(60_000, 5_000 * 2 ** Math.min(prior?.recovery_notice_failures ?? 0, 4))
+        MSG_DB.query(`UPDATE delivery_results SET recovery_notice_at=NULL,
+          recovery_notice_retry_at=?, recovery_notice_failures=recovery_notice_failures+1
+          WHERE delivery_id=? AND recovery_notice_at=?`)
+          .run(Date.now() + backoff, carrier.delivery_id, reservation)
+        process.stderr.write('telegram channel: background pause notice rejected; retry scheduled\n')
+      } else {
+        remember()
+        process.stderr.write('telegram channel: background pause notice unconfirmed; saved work retained\n')
+      }
+    }
+  }
+}
+
+// While a refused login holds the queue, every conversation with a waiting
+// request hears once that it is saved: the refused request and those queued
+// behind it. A group that hears everything is skipped: this kit marks no
+// message as addressed to the bot, so its queue may be chatter. A
+// conversation hears again only after a login or an answer since its notice.
+// The owner is told once per outage, after the rescue's own link had its
+// chance (its code waits 10 minutes); that alert is re-armed only when no
+// request waits on the login any more. Every notice is reserved before the
+// Bot API call: an unknown outcome is never sent twice.
+const LOGIN_PAUSE_ALERT_MS = envNumber('TG_LOGIN_PAUSE_ALERT_MS', 15 * 60_000)
+
+// Employees wait on the same login (parity G8, 28.09): the company runtime pauses on a refused
+// login and tells each waiting chat itself, but only this alert reaches the owner. The wait is
+// counted from the oldest employee request still queued, not from the pause row, which moves.
+function companyLoginWait(): { open: number; since: number | null } {
+  if (!corporateJobsTable()) return { open: 0, since: null }
+  const state = MSG_DB.query(`SELECT admission_state AS admission, pause_reason AS reason
+    FROM corporate_runtime_state WHERE singleton=1`).get() as { admission: string; reason: string | null } | null
+  if (state?.admission !== 'paused' || state.reason !== 'auth') return { open: 0, since: null }
+  return MSG_DB.query(`SELECT count(*) AS open, min(created_at) AS since FROM conversation_jobs WHERE state='queued'
+    AND coalesce(CASE WHEN json_valid(prompt_json) THEN json_extract(prompt_json, '$.addressed') END, 1) <> 0`)
+    .get() as { open: number; since: number | null }
+}
+
+async function notifyLoginPause(): Promise<void> {
+  const waiting = MSG_DB.query(`SELECT count(*) AS open, min(CASE WHEN state='paused' THEN resume_after END) AS since,
+      (SELECT count(*) FROM delivery_runtime WHERE key='provider_auth_alert') AS alerted
+    FROM delivery_results WHERE recovery_reason='provider_auth'
+      AND state IN ('queued','pending','deferred','paused','resume_pending')`)
+    .get() as { open: number; since: number | null; alerted: number }
+  const company = companyLoginWait()
+  if (!waiting.open && !company.open) {
+    if (waiting.alerted) MSG_DB.query(`DELETE FROM delivery_runtime WHERE key='provider_auth_alert'`).run()
+    return
+  }
+  const ownerWaits = waiting.open > 0 && authHoldsDrain()
+  if (ownerWaits) await noticeLoginConversations()
+  const starts = [ownerWaits ? waiting.since : null, company.since].filter((at): at is number => at != null)
+  const since = starts.length ? Math.min(...starts) : null
+  if (waiting.alerted || !/^[1-9][0-9]*$/.test(OWNER_CHAT_ID) || since == null
+    || Date.now() - since < LOGIN_PAUSE_ALERT_MS) return
+  if (!MSG_DB.query(`INSERT OR IGNORE INTO delivery_runtime (key, value, updated_at)
+    VALUES ('provider_auth_alert', '1', ?)`).run(Date.now()).changes) return
+  try {
+    await bot.api.sendMessage(OWNER_CHAT_ID, await ownerNotice('queue.login_refused',
+      '⚠️ Claude не приймає мій вхід, тому запити зараз не виконуються. Усі вони збережені: ' +
+      'щойно вхід відновиться, виконаю їх по черзі — надсилати повторно не потрібно. ' +
+      'Посилання для входу — командою /relogin.'),
+      undefined, AbortSignal.timeout(5000))
+  } catch {
+    process.stderr.write('telegram channel: login pause alert unconfirmed; not repeated\n')
+  }
+}
+
+async function noticeLoginConversations(): Promise<void> {
+  const worked = loginWorkedAt()
+  const access = loadAccess()
+  const conversations = MSG_DB.query(`SELECT DISTINCT r.chat_id, r.thread_id FROM delivery_results r
+    WHERE r.state IN ('paused','resume_pending') OR (r.state = 'queued' AND EXISTS (SELECT 1
+      FROM pending_inbound_deliveries p WHERE p.delivery_id = r.delivery_id AND p.state IN ('queued','offered')))`)
+    .all() as Array<{ chat_id: string; thread_id: string | null }>
+  for (const { chat_id, thread_id } of conversations) {
+    if (chat_id.startsWith('-') && access.groups[chat_id]?.requireMention === false) continue
+    const key = `login_notice:${chat_id}:${thread_id ?? ''}`
+    if (runtimeNumber(key) > worked) continue
+    MSG_DB.query(`INSERT INTO delivery_runtime (key, value, updated_at) VALUES (?, ?, ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`)
+      .run(key, String(Date.now()), Date.now())
+    try {
+      await bot.api.sendMessage(chat_id, await ownerNotice('queue.accepted', 'Прийняв, відповім трохи згодом'),
+        thread_id ? { message_thread_id: Number(thread_id) } : {})
+    } catch {
+      process.stderr.write('telegram channel: login pause notice unconfirmed; not repeated\n')
+    }
+  }
+}
+
+// A continuation that hangs again is offered at most twice more: the third
+// time the ladder has to interrupt the same request, it is closed as failed,
+// the person hears so once, and the queue moves on (the re-offer cap; one rule
+// with the Codex runtime). Every attempt counts: the request's own turns and
+// the response turn ending now. The owner's /stop is no hang.
+const HUNG_REOFFERS = 2
+
+function hangsOf(result: DurableResult): number {
+  return (MSG_DB.query(`SELECT count(*) AS hangs FROM delivery_turns t WHERE t.close_kind='escape'
+      AND coalesce(t.close_detail,'') <> 'interrupted by the owner' AND (t.turn_id=?
+        OR t.turn_id IN (SELECT turn_id FROM delivery_turn_messages WHERE delivery_id=?))`)
+    .get(result.response_turn_id ?? result.turn_id, result.delivery_id) as { hangs: number }).hangs
+}
+
+function failHungRequest(result: DurableResult): void {
+  MSG_DB.transaction(() => {
+    const now = Date.now()
+    const changed = MSG_DB.query(`UPDATE delivery_results SET state='failed', recovery_reason='hung_repeatedly',
+        finished_at=?, updated_at=?, recovery_notice_at=NULL
+      WHERE delivery_id=? AND turn_id=? AND state IN ('pending','deferred')`)
+      .run(now, now, result.delivery_id, result.turn_id).changes
+    if (!changed) return
+    MSG_DB.query(`DELETE FROM pending_inbound_deliveries WHERE delivery_id=?`).run(result.delivery_id)
+    MSG_DB.query(`UPDATE delivery_turn_messages SET closed_by='failed', closed_at=?
+      WHERE delivery_id=? AND closed_at IS NULL`).run(now, result.delivery_id)
+    process.stderr.write(`telegram channel: ${result.delivery_id} hung ${HUNG_REOFFERS + 1} times; `
+      + 'closed as failed, not offered again\n')
+  })()
+}
+
+// A worker that holds its request is bounded under the receiver (NOVSKY 27.09),
+// whichever comes first: it neither called back nor let its request send a
+// progress notice for this long (DESIGN v6.2; Руфус 10269, 25.09: the worker
+// went quiet at 22:55Z and nothing came after), or three refusals of the
+// request's final named it (countFinalRefusal, silent_notified_at 0). An
+// unresolved launch counts as a worker. The owner hears once, naming the
+// request, and the worker stops blocking: scopeWork() no longer lists it, so
+// the request's final is admitted, and a pending request whose turn ended
+// with that worker holding its FIFO head is deferred to it, which lets the
+// queue move on. A request already deferred stays deferred, and the worker's
+// late callback still binds. A worker of an older service stamp is left to
+// recovery at restart. Guard and shadow change nothing for anyone: the
+// receiver logs the silent worker once per run, and shadow also records the
+// verdict (AALL 1438, 27.09).
+const OWNED_WORKER_SILENT_MS = envNumber('TG_OWNED_WORKER_SILENT_MS', 30 * 60_000)
+let silentWorkerRetryAt = 0
+const silentWorkersLogged = new Set<string>() // ponytail: per process; a restart may log a worker once more
+
+async function silentWorkerNoticeText(requests: string[]): Promise<string> {
+  return (await ownerNotice('queue.silent_worker', 'Фонова задача запиту {requests} не відповідає: немає ні результату, ні оновлень. '
+    + 'Вона більше не затримує інші повідомлення. Якщо вона зависла, надішли /unstick, і запит буде виконано знову.'))
+    .replace('{requests}', requests.join(', '))
+}
+
+type HeldWork = { kind: 'task' | 'launch'; key: string; session_id: string; stamp: string; delivery_id: string;
+  turn_id: number; chat_id: string; thread_id: string | null }
+
+async function notifySilentWorkers(): Promise<void> {
+  const now = Date.now()
+  const quiet = `max(coalesce(%LAUNCHED%, 0), coalesce((SELECT max(c.created_at) FROM delivery_receipts c
+      WHERE c.delivery_id=r.delivery_id AND c.source IN ('reply','shell')), 0)) <= ?`
+  const held = [
+    ...MSG_DB.query(`SELECT 'task' AS kind, o.task_id AS key, o.session_id, o.stamp, r.delivery_id, r.turn_id,
+        r.chat_id, r.thread_id
+      FROM delivery_task_owners o JOIN delivery_results r ON r.session_id=o.session_id AND r.stamp=o.stamp
+        AND ((o.state IN ('owned','legacy') AND r.delivery_id=o.delivery_id)
+          OR (o.state='unowned' AND o.launched_turn IN (r.turn_id, r.response_turn_id)))
+      LEFT JOIN delivery_task_launches l ON l.launch_ref=o.launch_ref
+      WHERE o.stamp=? AND o.state IN ('owned','unowned','legacy') AND (o.silent_notified_at=0
+        OR (o.silent_notified_at IS NULL AND r.state IN ('pending','deferred')
+          AND ${quiet.replace('%LAUNCHED%', 'l.created_at')}))`)
+      .all(DELIVERY_STAMP, now - OWNED_WORKER_SILENT_MS) as HeldWork[],
+    ...MSG_DB.query(`SELECT 'launch' AS kind, l.launch_ref AS key, l.session_id, l.stamp, r.delivery_id, r.turn_id,
+        r.chat_id, r.thread_id
+      FROM delivery_task_launches l JOIN delivery_results r ON r.session_id=l.session_id AND r.stamp=l.stamp
+        AND l.launched_turn IN (r.turn_id, r.response_turn_id)
+      WHERE l.stamp=? AND l.state='launching' AND (l.silent_notified_at=0
+        OR (l.silent_notified_at IS NULL AND r.state IN ('pending','deferred')
+          AND ${quiet.replace('%LAUNCHED%', 'l.created_at')}))`)
+      .all(DELIVERY_STAMP, now - OWNED_WORKER_SILENT_MS) as HeldWork[],
+  ]
+  if (!held.length) return
+  if (!WORKER_GATES) {
+    for (const row of held) {
+      const key = `${row.kind} ${row.key} ${row.delivery_id}`
+      if (silentWorkersLogged.has(key)) continue
+      silentWorkersLogged.add(key)
+      process.stderr.write(`telegram channel: would_notify_silent: ${row.kind} ${row.key} of request `
+        + `${row.delivery_id} neither called back nor let it send progress for `
+        + `${Math.round(OWNED_WORKER_SILENT_MS / 1000)}s; ${DELIVERY_AUTHORITY} authority only logs it\n`)
+      recordShadow('would_notify_silent', { chat_id: row.chat_id, thread_id: row.thread_id,
+        delivery_id: row.delivery_id, turn_id: row.turn_id, detail: `${row.kind} ${row.key}` })
+    }
+    return
+  }
+  if (!/^[1-9][0-9]*$/.test(OWNER_CHAT_ID) || now < silentWorkerRetryAt) return
+  // Reserved before the Bot API call: a timeout may still have delivered it. The
+  // reservation releases the worker, in the same transaction as the request it held.
+  const reservation = -now
+  const requests = new Set<string>()
+  const released = new Set<string>()
+  MSG_DB.transaction(() => {
+    for (const row of held) {
+      if (released.has(`${row.kind} ${row.key}`)) {
+        requests.add(row.delivery_id) // another request of the same worker's turn
+        continue
+      }
+      const reserved = row.kind === 'task'
+        ? MSG_DB.query(`UPDATE delivery_task_owners SET silent_notified_at=? WHERE session_id=? AND stamp=?
+            AND task_id=? AND (silent_notified_at IS NULL OR silent_notified_at=0)`)
+          .run(reservation, row.session_id, row.stamp, row.key).changes
+        : MSG_DB.query(`UPDATE delivery_task_launches SET silent_notified_at=? WHERE launch_ref=?
+            AND (silent_notified_at IS NULL OR silent_notified_at=0)`).run(reservation, row.key).changes
+      if (reserved) {
+        released.add(`${row.kind} ${row.key}`)
+        requests.add(row.delivery_id)
+      }
+    }
+    for (const delivery_id of requests) {
+      const request = MSG_DB.query(`SELECT r.delivery_id, r.session_id, r.stamp, r.turn_id, r.response_turn_id,
+          r.chat_id, r.thread_id FROM delivery_results r
+          JOIN delivery_turns t ON t.turn_id=coalesce(r.response_turn_id, r.turn_id)
+        WHERE r.delivery_id=? AND r.state='pending' AND t.closed_at IS NOT NULL`)
+        .get(delivery_id) as (ScopedRequest & { chat_id: string; thread_id: string | null }) | null
+      if (!request || scopeWork(request).length) continue
+      MSG_DB.query(`UPDATE delivery_results SET state='deferred', updated_at=? WHERE delivery_id=? AND state='pending'`)
+        .run(now, delivery_id)
+      settleHead({ delivery_id, turn_id: request.turn_id }, request.chat_id, request.thread_id, now)
+    }
+  }).immediate()
+  if (!requests.size) return
+  try {
+    await bot.api.sendMessage(OWNER_CHAT_ID, await silentWorkerNoticeText([...requests]), undefined, AbortSignal.timeout(5000))
+    for (const table of ['delivery_task_owners', 'delivery_task_launches']) {
+      MSG_DB.query(`UPDATE ${table} SET silent_notified_at=? WHERE silent_notified_at=?`).run(Date.now(), reservation)
+    }
+  } catch (error) {
+    if (error instanceof GrammyError && error.error_code === 429) {
+      // Telegram refused it, so nothing was delivered: the workers stay released,
+      // and the notice is due again a minute later.
+      for (const table of ['delivery_task_owners', 'delivery_task_launches']) {
+        MSG_DB.query(`UPDATE ${table} SET silent_notified_at=0 WHERE silent_notified_at=?`).run(reservation)
+      }
+      silentWorkerRetryAt = Date.now() + 60_000
+    }
+    process.stderr.write(`telegram channel: owner notice for a silent worker not confirmed: ${error}\n`)
+  }
+}
+
+async function unconfirmedSilentNoticeText(requests: string[]): Promise<string> {
+  return (await ownerNotice('queue.silent_unconfirmed', 'Не знаю, чи дійшло повідомлення про фонову задачу запиту {requests}, '
+    + 'що мовчала: процес перервався або Telegram не підтвердив надсилання. Вона вже не затримує інші повідомлення.'))
+    .replace('{requests}', requests.join(', '))
+}
+
+// A silent-worker notice whose outcome stayed unknown for two minutes (the process died between
+// its reservation and the Bot API call, or Telegram never answered) is not resent as if new: the
+// owner hears once, reserved first, that it may not have arrived; the worker stays released
+// (Codex re-review of U, 28.09). That report is 2 while reserved and not yet sent (a restart sends
+// it), 3 while being sent (an unknown outcome is never sent twice) and 1 once Telegram took it; a
+// definite 429 makes it owed again after Telegram's wait (Codex re-review of the follow-ups, 28.09).
+const UNCONFIRMED_SILENT_NOTICE_MS = 120_000
+let unconfirmedSilentRetryAt = 0
+async function reportUnconfirmedSilentNotices(): Promise<void> {
+  if (!/^[1-9][0-9]*$/.test(OWNER_CHAT_ID) || Date.now() < unconfirmedSilentRetryAt) return
+  const before = -(Date.now() - UNCONFIRMED_SILENT_NOTICE_MS)
+  const tables = ['delivery_task_owners', 'delivery_task_launches']
+  let requests: string[] = []
+  // This attempt's rows, and only these, change state below: a report another attempt left
+  // uncertain (3) is never made owed again by this one's 429 (Codex re-review, 28.09).
+  const attempt = new Map<string, number[]>()
+  MSG_DB.transaction(() => {
+    requests = (MSG_DB.query(`SELECT DISTINCT r.delivery_id FROM delivery_task_owners o
+        JOIN delivery_results r ON r.session_id=o.session_id AND r.stamp=o.stamp
+          AND (r.delivery_id=o.delivery_id OR (o.delivery_id IS NULL AND o.launched_turn IN (r.turn_id, r.response_turn_id)))
+        WHERE (o.silent_notified_at < 0 AND o.silent_notified_at > ?1) OR o.silent_notified_at = 2
+      UNION SELECT DISTINCT r.delivery_id FROM delivery_task_launches l
+        JOIN delivery_results r ON r.session_id=l.session_id AND r.stamp=l.stamp
+          AND l.launched_turn IN (r.turn_id, r.response_turn_id)
+        WHERE (l.silent_notified_at < 0 AND l.silent_notified_at > ?1) OR l.silent_notified_at = 2`).all(before) as Array<{ delivery_id: string }>)
+      .map(row => row.delivery_id)
+    // Reserved first: a report left at 2 by a restart or a 429 is owed as well.
+    for (const table of tables) {
+      MSG_DB.query(`UPDATE ${table} SET silent_notified_at=2
+        WHERE silent_notified_at < 0 AND silent_notified_at > ?`).run(before)
+      attempt.set(table, (MSG_DB.query(`SELECT rowid AS id FROM ${table} WHERE silent_notified_at=2`).all() as Array<{ id: number }>)
+        .map(row => row.id))
+    }
+  }).immediate()
+  const move = (from: number, to: number): number => {
+    let changed = 0
+    for (const table of tables) {
+      for (const id of attempt.get(table) ?? []) {
+        changed += MSG_DB.query(`UPDATE ${table} SET silent_notified_at=? WHERE rowid=? AND silent_notified_at=?`)
+          .run(to, id, from).changes
+      }
+    }
+    return changed
+  }
+  // Only now is it handed to Telegram, so its outcome is unknown from here.
+  if (!requests.length) return
+  const text = await unconfirmedSilentNoticeText(requests)
+  if (!move(2, 3)) return
+  try {
+    await bot.api.sendMessage(OWNER_CHAT_ID, text, undefined, AbortSignal.timeout(5000))
+    move(3, 1)
+  } catch (error) {
+    if (error instanceof GrammyError && error.error_code === 429) {
+      // Refused, so it never arrived: owed again once Telegram's wait is over.
+      move(3, 2)
+      const after = error.parameters?.retry_after
+      unconfirmedSilentRetryAt = Date.now() + (typeof after === 'number' && after > 0 ? Math.min(after, 3600) : 5) * 1000
+    }
+    process.stderr.write(`telegram channel: unconfirmed silent-worker notice not sent: ${error}\n`)
   }
 }
 
@@ -2427,11 +4497,38 @@ async function drainPendingInboundDeliveries(): Promise<void> {
   ) return
   pendingInboundDrainActive = true
   try {
-    if (providerHoldsDrain()) return
+    // The held head still waiting its window, or already offered and not yet taken, settled
+    // or due for its retry. Once offered it keeps that claim however the queue is woken: an
+    // open turn, a pause or its own place at the front do not end it (Codex, 28.09, P1 1–2).
+    const heldHead = (): PendingInboundRow | null => typeof inboundBurstHead === 'string' && inboundBurstHead
+      ? MSG_DB.query(`SELECT p.rowid, p.delivery_id, p.payload, p.created_at, p.state, p.attempts, p.next_attempt_at
+          FROM pending_inbound_deliveries p WHERE p.delivery_id = ?
+            AND (p.state = 'queued' AND p.attempts = 0 OR p.state = 'offered' AND p.next_attempt_at > ?)
+            AND NOT EXISTS (SELECT 1 FROM delivery_results b WHERE b.state = 'blocked' AND b.delivery_id = p.delivery_id)`)
+        .get(inboundBurstHead, Date.now()) as PendingInboundRow | null
+      : null
+    const forgetBurstHead = () => { if (typeof inboundBurstHead === 'string' && heldHead()?.state !== 'offered') inboundBurstHead = '' }
+    if (providerHoldsDrain()) { forgetBurstHead(); return }
     scheduleRecoveredRequests(Date.now(), true)
-    if (typeof ledgerHoldsDrain === 'function' && ledgerHoldsDrain()) return
-    const row = pendingInboundHead()
-    if (!row) return
+    if (typeof ledgerHoldsDrain === 'function' && ledgerHoldsDrain()) { forgetBurstHead(); return }
+    const oldest = pendingInboundHead()
+    if (!oldest) return
+    // The claim lives in memory: after a restart the row still offered inside its retry window
+    // takes it back, so nothing else is offered until it is taken or its window ends (Codex, 28.09).
+    if (typeof inboundBurstHead === 'string' && !inboundBurstHead) {
+      const offered = MSG_DB.query(`SELECT delivery_id FROM pending_inbound_deliveries
+        WHERE state = 'offered' AND next_attempt_at > ? ORDER BY created_at ASC, rowid ASC LIMIT 1`)
+        .get(Date.now()) as { delivery_id: string } | null
+      if (offered) inboundBurstHead = offered.delivery_id
+    }
+    const held = heldHead()
+    if (!held && typeof inboundBurstHead === 'string') inboundBurstHead = ''
+    const kept = held && oldest.delivery_id !== held.delivery_id && oldest.state === 'queued' ? held : null
+    const row = kept ?? oldest
+    // A reply is in flight for this offered head. Keep FIFO until its receipt
+    // and result commit, or until restart fences the uncertain send.
+    if (MSG_DB.query(`SELECT 1 FROM delivery_results WHERE delivery_id=?
+      AND outbound_attempt_at IS NOT NULL LIMIT 1`).get(row.delivery_id)) return
     if (row.state === 'started' || row.state === 'recovering') return
 
     const now = Date.now()
@@ -2451,9 +4548,10 @@ async function drainPendingInboundDeliveries(): Promise<void> {
       return
     }
 
-    // Hold an album head until its siblings are queued; every other message is
-    // offered at once, exactly as before.
+    // Hold an album or private head briefly so adjacent text and files arrive
+    // together; already offered inputs are never delayed again.
     const wait = inboundBurstWaitMs(row, now)
+    if (wait > 0 && typeof inboundBurstHead === 'string') inboundBurstHead = row.delivery_id
     if (wait > 0) { setTimeout(() => void drainPendingInboundDeliveries(), wait).unref(); return }
 
     // A burst is folded into the head before it is offered: the same person's
@@ -2499,7 +4597,7 @@ function pendingInboundOrigin(row: PendingInboundRow): string | null {
   }
 }
 
-function pendingInboundThreadId(row: PendingInboundRow, chatId: string): number | undefined {
+function pendingInboundThreadId(row: Pick<PendingInboundRow, 'payload'>, chatId: string): number | undefined {
   const meta = (JSON.parse(row.payload) as InboundNotification).params.meta
   if (meta.thread_id === undefined) {
     if (meta.conversation_key?.startsWith('topic:')) throw new Error('pending inbound topic ID missing')
@@ -2511,6 +4609,12 @@ function pendingInboundThreadId(row: PendingInboundRow, chatId: string): number 
     throw new Error('pending inbound topic identity invalid')
   }
   return threadId
+}
+
+function pendingInboundConversationKey(row: Pick<PendingInboundRow, 'payload'>, chatId: string): string {
+  const threadId = pendingInboundThreadId(row, chatId)
+  return threadId != null ? `topic:${chatId}:${threadId}`
+    : `${chatId.startsWith('-') ? 'group' : 'user'}:${chatId}`
 }
 
 async function recoverStartedInboundHeadOnStartup(): Promise<void> {
@@ -2529,7 +4633,7 @@ async function recoverStartedInboundHeadOnStartup(): Promise<void> {
         .get(turn.turn_id) as { close_detail: string | null } | null
       pauseRequest(result, turn?.close_kind ?? 'unrecorded_attempt',
         turn?.close_kind === 'stop_failure' && LIMIT_ERROR_CLASS.test(detail?.close_detail ?? ''),
-        turn?.closed_at ?? undefined)
+        turn?.closed_at ?? undefined, detail?.close_detail)
     }
     if (turn === null && typeof recordShadow === 'function') {
       recordShadow('no_turn_record', { delivery_id: row.delivery_id,
@@ -2543,6 +4647,10 @@ async function recoverStartedInboundHeadOnStartup(): Promise<void> {
 async function startPendingInboundDrain(): Promise<void> {
   // Adopt older accepted requests before reconciling their interrupted turns.
   retainLegacyRequests()
+  fenceUncertainOutbounds()
+  void notifyOwnerOfUncertainOutbounds().catch(() => {
+    process.stderr.write('telegram channel: owner notice for uncertain outbound unavailable; saved work retained\n')
+  })
   settleTurnLedger()
   reconcileHistoricalProviderPauses()
   await settleResults()
@@ -2607,13 +4715,33 @@ function chatsUnderOpenTurn(now = Date.now()): Map<string, number | undefined> {
   const rows = MSG_DB.query(
     `SELECT m.chat_id, m.thread_id FROM delivery_turn_messages m
      JOIN delivery_turns t ON t.turn_id = m.turn_id
-     WHERE t.closed_at IS NULL AND t.opened_at > ? ORDER BY m.taken_at`,
+     LEFT JOIN delivery_results r ON r.delivery_id = m.delivery_id
+     WHERE t.closed_at IS NULL AND t.opened_at > ? AND coalesce(CASE WHEN json_valid(r.request_payload)
+       THEN json_extract(r.request_payload, '$.params.meta.addressed') END, '') <> 'false'
+     ORDER BY m.taken_at`,
   ).all(now - TYPING_KEEPALIVE_MAX_MS) as Array<{ chat_id: string; thread_id: string | null }>
   for (const { chat_id, thread_id } of rows) {
     if (live.has(chat_id)) continue
     live.set(chat_id, thread_id != null && /^[1-9][0-9]*$/.test(thread_id) ? Number(thread_id) : undefined)
   }
+  // A company job at work is typing too: employees saw nothing for minutes and wrote again
+  // (Menni, 28.09). Talk that asked nobody stays quiet, as above.
+  if (corporateJobsTable()) {
+    const jobs = MSG_DB.query(`SELECT chat_id, thread_id FROM conversation_jobs
+      WHERE state IN ('leased','prompt_submitted') AND coalesce(started_at, created_at) > ?
+        AND coalesce(CASE WHEN json_valid(prompt_json) THEN json_extract(prompt_json, '$.addressed') END, 1) <> 0
+      ORDER BY created_at`).all(now - TYPING_KEEPALIVE_MAX_MS) as Array<{ chat_id: string; thread_id: number | null }>
+    for (const { chat_id, thread_id } of jobs) if (!live.has(chat_id)) live.set(chat_id, thread_id ?? undefined)
+  }
   return live
+}
+
+let corporateJobsKnown: boolean | null = null
+function corporateJobsTable(): boolean {
+  if (corporateJobsKnown) return true
+  // Checked until the module creates it; the answer never goes back to false.
+  corporateJobsKnown = MSG_DB.query(`SELECT 1 FROM sqlite_master WHERE type='table' AND name='conversation_jobs'`).get() != null
+  return corporateJobsKnown
 }
 
 function syncTypingWithTurnLedger(): void {
@@ -2663,6 +4791,328 @@ async function interruptedTurnOfHead(deliveryId: string): Promise<LedgerTurn | '
 // Limit notices belong to the availability watcher. The request itself stays
 // paused until its provider is available, then resumes through the same FIFO.
 const LIMIT_ERROR_CLASS = /(?:session|weekly|usage|rate)[ _-]?limit|usage[ _-]?credits/i
+// A login or account the provider refuses: the CLI's own "auth" stop class
+// (StopFailure error authentication_failed, oauth_org_not_allowed,
+// account_on_hold) and verification_required, which also needs the owner.
+// Retrying on a timer only fails again (see authHoldsDrain).
+const AUTH_ERROR_CLASS = /authentication|oauth_org_not_allowed|account_on_hold|verification_required/i
+
+// ── B4: a reply the model forgot twice (receipts-b4-forgot-reply NOTE v2) ─────
+// Under the receiver a turn that ends without its answer is bounced once, then
+// its request is offered once more (recovery_reason 'stop'). When that recovery
+// turn ends without an answer too, the request is held: it leaves the queue with
+// its payload kept, and after a grace for a late answer the receiver acts once.
+// - Open background work of the request: the owner is told; its callback answers.
+// - Group chatter that addressed nobody: nothing is sent to anyone, the request
+//   closes as no_reply and the log says so; a busy group must not flood the owner.
+// - A private chat, nothing received for it since, and a closing text tg-turn-end
+//   found to be an answer: that text goes to that chat alone, in parts when it
+//   is long, admitted like a normal final, so the request completes with its own
+//   terminal receipt and a later reply to it is refused.
+// - Otherwise, or when the answer cannot go out, the owner gets one alert naming
+//   the request, and the person, who is owed an answer and heard nothing since,
+//   one line saying the request was taken (the owner's rule, 27.09: a person is
+//   never left in silence). The request stays open for an explicit answer.
+const FORGOT_REPLY_GRACE_MS = envNumber('TG_FORGOT_REPLY_GRACE_MS', 120_000)
+const FORGOT_REPLY_ATTEMPTS = 3
+// The forgotten-reply sends this process is making now; any other reservation in the
+// ledger has no living sender (B4 review P0).
+const forgotReplyInFlight = new Set<string>()
+type HeldRequest = DurableResult & { forgot_reply_at: number; final_text: string | null; final_text_kind: string | null }
+type SendOutcome = 'sent' | 'refused' | 'unknown' | { retryAfterMs: number }
+
+function holdForgottenReply(result: DurableResult & { closed_at: number | null }): boolean {
+  const held = MSG_DB.transaction(() => {
+    const changed = MSG_DB.query(`UPDATE delivery_results SET forgot_reply_at=?, updated_at=?
+      WHERE delivery_id=? AND turn_id=? AND state='pending' AND forgot_reply_at IS NULL
+        AND request_payload IS NOT NULL`)
+      .run(result.closed_at ?? Date.now(), Date.now(), result.delivery_id, result.turn_id).changes
+    if (changed) MSG_DB.query(`DELETE FROM pending_inbound_deliveries WHERE delivery_id=?
+      AND state IN ('started','recovering')`).run(result.delivery_id)
+    return changed === 1
+  })()
+  if (held) process.stderr.write(`telegram channel: ${result.delivery_id} ended its recovery turn without an answer too; held for the last resort\n`)
+  return held
+}
+
+function addressedNobody(request: DurableResult): boolean {
+  if (!request.chat_id.startsWith('-')) return false
+  try { return JSON.parse(request.request_payload ?? '').params.meta.addressed === 'false' } catch { return false }
+}
+
+// What B4 owes a held request, by NOTE v2 and the owner's rule (27.09).
+function forgottenReplyPlan(request: HeldRequest, answer: boolean): string[] {
+  if (scopeWork(request).length) return ['alert'] // its callback answers
+  const heard = MSG_DB.query(`SELECT 1 FROM delivery_receipts WHERE delivery_id=? AND created_at>=? LIMIT 1`)
+    .get(request.delivery_id, request.forgot_reply_at) != null
+  if (answer && !heard && request.final_text_kind === 'answer' && request.final_text
+    && !request.chat_id.startsWith('-') && request.thread_id == null) return ['answer']
+  // The owner's own chat gets the alert, which says more than the line.
+  return heard || request.chat_id === OWNER_CHAT_ID ? ['alert'] : ['line', 'alert']
+}
+
+function oweForgottenReply(request: HeldRequest, kinds: string[]): void {
+  MSG_DB.transaction(() => {
+    MSG_DB.query(`UPDATE delivery_results SET forgot_reply_decided_at=coalesce(forgot_reply_decided_at, ?)
+      WHERE delivery_id=? AND turn_id=?`).run(Date.now(), request.delivery_id, request.turn_id)
+    for (const kind of kinds) MSG_DB.query(`INSERT OR IGNORE INTO delivery_forgot_reply_sends (delivery_id, kind)
+      VALUES (?, ?)`).run(request.delivery_id, kind)
+  })()
+}
+
+// A 429 waits its retry_after; 400 to 404 is a refusal; anything else (a
+// timeout, a 5xx) leaves the outcome unknown.
+function sendOutcome(error: unknown): SendOutcome {
+  if (!(error instanceof GrammyError) || ![400, 401, 403, 404, 429].includes(error.error_code)) return 'unknown'
+  if (error.error_code !== 429) return 'refused'
+  const after = error.parameters?.retry_after
+  return { retryAfterMs: (typeof after === 'number' && after > 0 ? Math.min(after, 3600) : 5) * 1000 }
+}
+
+// An answer in parts Telegram accepts: each cut at the last paragraph break
+// that fits, else at the last sentence end, else at the last space.
+function answerParts(text: string, limit: number): string[] {
+  const parts: string[] = []
+  let rest = text.trim()
+  while (rest.length > limit) {
+    const window = rest.slice(0, limit + 1)
+    let cut = window.lastIndexOf('\n\n')
+    if (cut <= 0) for (const end of window.matchAll(/[.!?…](?=\s)/g)) cut = end.index! + 1
+    if (cut <= 0) cut = window.lastIndexOf(' ')
+    if (cut <= 0) cut = limit
+    parts.push(rest.slice(0, cut).trimEnd())
+    rest = rest.slice(cut).trimStart()
+  }
+  return rest ? [...parts, rest] : parts
+}
+
+// Each forgotten-reply send is bounded: a hung call must not hold settleResults or the
+// startup drain (B4v2 review L5).
+const FORGOT_REPLY_SEND_MS = 5_000
+
+async function forwardForgottenReply(request: HeldRequest): Promise<SendOutcome> {
+  const delivery: ResultDelivery = { chat_id: request.chat_id, thread_id: null, phase: 'final', task_id: null,
+    targets: [{ turn_id: request.turn_id, delivery_id: request.delivery_id }], generations: [request.result_generation] }
+  try { armOutboundAttempt(delivery) } catch (error) {
+    process.stderr.write(`telegram channel: the forward of ${request.delivery_id} was not admitted: ${error}\n`)
+    return 'refused'
+  }
+  const sentIds: number[] = []
+  try {
+    for (const part of answerParts(request.final_text!, MAX_CHUNK_LIMIT)) {
+      const sent = await bot.api.sendMessage(request.chat_id, part, undefined, AbortSignal.timeout(FORGOT_REPLY_SEND_MS))
+      recordOutgoingReceipt(sent, request.chat_id, undefined, part, undefined, sentIds, id => {
+        sentIds.push(id)
+        if (sentIds.length > 1) return
+        delivery.first_message_id = id
+        recordReceipt({ chat_id: request.chat_id, thread_id: null, message_id: id, source: 'reply', source_row: null,
+          targets: delivery.targets, offered_id: null, generations: delivery.generations, phase: 'final' })
+      })
+    }
+  } catch (error) {
+    // Only a refusal of the first part proves that nothing went out.
+    const outcome = sentIds.length ? 'unknown' : sendOutcome(error)
+    if (outcome === 'unknown') quarantineUncertainFinal(delivery)
+    else disarmRejectedOutbound(delivery)
+    return outcome
+  }
+  delivery.terminal_message_id = sentIds[sentIds.length - 1]
+  // The forward, its ledger row and the owner's line about it are one fact: a crash
+  // cannot leave a forward the owner never hears of (B4 review P1).
+  MSG_DB.transaction(() => {
+    recordResult(delivery)
+    MSG_DB.query(`UPDATE delivery_forgot_reply_sends SET sent_at=? WHERE delivery_id=? AND kind='answer'`)
+      .run(Date.now(), request.delivery_id)
+    if (request.chat_id !== OWNER_CHAT_ID) MSG_DB.query(`INSERT OR IGNORE INTO delivery_forgot_reply_sends
+      (delivery_id, kind) VALUES (?, 'forwarded')`).run(request.delivery_id)
+  })()
+  process.stderr.write(`telegram channel: forwarded the recovery turn's text as the answer to ${request.delivery_id} in ${sentIds.length} part(s)\n`)
+  return 'sent'
+}
+
+// Who asked and what, for the owner in plain words (B4v2 review L3).
+function forgottenRequestWords(request: DurableResult, russian: boolean): string {
+  let user = '', words = ''
+  try {
+    const payload = JSON.parse(request.request_payload ?? '') as { params?: { content?: unknown; meta?: { user?: unknown } } }
+    if (typeof payload.params?.meta?.user === 'string') user = payload.params.meta.user
+    if (typeof payload.params?.content === 'string') words = payload.params.content.replace(/\s+/gu, ' ').trim()
+  } catch {}
+  return [user ? `${russian ? 'от' : 'від'} ${user}` : '', words ? `«${words.length > 120 ? `${words.slice(0, 120)}…` : words}»` : '']
+    .filter(Boolean).join(' ')
+}
+
+// The owner's reconciliation item for a send whose outcome is unknown: it was cut off by a
+// restart or a network failure. What may be lost, that it is not sent again, what to do (B4 review P0).
+function unsureForgottenReplyNotice(kind: string, words: string, id: string, russian: boolean): string {
+  const toOwner = kind === 'alert' || kind === 'forwarded'
+  if (russian) {
+    const lost = ({ line: `до человека строка «Принял, отвечу чуть позже» на сообщение ${words}`,
+      answer: `до человека последний текст бота как ответ на сообщение ${words}`,
+      alert: `до тебя уведомление: бот не ответил на сообщение ${words}`,
+      forwarded: `до тебя уведомление: я отправил человеку последний текст бота как ответ на сообщение ${words}` } as Record<string, string>)[kind]
+    return `Не знаю, дошло ли ${lost}. `
+      + (toOwner ? 'Если ты его уже получил, это повтор. ' : 'Отправка оборвалась, поэтому повторно не отправляю. ')
+      + (kind === 'forwarded' ? 'Проверь, что это действительно ответ. ' : 'Если ответа нет, попроси бота здесь ответить на этот запрос. ')
+      + `Код запроса: ${id}.`
+  }
+  const lost = ({ line: `до людини рядок «Прийняв, відповім трохи згодом» на повідомлення ${words}`,
+    answer: `до людини останній текст бота як відповідь на повідомлення ${words}`,
+    alert: `до тебе сповіщення: бот не відповів на повідомлення ${words}`,
+    forwarded: `до тебе сповіщення: я надіслав людині останній текст бота як відповідь на повідомлення ${words}` } as Record<string, string>)[kind]
+  return `Не знаю, чи дійшло ${lost}. `
+    + (toOwner ? 'Якщо ти його вже отримав, це повтор. ' : 'Надсилання обірвалося, тож удруге не надсилаю. ')
+    + (kind === 'forwarded' ? 'Перевір, чи це справді відповідь. ' : 'Якщо відповіді немає, попроси бота тут відповісти на цей запит. ')
+    + `Код запиту: ${id}.`
+}
+
+// The forgotten-reply notices below pick their language here, synchronously, by the
+// same profile rule as agent_notice_locale.owner_notice_locale.
+function russianNotices(): boolean {
+  try {
+    // The per-agent profile, not VAULT_LOCALE or the process environment,
+    // selects owner-facing notices in the rest of the kit.
+    const profile = join(process.env.AGENT_ROOT || homedir(), '.agent-profile.env')
+    const metadata = lstatSync(profile)
+    if (!metadata.isFile() || metadata.nlink !== 1 || metadata.size > 64 * 1024) return false
+    const settings = readFileSync(profile, 'utf8').split(/\r?\n/)
+      .filter(line => line.startsWith('OWNER_NOTICE_LOCALE='))
+    return settings.length === 1 && /^OWNER_NOTICE_LOCALE=(?:ru|'ru'|"ru")$/.test(settings[0]!.trim())
+  } catch { return false } // Existing agents keep Ukrainian notices without a valid profile.
+}
+
+async function noticeForgottenReply(request: HeldRequest & { kind: string }): Promise<SendOutcome> {
+  const russian = russianNotices()
+  if (request.kind === 'alert' || request.kind === 'forwarded' || request.kind.startsWith('unsure-')) {
+    if (!/^[1-9][0-9]*$/.test(OWNER_CHAT_ID)) return 'refused'
+    // Who asked and what, what happened and what to do; the code lets the bot find the request
+    // when the owner asks it to answer. A forward is told too, so a wrong one is seen (B4v2 M1).
+    const words = forgottenRequestWords(request, russian)
+    const alert = request.kind.startsWith('unsure-') ? unsureForgottenReplyNotice(request.kind.slice(7), words, request.delivery_id, russian)
+      : request.kind === 'forwarded'
+      ? (russian
+        ? `Бот дважды не отправил ответ на сообщение ${words}, поэтому я отправил человеку его последний текст как ответ. Проверь, что это действительно ответ. Код запроса: ${request.delivery_id}.`
+        : `Бот двічі не надіслав відповідь на повідомлення ${words}, тож я надіслав людині його останній текст як відповідь. Перевір, чи це справді відповідь. Код запиту: ${request.delivery_id}.`)
+      : (russian
+        ? `Бот не ответил на сообщение ${words}: он дважды закончил работу, не отправив ответ. Запрос сохранён: чтобы ответить, попроси бота здесь ответить на этот запрос. Код запроса: ${request.delivery_id}.`
+        : `Бот не відповів на повідомлення ${words}: він двічі завершив роботу, не надіславши відповідь. Запит збережено: щоб відповісти, попроси бота тут відповісти на цей запит. Код запиту: ${request.delivery_id}.`)
+    try { await bot.api.sendMessage(OWNER_CHAT_ID, alert, undefined, AbortSignal.timeout(FORGOT_REPLY_SEND_MS)) }
+    catch (error) { return sendOutcome(error) }
+    return 'sent'
+  }
+  const text = russian ? 'Принял, отвечу чуть позже' : 'Прийняв, відповім трохи згодом'
+  const threadId = request.thread_id != null && /^[1-9][0-9]*$/.test(request.thread_id) ? Number(request.thread_id) : undefined
+  // In a busy group the line answers the person's own message (B4v2 review L2).
+  let asked = NaN
+  try { asked = Number(JSON.parse(request.request_payload ?? '').params.meta.message_id) } catch {}
+  try {
+    const sent = await bot.api.sendMessage(request.chat_id, text, {
+      ...(threadId != null ? { message_thread_id: threadId } : {}),
+      ...(request.chat_id.startsWith('-') && Number.isSafeInteger(asked) && asked > 0
+        ? { reply_parameters: { message_id: asked, allow_sending_without_reply: true } } : {}),
+    }, AbortSignal.timeout(FORGOT_REPLY_SEND_MS))
+    logMsg({ chat_id: request.chat_id, user_id: '', username: botUsername || 'bot', direction: 'out', text,
+      ts: Date.now(), message_id: sent.message_id, thread_id: threadId,
+      conversation_key: threadId != null ? `topic:${request.chat_id}:${threadId}`
+        : `${request.chat_id.startsWith('-') ? 'group' : 'user'}:${request.chat_id}` })
+  } catch (error) { return sendOutcome(error) }
+  return 'sent'
+}
+
+// Each owed message: reserved in the ledger before the network, then sent,
+// retried after a 429 or given up. An answer that cannot go out leaves the
+// person the line and the owner the alert.
+async function sendForgottenReplies(): Promise<void> {
+  const due = MSG_DB.query(`SELECT r.*, t.final_text, t.final_text_kind, s.kind, s.attempts
+    FROM delivery_forgot_reply_sends s JOIN delivery_results r ON r.delivery_id = s.delivery_id
+    LEFT JOIN delivery_turns t ON t.turn_id = coalesce(r.response_turn_id, r.turn_id)
+    WHERE s.sent_at IS NULL AND s.retry_at <= ? ORDER BY s.rowid`).all(Date.now()) as
+    Array<HeldRequest & { kind: string; attempts: number }>
+  for (const row of due) {
+    // A real answer that arrived meanwhile makes the rest moot; the owner's line about a
+    // forward follows the forward that completed the request.
+    const moot = row.state !== 'pending' && row.kind !== 'forwarded' && row.kind !== 'unsure-forwarded'
+    if (!MSG_DB.query(`UPDATE delivery_forgot_reply_sends SET sent_at=? WHERE delivery_id=? AND kind=?
+      AND sent_at IS NULL`).run(moot ? Date.now() : -Date.now(), row.delivery_id, row.kind).changes || moot) continue
+    const key = `${row.delivery_id}\u0000${row.kind}`
+    forgotReplyInFlight.add(key)
+    let outcome: SendOutcome
+    try { outcome = row.kind === 'answer' ? await forwardForgottenReply(row) : await noticeForgottenReply(row) }
+    finally { forgotReplyInFlight.delete(key) }
+    if (outcome === 'unknown') {
+      // The reservation stays: the next reconciliation tells the owner once and sends nothing again.
+      process.stderr.write(`telegram channel: the ${row.kind} for ${row.delivery_id} may have been delivered; it is not sent again\n`)
+      continue
+    }
+    const retry = typeof outcome === 'object' && row.attempts + 1 < FORGOT_REPLY_ATTEMPTS ? outcome.retryAfterMs : null
+    MSG_DB.query(`UPDATE delivery_forgot_reply_sends SET sent_at=?, attempts=attempts+?, retry_at=?
+      WHERE delivery_id=? AND kind=?`).run(retry == null ? Date.now() : null, outcome === 'sent' ? 0 : 1,
+      retry == null ? 0 : Date.now() + retry, row.delivery_id, row.kind)
+    if (outcome === 'sent' || retry != null) continue
+    process.stderr.write(`telegram channel: gave up the ${row.kind} for ${row.delivery_id} after ${row.attempts + 1} attempt(s)\n`)
+    if (row.kind === 'answer' && MSG_DB.query(`SELECT 1 FROM delivery_results WHERE delivery_id=? AND state='pending'`)
+      .get(row.delivery_id)) oweForgottenReply(row, forgottenReplyPlan(row, false))
+  }
+}
+
+// A reservation no living send holds: its process died between the ledger and Telegram, or
+// its send ended with an unknown outcome (B4 review P0). Nothing goes to the person again.
+// A forward whose result completed still owes the owner its line (P1). Any other send owes
+// the owner one notice naming what may be lost, and the request stays as it was. That
+// notice is the owner's alone, so one cut off in its turn is owed again, three times at most.
+function reconcileForgottenReplies(): void {
+  const orphans = (MSG_DB.query(`SELECT s.delivery_id, s.kind, s.attempts, -s.sent_at AS reserved_at, r.chat_id, r.state,
+      r.finished_at FROM delivery_forgot_reply_sends s JOIN delivery_results r ON r.delivery_id = s.delivery_id
+    WHERE s.sent_at < 0 AND NOT EXISTS (SELECT 1 FROM delivery_forgot_reply_sends u
+      WHERE u.delivery_id = s.delivery_id AND u.kind = 'unsure-' || s.kind)`).all() as
+    Array<{ delivery_id: string; kind: string; attempts: number; reserved_at: number; chat_id: string; state: string;
+      finished_at: number | null }>).filter(orphan => !forgotReplyInFlight.has(`${orphan.delivery_id}\u0000${orphan.kind}`))
+  for (const orphan of orphans) {
+    MSG_DB.transaction(() => {
+      if (orphan.kind.startsWith('unsure-')) {
+        const again = orphan.attempts + 1 < FORGOT_REPLY_ATTEMPTS
+        MSG_DB.query(`UPDATE delivery_forgot_reply_sends SET sent_at=?, attempts=attempts+1, retry_at=?
+          WHERE delivery_id=? AND kind=?`).run(again ? null : Date.now(), again ? Date.now() + 30_000 : 0,
+          orphan.delivery_id, orphan.kind)
+      } else if (orphan.kind === 'answer' && orphan.state === 'complete' && (orphan.finished_at ?? 0) >= orphan.reserved_at) {
+        MSG_DB.query(`UPDATE delivery_forgot_reply_sends SET sent_at=? WHERE delivery_id=? AND kind='answer'`)
+          .run(Date.now(), orphan.delivery_id)
+        if (orphan.chat_id !== OWNER_CHAT_ID) MSG_DB.query(`INSERT OR IGNORE INTO delivery_forgot_reply_sends
+          (delivery_id, kind) VALUES (?, 'forwarded')`).run(orphan.delivery_id)
+      } else {
+        MSG_DB.query(`INSERT OR IGNORE INTO delivery_forgot_reply_sends (delivery_id, kind) VALUES (?, ?)`)
+          .run(orphan.delivery_id, `unsure-${orphan.kind}`)
+      }
+    })()
+    process.stderr.write(`telegram channel: the ${orphan.kind} for ${orphan.delivery_id} has no living send; `
+      + 'it is not sent to the person again and the owner is told\n')
+  }
+}
+
+async function settleForgottenReplies(): Promise<void> {
+  reconcileForgottenReplies()
+  const due = MSG_DB.query(`SELECT r.*, t.final_text, t.final_text_kind FROM delivery_results r
+    LEFT JOIN delivery_turns t ON t.turn_id = coalesce(r.response_turn_id, r.turn_id)
+    WHERE r.state='pending' AND r.forgot_reply_at IS NOT NULL AND r.forgot_reply_at<=?
+      AND r.forgot_reply_decided_at IS NULL AND r.outbound_attempt_at IS NULL
+    ORDER BY r.forgot_reply_at`).all(Date.now() - FORGOT_REPLY_GRACE_MS) as HeldRequest[]
+  for (const request of due) {
+    if (!addressedNobody(request)) {
+      oweForgottenReply(request, forgottenReplyPlan(request, true))
+      continue
+    }
+    // Chatter is nobody's request: a log line, never a message.
+    const work = scopeWork(request).length > 0
+    if (work) MSG_DB.query(`UPDATE delivery_results SET forgot_reply_decided_at=? WHERE delivery_id=? AND turn_id=?`)
+      .run(Date.now(), request.delivery_id, request.turn_id)
+    else MSG_DB.query(`UPDATE delivery_results SET state='no_reply', finished_at=?, updated_at=?
+      WHERE delivery_id=? AND turn_id=? AND state='pending'`).run(Date.now(), Date.now(), request.delivery_id, request.turn_id)
+    process.stderr.write(`telegram channel: ${request.delivery_id} is group chatter that addressed nobody; `
+      + `its forgotten reply (${request.final_text_kind ?? 'empty'}) stays silent${work ? ' while its worker runs' : ''}\n`)
+  }
+  await sendForgottenReplies()
+}
+
 let resultSettleActive = false
 async function settleResults(): Promise<void> {
   if (SUPPRESS || process.env.TG_TRANSPORT === 'daemon' || resultSettleActive) return
@@ -2670,13 +5120,17 @@ async function settleResults(): Promise<void> {
   try {
     MSG_DB.transaction(() => {
       // A confirmed final can arrive while recovery is waiting to be claimed.
+      // Under the receiver a complete result settles its head only with its own
+      // terminal receipt at its generation (B0-b); without one it keeps the head.
       const completed = MSG_DB.query(`SELECT r.delivery_id, r.turn_id, r.state FROM delivery_results r
-        WHERE r.state IN ('complete','no_reply','cancelled') AND (
+        WHERE (r.state IN ('no_reply','cancelled') OR (r.state='complete' AND (?<>'receiver' OR EXISTS (
+          SELECT 1 FROM delivery_terminal_receipts tr WHERE tr.delivery_id=r.delivery_id AND tr.turn_id=r.turn_id
+            AND tr.result_generation=r.result_generation)))) AND (
           EXISTS (SELECT 1 FROM delivery_turn_messages m WHERE m.delivery_id=r.delivery_id
             AND m.turn_id=r.turn_id AND m.closed_at IS NULL)
           OR EXISTS (SELECT 1 FROM pending_inbound_deliveries p WHERE p.delivery_id=r.delivery_id
             AND (?='receiver' OR p.state!='started')))`)
-        .all(DELIVERY_AUTHORITY) as Array<{delivery_id: string; turn_id: number; state: string}>
+        .all(DELIVERY_AUTHORITY, DELIVERY_AUTHORITY) as Array<{delivery_id: string; turn_id: number; state: string}>
       for (const target of completed) {
         MSG_DB.query(`UPDATE delivery_turn_messages SET closed_by = ?, closed_at = ?
           WHERE turn_id = ? AND delivery_id = ? AND closed_at IS NULL`)
@@ -2686,15 +5140,29 @@ async function settleResults(): Promise<void> {
           AND (? = 'receiver' OR state != 'started')`).run(target.delivery_id, DELIVERY_AUTHORITY)
       }
     })()
+    if (WORKER_GATES) {
+      settleOrphanedShellAttempts()
+      settleAcksOfEndedStamps()
+      // B0-b: a quarantine made since the start reaches the owner now, once per delivery.
+      void notifyOwnerOfUncertainOutbounds().catch(() => {
+        process.stderr.write('telegram channel: owner notice for uncertain outbound unavailable; saved work retained\n')
+      })
+    }
     const interrupted = MSG_DB.query(`SELECT r.*, t.closed_at, t.close_kind, t.close_detail
       FROM delivery_results r JOIN delivery_turns t ON t.turn_id = coalesce(r.response_turn_id, r.turn_id)
-      WHERE r.state IN ('pending','deferred') AND (
+      WHERE r.state IN ('pending','deferred') AND r.outbound_attempt_at IS NULL AND r.forgot_reply_at IS NULL AND (
         (r.stamp IS NOT NULL AND ? IS NOT NULL AND r.stamp != ?)
         OR (r.state = 'pending' AND t.closed_at IS NOT NULL
           AND t.close_kind IN ('stop','stop_failure','escape','session_replaced','session_end')))
       ORDER BY r.created_at, r.delivery_id`).all(DELIVERY_STAMP, DELIVERY_STAMP) as Array<
         DurableResult & { closed_at: number | null; close_kind: string | null; close_detail: string | null }>
     for (const result of interrupted) {
+      // Under the receiver a pending request whose turn ended while a worker of
+      // its scope still runs, registered or not, waits for that worker's
+      // callback or stop like a deferred one. After a restart its old stamp's
+      // workers are gone and it is recovered as before.
+      if (WORKER_GATES && result.stamp === DELIVERY_STAMP && result.state === 'pending'
+        && scopeWork(result).length) continue
       if (result.close_kind === 'escape' && result.close_detail === 'interrupted by the owner') {
         MSG_DB.transaction(() => {
           MSG_DB.query(`UPDATE delivery_results SET state='cancelled',finished_at=?,updated_at=?
@@ -2704,12 +5172,26 @@ async function settleResults(): Promise<void> {
         })()
         continue
       }
+      // B4: the request's one recovery turn for a forgotten reply ended without
+      // an answer too. No further recovery: the last resort takes it after the grace.
+      if (WORKER_GATES && result.state === 'pending' && result.close_kind === 'stop'
+        && result.recovery_reason === 'stop' && result.recovery_count > 0 && holdForgottenReply(result)) continue
+      // The re-offer cap is the receiver's liveness policy; under guard and shadow a hang is
+      // recovered as before K, with no failure and no notice (Codex, task 46 P0-2).
+      if (WORKER_GATES && result.close_kind === 'escape' && hangsOf(result) > HUNG_REOFFERS) {
+        failHungRequest(result)
+        continue
+      }
       const limit = result.close_kind === 'stop_failure' && LIMIT_ERROR_CLASS.test(result.close_detail ?? '')
       pauseRequest(result, limit ? 'provider_limit' : result.close_kind ?? 'process_interrupted', limit,
-        result.closed_at ?? undefined)
+        result.closed_at ?? undefined, result.close_detail)
     }
+    await notifySilentWorkers()
+    await reportUnconfirmedSilentNotices()
     await notifyPausedBackgroundResults()
+    await notifyLoginPause()
     scheduleRecoveredRequests()
+    if (WORKER_GATES) await settleForgottenReplies()
   } catch (error) {
     process.stderr.write(`telegram channel: durable result recovery deferred: ${error}\n`)
   } finally { resultSettleActive = false }
@@ -2733,11 +5215,24 @@ function outcomeSince(turn_id: number, chat_id: string, thread_id: string | null
   })
 }
 
+// Receipts into this chat and topic since the turn opened, every one naming
+// another request: the receiver saw the send and gave it to its own origin.
+// The window ends when the guard closed the head: a later receipt is a later
+// send and cannot be the one the guard credited.
+function onlyOtherOriginsSince(delivery_id: string, chat_id: string, thread_id: string | null, since: number,
+  until: number): boolean {
+  const named = MSG_DB.query(
+    `SELECT DISTINCT delivery_id FROM delivery_receipts
+     WHERE chat_id = ? AND thread_id IS ? AND created_at >= ? AND created_at <= ? AND delivery_id IS NOT NULL`,
+  ).all(chat_id, thread_id, since, until) as Array<{ delivery_id: string }>
+  return named.length > 0 && named.every(row => row.delivery_id !== delivery_id)
+}
+
 // ── inactivity ladder and /stop (added 2026-09-19, R11, R12, KTD7) ───────────
 // Receiver mode: a hung turn is cured by an interruption, not by a service
-// restart. Inactivity is the silence of the open turn's transcript file — only
-// its mtime is read, never its content — counted from the later of the turn's
-// start and the last write. Only turns of a bound session (one that has ever
+// restart. Inactivity is the silence of the model's records (below) in the
+// open turn's transcript and its subagents', from the later of the turn's
+// start and the newest one. Only turns of a bound session (one that has ever
 // taken a message from this queue) are watched. While a permission card the
 // CLI asked during this turn is unanswered the clock does not run: waiting for
 // the owner is not a hang. First threshold: one short warning to each chat and
@@ -2749,7 +5244,8 @@ function outcomeSince(turn_id: number, chat_id: string, thread_id: string | null
 // as `escape` and schedules contextual continuation of the retained request. A turn is escaped at most once by the ladder; a screen
 // failure is logged and left to the healthcheck's dead-process restart. /stop
 // from the owner takes the same path at once. All receipt modes recover silent
-// turns; shadow additionally records would_interrupt at each threshold.
+// turns; shadow additionally records would_interrupt at each threshold of a
+// turn that took a Telegram message.
 function envNumber(name: string, fallback: number): number {
   const value = Number(process.env[name])
   return Number.isFinite(value) && value > 0 ? value : fallback
@@ -2782,10 +5278,75 @@ function openTurnsOfBoundSessions(): LadderTurn[] {
   ).all() as LadderTurn[]
 }
 
+// The health check's rule for a stuck turn (28G1): only conversation records
+// are the turn. Queue rows, last-prompt, mode and the rest of the CLI's
+// bookkeeping land while a tool call hangs too, and a headless run (entrypoint
+// sdk*) is another session. A foreground subagent works in the session's own
+// folder while its transcript stays silent (Кнопа #340 and #476: 25 and 28
+// minutes of work, then a group no_reply). A line that cannot be classified
+// counts at its file's mtime, so the ladder never interrupts work it cannot read.
+const TURN_RECORD_TYPES = new Set(['user', 'assistant', 'attachment', 'system'])
+const TURN_RECORD_WINDOWS = [64 * 1024, 16 * 1024 * 1024]
+// The last verdict per file: the 16 MB window is a synchronous read in this
+// loop, so a file with the same size and mtime is not read again.
+const turnRecordVerdicts = new Map<string, { size: number; mtimeMs: number; at: number }>()
+
+// The newest turn record's time, 0 when the file has none.
+function newestTurnRecord(path: string, size: number, mtimeMs: number): number {
+  const known = turnRecordVerdicts.get(path)
+  if (known?.size === size && known.mtimeMs === mtimeMs) return known.at
+  const at = scanTurnRecords(path, size, mtimeMs)
+  if (turnRecordVerdicts.size >= 1000) turnRecordVerdicts.clear() // a bound, not an eviction policy
+  turnRecordVerdicts.set(path, { size, mtimeMs, at })
+  return at
+}
+
+function scanTurnRecords(path: string, size: number, mtimeMs: number): number {
+  let fd: number | undefined
+  try {
+    fd = openSync(path, 'r')
+    for (const window of TURN_RECORD_WINDOWS) {
+      const start = Math.max(0, size - window)
+      const data = Buffer.alloc(size - start)
+      readSync(fd, data, 0, data.length, start)
+      const lines = data.toString('utf8').split('\n')
+      if (start > 0 && lines.length < 2) return mtimeMs // one record longer than the window
+      for (let i = lines.length - 1; i >= (start > 0 ? 1 : 0); i--) {
+        if (!lines[i]!.trim()) continue
+        let event: any
+        try { event = JSON.parse(lines[i]!) } catch { return mtimeMs }
+        if (!event || typeof event !== 'object' || Array.isArray(event)) return mtimeMs
+        if (!TURN_RECORD_TYPES.has(event.type) || String(event.entrypoint ?? '').startsWith('sdk')) continue
+        const at = typeof event.timestamp === 'string' && /(?:Z|[+-]\d\d:?\d\d)$/.test(event.timestamp)
+          ? Date.parse(event.timestamp) : NaN
+        return Number.isFinite(at) ? at : mtimeMs
+      }
+      if (start === 0) break
+    }
+    return 0
+  } catch {
+    return mtimeMs
+  } finally {
+    if (fd !== undefined) closeSync(fd)
+  }
+}
+
 function lastTranscriptActivity(turn: LadderTurn): number {
   let last = turn.opened_at
-  if (turn.transcript_path) {
-    try { last = Math.max(last, statSync(turn.transcript_path).mtimeMs) } catch {}
+  if (!turn.transcript_path) return last
+  const paths = [turn.transcript_path]
+  if (turn.transcript_path.endsWith('.jsonl')) {
+    const folder = turn.transcript_path.slice(0, -'.jsonl'.length)
+    try {
+      for (const name of readdirSync(folder, { recursive: true }) as string[]) {
+        if (name.endsWith('.jsonl')) paths.push(join(folder, name))
+      }
+    } catch {}
+  }
+  for (const path of paths) {
+    let file: { size: number; mtimeMs: number }
+    try { file = statSync(path) } catch { continue }
+    if (file.mtimeMs > last) last = Math.max(last, newestTurnRecord(path, file.size, file.mtimeMs))
   }
   return last
 }
@@ -2815,8 +5376,12 @@ async function sendEscapeToSession(): Promise<boolean> {
 }
 
 async function warnTurnChats(turn: LadderTurn, idleMs: number): Promise<void> {
+  // Group talk that addressed nobody here is no one's request to reassure (Кнопа 15.09).
   const addressees = MSG_DB.query(
-    `SELECT DISTINCT chat_id, thread_id FROM delivery_turn_messages WHERE turn_id = ?`,
+    `SELECT DISTINCT m.chat_id, m.thread_id FROM delivery_turn_messages m
+     LEFT JOIN delivery_results r ON r.delivery_id = m.delivery_id
+     WHERE m.turn_id = ? AND coalesce(CASE WHEN json_valid(r.request_payload)
+       THEN json_extract(r.request_payload, '$.params.meta.addressed') END, '') <> 'false'`,
   ).all(turn.turn_id) as Array<{ chat_id: string; thread_id: string | null }>
   for (const { chat_id, thread_id } of addressees) {
     const threadId = thread_id != null && /^[1-9][0-9]*$/.test(thread_id) ? Number(thread_id) : undefined
@@ -2866,11 +5431,16 @@ function recordWouldInterrupt(turn: LadderTurn, threshold: 1 | 2): void {
   const first = MSG_DB.query(
     `SELECT chat_id, thread_id FROM delivery_turn_messages WHERE turn_id = ? ORDER BY taken_at LIMIT 1`,
   ).get(turn.turn_id) as { chat_id: string; thread_id: string | null } | null
-  process.stderr.write(`telegram channel: inactivity ladder (shadow): would_interrupt threshold=${threshold} turn=${turn.turn_id} chat=${first?.chat_id ?? '-'} thread=${first?.thread_id ?? '-'}\n`)
+  if (!first) {
+    // Nobody's Telegram request waits on this turn; the ladder itself still acts.
+    process.stderr.write(`telegram channel: inactivity ladder (shadow): turn=${turn.turn_id} threshold=${threshold} has no Telegram head; would_interrupt not recorded\n`)
+    return
+  }
+  process.stderr.write(`telegram channel: inactivity ladder (shadow): would_interrupt threshold=${threshold} turn=${turn.turn_id} chat=${first.chat_id} thread=${first.thread_id ?? '-'}\n`)
   // The shadow table and its helper arrive with the authority-flag unit.
   if (typeof recordShadow === 'function') {
     recordShadow('would_interrupt', {
-      threshold, chat_id: first?.chat_id ?? null, thread_id: first?.thread_id ?? null, turn_id: turn.turn_id,
+      threshold, chat_id: first.chat_id, thread_id: first.thread_id, turn_id: turn.turn_id,
     })
   }
 }
@@ -2955,8 +5525,8 @@ async function stopLiveTurn(ctx: Context): Promise<void> {
 // verdict is judged after a grace period, so a late shell scan and the end
 // signal have had their chance. would_interrupt arrives from the inactivity
 // ladder through recordShadow. A head that leaves the queue with no ledger row
-// is noticed by remembering the heads taken: that memory is this process, so a
-// head removed while the receiver was down is not recorded.
+// is noticed by remembering the heads taken and by a durable SQLite trigger:
+// a guard removal while the receiver is down must not disappear from the audit.
 const SHADOW_GRACE_MS = Number(process.env.TG_SHADOW_GRACE_MS) || 60_000
 const SHADOW_SINCE = (MSG_DB.query(
   `SELECT updated_at FROM delivery_runtime WHERE key = 'authority'`,
@@ -2995,7 +5565,8 @@ function recordShadow(cls: string, fields: ShadowFields): void {
     }
     // Result completion is independent of the transport observation: an
     // acknowledgement can agree with the guard while its result is missing.
-    if (!['receiver_would_close', 'would_interrupt', 'incomplete_result', 'result_complete', 'provider_paused', 'recovery_pending'].includes(cls)) {
+    if (!['receiver_would_close', 'would_interrupt', 'incomplete_result', 'result_complete', 'provider_paused', 'recovery_pending',
+      'would_refuse_final', 'would_refuse_registration', 'would_quarantine', 'would_refuse_repeat_progress'].includes(cls)) {
       const replaced = MSG_DB.query(
         `UPDATE delivery_shadow SET class = ?, created_at = ?, detail = ?
          WHERE class IN ('receiver_would_close', 'no_end_signal') AND delivery_id IS ? AND turn_id IS ?`,
@@ -3042,7 +5613,10 @@ function settleShadow(): void {
          AND NOT EXISTS (SELECT 1 FROM delivery_shadow s WHERE s.delivery_id = m.delivery_id
                          AND s.turn_id = m.turn_id AND s.class NOT IN
                            ('would_interrupt', 'receiver_would_close', 'no_end_signal', 'incomplete_result', 'result_complete',
-                            'provider_paused','recovery_pending','provider_resumed','recovery_complete','incomplete_result_cancelled','provider_paused_cancelled','recovery_pending_cancelled'))
+                            'provider_paused','recovery_pending','provider_resumed','recovery_complete','incomplete_result_cancelled','provider_paused_cancelled','recovery_pending_cancelled',
+                            -- the worker gates' verdicts observe a send, not how its head left the queue
+                            'would_refuse_final','would_refuse_registration','would_quarantine','would_supersede_final',
+                            'would_refuse_repeat_progress'))
        ORDER BY m.closed_at`,
     ).all(SHADOW_SINCE) as ShadowLedgerRow[]
     const waitingForEnd = new Set<string>()
@@ -3068,7 +5642,15 @@ function settleShadow(): void {
       } else if (!grace) {
         continue
       } else if (row.closed_by === 'guard_delivered' && !outcomeSince(row.turn_id, row.chat_id, row.thread_id, row.opened_at)) {
-        recordShadow('receiver_blind', where)
+        // The guard may credit another request's send to this head (Кнопа, 25.09).
+        const otherOrigin = onlyOtherOriginsSince(row.delivery_id, row.chat_id, row.thread_id, row.opened_at, row.closed_at)
+        // A missing end is its own record; neither origin verdict answers for it.
+        // The neutral one waits for the end, so a missing end keeps blocking.
+        const waiting = waitingForEnd.has(key)
+        if (waiting && !endGrace) continue
+        if (!otherOrigin) recordShadow('receiver_blind', where)
+        else if (ended) recordShadow('guard_wrong_origin', where)
+        if (waiting) recordShadow('no_end_signal', where)
       } else if (!ended) {
         if (endGrace) recordShadow('no_end_signal', where)
       } else {
@@ -3078,6 +5660,16 @@ function settleShadow(): void {
     for (const key of shadowMissingEnds.keys()) {
       if (!waitingForEnd.has(key)) shadowMissingEnds.delete(key)
     }
+    // A closed turn whose every message was group chatter it declined with
+    // no_reply kept nobody waiting; its long silence needs no manual review.
+    MSG_DB.query(
+      `UPDATE delivery_shadow SET class = 'would_interrupt_no_reply'
+       WHERE class = 'would_interrupt' AND created_at >= ?
+         AND EXISTS (SELECT 1 FROM delivery_turns t WHERE t.turn_id = delivery_shadow.turn_id AND t.closed_at IS NOT NULL)
+         AND EXISTS (SELECT 1 FROM delivery_turn_messages m WHERE m.turn_id = delivery_shadow.turn_id)
+         AND NOT EXISTS (SELECT 1 FROM delivery_turn_messages m WHERE m.turn_id = delivery_shadow.turn_id
+           AND (m.closed_by IS NOT 'no_reply' OR m.chat_id NOT LIKE '-%'))`,
+    ).run(SHADOW_SINCE)
     // A progress receipt proves transport, not completion. Deferred work has
     // its own lifecycle and may outlive the parent turn without blocking here.
     // When a response turn exists, only that turn's end can lack a result.
@@ -3132,6 +5724,30 @@ function settleShadow(): void {
       ).get(delivery_id, delivery_id)
       if (!recorded) recordShadow('no_turn_record', { ...origin, delivery_id })
     }
+    // The legacy Stop guard can delete a taken head while this process is down.
+    // A trigger writes the departure in the same transaction as that deletion.
+    // Delay judgment so a late ledger write can still account for the head.
+    const unseenDepartures = MSG_DB.query(
+      `SELECT d.delivery_id, d.chat_id, d.thread_id FROM delivery_shadow_departures d
+       WHERE d.observed_at >= ? AND d.observed_at <= ?
+         AND NOT EXISTS (SELECT 1 FROM pending_inbound_deliveries p WHERE p.delivery_id=d.delivery_id)
+         AND NOT EXISTS (SELECT 1 FROM delivery_turn_messages m WHERE m.delivery_id=d.delivery_id)
+         AND NOT EXISTS (SELECT 1 FROM delivery_receipts r WHERE r.delivery_id=d.delivery_id)
+         AND NOT EXISTS (SELECT 1 FROM delivery_results r WHERE r.delivery_id=d.delivery_id AND r.state='cancelled')`,
+    ).all(SHADOW_SINCE, now - SHADOW_GRACE_MS) as Array<{
+      delivery_id: string; chat_id: string; thread_id: string | null
+    }>
+    for (const departure of unseenDepartures) recordShadow('no_turn_record', departure)
+    // Once a departure has durable evidence, keep that evidence in the
+    // ledger/receipt/shadow record and drop this transient audit marker.
+    // A failed shadow write leaves its marker for the next tick.
+    MSG_DB.query(`DELETE FROM delivery_shadow_departures
+      WHERE observed_at < ? OR (observed_at <= ? AND (
+        EXISTS (SELECT 1 FROM delivery_turn_messages m WHERE m.delivery_id=delivery_shadow_departures.delivery_id)
+        OR EXISTS (SELECT 1 FROM delivery_receipts r WHERE r.delivery_id=delivery_shadow_departures.delivery_id)
+        OR EXISTS (SELECT 1 FROM delivery_results r WHERE r.delivery_id=delivery_shadow_departures.delivery_id AND r.state='cancelled')
+        OR EXISTS (SELECT 1 FROM delivery_shadow s WHERE s.delivery_id=delivery_shadow_departures.delivery_id AND s.class='no_turn_record')
+      ))`).run(SHADOW_SINCE, now - SHADOW_GRACE_MS)
   } catch (error) {
     process.stderr.write(`telegram channel: shadow settle failed: ${error}\n`)
   }
@@ -3172,7 +5788,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'reply',
       description:
-        `Reply on Telegram. Pass chat_id and, for a forum topic, thread_id from the inbound message. thread_id selects the topic independently of reply_to (an optional quote). Pass absolute file paths staged inside ${ATTACHMENT_OUTBOX} to attach images or documents.`,
+        `Reply on Telegram. Pass chat_id and the exact inbound delivery_id when available; preserve thread_id for forum topics independently of reply_to (an optional quote). Unresolved forums fail closed; general_topic: true is only for deliberate General delivery. Pass absolute file paths staged inside ${ATTACHMENT_OUTBOX} to attach images or documents.`,
       inputSchema: {
         type: 'object',
         properties: {
@@ -3188,9 +5804,17 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: 'integer', minimum: 1, maximum: Number.MAX_SAFE_INTEGER,
             description: 'Forum topic ID from inbound thread_id. Preserve it for every reply and attachment, even without reply_to.',
           },
+          delivery_id: {
+            type: 'string',
+            description: 'Exact delivery_id from the inbound notification. Must match its persisted offered/started chat, message and topic; never copy a different turn or infer the queue head. Routing evidence only, not an access grant.',
+          },
+          general_topic: {
+            type: 'boolean',
+            description: 'Set true only to deliberately send to General. Conflicts with any non-General topic evidence; omission never silently selects General in an unresolved forum.',
+          },
           reply_to: {
             type: 'string',
-            description: 'Message ID to quote. Use message_id from the inbound <channel> block; forum thread_id must be passed separately.',
+            description: 'Message ID to quote in this chat. Verified local history can recover its topic; preserve inbound thread_id independently whenever available.',
           },
           files: {
             type: 'array',
@@ -3377,10 +6001,14 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const parseMode = format === "markdownv2" ? "MarkdownV2" as const : format === "markdown" ? "Markdown" as const : undefined
 
         assertAllowedChat(chat_id)
-        if (reply_to !== undefined && (!Number.isSafeInteger(reply_to) || reply_to <= 0)) {
-          throw new Error('reply_to must be a positive safe integer')
+        if (!text.length && !files.length) throw new Error('reply requires text or an attachment')
+        if (args.reply_to !== undefined && (typeof args.reply_to !== 'string'
+          || !/^[1-9][0-9]*$/.test(args.reply_to) || !Number.isSafeInteger(reply_to))) {
+          throw new Error('reply_to must be a positive safe integer message ID string')
         }
-        const threadId = resolveReplyThreadId(chat_id, args.thread_id, reply_to)
+        const threadId = await resolveReplyThreadId(
+          chat_id, args.thread_id, reply_to, args.delivery_id, args.general_topic,
+        )
         const topicParams = threadId != null ? { message_thread_id: threadId } : {}
 
         for (const f of files) {
@@ -3400,97 +6028,167 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const limit = Math.max(1, Math.min(access.textChunkLimit ?? MAX_CHUNK_LIMIT, MAX_CHUNK_LIMIT))
         const mode = access.chunkMode ?? 'length'
         const replyMode = access.replyToMode ?? 'first'
-        const chunks = chunk(text, limit, mode)
+        const chunks = text.length ? chunk(text, limit, mode) : []
         const sentIds: number[] = []
         const origin = receiptContext(chat_id, threadId != null ? String(threadId) : null, args.delivery_id)
         const completion = resultDelivery(chat_id, threadId != null ? String(threadId) : null,
           origin.targets, args.phase ?? 'final', args.task_id)
         completion.offered_id = origin.offered_id
         if (!chunks.length && !files.length) throw new Error('reply needs text or an attachment')
+        const continuationKey = () => completion.targets.length === 1 && !completion.offered_id
+          ? JSON.stringify([chat_id, completion.thread_id, completion.targets[0], completion.generations[0]])
+          : null
+        const pendingPartialKey = continuationKey()
+        const pendingPartial = pendingPartialKey ? partialFileContinuations.get(pendingPartialKey) : undefined
+        if (pendingPartial && completion.phase !== pendingPartial.phase) {
+          throw new Error('File continuation must keep the original result phase; nothing was sent')
+        }
+        if (pendingPartial && (chunks.length || !files.length
+          || args.delivery_id !== completion.targets[0].delivery_id || args.task_id != null)) {
+          throw new Error('Text was already sent; retry only the unsent file with the original delivery_id and empty text')
+        }
         registerBackgroundResult(completion)
+        // A file continuation ends the same notice; it is not a new acknowledgement.
+        const unsent = pendingPartial ? null : refuseRepeatedAcknowledgement(completion)
+        if (unsent) return { content: [{ type: 'text', text: unsent }] }
+        const partialFileKey = continuationKey()
+        const partialFile = partialFileKey && args.delivery_id === completion.targets[0].delivery_id
+          && !chunks.length && files.length ? partialFileContinuations.get(partialFileKey) : undefined
+        const partialReceiptId = partialFile?.messageId
+        let outboundArmed = false
+        const beginOutbound = (): void => {
+          if (outboundArmed) return
+          if (partialFile && partialFileKey) {
+            if (partialFileContinuations.get(partialFileKey) !== partialFile) {
+              throw new Error('This file continuation was already used; nothing was sent')
+            }
+            partialFileContinuations.delete(partialFileKey)
+          }
+          armOutboundAttempt(completion, partialReceiptId)
+          outboundArmed = true
+        }
         // The first accepted part is a transport receipt. It does not certify
         // completion: every requested part/file below must succeed first.
         const delivered = (id: number): void => {
           sentIds.push(id)
           if (sentIds.length === 1) {
-            recordReceipt({ chat_id, thread_id: threadId != null ? String(threadId) : null, message_id: id, source: 'reply', source_row: null, ...origin })
+            completion.first_message_id = id
+            recordReceipt({ chat_id, thread_id: threadId != null ? String(threadId) : null, message_id: id, source: 'reply', source_row: null, ...origin, generations: completion.generations, phase: completion.phase })
           }
         }
 
-        for (let i = 0; i < chunks.length; i++) {
-          const shouldReplyTo =
-            reply_to != null &&
-            replyMode !== 'off' &&
-            (replyMode === 'all' || i === 0)
-          const replyParams = {
-            ...topicParams,
-            ...(shouldReplyTo ? { reply_parameters: { message_id: reply_to! } } : {}),
-          }
-          // Pre-escape for MarkdownV2 (2026-06-23): always run through tg-escape
-          // before send so reserved chars are escaped even when the model wrote
-          // raw `*bold*` text. Saves the round-trip via the reactive fallback below.
-          let outText = chunks[i]
-          if (parseMode === 'MarkdownV2') {
-            try { outText = await tgEscape(chunks[i]) } catch { outText = chunks[i] }
-          }
-          try {
-            const sent = await bot.api.sendMessage(chat_id, outText, {
-              ...replyParams,
-              ...(parseMode ? { parse_mode: parseMode } : {}),
-            })
-            delivered(sent.message_id)
-          } catch (err) {
-            const msg = err instanceof Error ? err.message : String(err)
-            // Fallback: bad markdown(v2) escaping -> Telegram "can't parse entities".
-            // The model often writes RAW *bold* without escaping reserved chars (. - ( )
-            // etc) -> parse fails. Auto-escape via tg-escape and resend as MarkdownV2 so
-            // formatting RENDERS, instead of degrading to a plain wall with literal *. If
-            // the escaper itself fails, last resort = strip escapes + send plain. 2026-05-30.
-            if (parseMode && /can.?t parse entities|can not parse/i.test(msg)) {
-              try {
-                const escaped = await tgEscape(chunks[i])
-                const sent = await bot.api.sendMessage(chat_id, escaped, { ...replyParams, parse_mode: 'MarkdownV2' })
-                delivered(sent.message_id)
-                continue
-              } catch {
-                const plain = chunks[i].replace(/\\([_*\[\]()~`>#+=|{}.!-])/g, '$1')
-                const sent = await bot.api.sendMessage(chat_id, plain, { ...replyParams })
-                delivered(sent.message_id)
-                continue
+        let rejectedFile = false
+        let sentFiles = 0
+        try {
+          for (let i = 0; i < chunks.length; i++) {
+            const shouldReplyTo =
+              reply_to != null &&
+              replyMode !== 'off' &&
+              (replyMode === 'all' || i === 0)
+            const replyParams = {
+              ...topicParams,
+              ...(shouldReplyTo ? { reply_parameters: { message_id: reply_to! } } : {}),
+            }
+            // Pre-escape for MarkdownV2 (2026-06-23): always run through tg-escape
+            // before send so reserved chars are escaped even when the model wrote
+            // raw `*bold*` text. Saves the round-trip via the reactive fallback below.
+            let outText = chunks[i]
+            if (parseMode === 'MarkdownV2') {
+              try { outText = await tgEscape(chunks[i]) } catch { outText = chunks[i] }
+            }
+            let sent: unknown
+            try {
+              beginOutbound()
+              sent = await bot.api.sendMessage(chat_id, outText, {
+                ...replyParams,
+                ...(parseMode ? { parse_mode: parseMode } : {}),
+              })
+            } catch (err) {
+              const msg = err instanceof Error ? err.message : String(err)
+              // Fallback: bad markdown(v2) escaping -> Telegram "can't parse entities".
+              // The model often writes RAW *bold* without escaping reserved chars (. - ( )
+              // etc) -> parse fails. Auto-escape via tg-escape and resend as MarkdownV2 so
+              // formatting RENDERS, instead of degrading to a plain wall with literal *. If
+              // the escaper itself fails, last resort = strip escapes + send plain. 2026-05-30.
+              if (parseMode && /can.?t parse entities|can not parse/i.test(msg)) {
+                try {
+                  outText = await tgEscape(chunks[i])
+                  beginOutbound()
+                  sent = await bot.api.sendMessage(chat_id, outText, { ...replyParams, parse_mode: 'MarkdownV2' })
+                } catch {
+                  outText = chunks[i].replace(/\\([_*\[\]()~`>#+=|{}.!-])/g, '$1')
+                  beginOutbound()
+                  sent = await bot.api.sendMessage(chat_id, outText, { ...replyParams })
+                }
+              } else {
+                throw err
               }
             }
-            throw new Error(
-              `reply failed after ${sentIds.length} of ${chunks.length} chunk(s) sent: ${msg}`,
-            )
+            // Receipt validation/storage is outside every Markdown retry catch:
+            // an acknowledged chunk can never be resent to repair its history.
+            recordOutgoingReceipt(sent, chat_id, threadId, outText, undefined, sentIds, delivered)
           }
+
+          // Files go as separate messages (Telegram doesn't mix text+file in one
+          // sendMessage call). Topic routing is independent of the quote setting.
+          for (const f of files) {
+            const ext = extname(f).toLowerCase()
+            const input = new InputFile(f)
+            const opts = {
+              ...topicParams,
+              ...(reply_to != null && replyMode !== 'off'
+                ? { reply_parameters: { message_id: reply_to } } : {}),
+            }
+            const kind = PHOTO_EXTS.has(ext) ? 'photo' : 'document'
+            beginOutbound()
+            rejectedFile = true
+            const sent = kind === 'photo'
+              ? await bot.api.sendPhoto(chat_id, input, opts)
+              : await bot.api.sendDocument(chat_id, input, opts)
+            rejectedFile = false
+            recordOutgoingReceipt(sent, chat_id, threadId,
+              `[${kind}: ${basename(f).slice(0, 200)}]`, kind, sentIds, delivered)
+            sentFiles++
+          }
+        } catch (error) {
+          const definitelyRejected = error instanceof GrammyError
+            && [400, 401, 403, 404, 429].includes(error.error_code)
+          const rejectedOutright = outboundArmed && sentIds.length === 0 && partialReceiptId == null
+            && definitelyRejected
+          if (rejectedOutright) disarmRejectedOutbound(completion)
+          const acknowledgedTextId = completion.first_message_id ?? partialReceiptId
+          const canContinueFile = outboundArmed && rejectedFile && definitelyRejected
+            && sentFiles === 0 && partialFileKey != null && acknowledgedTextId != null
+            && MSG_DB.query(`SELECT 1 FROM delivery_receipts WHERE source='reply'
+              AND message_id=? AND chat_id=? AND thread_id IS ? AND stamp IS ?
+              AND delivery_id=? LIMIT 1`)
+              .get(acknowledgedTextId, chat_id, completion.thread_id, DELIVERY_STAMP,
+                completion.targets[0].delivery_id)
+          if (canContinueFile) partialFileContinuations.set(partialFileKey!, {
+            messageId: acknowledgedTextId!, phase: completion.phase, task_id: completion.task_id,
+          })
+          else if (outboundArmed && !rejectedOutright && completion.phase === 'final') quarantineUncertainFinal(completion)
+          // Under the receiver a progress notice short of its whole acknowledgement
+          // registered nothing (B0-a) and holds no fence: the fence exists for finals.
+          else if (WORKER_GATES && outboundArmed && !rejectedOutright) disarmRejectedOutbound(completion)
+          const reason = error instanceof Error ? error.message : String(error)
+          const delivery = completion.targets[0]?.delivery_id ?? 'from the request'
+          const retryNotice = !completion.task_id || completion.phase !== 'progress' ? ''
+            : WORKER_GATES ? (recordProgressRetry(completion, chunks.length === 1 && !files.length
+              && sentIds.length === 0 && partialReceiptId == null)
+              ? `; nothing was registered; if the background task is still running, retry only the progress notice once with the same task_id and delivery_id ${delivery}; if its callback arrived, send its final result instead; do not start another task`
+              : '; nothing was registered, and this progress notice may not be sent again: the request waits for the background task\'s callback; send its final result then, or stop the task')
+            : definitelyRejected && sentIds.length === 0 && partialReceiptId == null
+              ? `; the original background task remains registered; if it is still running, retry only the progress notice once with the same task_id and delivery_id ${delivery}; if its callback arrived, send its final result instead; do not start another task`
+              : ''
+          throw new Error(`reply failed; acknowledged ${sentIds.length} part(s) (ids: ${sentIds.join(', ') || 'none'}): ${reason}`
+            + (canContinueFile ? '; retry only the unsent file with the original delivery_id and empty text' : '')
+            + retryNotice)
         }
 
-        // Log outbound once per reply (full text) — history/context.
-        logMsg({ chat_id, user_id: '', username: botUsername || 'bot', direction: 'out', text, ts: Date.now(), message_id: sentIds[0],
-          thread_id: threadId,
-          conversation_key: threadId != null ? `topic:${chat_id}:${threadId}`
-            : `${chat_id.startsWith('-') ? 'group' : 'user'}:${chat_id}`,
-        })
-
-        // Files go as separate messages (Telegram doesn't mix text+file in one
-        // sendMessage call). Topic routing is independent of the quote setting.
-        for (const f of files) {
-          const ext = extname(f).toLowerCase()
-          const input = new InputFile(f)
-          const opts = {
-            ...topicParams,
-            ...(reply_to != null && replyMode !== 'off'
-              ? { reply_parameters: { message_id: reply_to } } : {}),
-          }
-          if (PHOTO_EXTS.has(ext)) {
-            const sent = await bot.api.sendPhoto(chat_id, input, opts)
-            delivered(sent.message_id)
-          } else {
-            const sent = await bot.api.sendDocument(chat_id, input, opts)
-            delivered(sent.message_id)
-          }
-        }
-
+        if (partialFileKey) partialFileContinuations.delete(partialFileKey)
+        completion.terminal_message_id = sentIds[sentIds.length - 1]
+        if (partialFile?.task_id) completion.task_id = partialFile.task_id
         recordResult(completion)
 
         const result =
@@ -3512,7 +6210,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           }
         }
         assertAllowedChat(chat_id)
-        const threadId = resolveReplyThreadId(chat_id, args.thread_id, undefined)
+        const threadId = await resolveReplyThreadId(chat_id, args.thread_id, undefined, undefined, undefined)
         const closed = declareSilence(chat_id, threadId != null ? String(threadId) : null)
         return {
           content: [{
@@ -3618,7 +6316,16 @@ function shutdown(reason: string = 'signal'): void {
         process.stderr.write('telegram channel: corporate shutdown failed\n')
       })
     : Promise.resolve()
-  const botStop = Promise.resolve().then(() => bot.stop())
+  // When middleware is still working, wait for durable intake before bot.stop().
+  // A failed or stalled handler exits without confirmation so Telegram can
+  // replay it after restart; the seven-second deadline bounds a network stall.
+  const inFlight = currentBotUpdate
+  const botStop = inFlight
+    ? inFlight.then(
+      () => currentBotUpdate === null ? bot.stop() : undefined,
+      () => undefined,
+    )
+    : bot.stop()
   void Promise.allSettled([botStop, corporateStop]).finally(() => {
     clearTimeout(forceExit)
     process.exit(0)
@@ -3647,24 +6354,45 @@ setInterval(() => {
 bot.on('my_chat_member', async ctx => {
   const update = ctx.myChatMember
   const chat = update.chat
-  if (chat.type !== 'group' && chat.type !== 'supergroup') return
+  // A channel is connected like a group once an admin makes the bot its administrator (Bro, 28.09).
+  const channel = chat.type === 'channel'
+  if (chat.type !== 'group' && chat.type !== 'supergroup' && !channel) return
 
   const groupId = String(chat.id)
   const title = chat.title ?? ''
   const oldStatus = update.old_chat_member.status
   const newStatus = update.new_chat_member.status
-  const wasMember = oldStatus === 'member' || oldStatus === 'administrator'
-  const isMember = newStatus === 'member' || newStatus === 'administrator'
+  const wasMember = oldStatus === 'member' || oldStatus === 'administrator' || oldStatus === 'restricted'
+  const isMember = newStatus === 'administrator' || (!channel && newStatus === 'member')
 
   if (!isMember) {
     await updateAccess(['group-deactivate', ACCESS_FILE, groupId, title])
     return
   }
-  if (wasMember) return
+  // A join connects the chat (again after a removal). A change in place, such as a promotion,
+  // connects only a chat that has no policy at all, a join the bot never saw (a backlog dropped
+  // at the first start; Bro, 28.09); a policy the owner turned off stays off.
+  const access = loadAccess()
+  if (wasMember && access.groups?.[groupId]) return
 
   const actorId = String(update.from.id)
-  const access = loadAccess()
-  if (!access.admins.includes(actorId)) return
+  if (!access.admins.includes(actorId)) {
+    // Someone else, or an admin acting anonymously (Telegram names GroupAnonymousBot), added
+    // the bot: the chat stays unconnected, and the owner hears why and what to do, not silence.
+    process.stderr.write(`telegram channel: ${chat.type} ${groupId} not connected: added by ${actorId}\n`)
+    if (/^[1-9][0-9]*$/.test(OWNER_CHAT_ID)) {
+      const what = channel ? 'каналу' : 'групи'
+      await bot.api.sendMessage(
+        OWNER_CHAT_ID,
+        `Мене додали до ${what} «${title}» (${groupId}), але не ти, тому я ${channel ? 'його' : 'її'} не підключив. ` +
+        `Щоб підключити, видали мене звідти й додай сам від свого імені, не анонімно` +
+        `${channel ? ', адміністратором' : ''}.`,
+        undefined,
+        AbortSignal.timeout(5000),
+      ).catch(error => process.stderr.write(`telegram channel: group registration notice failed: ${error}\n`))
+    }
+    return
+  }
 
   try {
     await updateAccess(['group-register', ACCESS_FILE, actorId, groupId, title])
@@ -3683,14 +6411,11 @@ bot.on('my_chat_member', async ctx => {
     }
     return
   }
-  const liveBotInfo = await bot.api.getMe(AbortSignal.timeout(5000)).catch(() => bot.botInfo)
-  const readsChat = liveBotInfo.can_read_all_group_messages === true || newStatus === 'administrator'
-  const name = liveBotInfo.first_name || bot.botInfo.first_name || botUsername
+  // A channel is an audience, not a conversation: no greeting is posted to it.
+  if (channel) return
+  const name = bot.botInfo.first_name.trim() || botUsername
   await ctx.reply(
-    `Усім привіт! Я — ${name}. ` +
-      (readsChat ? 'Сиджу й читаю весь чат. ' : '') +
-      `Якщо хочете, щоб я відповів, тегніть мене через @${botUsername}` +
-      (readsChat ? ' або зверніться до мене по імені.' : '.'),
+    `Вітаю! Я — ${name}.`,
     undefined,
     AbortSignal.timeout(5000),
   )
@@ -3700,14 +6425,18 @@ bot.command('health', async (ctx, next) => {
   const allowed = corporateCommandGate(ctx)
   if (!allowed) return
   const isolationActivated = readCorporateIsolationActivated()
-  if (!CORPORATE_ENABLED && !isolationActivated) return next()
+  if (!CORPORATE_ENABLED && !isolationActivated) {
+    if (!allowed.ownerDirect) return next()
+    await ctx.reply(`Telegram працює.\nНеперевірених відповідей після перезапуску: ${uncertainOutboundCount()}.\nЗафіксованих помилок прийому: ${corporateIntakeFailureCount()}.`)
+    return
+  }
   const corporate = await corporateRuntimeReady()
   const key = allowed.ownerDirect ? undefined : allowed.conversationKey
-  await ctx.reply(formatGatewayHealth(
-    allowed.ownerDirect,
-    corporate?.health(key),
-    isolationActivated,
-  ), inboundTopicOptions(ctx))
+  const base = formatGatewayHealth(allowed.ownerDirect, corporate?.health(key), isolationActivated)
+  const count = allowed.ownerDirect ? uncertainOutboundCount() : 0
+  await ctx.reply(allowed.ownerDirect
+    ? `${base}\nНеперевірених відповідей після перезапуску: ${count}.\nЗафіксованих помилок прийому: ${corporateIntakeFailureCount()}.`
+    : base, inboundTopicOptions(ctx))
 })
 
 bot.command('unstick', async (ctx, next) => {
@@ -3715,16 +6444,26 @@ bot.command('unstick', async (ctx, next) => {
   if (!allowed) return
   const target = typeof ctx.match === 'string' ? ctx.match.trim() : ''
   if (target) {
-    // Owner alerts refer to a specific blocked job, not whichever turn is now
-    // active. Never forward this form to the model or legacy restart handler.
-    if (!allowed.ownerDirect || ctx.chat?.type !== 'private'
-      || String(ctx.chat.id) !== OWNER_CHAT_ID) {
-      await ctx.reply('Адресне розблокування доступне лише власнику в особистому чаті.')
+    // A named business job may be recovered by the owner or a verified
+    // superadmin; the latter never gains the owner's private conversation.
+    const access = loadAccess()
+    const superadmin = ctx.chat?.type === 'private' && String(ctx.chat.id) === allowed.senderId
+      && allowed.senderId !== OWNER_CHAT_ID
+      && access.superadmins?.includes(allowed.senderId)
+      && access.admins.includes(allowed.senderId)
+      && access.allowFrom.includes(allowed.senderId)
+    if (!(allowed.ownerDirect && ctx.chat?.type === 'private'
+      && String(ctx.chat.id) === OWNER_CHAT_ID || superadmin)) {
+      await ctx.reply('Адресне розблокування доступне власнику або суперадміну в особистому чаті.')
       return
     }
-    const match = /^(user:[1-9]\d*|group:-[1-9]\d*|topic:-[1-9]\d*:[1-9]\d*)\s+([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i.exec(target)
+    const match = /^(user:[1-9]\d*|group:-[1-9]\d*|topic:-[1-9]\d*:[1-9]\d*)\s+([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:\s+(close|закрити|done|виконано))?$/iu.exec(target)
     if (!match) {
-      await ctx.reply('Скопіюй повну команду з повідомлення про блокування: /unstick <сесія> <ID запиту>.')
+      await ctx.reply('Скопіюй повну команду з повідомлення про блокування: /unstick <сесія> <ID запиту>, або з close у кінці, щоб закрити запит.')
+      return
+    }
+    if (superadmin && match[1] === `user:${OWNER_CHAT_ID}`) {
+      await ctx.reply('Особиста розмова власника недоступна.')
       return
     }
     if (!CORPORATE_ENABLED && !readCorporateIsolationActivated()) {
@@ -3738,14 +6477,57 @@ bot.command('unstick', async (ctx, next) => {
       await ctx.reply(CORPORATE_TEMPORARILY_UNAVAILABLE)
       return
     }
-    const result = await corporate.releaseBlockedJob(match[1]!.toLowerCase(), match[2]!.toLowerCase())
+    // Changed rights, an unknown action result and an unconfirmed reply wait for the owner alone:
+    // the module is told who acts (E+J2 review P1 1).
+    const ownerOnly = 'Цей запит чекає рішення лише власника: після зміни прав, невідомого результату дії '
+      + 'чи непідтвердженої відповіді його відновлює або закриває тільки він. Нічого не змінено.'
+    if (match[3] && /^(close|закрити)$/iu.test(match[3])) {
+      // The owner closes the request after his check; its author hears one closing line.
+      const closed = corporate.closeBlockedJob
+        ? await corporate.closeBlockedJob(match[1]!.toLowerCase(), match[2]!.toLowerCase(), allowed.senderId) : 'idle'
+      await ctx.reply(closed === 'closed'
+        ? 'Запит закрито, автор отримав повідомлення про це.'
+        : closed === 'owner_only' ? ownerOnly
+          : 'Цей запит уже не заблокований або не належить указаній сесії. Нічого не змінено.')
+      return
+    }
+    // «done»: the owner found that the unknown action happened, so the rerun never repeats it
+    // (Codex review of 136289cd, 28.09); a plain release says it did not.
+    const happened = match[3] != null
+    // An older module would take «done» for a plain release and repeat the action.
+    if (happened && !corporate.releaseOutcomes?.includes('happened')) {
+      await ctx.reply('Цей бот ще не приймає відповідь «done». Нічого не змінено; онови кит або закрий запит.')
+      return
+    }
+    const result = happened
+      ? await corporate.releaseBlockedJob(match[1]!.toLowerCase(), match[2]!.toLowerCase(), allowed.senderId, 'happened')
+      : await corporate.releaseBlockedJob(match[1]!.toLowerCase(), match[2]!.toLowerCase(), allowed.senderId)
+    if (result === 'no_unknown_action') {
+      await ctx.reply(`Команда done — лише для дії з невідомим результатом, а цей запит чекає іншого рішення. `
+        + `Якщо відповідь уже є в чаті, надішли /unstick ${match[1]} ${match[2]} close; якщо її там немає — /unstick ${match[1]} ${match[2]}. `
+        + 'Нічого не змінено.')
+      return
+    }
     await ctx.reply(result === 'released'
-      ? 'Заблокований запит закрито. Він не повторювався; наступні повідомлення можуть оброблятися.'
-      : 'Цей запит уже не заблокований або не належить указаній сесії. Нічого не змінено.')
+      ? happened
+        ? 'Запит відновлено: дію зараховано як виконану, я її не повторю й відповім автору.'
+        : 'Заблокований запит відновлено. Для невизначеної доставки відповідь може бути надіслана повторно — перевір чат на дубль. '
+          + 'Після зміни прав або невизначеної дії запит виконається заново з поточними правами й не повторить уже виконаного.'
+      : result === 'owner_only' ? ownerOnly
+        : 'Цей запит уже не заблокований або не належить указаній сесії. Нічого не змінено.')
     return
   }
   const isolationActivated = readCorporateIsolationActivated()
-  if (!CORPORATE_ENABLED && !isolationActivated) return next()
+  if (!CORPORATE_ENABLED && !isolationActivated) {
+    const access = loadAccess()
+    if (ctx.chat?.type === 'private' && String(ctx.chat.id) === allowed.senderId
+      && allowed.senderId !== OWNER_CHAT_ID && access.superadmins?.includes(allowed.senderId)
+      && access.admins.includes(allowed.senderId) && access.allowFrom.includes(allowed.senderId)) {
+      await ctx.reply(CORPORATE_TEMPORARILY_UNAVAILABLE)
+      return
+    }
+    return next()
+  }
   if (allowed.ownerDirect) return next()
   const corporate = await corporateRuntimeReady()
   if (!corporate && isolationActivated) {
@@ -3817,9 +6599,11 @@ const CALLBACK_UUID = '([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]
 const CORPORATE_ACTION_CALLBACK_RE = new RegExp(`^corp-action:(approve|cancel):${CALLBACK_UUID}$`)
 const CORPORATE_POLICY_CALLBACK_RE = new RegExp(`^corp-policy:(approve|cancel):${CALLBACK_UUID}$`)
 const CORPORATE_RESOURCE_CALLBACK_RE = new RegExp(`^corp-resource:(approve|cancel):${CALLBACK_UUID}$`)
+const CORPORATE_TEAM_CALLBACK_RE = new RegExp(`^corp-team:(approve|cancel):${CALLBACK_UUID}$`)
+const CORPORATE_SETTINGS_CALLBACK_RE = new RegExp(`^corp-settings:(approve|cancel):${CALLBACK_UUID}$`)
 
 function corporateCallbackLabel(
-  kind: 'action' | 'policy' | 'resource',
+  kind: 'action' | 'policy' | 'resource' | 'team' | 'settings',
   result: CorporateGatewayActionResult | CorporateGatewayPolicyResult,
 ): string {
   if (result.ok) {
@@ -3830,16 +6614,21 @@ function corporateCallbackLabel(
       }
       return `✅ Виконано\nРезультат: ${result.resourceUrl ?? result.receiptId}`
     }
-    return kind === 'action' ? '✅ Виконано' : kind === 'resource' ? '✅ Ресурс оновлено' : '✅ Права оновлено'
+    return kind === 'action' ? '✅ Виконано' : kind === 'resource' ? '✅ Ресурс оновлено'
+      : kind === 'team' ? '✅ Роль оновлено' : kind === 'settings' ? '✅ Налаштування оновлено' : '✅ Права оновлено'
   }
   if (result.reason === 'actor') return 'Немає доступу.'
   if (result.reason === 'expired') return 'Час підтвердження минув.'
   if (result.reason === 'used') return 'Цей запит уже оброблено.'
   if (result.reason === 'stale') return 'Права змінилися; запит не виконано.'
   if (result.reason === 'uncertain') {
-    return '⚠️ Статус дії невизначений; повторно її не запускаю.'
+    return '⚠️ Статус дії не підтверджено. Натисни цю ж кнопку ще раз для перевірки.'
   }
   return 'Запит недоступний або не виконаний.'
+}
+
+function shouldCloseCorporateAccessPreview(result: { ok: boolean; reason?: string }): boolean {
+  return result.ok || (result.reason !== 'uncertain' && result.reason !== 'actor')
 }
 
 // Inline-button handler for corporate confirmations and legacy permission
@@ -3850,9 +6639,12 @@ bot.on('callback_query:data', async ctx => {
   const action = CORPORATE_ACTION_CALLBACK_RE.exec(data)
   const policy = CORPORATE_POLICY_CALLBACK_RE.exec(data)
   const resource = CORPORATE_RESOURCE_CALLBACK_RE.exec(data)
-  if (action || policy || resource) {
-    const kind = action ? 'action' as const : policy ? 'policy' as const : 'resource' as const
-    const match = action ?? policy ?? resource!
+  const team = CORPORATE_TEAM_CALLBACK_RE.exec(data)
+  const settings = CORPORATE_SETTINGS_CALLBACK_RE.exec(data)
+  if (action || policy || resource || team || settings) {
+    const kind = action ? 'action' as const : policy ? 'policy' as const : resource ? 'resource' as const
+      : team ? 'team' as const : 'settings' as const
+    const match = action ?? policy ?? resource ?? team ?? settings!
     const behavior = match[1] as 'approve' | 'cancel'
     const token = match[2]!
     const message = ctx.callbackQuery.message
@@ -3876,6 +6668,25 @@ bot.on('callback_query:data', async ctx => {
       ...('message_thread_id' in message && message.message_thread_id != null
         ? { threadId: message.message_thread_id }
         : {}),
+    }
+    if (kind === 'team' || kind === 'settings') {
+      try {
+        const input = {
+          accessPath: ACCESS_FILE, script: join(homedir(), 'bin/access-update'), ownerId: OWNER_CHAT_ID,
+          token, decision: behavior, context: callbackContext,
+        }
+        const result = kind === 'team'
+          ? await (await import(new URL('./team-access.ts', pathToFileURL(CORPORATE_MODULE)).href)).teamAccessDecision(input)
+          : await (await import(new URL('./settings-access.ts', pathToFileURL(CORPORATE_MODULE)).href)).settingsAccessDecision(input)
+        const label = corporateCallbackLabel(kind, result)
+        await ctx.answerCallbackQuery({ text: label.slice(0, 200) }).catch(() => {})
+        if ('text' in message && message.text && shouldCloseCorporateAccessPreview(result)) {
+          await ctx.editMessageText(`${message.text}\n\n${label}`).catch(() => {})
+        }
+      } catch {
+        await ctx.answerCallbackQuery({ text: 'Запит недоступний або не виконаний.' }).catch(() => {})
+      }
+      return
     }
     let agentDecision: CorporateGatewayPolicyResult | null = null
     if (kind === 'policy') {
@@ -3988,7 +6799,33 @@ bot.on('callback_query:data', async ctx => {
   }
 })
 
+function isPrivateSuperadminUnstickAlias(
+  text: string, chatType: string, chatId: string, userId: string,
+  access: Pick<Access, 'dmPolicy' | 'admins' | 'allowFrom' | 'superadmins'>,
+): boolean {
+  return access.dmPolicy !== 'disabled'
+    && chatType === 'private' && chatId === userId && userId !== OWNER_CHAT_ID
+    && !!access.superadmins?.includes(userId) && access.admins.includes(userId)
+    && access.allowFrom.includes(userId)
+    && /^\/?(unstick|fix|фикс|отвисни|оживи|перезапустись|розблокуйся|відвисни|перезапустися)\s*[.!]*$/iu.test(text.trim())
+}
+
 bot.on('message:text', async ctx => {
+  if (!ctx.message.forward_origin && isPrivateSuperadminUnstickAlias(ctx.message.text, ctx.chat?.type ?? '',
+    String(ctx.chat?.id ?? ''), String(ctx.from?.id ?? ''), loadAccess())) {
+    if (!CORPORATE_ENABLED && !readCorporateIsolationActivated()) {
+      await ctx.reply(CORPORATE_TEMPORARILY_UNAVAILABLE)
+      return
+    }
+    const corporate = await corporateRuntimeReady()
+    if (!corporate) {
+      await ctx.reply(CORPORATE_TEMPORARILY_UNAVAILABLE)
+      return
+    }
+    const outcome = await corporate.unstick(`user:${ctx.from!.id}`)
+    await ctx.reply(formatCorporateUnstick(outcome))
+    return
+  }
   await handleInbound(ctx, ctx.message.text, undefined)
 })
 
@@ -3996,8 +6833,21 @@ bot.on('message:text', async ctx => {
 // the update dies unhandled. Registered last: it only sees what nothing else took,
 // and it stays out of the way unless the message really carries rich words.
 bot.on('message', async (ctx, next) => {
-  const text = richMessageText(ctx.message) || sharedPlaceOrContactText(ctx.message)
+  const text = richMessageText(ctx.message) || sharedPlaceOrContactText(ctx.message) || sharedPollOrStoryText(ctx.message)
   if (!text) {
+    // A game, an invoice, paid media or a giveaway: nothing here can open them,
+    // so whoever addressed the bot hears that once, and nobody else anything.
+    if (['game', 'invoice', 'paid_media', 'giveaway', 'giveaway_winners'].some(kind => kind in ctx.message)) {
+      // A stranger's message must not spend the pairing replies the gate counts.
+      if (ctx.chat.type === 'private' && !loadAccess().allowFrom.includes(String(ctx.from?.id))) return
+      const result = gate(ctx)
+      if (result.action !== 'deliver' || !addressesBot(ctx, result.access)) return
+      await ctx.reply('Такий тип повідомлення я не відкриваю.', {
+        ...inboundTopicOptions(ctx),
+        reply_parameters: { message_id: ctx.message.message_id, allow_sending_without_reply: true },
+      }).catch(error => process.stderr.write(`telegram channel: unopened kind notice not sent: ${error}\n`))
+      return
+    }
     await next()
     return
   }
@@ -4146,6 +6996,58 @@ bot.on('message:sticker', async ctx => {
   })
 })
 
+// An edit is not a second request: both queues know a message by its id, and the
+// original already has its answer or its place. A group message the bot only
+// watched becomes a request once an edit addresses the bot (the mention was
+// forgotten); any other correction gets, once a day per person and chat, a line
+// asking to send it anew. A live location moves by editing itself, so a place
+// never counts, and Telegram also sends an edit when a field the bot does not
+// read changes: only words other than the stored ones are a correction.
+const EDIT_NOTICE_COOLDOWN_MS = 24 * 60 * 60 * 1000
+// Group messages the bot only watched, by chat:message.
+// ponytail: in memory; after a restart such an edit gets the line instead.
+const observedOnly = new Set<string>()
+bot.on('edited_message', async ctx => {
+  const edited = ctx.editedMessage
+  const words = plainOrRichText(edited)
+  if (edited.location || !ctx.from || !words) return
+  const stored = MSG_DB.query(`SELECT text FROM messages WHERE chat_id=? AND direction='in' AND message_id=?`)
+    .get(String(ctx.chat.id), edited.message_id) as { text: string } | null
+  if (stored?.text === withHiddenLinks(edited, words)) return
+  // A stranger's edit must not spend the pairing replies the gate counts.
+  if (ctx.chat.type === 'private' && !loadAccess().allowFrom.includes(String(ctx.from.id))) return
+  const update = ctx.update as { message?: unknown; edited_message?: unknown }
+  update.message = edited
+  const result = gate(ctx)
+  if (result.action !== 'deliver') return
+  // A group that hands the bot every message also hands it people's chatter:
+  // only an edit that addresses the bot counts, as in handleInbound.
+  if (ctx.chat.type !== 'private' && !isMentioned(ctx, result.access.mentionPatterns)
+    && !matchesAutoAnswer(ctx, result.access.groups[String(ctx.chat.id)]?.autoAnswerPatterns)) return
+  const watched = `${ctx.chat.id}:${edited.message_id}`
+  if (observedOnly.has(watched)) {
+    // Handled exactly as if it had arrived addressed, under its own id.
+    delete update.edited_message
+    await bot.middleware()(ctx, async () => {})
+    observedOnly.delete(watched)
+    return
+  }
+  try {
+    const now = Date.now()
+    const claimed = MSG_DB.query(`INSERT INTO delivery_runtime (key, value, updated_at) VALUES (?, ?, ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+      WHERE delivery_runtime.updated_at <= ?`)
+      .run(`edit_notice:${ctx.chat.id}:${ctx.from.id}`, String(edited.message_id), now, now - EDIT_NOTICE_COOLDOWN_MS).changes
+    if (claimed !== 1) return
+    await ctx.reply('Бачу правку. Щоб я її врахував, надішли новим повідомленням.', {
+      ...inboundTopicOptions(ctx),
+      reply_parameters: { message_id: edited.message_id, allow_sending_without_reply: true },
+    })
+  } catch (error) {
+    process.stderr.write(`telegram channel: edit notice not sent: ${error}\n`)
+  }
+})
+
 // Who acknowledged a post. Recorded straight to the reaction log and never
 // delivered as a turn — see the reaction-log note. Telegram only sends per-user
 // reactions where the bot is an administrator; anonymous ones carry no user.
@@ -4154,11 +7056,22 @@ bot.on('message:sticker', async ctx => {
 // a turn. That is what "the bot reads the channel" means in practice — ask it
 // afterwards and the post is in its history. The channel still has to be
 // registered in access.json, exactly like a group.
+// A chat that was never connected leaves one line per process instead of vanishing (Bro, 28.09).
+const unconnectedLogged = new Set<string>() // ponytail: per process; a restart logs a chat once more
+function logUnconnectedChat(type: string, chatId: string): void {
+  if (unconnectedLogged.has(chatId)) return
+  unconnectedLogged.add(chatId)
+  process.stderr.write(`telegram channel: ${type} ${chatId} is not connected; its updates are dropped\n`)
+}
+
 bot.on('channel_post', ctx => {
   try {
     const chatId = String(ctx.chat.id)
     const policy = loadAccess().groups[chatId]
-    if (!policy || policy.observeEnabled === false) return
+    if (!policy || policy.observeEnabled === false) {
+      if (!policy) logUnconnectedChat('channel', chatId)
+      return
+    }
     const post = ctx.channelPost
     const text = (post.text ?? post.caption ?? '').trim()
     if (!text) return
@@ -4217,6 +7130,17 @@ type AttachmentMeta = {
 // or forge a second meta entry.
 function safeName(s: string | undefined): string | undefined {
   return s?.replace(/[<>\[\]\r\n;]/g, '_')
+}
+
+// The file of the message a reply answers: «що тут?» under a photo or a
+// document is about that file, whoever posted it.
+function repliedAttachment(message: Context['message']): AttachmentMeta | undefined {
+  const replied = message?.reply_to_message
+  const photo = replied?.photo?.at(-1)
+  if (photo) return { kind: 'photo', file_id: photo.file_id, size: photo.file_size }
+  const kind = (['document', 'video', 'video_note', 'voice', 'audio'] as const).find(k => replied?.[k])
+  const file = kind && replied?.[kind] as { file_id: string; file_size?: number; mime_type?: string; file_name?: string }
+  return file ? { kind: kind!, file_id: file.file_id, size: file.file_size, mime: file.mime_type, name: safeName(file.file_name) } : undefined
 }
 
 const TRANSCRIBE_TELEGRAM_BIN = `${process.env.HOME ?? '/home/claude'}/bin/transcribe-telegram`
@@ -4346,50 +7270,53 @@ async function downloadCorporateDocumentFile(api: Context['api'], attachment: At
 // the mention that follows ("проаналізуй файл", "перефразуй текст із фото")
 // arrives without it — the MANZARO finance chat lost six uploads this way, and
 // Maria's groups lost every bare screenshot. The observe branch journals what
-// it saw; a turn with no attachment of its own then binds the last few
-// observed files of the same conversation. Each kind keeps its own window, so
-// a burst of photos cannot evict a document the mention is about.
-const LATE_BIND_WINDOW_MS = 10 * 60 * 1000
+// it saw; a turn with no attachment of its own then binds the last few files
+// its own author posted in the same conversation — never another member's
+// (Rufus, 19.09: the chat's last three photos, whoever posted them). Each kind
+// keeps its own window, so a burst of photos cannot evict a document the
+// mention is about. Half an hour covers a nudge after waiting in vain.
+// ponytail: the journal lives in memory and a receiver restart empties it;
+// messages.db holds the same file ids if a longer reach is ever needed.
+const LATE_BIND_WINDOW_MS = 30 * 60 * 1000
 const LATE_BIND_LIMIT = 3
-const LATE_BIND_KINDS = ['document', 'photo', 'voice', 'audio']
+const LATE_BIND_KINDS = ['document', 'photo', 'voice', 'audio', 'video', 'video_note']
 // A recording binds as text: the observe branch already transcribed it into
 // durable history, so the journal carries that transcript and who said it when.
-type SpokenMeta = { transcript: string, user: string, at: number }
+type SpokenMeta = { transcript: string, user: string, at: number, forwardedFrom?: string }
 const observedAttachments = new Map<string, (AttachmentMeta & Partial<SpokenMeta> & { ts: number })[]>()
-const lateBindKey = (kind: string, chat_id: string, threadId: number | undefined) => `${kind}|${chat_id}|${threadId ?? ''}`
+// sender: inboundSenderKey of the chat, the topic and the person.
+const lateBindKey = (kind: string, sender: string) => `${kind}|${sender}`
 function journalObservedAttachment(
-  chat_id: string, threadId: number | undefined, attachment: AttachmentMeta | undefined, now = Date.now(),
-  spoken?: SpokenMeta,
+  sender: string, attachment: AttachmentMeta | undefined, now = Date.now(), spoken?: SpokenMeta,
 ): void {
-  if (!attachment || !LATE_BIND_KINDS.includes(attachment.kind)) return
+  if (!sender || !attachment || !LATE_BIND_KINDS.includes(attachment.kind)) return
   // Audio shares the voice list — both arrive as a recording — and a recording
-  // whose transcription failed has nothing to bind, so it takes no slot.
+  // binds only once its transcription was tried: its text, or that it failed.
   const recording = attachment.kind === 'voice' || attachment.kind === 'audio'
-  if (recording && !spoken?.transcript) return
-  const key = lateBindKey(recording ? 'voice' : attachment.kind, chat_id, threadId)
+  if (recording && !spoken) return
+  // A round video shares the video list the same way.
+  const key = lateBindKey(recording ? 'voice' : attachment.kind === 'video_note' ? 'video' : attachment.kind, sender)
   const fresh = (observedAttachments.get(key) ?? []).filter(a => now - a.ts < LATE_BIND_WINDOW_MS)
   fresh.push({ ...attachment, ...spoken, ts: now })
   observedAttachments.set(key, fresh.slice(-LATE_BIND_LIMIT))
 }
 function lateBoundAttachments(
-  kind: string, chat_id: string, threadId: number | undefined, now = Date.now(),
+  kind: string, sender: string, now = Date.now(),
 ): (AttachmentMeta & Partial<SpokenMeta>)[] {
-  const fresh = (observedAttachments.get(lateBindKey(kind, chat_id, threadId)) ?? [])
+  const fresh = (observedAttachments.get(lateBindKey(kind, sender)) ?? [])
     .filter(a => now - a.ts < LATE_BIND_WINDOW_MS)
   return fresh.slice(-LATE_BIND_LIMIT).map(({ ts: _ts, ...attachment }) => attachment)
 }
-const lateBoundDocuments = (chat_id: string, threadId: number | undefined, now = Date.now()) =>
-  lateBoundAttachments('document', chat_id, threadId, now)
-const lateBoundPhotos = (chat_id: string, threadId: number | undefined, now = Date.now()) =>
-  lateBoundAttachments('photo', chat_id, threadId, now)
+const lateBoundDocuments = (sender: string, now = Date.now()) => lateBoundAttachments('document', sender, now)
+const lateBoundPhotos = (sender: string, now = Date.now()) => lateBoundAttachments('photo', sender, now)
+const lateBoundVideos = (sender: string, now = Date.now()) => lateBoundAttachments('video', sender, now)
 // The recordings of the conversation as the agent reads them: one labelled line
 // each, appended to the text of the mention that follows. No file is fetched
 // again — the transcript is what the journal kept.
-const lateBoundVoiceLines = (chat_id: string, threadId: number | undefined, now = Date.now()): string[] =>
-  lateBoundAttachments('voice', chat_id, threadId, now)
-    .filter(a => a.transcript)
-    .map(a => `Голосове від ${a.user ?? 'учасника'} (${new Date((a.at ?? 0) * 1000)
-      .toTimeString().slice(0, 5)}): ${a.transcript}`)
+const lateBoundVoiceLines = (sender: string, now = Date.now()): string[] =>
+  lateBoundAttachments('voice', sender, now)
+    .map(a => `Голосове від ${a.forwardedFrom ? `${a.forwardedFrom}, переслав ${a.user}` : a.user ?? 'учасника'} (${new Date((a.at ?? 0) * 1000)
+      .toTimeString().slice(0, 5)})${a.transcript ? `: ${a.transcript}` : ' не вдалося розпізнати'}`)
 
 // Late-bound pictures ride the same envelope as an attached one, so they stop
 // at the module's total-image budget instead of failing the whole turn at
@@ -4425,6 +7352,7 @@ async function routeInbound(
   downloadImage: (() => Promise<string | undefined>) | undefined,
   attachment: AttachmentMeta | undefined,
   legacyInbound: (deliveryId: string) => Promise<void>,
+  unaddressed = false,
 ): Promise<void> {
   const from = ctx.from!
   const chat_id = String(ctx.chat!.id)
@@ -4449,18 +7377,31 @@ async function routeInbound(
     stopTypingKeepAlive(chat_id)
     await ctx.reply(message, inboundTopicOptions(ctx))
   }
-  if (attachment && !['voice', 'audio', 'document', 'photo'].includes(attachment.kind)) {
-    await replyCorporate(CORPORATE_FILE_INSPECTION_DISABLED)
+  // Every company message gets a recorded outcome, a refusal included (parity G12).
+  const refuse = async (reason: string, message: string): Promise<void> => {
+    recordCorporateIntakeRefusal(ctx, msgId, reason)
+    await replyCorporate(message)
+  }
+  // A video or a round video is named to the worker like an unopened file and a sticker comes
+  // as its emoji, as in the owner's chat; no refusal for them (parity, 28.09).
+  const namedOnly = attachment != null && ['video', 'video_note', 'sticker'].includes(attachment.kind)
+  if (attachment && !namedOnly && !['voice', 'audio', 'document', 'photo'].includes(attachment.kind)) {
+    await refuse('unsupported_file', CORPORATE_FILE_INSPECTION_DISABLED)
+    return
+  }
+  // Telegram hands no bot a file over 20 MB: that is the answer, not "try later".
+  if (!namedOnly && (attachment?.size ?? 0) > 20 * 1024 * 1024) {
+    await replyCorporate(CORPORATE_FILE_TOO_LARGE)
     return
   }
   if (!CORPORATE_ENABLED) {
-    await replyCorporate(CORPORATE_TEMPORARILY_UNAVAILABLE)
+    await refuse('runtime_unavailable', CORPORATE_TEMPORARILY_UNAVAILABLE)
     return
   }
 
   const corporate = await corporateRuntimeReady()
   if (!corporate) {
-    await replyCorporate(CORPORATE_TEMPORARILY_UNAVAILABLE)
+    await refuse('runtime_unavailable', CORPORATE_TEMPORARILY_UNAVAILABLE)
     return
   }
   if (msgId == null) {
@@ -4484,22 +7425,44 @@ async function routeInbound(
         if (attachment?.kind === 'document' && !imageDocument) documents = [await downloadCorporateDocument(ctx, attachment)]
         else images = [await downloadCorporateImage(ctx, attachment)]
       } catch {
-        await replyCorporate(CORPORATE_FILE_INSPECTION_DISABLED)
+        await refuse('file_unavailable', CORPORATE_FILE_INSPECTION_DISABLED)
         return
       }
     }
+    // A reply brings the photo or document it answers, before any late binding.
+    const unopened: AttachmentMeta[] = []
+    if (namedOnly && attachment.kind !== 'sticker') unopened.push(attachment)
+    const replied = !images && !documents && attachment == null ? repliedAttachment(ctx.message) : undefined
+    if (replied) {
+      try {
+        if (replied.kind === 'photo' || /^image\//.test(replied.mime ?? '')) images = [await downloadCorporateImageFile(ctx.api, replied)]
+        else if (replied.kind === 'document') documents = [await downloadCorporateDocumentFile(ctx.api, replied)]
+        else unopened.push(replied)
+      } catch (err) {
+        process.stderr.write(`telegram channel: replied file skipped: ${err}\n`)
+        unopened.push(replied)
+      }
+    }
     const lateThreadId = ctx.message?.is_topic_message === true ? ctx.message.message_thread_id : undefined
+    const lateSender = ctx.message?.sender_chat ? '' : inboundSenderKey(chat_id, lateThreadId, String(from.id))
     if (!images && !documents && ctx.chat?.type !== 'private') {
       const bound = []
-      for (const late of lateBoundDocuments(chat_id, lateThreadId)) {
+      // The file a reply answers is not named a second time from the journal.
+      const notReplied = (late: AttachmentMeta) => late.file_id !== replied?.file_id
+      for (const late of lateBoundDocuments(lateSender)) {
+        if (!notReplied(late)) continue
         try { bound.push(await downloadCorporateDocumentFile(ctx.api, late)) }
-        catch (err) { process.stderr.write(`telegram channel: late-bound document skipped: ${err}\n`) }
+        catch (err) {
+          process.stderr.write(`telegram channel: late-bound document skipped: ${err}\n`)
+          unopened.push(late)
+        }
       }
+      unopened.push(...lateBoundVideos(lateSender).filter(notReplied))
       // A document is the more deliberate upload, so it wins; photos stand in
       // when the conversation left none.
       if (bound.length) documents = bound
       else {
-        const pictures = await downloadLateBoundImages(ctx.api, lateBoundPhotos(chat_id, lateThreadId))
+        const pictures = await downloadLateBoundImages(ctx.api, lateBoundPhotos(lateSender))
         if (pictures.length) images = pictures
       }
     }
@@ -4511,15 +7474,28 @@ async function routeInbound(
         attachment,
       )
       if (!transcript) {
-        await replyCorporate(CORPORATE_TEMPORARILY_UNAVAILABLE)
+        // Addressed: the author hears it and the refusal is recorded (parity G12); group
+        // chatter that never asked the bot hears nothing (message kinds).
+        if (addressesBot(ctx, loadAccess())) await refuse('transcription_failed', CORPORATE_VOICE_UNRECOGNIZED)
         return
       }
-      corporateText = transcript
+      // A forwarded recording is someone else's voice: its author comes first.
+      corporateText = ctx.message?.forward_origin
+        ? `Переслано від ${forwardOrigin(ctx.message.forward_origin)}:\n${transcript}` : transcript
     } else if (ctx.chat?.type !== 'private') {
       // Nothing was said in this message, so what was said just before it in the
       // group reaches the agent with it — as text, the recording stays observed.
-      const spoken = lateBoundVoiceLines(chat_id, lateThreadId)
+      const spoken = lateBoundVoiceLines(lateSender)
       if (spoken.length) corporateText = [corporateText, ...spoken].join('\n')
+    }
+    if (unopened.length) corporateText = `${corporateText}\n${unopenedLine(unopened)}`
+
+    // The words a reply answers: the legacy tag carries them as reply_to_text.
+    const answered = ctx.message?.reply_to_message
+    const quoted = answered ? ((answered as { text?: string }).text ?? answered.caption ?? '')
+      .replace(GITHUB_TOKEN, '(токен GitHub приховано)').slice(0, 200) : ''
+    if (quoted) {
+      corporateText = `У відповідь на ${answered!.from?.username ?? answered!.from?.first_name ?? 'повідомлення'}: «${quoted}»\n${corporateText}`
     }
 
     const isTopicMessage = ctx.chat?.type === 'supergroup'
@@ -4537,16 +7513,24 @@ async function routeInbound(
         : {}),
       messageId: msgId,
       text: corporateText,
+      ...(unaddressed ? { addressed: false as const } : {}),
       ...(images ? { images } : {}),
       ...(documents ? { documents } : {}),
+      // The store folds an album's parts into its first job.
+      ...(ctx.message?.media_group_id ? { albumId: String(ctx.message.media_group_id) } : {}),
+      // The store folds a batch of forwards, and the question right after it, into one job.
+      ...(ctx.message?.forward_origin ? { forwarded: true as const } : {}),
       createdAt: Date.now(),
     })
-    if (corporate.health().admissionState !== 'active') {
-      await replyCorporate(CORPORATE_TEMPORARILY_UNAVAILABLE)
+    const health = corporate.health()
+    if (health.admissionState !== 'active') {
+      // During a limit, login or start pause the runtime tells each waiting chat «Прийняв…»
+      // once; group talk that addressed nobody hears nothing (parity G7).
+      if (!unaddressed && !health.waitingChatsTold) await replyCorporate(CORPORATE_TEMPORARILY_UNAVAILABLE)
     }
   } catch {
     process.stderr.write('telegram channel: corporate route unavailable\n')
-    await replyCorporate(CORPORATE_TEMPORARILY_UNAVAILABLE)
+    await refuse('enqueue_failed', CORPORATE_TEMPORARILY_UNAVAILABLE)
   }
 }
 
@@ -4554,12 +7538,12 @@ async function routeInbound(
 
 // file_id → inbox path: a second mention of the same photo does not fetch it again.
 const lateBoundPhotoPaths = new Map<string, string>()
-async function lateBoundPhotoFiles(chat_id: string, threadId: number | undefined): Promise<string[]> {
+async function lateBoundPhotoFiles(sender: string, photos = lateBoundPhotos(sender)): Promise<string[]> {
   // ponytail: a flat cap instead of per-entry expiry — anything older than the
   // journal window is unreachable anyway, and dropping it costs one re-download.
   if (lateBoundPhotoPaths.size > 256) lateBoundPhotoPaths.clear()
   const paths: string[] = []
-  for (const { file_id } of lateBoundPhotos(chat_id, threadId)) {
+  for (const { file_id } of photos) {
     const cached = lateBoundPhotoPaths.get(file_id)
     if (cached && existsSync(cached)) { paths.push(cached); continue }
     try {
@@ -4607,6 +7591,34 @@ function inboundImageMeta(
   }
 }
 
+// A group caption mentions the bot on an album's first photo only. The author's later photo or
+// file of that album joins its waiting company request, or stays in the journal for their next
+// mention; it never becomes a request of its own, even when the album filled up or a worker took
+// it while this part downloaded (Codex, 28.09). True when it joined.
+async function joinCompanyAlbum(ctx: Context, text: string, attachment: AttachmentMeta, threadId: number | undefined): Promise<boolean> {
+  if (!CORPORATE_ENABLED && !readCorporateIsolationActivated()) return false
+  const message = ctx.message!
+  const where = { chatType: ctx.chat!.type as 'private' | 'group' | 'supergroup', chatId: String(ctx.chat!.id),
+    userId: String(ctx.from!.id), isTopicMessage: threadId != null, ...(threadId != null ? { threadId } : {}),
+    albumId: String(message.media_group_id) }
+  try {
+    const corporate = await corporateRuntimeReady()
+    // A cheap look first, so no photo of an album nobody addressed is downloaded.
+    if (!corporate?.joinAlbum || corporate.albumWaiting?.(where) !== true) return false
+    const imageDocument = attachment.kind === 'document'
+      && (/^image\//.test(message.document?.mime_type ?? attachment.mime ?? '')
+        || /\.(jpe?g|png|gif|webp)$/i.test(message.document?.file_name ?? attachment.name ?? ''))
+    const part = attachment.kind === 'document' && !imageDocument
+      ? { documents: [await downloadCorporateDocument(ctx, attachment)] }
+      : { images: [await downloadCorporateImage(ctx, attachment)] }
+    return corporate.joinAlbum({ ...where, deliveryId: `${where.chatId}:${message.message_id}`,
+      username: ctx.from!.username ?? ctx.from!.first_name ?? where.userId, messageId: message.message_id,
+      text, ...part, createdAt: Date.now() }) === true
+  } catch {
+    return false
+  }
+}
+
 async function handleInbound(
   ctx: Context,
   text: string,
@@ -4624,6 +7636,10 @@ async function handleInbound(
     )
     return
   }
+
+  // Before the credential intake below: a callback URL hidden in a link is
+  // caught there like a pasted one instead of reaching the agent.
+  text = withHiddenLinks(ctx.message, text)
 
   const access = result.access
   const from = ctx.from!
@@ -4645,29 +7661,36 @@ async function handleInbound(
   let sensitiveIntegrationInput = false
   if (!(ctx.chat?.type === 'private' && chat_id === OWNER_CHAT_ID) && msgId != null
     && (CORPORATE_ENABLED || readCorporateIsolationActivated())) {
+    const corporate = await corporateRuntimeForIntake()
+    if (!corporate) {
+      if (shuttingDown) throw new RetryableInboundDeliveryError(new Error('Telegram receiver is stopping'))
+      recordCorporateIntakeFailure(ctx, msgId, result.action === 'deliver')
+      return
+    }
+    let consumed: { text: string; sensitive: true } | null | undefined
     try {
-      const corporate = await corporateRuntimeReady()
-      if (!corporate) throw new Error('Integration intake unavailable')
-      const consumed = await corporate.consumeIntegrationInput?.({
+      consumed = await corporate.consumeIntegrationInput?.({
         chatType: ctx.chat!.type as 'private' | 'group' | 'supergroup', chatId: chat_id, userId: String(from.id),
       }, text, msgId)
-      if (gate(ctx).action !== result.action) return
-      if (consumed) {
-        text = consumed.text
-        sensitiveIntegrationInput = true
-        attachment = undefined
-        downloadImage = undefined
-        const message = ctx.message!
-        // Captions, quoted messages and forwarded attachments must not carry
-        // another copy of the submitted credential into the worker.
-        ;(ctx.update as { message?: unknown }).message = {
-          message_id: message.message_id, date: message.date, chat: ctx.chat!, from,
-          ...(isForumTopic ? { is_topic_message: true, message_thread_id: threadId } : {}),
-          text,
-        }
-      }
     } catch {
+      // consumeIntegrationInput may have failed its own credential write;
+      // never confirm the Telegram update without that durable result.
       throw new RetryableInboundDeliveryError(new Error('Integration intake unavailable'))
+    }
+    if (gate(ctx).action !== result.action) return
+    if (consumed) {
+      text = consumed.text
+      sensitiveIntegrationInput = true
+      attachment = undefined
+      downloadImage = undefined
+      const message = ctx.message!
+      // Captions, quoted messages and forwarded attachments must not carry
+      // another copy of the submitted credential into the worker.
+      ;(ctx.update as { message?: unknown }).message = {
+        message_id: message.message_id, date: message.date, chat: ctx.chat!, from,
+        ...(isForumTopic ? { is_topic_message: true, message_thread_id: threadId } : {}),
+        text,
+      }
     }
   }
 
@@ -4681,6 +7704,14 @@ async function handleInbound(
       process.stderr.write('telegram channel: integration input deletion unavailable\n')
     }
   }
+
+  // A forwarded message carries somebody else's words: one line says whose, in
+  // the history and for the agent, and a forwarded command never runs as one.
+  // The owner's own login code keeps its bare form for the login rescue.
+  const forwardedFrom = ctx.message?.forward_origin
+    && !isOwnerLoginCode(chat_id, String(from.id), ctx.chat?.type ?? '', text)
+    ? forwardOrigin(ctx.message.forward_origin) : undefined
+  if (forwardedFrom) text = `Переслано від ${forwardedFrom}:\n${text}`
 
   // Persist only traffic that passed the access gate. Pairing attempts and
   // non-allowlisted traffic are not durable agent context.
@@ -4698,10 +7729,7 @@ async function handleInbound(
     conversation_key: conversationKey,
   })
 
-  // Service control belongs to the out-of-band recovery workers, not the model.
-  // Keep the input in messages.db for that worker, but never block the task FIFO
-  // with /relogin, /restart, /unstick or expose this flow's OAuth code to the model.
-  if (isOwnerServiceControlInput(chat_id, String(from.id), ctx.chat?.type ?? '', text)) {
+  const assertServiceInputPersisted = () => {
     try {
       const saved = MSG_DB.query(
         `SELECT user_id,text FROM messages WHERE chat_id=? AND direction='in' AND message_id=?`,
@@ -4712,6 +7740,30 @@ async function handleInbound(
     } catch {
       throw new RetryableInboundDeliveryError(new Error('service control input not persisted'))
     }
+  }
+
+  if (ctx.chat?.type === 'private' && chat_id === String(from.id) && /^\/stop$/iu.test(text.trim())) {
+    const access = loadAccess()
+    const actorId = String(from.id)
+    if (actorId !== OWNER_CHAT_ID && access.superadmins?.includes(actorId)
+      && access.admins.includes(actorId) && access.allowFrom.includes(actorId)) {
+      assertServiceInputPersisted()
+      const corporate = await corporateRuntimeReady()
+      if (!corporate?.stopOwn) {
+        await ctx.reply(CORPORATE_TEMPORARILY_UNAVAILABLE)
+      } else {
+        const outcome = await corporate.stopOwn(`user:${actorId}`, actorId)
+        await ctx.reply(outcome === 'stopped' ? STOP_DONE : STOP_NOTHING)
+      }
+      return
+    }
+  }
+
+  // Service control belongs to the out-of-band recovery workers, not the model.
+  // Keep the input in messages.db for that worker, but never block the task FIFO
+  // with /relogin, /restart, /unstick or expose this flow's OAuth code to the model.
+  if (isOwnerServiceControlInput(chat_id, String(from.id), ctx.chat?.type ?? '', text)) {
+    assertServiceInputPersisted()
     // /stop is the one control the receiver performs itself (R12); the rest
     // stays with the recovery workers.
     if (/^\/stop$/iu.test(text.trim())) await stopLiveTurn(ctx)
@@ -4720,14 +7772,34 @@ async function handleInbound(
 
   // An allowlisted group without a mention is durable PM context, not a Claude
   // turn. Voice/audio is transcribed into durable history without waking Claude.
+  // Files are journaled under their author, for that person's next mention.
+  // Anonymous admins and channels share one sender id: nothing is journaled,
+  // bound or folded for them.
+  const sender = ctx.message?.sender_chat ? '' : inboundSenderKey(chat_id, threadId, String(from.id))
+  // A later photo of an album whose caption addressed the bot joins that album's waiting company
+  // request, matched by author, chat, topic and album (joinCompanyAlbum); otherwise it is observed.
+  if (result.action === 'observe' && sender && ctx.message?.media_group_id
+    && (attachment?.kind === 'photo' || attachment?.kind === 'document')
+    && await joinCompanyAlbum(ctx, text, attachment, threadId)) {
+    await removeIntegrationInput()
+    return
+  }
   if (result.action === 'observe') {
-    journalObservedAttachment(chat_id, threadId, attachment)
+    // An edit that addresses the bot later turns this message into a request.
+    if (observedOnly.size > 4096) observedOnly.clear()
+    if (msgId != null) observedOnly.add(`${chat_id}:${msgId}`)
+    journalObservedAttachment(sender, attachment)
     const transcript = await transcribeObservedAttachment(ctx, chat_id, msgId, attachment)
     // A recording binds by its text, so it enters the journal once transcribed;
     // only voice and audio return a transcript, so nothing else is journaled twice.
     if (transcript) {
-      journalObservedAttachment(chat_id, threadId, attachment, Date.now(),
-        { transcript, user: from.username ?? String(from.id), at: ctx.message?.date ?? 0 })
+      journalObservedAttachment(sender, attachment, Date.now(),
+        { transcript, user: from.username ?? String(from.id), at: ctx.message?.date ?? 0, forwardedFrom })
+    } else if (attachment?.kind === 'voice' || attachment?.kind === 'audio') {
+      // One nobody could read reaches its author's next mention, named as
+      // unreadable; the group itself hears nothing.
+      journalObservedAttachment(sender, attachment, Date.now(),
+        { transcript: '', user: from.username ?? String(from.id), at: ctx.message?.date ?? 0, forwardedFrom })
     }
     await removeIntegrationInput()
     return
@@ -4763,11 +7835,18 @@ async function handleInbound(
     }
   }
 
+  // A group that hands the bot every message (requireMention false) hands it
+  // people talking to each other too. Such a message addressed nobody here: the
+  // model sees addressed="false" as observation, and no service notice about it
+  // goes to the group (Кнопа 03.09 and 15.09).
+  const unaddressed = ctx.chat?.type !== 'private' && !isMentioned(ctx, access.mentionPatterns)
+    && !matchesAutoAnswer(ctx, access.groups[chat_id]?.autoAnswerPatterns)
+
   // Ack reaction — says "received"; "in work" is the typing indicator, which
   // follows the turn ledger (see syncTypingWithTurnLedger). Fire-and-forget.
   // Telegram only accepts a fixed emoji whitelist — if the user configures
   // something outside that set the API rejects it and we swallow.
-  if (access.ackReaction && msgId != null) {
+  if (access.ackReaction && msgId != null && !unaddressed) {
     void bot.api
       .setMessageReaction(chat_id, msgId, [
         { type: 'emoji', emoji: access.ackReaction as ReactionTypeEmoji['emoji'] },
@@ -4775,26 +7854,38 @@ async function handleInbound(
       .catch(() => {})
   }
 
-  await routeInbound(ctx, text, downloadImage, attachment, async deliveryId => {
+  const continues = result.action === 'deliver' ? result.continues : undefined
+  // Until this update is queued, a waiting request of the same person holds on.
+  await routeInbound(ctx, text, downloadImage, attachment, deliveryId => takingIn(sender, async () => {
     const imagePath = downloadImage ? await downloadImage() : undefined
     let inboundText = text
     if (ctx.chat?.type === 'private' && chat_id === OWNER_CHAT_ID && String(from.id) === OWNER_CHAT_ID && (attachment?.kind === 'voice' || attachment?.kind === 'audio')) {
       const saved = MSG_DB.query("SELECT text FROM messages WHERE chat_id=? AND direction='in' AND message_id=?").get(chat_id, msgId ?? null) as {text: string} | null
       const transcript = saved?.text && saved.text !== text ? saved.text : await transcribeObservedAttachment(ctx, chat_id, msgId, attachment)
-      if (transcript) inboundText = ctx.message?.caption ? `${text}\n${transcript}` : transcript
+      // A forwarded recording keeps the line naming its author; a transcript read
+      // back from history may already carry it.
+      const lead = forwardedFrom ? `Переслано від ${forwardedFrom}:\n` : ''
+      const said = transcript?.startsWith(lead) ? transcript.slice(lead.length) : transcript
+      if (said) inboundText = ctx.message?.caption ? `${text}\n${said}` : `${lead}${said}`
     }
     // Only a message that brought no picture of its own binds to earlier ones,
     // and only in a group — a private chat delivers every photo as it arrives.
     const latePaths = imagePath == null && downloadImage == null && ctx.chat?.type !== 'private'
-      ? await lateBoundPhotoFiles(chat_id, threadId)
+      ? await lateBoundPhotoFiles(sender)
       : []
-    // A message that brought no file at all also names the documents posted
-    // just before it, and carries what was said in the recordings before it.
+    // A message that brought no file at all also names the documents and videos
+    // posted just before it, and carries what was said in the recordings before it.
     const lateDocs = attachment == null && downloadImage == null && ctx.chat?.type !== 'private'
-      ? lateBoundDocuments(chat_id, threadId)
+      ? [...lateBoundDocuments(sender), ...lateBoundVideos(sender)]
       : []
+    // A reply brings the photo or file it answers, first and once, in any chat.
+    const replied = attachment == null && downloadImage == null ? repliedAttachment(ctx.message) : undefined
+    if (replied?.kind === 'photo') {
+      const [path] = await lateBoundPhotoFiles(sender, [replied])
+      if (path) latePaths.splice(0, latePaths.length, path, ...latePaths.filter(late => late !== path))
+    } else if (replied) lateDocs.splice(0, lateDocs.length, replied, ...lateDocs.filter(late => late.file_id !== replied.file_id))
     if (attachment?.kind !== 'voice' && attachment?.kind !== 'audio' && ctx.chat?.type !== 'private') {
-      const spoken = lateBoundVoiceLines(chat_id, threadId)
+      const spoken = lateBoundVoiceLines(sender)
       if (spoken.length) inboundText = [inboundText, ...spoken].join('\n')
     }
     const notification: InboundNotification = {
@@ -4810,10 +7901,14 @@ async function handleInbound(
           user: from.username ?? String(from.id),
           user_id: String(from.id),
           ts: new Date((ctx.message?.date ?? 0) * 1000).toISOString(),
+          ...(unaddressed ? { addressed: 'false' } : {}),
+          ...(forwardedFrom ? { forward_from: safeName(forwardedFrom)! } : {}),
           ...(ctx.message?.reply_to_message ? (() => {
             const r = ctx.message!.reply_to_message!
             const rf = r.from
-            const rt = safeName((((r as { text?: string; caption?: string }).text ?? (r as { text?: string; caption?: string }).caption ?? '')).slice(0, 200))
+            // An old message may still hold a token pasted before the backup handler took it.
+            const rt = safeName((((r as { text?: string; caption?: string }).text ?? (r as { text?: string; caption?: string }).caption ?? ''))
+              .replace(GITHUB_TOKEN, '(токен GitHub приховано)').slice(0, 200))
             return {
               reply_to_message_id: String(r.message_id),
               ...(rf ? {
@@ -4824,11 +7919,18 @@ async function handleInbound(
             }
           })() : {}),
           ...(ctx.message?.media_group_id ? { media_group_id: String(ctx.message.media_group_id) } : {}),
+          ...(ctx.message?.sender_chat ? { sender_chat_id: String(ctx.message.sender_chat.id) } : {}),
           ...inboundImageMeta(imagePath, attachment, latePaths, lateDocs),
         },
       },
     }
     const durableDirect = process.env.TG_TRANSPORT !== 'daemon'
+    if (continues != null) notification.params.meta.continues_message_id = String(continues)
+    else if (sender && msgId != null && ctx.chat?.type !== 'private') {
+      // ponytail: a flat cap; an entry older than a minute is never read again.
+      if (lastAddressed.size > 1024) lastAddressed.clear()
+      lastAddressed.set(sender, { at: Date.now(), messageId: msgId })
+    }
     if (durableDirect) {
       try {
         queueInboundDelivery(deliveryId, notification)
@@ -4837,7 +7939,9 @@ async function handleInbound(
         throw new RetryableInboundDeliveryError(err)
       }
       // Every direct delivery goes through the same single FIFO drain. If an
-      // older item is waiting, a newer Telegram update cannot overtake it.
+      // older item is waiting, a newer Telegram update cannot overtake it; only
+      // a message already waiting out its merge window at the front keeps its
+      // turn over an older request re-queued meanwhile (inboundBurstHead).
       void drainPendingInboundDeliveries()
       return
     }
@@ -4854,15 +7958,31 @@ async function handleInbound(
         throw new RetryableInboundDeliveryError(err)
       }
     }
-  })
+  }), unaddressed)
   await removeIntegrationInput()
 }
 
 // Without this, any throw in a message handler stops polling permanently
 // (grammy's default error handler calls bot.stop() and rethrows).
-bot.catch(err => {
+bot.catch(async err => {
   process.stderr.write(`telegram channel: handler error: ${err.error}\n`)
-  if (err.error instanceof RetryableInboundDeliveryError) throw err.error
+  const retryable = retryableInboundDeliveryError(err)
+  if (!retryable) return
+  // grammY records the update ID before calling middleware, then waits for
+  // this error handler. Retry here so it cannot poll with a higher offset
+  // until this same update has reached durable inbound storage.
+  for (;;) {
+    if (shuttingDown) throw retryable
+    await new Promise(r => setTimeout(r, 1000))
+    if (shuttingDown) throw retryable
+    try {
+      await bot.handleUpdate(err.ctx.update)
+      return
+    } catch (next) {
+      if (!retryableInboundDeliveryError(next)) throw next
+      process.stderr.write(`telegram channel: inbound retry pending: ${next}\n`)
+    }
+  }
 })
 
 // Retry polling with backoff on any error. Previously only 409 was retried —

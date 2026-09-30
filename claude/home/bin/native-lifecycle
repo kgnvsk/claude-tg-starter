@@ -243,7 +243,13 @@ def schedule(operation, args, owner):
                     continue
             claim = {'key': key, 'file': path.name, 'sha256': sha, 'task': task, 'owner': owner, 'messageId': binding['messageId'], 'text': record.body, 'run': headers.get('RUN') == '1'}
             save(ROOT / 'claims' / (key + '.json'), claim)
-            due.append({name: claim[name] for name in ('key', 'task', 'messageId', 'text', 'run')})
+            item = {name: claim[name] for name in ('key', 'task', 'messageId', 'text', 'run')}
+            # The start time names a run the process died under in the owner's alert, and only a
+            # read-and-report run (RETRY_SAFE=1, not QUIET) may run once more (Codex review of №29 round 3).
+            item['epoch'] = int(headers['EPOCH'])
+            if headers.get('RETRY_SAFE') == '1' and headers.get('QUIET') != '1':
+                item['retrySafe'] = True
+            due.append(item)
             if len(due) >= 24:
                 break
         return due

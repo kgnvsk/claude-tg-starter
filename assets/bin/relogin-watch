@@ -52,6 +52,20 @@ def owner() -> str:
     return str(ids[0]) if ids else ""
 
 
+def control_chats(primary: str) -> set[str]:
+    allowed = {primary}
+    try:
+        access = json.loads(ACCESS_FILE.read_text(encoding="utf-8"))
+        admins, admitted, superadmins = (access[key] for key in ("admins", "allowFrom", "superadmins"))
+        if not all(isinstance(items, list) and all(isinstance(item, str) and re.fullmatch(r"[1-9]\d{0,19}", item)
+                                                   for item in items) for items in (admins, admitted, superadmins)):
+            return allowed
+        allowed.update((set(superadmins) & set(admins) & set(admitted)) - {primary})
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return allowed
+
+
 def send(chat: str, text: str) -> None:
     token = env_val("TELEGRAM_BOT_TOKEN")
     if not token or not chat:
@@ -67,8 +81,8 @@ def send(chat: str, text: str) -> None:
 def main() -> int:
     if not MESSAGES_DB.exists() or not RESCUE.exists():
         return 0
-    chat = owner()
-    if not chat:
+    primary = owner()
+    if not primary:
         return 0
     try:
         last = int(json.loads(STATE_FILE.read_text(encoding="utf-8"))["ts"])
@@ -77,25 +91,33 @@ def main() -> int:
 
     try:
         conn = sqlite3.connect(f"file:{MESSAGES_DB}?mode=ro", uri=True, timeout=2)
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(messages)")}
+        chats = control_chats(primary) if "user_id" in columns else {primary}
+        placeholders = ",".join("?" for _ in chats)
         rows = conn.execute(
-            "SELECT ts,text FROM messages WHERE chat_id=? AND direction='in' "
-            "AND ts>? ORDER BY ts", (chat, last)).fetchall()
+            f"SELECT ts,text,chat_id FROM messages WHERE chat_id IN ({placeholders}) AND direction='in' "
+            + ("AND chat_id=user_id " if "user_id" in columns else "")
+            + "AND ts>? ORDER BY ts", (*sorted(chats), last)).fetchall()
         conn.close()
     except Exception:
         return 0
 
-    fired = False
+    # One OAuth flow may run at a time. Keep every authorized requester visible
+    # when several people asked before this cron tick.
+    requests: dict[str, int] = {}
     newest = last
-    for ts, text in rows:
+    for ts, text, sender_chat in rows:
         newest = max(newest, ts)
         if text and TRIGGER.match(text.strip()):
-            fired = True
+            requests[sender_chat] = ts
 
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
     STATE_FILE.write_text(json.dumps({"ts": newest}))
 
-    if fired:
-        send(chat, "🔄 Запускаю повторний вхід — за кілька секунд надішлю свіже посилання.")
+    authorized = control_chats(owner())
+    requests = {chat: ts for chat, ts in requests.items() if chat in authorized}
+    if requests:
+        chat = max(requests, key=requests.get)
         # exactly ONE live login flow: kill any stale one first (no verifier clobber)
         subprocess.run(["pkill", "-f", "claude auth login"],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -105,9 +127,17 @@ def main() -> int:
             except OSError:
                 pass
         subprocess.Popen(
-            ["/usr/bin/timeout", "900", str(RESCUE), "--force"],
+            ["/usr/bin/timeout", "900", str(RESCUE), "--force", "--chat", chat],
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL, start_new_session=True)
+        # Network notices can each block for 15 seconds. The rescue must be
+        # running before any send, or the 55-second cron deadline can consume
+        # checkpointed requests without starting the login flow.
+        for superseded in requests:
+            if superseded != chat:
+                send(superseded, "⚠️ Одночасно надійшов запит на вхід з іншого дозволеного чату. "
+                                 "Запускаю одне нове посилання там; повтори /relogin пізніше, якщо потрібне окреме посилання.")
+        send(chat, "🔄 Запускаю повторний вхід — за кілька секунд надішлю свіже посилання.")
     return 0
 
 

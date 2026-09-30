@@ -13,6 +13,7 @@ import os
 from pathlib import Path, PurePosixPath
 import pwd
 import re
+import stat
 import subprocess
 import sys
 import tempfile
@@ -32,6 +33,70 @@ def license_helper():
 
 def digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+class UpdatesFrozenError(ValueError):
+    """The owner froze kit updates on this server; refuse before any change."""
+
+
+def assert_updates_not_frozen(marker=None):
+    # box-update.sh and Novsky's assertKitUpdatesAllowed already refuse on this
+    # marker before they ever reach this installer; a direct run must too.
+    # A symlink (even a dangling one) or any other non-regular marker refuses
+    # unopened; a regular one shows its first 2000 bytes.
+    marker = Path("/etc/claude-tg-starter") / "updates-frozen" if marker is None else marker
+    try:
+        regular = stat.S_ISREG(os.lstat(marker).st_mode)
+    except (FileNotFoundError, NotADirectoryError):
+        return
+    except OSError:
+        regular = False
+    text = ""
+    if regular:
+        try:
+            fd = os.open(marker, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            try:
+                if stat.S_ISREG(os.fstat(fd).st_mode):
+                    text = os.read(fd, 2000).decode("utf-8", "replace")
+            finally:
+                os.close(fd)
+        except OSError:
+            text = ""
+    raise UpdatesFrozenError("FATAL: оновлення кита на цьому сервері заморожено власником" + (": " + text if text else ""))
+
+
+# The owner's Codex canary received one verified four-column SQL hotfix on its
+# old kit. Accept only those exact bytes from that exact revision; any further
+# change remains an owner-managed conflict and stops before installation.
+KNOWN_CODEX_STORE_HOTFIX = {
+    "revision": "7b2ee757625859758e82dded46f97aede51fd682",
+    "baseline": "a07f4f1f5e423b12516319693bb74dcc3debfa2d318f1d6d9aaaa473a289fc9c",
+    "hotfix": "5546146ffc1d20d57a1a63e26e7419b9af4eed4503d583ab3ebf78b0c1ebff32",
+}
+
+
+# The 13.09 tmux pilot on the owner's Codex canary replaced the kit's launch with a drop-in,
+# and its report leaves reconciling it to kit updates. Only that exact file (its receipt's
+# overrideSha) is retired; any other override stops the update before the agent is touched.
+RETIRED_TMUX_PILOT = {
+    "user": "codex-8865933230", "name": "90-tmux-pilot.conf",
+    "sha256": "fa52096303b366f72ff5f6a8db642be86c8cd8c835500a26a48c80cfd769e51a",
+}
+
+
+def service_overrides(user: str) -> list[Path]:
+    """Drop-ins on the agent's unit: return the retired pilot, refuse any other one."""
+    systemd = Path("/etc/systemd/system")
+    pilot = safe_path(systemd, "codex-telegram@" + user + ".service.d/" + RETIRED_TMUX_PILOT["name"])
+    retired = []
+    for name in ("codex-telegram@" + user + ".service.d", "codex-telegram@.service.d"):
+        folder = safe_path(systemd, name)
+        for path in sorted(folder.glob("*.conf")) if folder.is_dir() else ():
+            if (path != pilot or user != RETIRED_TMUX_PILOT["user"] or path.is_symlink() or not path.is_file()
+                    or digest(path.read_bytes()) != RETIRED_TMUX_PILOT["sha256"]):
+                raise ValueError("service override is not part of the kit: " + str(path) + "; move it into the kit or remove it, then retry")
+            retired.append(path)
+    return retired
 
 
 def assert_stopped(unit: str):
@@ -114,6 +179,35 @@ def atomic(path: Path, data: bytes | str, uid: int, gid: int, mode: int = 0o600)
             os.unlink(name)
 
 
+LOG_DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+LOG_FILE_FLAGS = os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK
+
+
+def runtime_log(home: Path, uid: int, gid: int):
+    """The unit appends its output to ~/logs/codex-telegram.log, and systemd creates a missing
+    file there as root 0600; the runtime, running as the agent, then loses every event it
+    appends. Keep the log the agent's own file, reached only through pinned descriptors."""
+    logs = safe_path(home, "logs")
+    try:
+        logs.mkdir(mode=0o700, exist_ok=True)
+        directory = os.open(logs, LOG_DIRECTORY_FLAGS)
+        try:
+            os.fchown(directory, uid, gid)
+            descriptor = os.open("codex-telegram.log", LOG_FILE_FLAGS, 0o600, dir_fd=directory)
+        finally:
+            os.close(directory)
+    except OSError:
+        raise ValueError("unsafe runtime log") from None
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise ValueError("unsafe runtime log")
+        os.fchown(descriptor, uid, gid)
+        os.fchmod(descriptor, 0o600)
+    finally:
+        os.close(descriptor)
+
+
 def target_change(path: Path, data: bytes | str | None = None, mode: int | None = None) -> dict:
     if path.exists() and not path.is_file():
         raise ValueError("non-file installation target")
@@ -144,7 +238,7 @@ def skill_destination(home: Path, relative: str) -> str:
 
 def plan_reconcile(root: Path, home: Path, manifest: dict, previous: dict, render: dict | None = None) -> dict:
     """Read every managed target and ownership conflict without creating files."""
-    writes, baseline, targets = [], {}, []
+    writes, baseline, targets, acknowledged_hotfixes = [], {}, [], []
     previous_files = {}
     for relative, sha in previous.get("files", {}).items():
         destination = skill_destination(home, relative)
@@ -198,7 +292,14 @@ def plan_reconcile(root: Path, home: Path, manifest: dict, previous: dict, rende
                 targets.append({"path": str(path), "action": "preserve"})
                 continue
             elif digest(existing) not in (digest(data), previous_files.get(destination)):
-                raise ValueError("locally modified managed file: " + destination)
+                known = KNOWN_CODEX_STORE_HOTFIX
+                if not (relative == "resources/modules/telegram-corporate/store.ts"
+                        and previous.get("revision") == known["revision"]
+                        and previous_files.get(destination) == known["baseline"]
+                        and digest(existing) == known["hotfix"]
+                        and b"codex_session_id" not in data):
+                    raise ValueError("locally modified managed file: " + destination)
+                acknowledged_hotfixes.append({"path": str(path), "installedSha256": known["hotfix"]})
         if relative not in preserve:
             baseline[destination] = digest(data)
         change = target_change(path, data, mode)
@@ -217,7 +318,8 @@ def plan_reconcile(root: Path, home: Path, manifest: dict, previous: dict, rende
                 raise ValueError("modified file from previous kit: " + relative)
             removals.append(path)
             targets.append({"path": str(path), "action": "remove"})
-    return {"writes": writes, "removals": removals, "files": baseline, "targets": targets}
+    return {"writes": writes, "removals": removals, "files": baseline,
+            "targets": targets, "acknowledgedHotfixes": acknowledged_hotfixes}
 
 
 def apply_reconcile(plan: dict, uid: int, gid: int) -> dict:
@@ -295,7 +397,143 @@ def starter_configuration(manifest: dict, data: dict, previous: dict) -> dict:
     return {**data, "semanticMemory": True}
 
 
+REVIEWED_DEPENDENCY_BASE = "7b2ee757625859758e82dded46f97aede51fd682"
+# The corporate export's move from 0.153.3 to 0.156.0 (batch 1, 28.09.2026) has
+# no native profile/database smoke on copied state yet, so it is not a reviewed
+# transition: a box on the old recipe is refused for individual review (batch 1
+# review, 29.09). Add it back here only with that smoke, the live canary and the
+# corporate role checks. Any later recipe or package version change needs a new review.
+REVIEWED_DEPENDENCY_DELTA = {
+    "installer/dependencies.py": (
+        "1baf48535fd53745ce61ba59f7d520d159b5d5fb4f09484c580bcb56b07d75e3",
+        "4c7bad77e178bb4a8d042e0c27165658fac0eff234911a61ab5cadb1a3385e28"),
+}
+DEPENDENCY_RECIPE_FILES = (
+    "installer/dependencies.py", "installer/corporate.py", "installer/install-node.py",
+)
+
+
+def dependency_version_contract(installed: dict, target: dict, previous_revision: str):
+    """A path-only feature inventory cannot prove dependency version parity."""
+    before, after = installed.get("files"), target.get("files")
+    if not isinstance(before, dict) or not isinstance(after, dict):
+        raise ValueError("maintenance dependency versions cannot be verified")
+    for path in DEPENDENCY_RECIPE_FILES:
+        old, new = before.get(path), after.get(path)
+        if not all(isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value)
+                   for value in (old, new)):
+            raise ValueError("maintenance dependency recipe missing")
+        if old != new and not (previous_revision == REVIEWED_DEPENDENCY_BASE
+                               and REVIEWED_DEPENDENCY_DELTA.get(path) == (old, new)):
+            raise ValueError("maintenance dependency recipe changed; review this agent separately")
+
+    def package_inputs(files):
+        return {path: value for path, value in files.items()
+                if path.startswith("resources/") and (
+                    PurePosixPath(path).name in {"package.json", "package-lock.json", "pnpm-lock.yaml",
+                                                "yarn.lock", "pyproject.toml", "poetry.lock",
+                                                "Pipfile.lock", "requirements.txt"}
+                    or "/requirements/" in path and path.endswith(".txt"))}
+
+    if package_inputs(before) != package_inputs(after):
+        raise ValueError("maintenance dependency package inputs changed; review this agent separately")
+
+
+def maintenance_contract(previous: dict, target: dict) -> dict:
+    """Do not replay dependency installers against a changed product profile."""
+    path = previous.get("payload")
+    if not isinstance(path, str) or not Path(path).is_absolute():
+        raise ValueError("maintenance requires the installed kit")
+    try:
+        installed = verify(Path(path))
+    except (OSError, ValueError) as error:
+        raise ValueError("maintenance installed kit cannot be verified") from error
+    if (not isinstance(installed.get("dependencies"), dict) or
+            not isinstance(target.get("dependencies"), dict) or
+            installed["productId"] != previous.get("productId") or
+            installed["sourceRevision"] != previous.get("revision") or
+            installed["productId"] != target["productId"] or
+            installed["features"] != target["features"] or
+            installed["nativePlugins"] != target["nativePlugins"] or
+            installed.get("dependencies") != target.get("dependencies")):
+        raise ValueError("maintenance dependency profile changed; review this agent separately")
+    dependency_version_contract(installed, target, previous["revision"])
+    return installed
+
+
+def required_codex_cli(root: Path) -> str:
+    """The Codex CLI this payload's runtime was proven on (runtime/SOURCE.json)."""
+    try:
+        version = json.loads(safe_path(root, "runtime/SOURCE.json").read_text()).get("codexCliVersion")
+    except (OSError, ValueError, AttributeError) as error:
+        raise ValueError("runtime Codex CLI pin is unreadable") from error
+    if not isinstance(version, str) or not re.fullmatch(r"\d+\.\d+\.\d+", version):
+        raise ValueError("runtime Codex CLI pin is unreadable")
+    return version
+
+
+CODEX_CLI_VERSION_OUTPUT = re.compile(r"\bcodex-cli (\d+\.\d+\.\d+)\b")
+
+
+def installed_codex_cli(home: Path, user: str) -> str | None:
+    """The version the agent's own launcher reports, run as the agent (never as root): the executable
+    the service starts, not the package metadata beside it (batch 1 review, round 2)."""
+    binary = home / ".local/lib/novsky-runtime/node_modules/.bin/codex"
+    env = {"HOME": str(home), "CODEX_HOME": str(home / ".codex"), "LANG": "C.UTF-8",
+           "PATH": f"{home}/.local/lib/novsky-node/bin:{home}/.local/lib/novsky-runtime/node_modules/.bin:/usr/local/bin:/usr/bin:/bin"}
+    command = [str(binary), "--version"]
+    as_root = os.geteuid() == 0
+    if as_root:
+        command = ["runuser", "-u", user, "--", "env", "-i", *[key + "=" + value for key, value in env.items()], *command]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=30, cwd=str(home),
+                                env=None if as_root else env)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    match = CODEX_CLI_VERSION_OUTPUT.search(result.stdout or "") if result.returncode == 0 else None
+    return match.group(1) if match else None
+
+
+def assert_codex_cli_matches(root: Path, home: Path, user: str):
+    """Batch 1 (Codex review P1): the runtime was proven on one CLI only. Actual maintenance, and
+    the license preflight before the agent is stopped, refuse while the agent runs another one;
+    the read-only plan stays usable. The server setup installs the pinned CLI before maintenance."""
+    required, installed = required_codex_cli(root), installed_codex_cli(home, user)
+    if installed != required:
+        raise ValueError(f"Codex CLI {installed or 'not found'} is not {required}, the version this runtime needs: "
+                         f"install Codex CLI {required} for this agent first (the release's server setup does it), "
+                         "then run maintenance again")
+
+
+def check_existing_dependencies(home: Path, user: str, manifest: dict):
+    from dependencies import check_existing_dependencies as check
+    check(home, user, manifest)
+
+
+def preflight_maintenance(root: Path, home: Path, user: str, manifest: dict, previous: dict, *,
+                          allow_pinned_legacy_shared_context: bool = False):
+    """Read only, while the old agent can still be restarted without a swap."""
+    if allow_pinned_legacy_shared_context and user != "codex-8865933230":
+        raise ValueError("pinned legacy backup context is owner canary-only")
+    maintenance_contract(previous, manifest)
+    check_existing_dependencies(home, user, manifest)
+    command = ["python3", str(root / "installer/install-backup-context.py"),
+               "--check-current", "--allow-maintenance-hold", "--home", str(home),
+               "--user", user, "--unit", "codex-telegram@" + user + ".service",
+               "--engine", "codex"]
+    if allow_pinned_legacy_shared_context:
+        command.append("--allow-pinned-legacy-shared-context")
+    result = subprocess.run(command, capture_output=True, timeout=180)
+    try:
+        checked = json.loads(result.stdout)
+    except (TypeError, ValueError):
+        checked = None
+    if result.returncode or not isinstance(checked, dict) or checked.get("ok") is not True:
+        raise ValueError("backup context requires reviewed migration before maintenance")
+
+
 def main():
+    assert_updates_not_frozen()
     data = json.load(sys.stdin)
     action = data.get("action", "install")
     if action not in ("install", "plan", "license-preflight"):
@@ -305,6 +543,12 @@ def main():
     user = data["user"]
     if os.geteuid() != 0 or not re.fullmatch(r"codex-[a-z0-9][a-z0-9-]{0,23}", user):
         raise ValueError("a Novsky Codex account is required")
+    allow_pinned_context = data.get("allowPinnedLegacySharedContext", False)
+    if not isinstance(allow_pinned_context, bool):
+        raise ValueError("invalid pinned legacy backup context setting")
+    if allow_pinned_context and (user != "codex-8865933230" or data.get("maintenance") is not True
+                                 or action not in ("plan", "install")):
+        raise ValueError("pinned legacy backup context is owner canary maintenance-only")
     home = Path("/home") / user
     config_dir = Path("/etc/novsky/codex")
     marker = safe_path(config_dir, user + ".installed.json")
@@ -321,6 +565,8 @@ def main():
     previous = json.loads(state_path.read_text()) if state_path.exists() else {}
     if not isinstance(previous, dict) or not isinstance(previous.get("files", {}), dict):
         raise ValueError("invalid existing managed state")
+    if allow_pinned_context and not previous.get("revision"):
+        raise ValueError("pinned legacy backup context requires existing maintenance state")
     config_path = safe_path(config_dir, user + ".json")
     config = json.loads(config_path.read_text())
     if not isinstance(config, dict):
@@ -347,7 +593,11 @@ def main():
     config_text = native_config(home, user, browser, inventory_path)
     target_change(project_config, config_text)
     if project_config.exists() and digest(project_config.read_bytes()) not in (digest(config_text.encode()), previous.get("configSha")):
-        raise ValueError("local project configuration needs reconciliation")
+        raise ValueError("local project configuration needs reconciliation: " + str(project_config.relative_to(home)))
+    retired = service_overrides(user)
+    # The kit was reviewed with one Codex CLI. Novsky and codex/server.py install it after the
+    # read-only plan and before this step (census 26.09: 0.153.3 and 0.154.0 ran side by side).
+    codex_cli = {"installed": installed_codex_cli(home, user), "required": required_codex_cli(root)}
     directories = ("bin", ".agents", ".codex/agents", "obsidian-vault/.codex", ".local/lib", ".local/bin", ".npm-global", ".local/state/novsky-codex", ".local/share/novsky-kit", ".venvs", ".config")
     for relative in directories:
         path = safe_path(home, relative)
@@ -357,16 +607,30 @@ def main():
                  (project_config, config_text, 0o600), *configuration["writes"]]
     targets = [*plan["targets"], *(target_change(path, content, mode) for path, content, mode in generated),
                target_change(state_path), target_change(config_path),
-               *({"path": str(path), "action": "preserve"} for path in configuration["preserved"])]
+               *({"path": str(path), "action": "preserve"} for path in configuration["preserved"]),
+               *({"path": str(path), "action": "remove"} for path in retired)]
+    if data.get("maintenance") is True and action != "license-preflight":
+        preflight_maintenance(root, home, user, manifest, previous,
+                              **({"allow_pinned_legacy_shared_context": True} if allow_pinned_context else {}))
     if action == "plan":
+        compatibility = {"engine": "codex", "previousProductId": previous.get("productId"),
+                         "previousRevision": previous.get("revision"), "ownerAccess": configuration["ownerAccess"],
+                         "projectConfig": "compatible", "requiresStoppedAgent": True, "codexCli": codex_cli}
+        if data.get("maintenance") is True:
+            # Emitted only after the read-only maintenance preflight passes.
+            compatibility["maintenanceTransactionSafe"] = True
+            compatibility["maintenanceTransactionScope"] = "native-installer"
+            compatibility["maintenanceTargetRevision"] = manifest["sourceRevision"]
         print(json.dumps({"ok": True, "action": "plan", "coverage": "managed-files", "productId": manifest["productId"],
                           "revision": manifest["sourceRevision"],
+                          "acknowledgedHotfixes": plan["acknowledgedHotfixes"],
                           "changes": {name: sum(target["action"] == name for target in targets) for name in ("create", "update", "remove", "preserve", "unchanged")},
                           "targets": sorted(targets, key=lambda target: target["path"]),
-                          "compatibility": {"engine": "codex", "previousProductId": previous.get("productId"),
-                                            "previousRevision": previous.get("revision"), "ownerAccess": configuration["ownerAccess"],
-                                            "projectConfig": "compatible", "requiresStoppedAgent": True}}))
+                          "compatibility": compatibility}))
         return
+    if action == "install" or data.get("maintenance") is True:
+        # Before activation or any change: a new runtime never goes in beside another CLI.
+        assert_codex_cli_matches(root, home, user)
     licensing = None
     if manifest["productId"] != "starter":
         licensing = license_helper()
@@ -378,23 +642,31 @@ def main():
         print(json.dumps({"ok": True, "action": action, "productId": manifest["productId"],
                           "revision": manifest["sourceRevision"]}))
         return
-    if licensing:
+    if licensing and not data.get("maintenance"):
         licensing.store_key(key_path, key)
     # Every managed path, config conflict and owner check above is read-only.
     # Dependency installation and native discovery still need runtime checks.
+    runtime_log(home, account.pw_uid, account.pw_gid)
+    for path in retired:
+        # systemd ignores the renamed file, and the kit's own unit launches the runtime again.
+        path.rename(path.with_name(path.name + ".retired"))
+    if retired:
+        subprocess.run(["systemctl", "daemon-reload"], check=True, capture_output=True, timeout=60)
     apply_reconcile(plan, account.pw_uid, account.pw_gid)
     atomic(manifest_path, json.dumps(manifest), account.pw_uid, account.pw_gid)
     # Root-owned baseline is persisted before dependency work so an interrupted
     # first install can retry the same managed files without mistaking them for edits.
     atomic(state_path, json.dumps({**previous, "productId": manifest["productId"], "files": files}), 0, 0)
     safe_env = {"HOME": str(home), "CODEX_HOME": str(home / ".codex"), "NOVSKY_WORKSPACE": str(home / "obsidian-vault"), "PATH": f"{home}/bin:{home}/.local/lib/novsky-node/bin:{home}/.local/lib/novsky-runtime/node_modules/.bin:/usr/local/bin:/usr/bin:/bin", "LANG": "C.UTF-8"}
-    from dependencies import install_dependencies
-    install_dependencies(root, home, user, manifest, safe_env)
+    if not data.get("maintenance"):
+        from dependencies import install_dependencies
+        install_dependencies(root, home, user, manifest, safe_env)
     # Linux bwrap needs directory rule ancestors to exist. In particular a
     # Starter without Python feature venvs must still have the protected root.
     from dependencies import directory
-    for relative in directories:
-        directory(safe_path(home, relative), user)
+    if not data.get("maintenance"):
+        for relative in directories:
+            directory(safe_path(home, relative), user)
     atomic(inventory_path, json.dumps(inventory), 0, account.pw_gid, 0o440)
     atomic(project_config, config_text, account.pw_uid, account.pw_gid)
     atomic(state_path, json.dumps({**previous, "productId": manifest["productId"], "files": files,
@@ -405,18 +677,19 @@ def main():
         result["foundation"] = verify_starter_foundation(home, user, safe_env)
     config["kit"] = {"home": str(home)}
     from corporate import export_corporate
-    corporate = export_corporate(root, home, user, manifest, safe_env)
+    corporate = export_corporate(root, home, user, manifest, safe_env, maintenance=data.get("maintenance") is True)
     if corporate:
         config["corporate"] = corporate
     else:
         config.pop("corporate", None)
     atomic(config_path, json.dumps(config), account.pw_uid, account.pw_gid, 0o400)
-    collector = subprocess.run(["python3", str(root / "installer/install-backup-context.py"),
-                                "--home", str(home), "--user", user,
-                                "--unit", "codex-telegram@" + user + ".service", "--engine", "codex"],
-                               capture_output=True, timeout=180)
-    if collector.returncode:
-        raise ValueError("encrypted backup context installation failed")
+    if not data.get("maintenance"):
+        collector = subprocess.run(["python3", str(root / "installer/install-backup-context.py"),
+                                    "--home", str(home), "--user", user,
+                                    "--unit", "codex-telegram@" + user + ".service", "--engine", "codex"],
+                                   capture_output=True, timeout=180)
+        if collector.returncode:
+            raise ValueError("encrypted backup context installation failed")
     atomic(state_path, json.dumps({"productId": manifest["productId"], "revision": manifest["sourceRevision"], "payload": str(root), "files": files, "configSha": digest(config_text.encode()), "capabilities": result, "state": "ready"}), 0, 0)
     print(json.dumps({"ok": True, "productId": manifest["productId"], "capabilities": result}))
 
@@ -427,4 +700,4 @@ if __name__ == "__main__":
     except Exception as error:
         # No raw command output or credential-bearing subprocess exceptions.
         print("Native kit setup failed: " + str(error) if isinstance(error, ValueError) else "Native kit setup failed; inspect the named setup stage.", file=sys.stderr)
-        sys.exit(1)
+        sys.exit(3 if isinstance(error, UpdatesFrozenError) else 1)

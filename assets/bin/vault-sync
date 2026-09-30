@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Serialize secret-scanned vault synchronization without changing owner remotes."""
+"""Manually serialize secret-scanned vault sync without changing owner remotes."""
 
 from __future__ import annotations
 
@@ -85,18 +85,21 @@ def config_entry(key: str, value: str) -> str:
 
 
 def transport_config(guard) -> tuple[list[tuple[str, str]], list[str], str] | None:
-    # Read the owner's auth settings once, privately, before staging anything.
-    # Runtime transport gets a new config containing only those auth settings
+    # Resolve endpoint identity without owner-wide URL rewrites.
+    # Runtime transport gets a new config containing only selected auth settings
     # and the original endpoints; url.* rules and includes never reach it.
     environment = guard.clean_git_environment()
-    environment.pop("GIT_CONFIG_GLOBAL", None)
-    environment.pop("GIT_CONFIG_NOSYSTEM", None)
     result = guard.require_success(guard.git("config", "--null", "--list", environment=environment), "remote-invalid")
-    entries = []
-    for record in result.stdout.decode("utf-8", errors="strict").split("\0"):
-        if record:
-            key, separator, value = record.partition("\n")
-            entries.append((key, value if separator else "true"))
+
+    def parse_entries(output):
+        entries = []
+        for record in output.decode("utf-8", errors="strict").split("\0"):
+            if record:
+                key, separator, value = record.partition("\n")
+                entries.append((key, value if separator else "true"))
+        return entries
+
+    entries = parse_entries(result.stdout)
 
     def values(key):
         return [value for name, value in entries if name == key]
@@ -111,11 +114,19 @@ def transport_config(guard) -> tuple[list[tuple[str, str]], list[str], str] | No
         resolved = guard.require_success(guard.git("remote", "get-url", *arguments, "--all", "origin", environment=environment), "remote-invalid")
         if guard.decoded(resolved).splitlines() != expected:
             raise guard.BackupError("remote-invalid")
-    ssh_command = values("core.sshcommand")
+    # HTTP/credential helpers and core.sshCommand may live in the owner's
+    # global Git config. Read them after validating endpoints, never copying
+    # URL rewrite rules into the frozen transport.
+    auth_environment = environment.copy()
+    auth_environment.pop("GIT_CONFIG_GLOBAL", None)
+    auth_environment.pop("GIT_CONFIG_NOSYSTEM", None)
+    auth_result = guard.require_success(guard.git("config", "--null", "--list", environment=auth_environment), "transport-auth-unavailable")
+    owner_entries = parse_entries(auth_result.stdout)
     auth = [
-        (key, value) for key, value in entries
+        (key, value) for key, value in owner_entries
         if key.startswith(("credential.", "http.")) and not key.endswith(".followredirects")
     ]
+    ssh_command = [value for key, value in owner_entries if key == "core.sshcommand"]
     return auth, [fetch[0], push[0]], ssh_command[-1] if ssh_command else "ssh"
 
 
@@ -259,6 +270,7 @@ def synchronize(guard, stack: ExitStack) -> bool:
         raise guard.BackupError("revision-invalid")
     backup = guard.load_backup_module()
     checked = guard.require_safe_history(backup, before) if before else set()
+    author = guard.commit_author("Agent Vault", "agent-vault@localhost")
     config = transport_config(guard)
     transport = None
     if config is not None:
@@ -272,8 +284,8 @@ def synchronize(guard, stack: ExitStack) -> bool:
             tree = guard.decoded(guard.require_success(guard.git("write-tree"), "index-invalid"))
             checked = guard.require_safe_history(backup, tree, checked)
             guard.require_success(guard.git(
-                "-c", "core.hooksPath=/dev/null", "-c", "user.name=Agent Vault",
-                "-c", "user.email=agent-vault@localhost", "commit", "--no-gpg-sign", "--no-verify",
+                "-c", "core.hooksPath=/dev/null", "-c", "user.name=" + author[0],
+                "-c", "user.email=" + author[1], "commit", "--no-gpg-sign", "--no-verify",
                 "-m", "auto: vault update " + datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             ), "commit-failed")
             committed = True
@@ -290,8 +302,8 @@ def synchronize(guard, stack: ExitStack) -> bool:
         if remote_revision:
             checked = guard.require_safe_history(backup, remote_revision, checked)
             result = guard.git(
-                "-c", "core.hooksPath=/dev/null", "-c", "user.name=Agent Vault",
-                "-c", "user.email=agent-vault@localhost", "-c", "rebase.updateRefs=false",
+                "-c", "core.hooksPath=/dev/null", "-c", "user.name=" + author[0],
+                "-c", "user.email=" + author[1], "-c", "rebase.updateRefs=false",
                 "rebase", "--no-autostash", "--no-autosquash", "--no-gpg-sign", remote_revision,
             )
             if result.returncode:
@@ -306,6 +318,10 @@ def synchronize(guard, stack: ExitStack) -> bool:
 
 
 def main() -> int:
+    # Older corporate update flows can restore a retired cron or hook entry.
+    # Both call this helper without an explicit operator opt-in.
+    if os.environ.get("VAULT_SYNC_MANUAL") != "1":
+        return 0
     if not (VAULT / ".git").is_dir():
         return 0
     guard = None

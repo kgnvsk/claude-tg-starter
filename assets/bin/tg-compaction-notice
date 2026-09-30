@@ -20,6 +20,16 @@ import time
 TEXT = 'Секундочку, зараз стискаю контекст розмови. Після цього продовжу завдання.'
 
 
+def addressed(payload):
+    """A group that hands the bot every message also hands it people talking to
+    each other; the receiver marks those addressed="false", and nobody there is
+    waiting for a status (Кнопа 15.09)."""
+    try:
+        return json.loads(payload)['params']['meta'].get('addressed') != 'false'
+    except (TypeError, ValueError, KeyError, AttributeError):
+        return True
+
+
 def main():
     if os.environ.get('ATARAX_SUPPRESS_TELEGRAM') == '1':
         return
@@ -35,7 +45,7 @@ def main():
     state = Path(os.environ.get('TELEGRAM_STATE_DIR') or config / 'channels/telegram')
     with sqlite3.connect(f'file:{state / "messages.db"}?mode=ro', uri=True, timeout=1) as db:
         targets = db.execute(
-            'SELECT DISTINCT t.turn_id,r.chat_id,r.thread_id FROM delivery_results r '
+            'SELECT DISTINCT t.turn_id,r.chat_id,r.thread_id,r.request_payload FROM delivery_results r '
             'JOIN delivery_turns t ON t.turn_id=coalesce(r.response_turn_id,r.turn_id) '
             'JOIN delivery_sessions s ON s.session_id=t.session_id '
             'WHERE t.session_id=? AND s.stamp=? AND r.session_id=? AND r.stamp=? '
@@ -53,8 +63,8 @@ def main():
         now = time.time()
         saved = json.loads(claims.read_text()) if claims.exists() else {}
         saved = {key: ts for key, ts in saved.items() if isinstance(ts, (int, float)) and now - ts < 604800}
-        for turn, chat, thread in targets:
-            if not re.fullmatch(r'-?[1-9][0-9]{0,19}', chat):
+        for turn, chat, thread, payload in targets:
+            if not re.fullmatch(r'-?[1-9][0-9]{0,19}', chat) or not addressed(payload):
                 continue
             if thread is not None and (not chat.startswith('-') or not re.fullmatch(r'[1-9][0-9]{0,9}', thread)):
                 continue

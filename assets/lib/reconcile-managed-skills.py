@@ -179,6 +179,19 @@ def checksum(value: Snapshot | None) -> str | None:
     return hashlib.sha256(json.dumps(entries, ensure_ascii=True).encode()).hexdigest()
 
 
+def retain_restrictive_modes(live: Snapshot, target: Snapshot) -> Snapshot:
+    """Keep an accepted owner's private permissions on replaced kit entries."""
+    adjusted = dict(target)
+    for name, (kind, mode, payload) in target.items():
+        previous = live.get(name)
+        if previous is None:
+            continue
+        live_kind, live_mode, _ = previous
+        if live_kind == kind and live_mode & ~mode == 0:
+            adjusted[name] = kind, live_mode, payload
+    return adjusted
+
+
 def install_snapshot(path: Path, value: Snapshot | None) -> None:
     """Stage complete content before replacing a verified, unchanged skill."""
     check_path(path)
@@ -310,10 +323,13 @@ def reconcile_entries(
         if disabled is not None and active.exists() and disabled.exists():
             raise PolicyError(f"конфлікт навички {name}: одночасно ввімкнена й вимкнена копії")
         destination = disabled if disabled is not None and disabled.exists() else active
-        live = checksum(snapshot(destination))
+        live_snapshot = snapshot(destination)
+        live = checksum(live_snapshot)
         target = targets.get(name)
-        desired = checksum(target)
         previous = baseline.get(name)
+        if target is not None and live_snapshot is not None and live == previous:
+            target = retain_restrictive_modes(live_snapshot, target)
+        desired = checksum(target)
         if live == desired:
             action = "same"
         elif target is None:

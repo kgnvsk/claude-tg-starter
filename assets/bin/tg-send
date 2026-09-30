@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""tg-send [--no-watchdog-credit] <chat_id> "text" [--thread-id <positive_id>]
-Deliver a plain message straight through the
+"""tg-send [--no-watchdog-credit] [--thread-id ID | --general-topic] <chat_id> "text"
+— deliver a plain message straight through the
 Telegram Bot API, bypassing the MCP reply-tool.
 
 The FALLBACK path: when the telegram plugin's MCP reply-tool is momentarily gone
@@ -22,6 +22,493 @@ send (limit notices) records no row at all, as before: every watchdog reads any
 outbound row as "the chat was answered".
 """
 import sys, os, re, json, sqlite3, subprocess, time, urllib.parse, urllib.request
+import urllib.error, hashlib, tempfile, fcntl, signal
+from datetime import datetime
+from pathlib import Path
+
+
+def log(message):
+    """A line for the operator, in the agent's logs rather than the Bash tool output
+    the model reads."""
+    try:
+        path = Path(os.environ.get("AGENT_ROOT") or Path.home()) / "logs" / "tg-send.log"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(f"{datetime.now().astimezone().isoformat(timespec='seconds')} {message}\n")
+    except OSError:
+        pass
+
+
+def routing_error():
+    sys.exit("not delivered: routing validation failed; preserve the verified topic "
+             "or choose General explicitly. Do not bypass this rejection using another tool")
+
+
+def parse_arguments(arguments):
+    watchdog_credit, general_topic, thread_id = True, False, None
+    positional = []
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument == "--no-watchdog-credit" and watchdog_credit:
+            watchdog_credit = False
+        elif argument == "--general-topic" and not general_topic:
+            general_topic = True
+        elif argument == "--thread-id" and thread_id is None:
+            index += 1
+            if (index >= len(arguments) or not re.fullmatch(r"[1-9][0-9]{0,9}", arguments[index])
+                    or int(arguments[index]) > 2_147_483_647):
+                routing_error()
+            thread_id = int(arguments[index])
+        elif argument.startswith("--"):
+            routing_error()
+        else:
+            positional.append(argument)
+        index += 1
+    if len(positional) != 2:
+        sys.exit('usage: tg-send [--no-watchdog-credit] [--thread-id ID | --general-topic] <chat_id> "text"')
+    chat_id, text = positional
+    if (not re.fullmatch(r"-?[1-9][0-9]*", chat_id)
+            or (thread_id is not None and general_topic)
+            or ((thread_id is not None or general_topic) and not chat_id.startswith("-"))):
+        routing_error()
+    if text.strip() == "NO_REPLY":
+        # The silence sentinel is never a message: a scheduled task sent it to the owner
+        # as text, and inside a turn it became the request's answer (Мартин, 23 and 25.09).
+        print("not delivered: NO_REPLY marks silence and is not a message; nothing was sent")
+        sys.exit(0)
+    return chat_id, text, thread_id, general_topic, watchdog_credit
+
+
+def destination_status(chat_id, thread_id, general_topic, bot_token):
+    if not chat_id.startswith("-") or thread_id is not None or general_topic:
+        return True
+    request = urllib.request.Request(
+        f"https://api.telegram.org/bot{bot_token}/getChat",
+        data=urllib.parse.urlencode({"chat_id": chat_id}).encode(),
+    )
+    try:
+        payload = json.loads(urllib.request.urlopen(request, timeout=15).read())
+        result = payload.get("result") if isinstance(payload, dict) and payload.get("ok") is True else None
+    except Exception:
+        return None
+    if result is None:
+        return None
+    return (isinstance(result, dict) and type(result.get("id")) is int
+            and str(result["id"]) == chat_id and result.get("type") in ("group", "supergroup")
+            and ("is_forum" not in result or result["is_forum"] is False))
+
+
+def ensure_destination(chat_id, thread_id, general_topic, bot_token):
+    if destination_status(chat_id, thread_id, general_topic, bot_token) is not True:
+        routing_error()
+
+
+def confirmed_receipt(chat_id, payload, thread_id):
+    if not isinstance(payload, dict) or payload.get("ok") is not True:
+        return False
+    result = payload.get("result")
+    if not isinstance(result, dict):
+        return False
+    chat = result.get("chat")
+    if (type(result.get("message_id")) is not int or result["message_id"] <= 0
+            or not isinstance(chat, dict) or type(chat.get("id")) is not int
+            or str(chat["id"]) != chat_id):
+        return False
+    if thread_id is not None:
+        return (result.get("is_topic_message") is True
+                and type(result.get("message_thread_id")) is int
+                and result["message_thread_id"] == thread_id)
+    return "is_topic_message" not in result or result["is_topic_message"] is False
+
+
+def definite_bot_api_rejection(payload):
+    """A parsed Bot API response proves this particular send was rejected."""
+    return (isinstance(payload, dict) and payload.get("ok") is False
+            and type(payload.get("error_code")) is int
+            and payload["error_code"] in (400, 401, 403, 404, 429))
+
+
+def rejected_background_notice(context):
+    """Leave the already-running native task bound; retry its notice, not its work.
+    Under the receiver nothing was registered: abandon_attempt() left the note
+    that says whether the notice may be sent once more (R4-7)."""
+    if context.get("retry_note"):
+        return f"Telegram rejected the progress notice{context['retry_note']}"
+    delivery = context["targets"][0]["delivery_id"] if len(context["targets"]) == 1 else "the original delivery"
+    return ("Telegram rejected the progress notice; the original background task remains registered. "
+            f"If it is still running, retry only the progress notice once with the same task_id "
+            f"and delivery_id {delivery}; if its callback arrived, send its final result instead. "
+            "Do not start another task")
+
+
+# Background work still open in a request's scope, of its own service stamp:
+# its owned or legacy obligations, and every unowned obligation and unresolved
+# launch of its claim turn or response turn. The receiver's scopeWork() is the
+# same list. A final is admitted, and a superseded final may complete its
+# request, only while it is empty.
+SCOPE_WORK = (
+    "SELECT 'launch ' || launch_ref FROM delivery_task_launches WHERE session_id=:session "
+    "AND stamp=:stamp AND state='launching' AND launched_turn IN (:turn, :response){released} "
+    "UNION ALL SELECT 'task ' || task_id FROM delivery_task_owners WHERE session_id=:session "
+    "AND stamp=:stamp AND ((state IN ('owned','legacy') AND delivery_id=:delivery) "
+    "OR (state='unowned' AND launched_turn IN (:turn, :response))){released}"
+)
+
+
+def scope_work(connection, delivery, session, stamp, turn, response):
+    # A worker the owner was told about no longer counts: it stops blocking (NOVSKY 27.09).
+    released = "silent_notified_at" in {
+        row[1] for row in connection.execute("PRAGMA table_info(delivery_task_launches)")}
+    return [row[0] for row in connection.execute(
+        SCOPE_WORK.format(released=" AND silent_notified_at IS NULL" if released else ""), {
+            "delivery": delivery, "session": session, "stamp": stamp, "turn": turn, "response": response})]
+
+
+class OpenWork(ValueError):
+    """A final refused before the network while work of its scope is open."""
+
+    def __init__(self, message, work, session, stamp):
+        super().__init__(message)
+        self.work, self.session, self.stamp = work, session, stamp
+
+
+def count_final_refusal(connection, refusal):
+    """Each worker a refused final names gets one refusal more; the third makes it
+    due for the owner's notice and releases it (NOVSKY 27.09), as the receiver's
+    countFinalRefusal() does. A failure here only goes to the log."""
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        release = ("final_refusals=final_refusals+1, silent_notified_at=CASE WHEN final_refusals+1>=3 "
+                   "AND silent_notified_at IS NULL THEN 0 ELSE silent_notified_at END")
+        for item in refusal.work:
+            kind, name = item.split(" ", 1)
+            if kind == "task":
+                connection.execute(f"UPDATE delivery_task_owners SET {release} WHERE session_id=? AND stamp=? "
+                                   "AND task_id=?", (refusal.session, refusal.stamp, name))
+            else:
+                connection.execute(f"UPDATE delivery_task_launches SET {release} WHERE launch_ref=?", (name,))
+        connection.commit()
+    except sqlite3.Error as error:
+        if connection.in_transaction:
+            connection.rollback()
+        log(f"refused final not counted: {error}")
+
+
+def ack_verdict(connection, delivery, session, stamp, turn, response):
+    """What the ACK of a superseded final proves now (v6): 'complete' once no
+    work of its scope is open; 'keep' while the only open work is calls not
+    resolved yet, which may still launch nothing; 'evidence' once a worker of
+    its scope was launched after that final, so the request waits for it. The
+    receiver's ackVerdict() is the same rule."""
+    work = scope_work(connection, delivery, session, stamp, turn, response)
+    if any(item.startswith("task ") for item in work):
+        return "evidence"
+    return "keep" if work else "complete"
+
+
+def record_verdict(connection, verdict, delivery, turn, chat_id, thread_id, detail=None):
+    """Shadow mode only: what a worker gate would have done, as the receiver's
+    recordShadow() records it. Guard mode records nothing."""
+    if os.environ.get("TG_DELIVERY_AUTHORITY") != "shadow" or not connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='delivery_shadow'").fetchone():
+        return
+    if connection.execute("SELECT 1 FROM delivery_shadow WHERE class=? AND delivery_id IS ? AND turn_id IS ?",
+                          (verdict, delivery, turn)).fetchone():
+        return
+    connection.execute(
+        "INSERT INTO delivery_shadow (created_at,class,chat_id,thread_id,delivery_id,turn_id,detail) "
+        "VALUES (?,?,?,?,?,?,?)", (int(time.time() * 1000), verdict, chat_id, thread_id, delivery, turn, detail))
+
+
+def process_start(pid):
+    """The kernel's start time of a process, which a later process given the
+    same PID does not share: field 22 of /proc/<pid>/stat, or ps's lstart where
+    there is no /proc. The receiver's processStart() reads it the same way."""
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as stat:
+            return stat.read().rsplit(b")", 1)[1].split()[19].decode()
+    except (OSError, IndexError):
+        pass
+    try:
+        started = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True,
+                                 timeout=3, env={**os.environ, "TZ": "UTC", "LC_ALL": "C"}).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return started or None
+
+
+def admit(connection, delivery, row, phase, task_id=None):
+    """Under the receiver, the fence its reply arms, inside the capture
+    transaction: a final is refused before the network while work of its scope
+    is open, and is otherwise admitted at its generation with the send fenced.
+    A new attempt ends the link of a superseded one: something was sent after
+    that final."""
+    session, stamp, turn, response, _, generation = row
+    now = int(time.time() * 1000)
+    work = scope_work(connection, delivery, session, stamp, turn, response) if phase == "final" else []
+    if work:
+        raise OpenWork(f"background work of this request is still open ({', '.join(work)}); nothing "
+                       "was sent. Send TG_DELIVERY_PHASE=progress with its TG_DELIVERY_TASK_ID now and "
+                       "the final after its callback, or stop that task first", work, session, stamp)
+    # The attempt carries this sender's PID: if it is killed before it can settle the
+    # attempt, the receiver's tick finds it gone and settles it instead.
+    armed = connection.execute(
+        "UPDATE delivery_results SET outbound_attempt_at=?, outbound_attempt_generation=result_generation, "
+        "outbound_attempt_pid=?, outbound_attempt_pid_start=?, superseded_by=NULL, superseded_ack=NULL, "
+        "updated_at=?, final_admitted_generation="
+        "CASE WHEN ?='final' THEN result_generation ELSE final_admitted_generation END, "
+        "progress_retry=CASE WHEN ? AND progress_retry=result_generation || ':offered' "
+        "THEN result_generation || ':closed' ELSE progress_retry END "
+        "WHERE delivery_id=? AND turn_id=? AND stamp=? AND result_generation=? "
+        "AND state IN ('pending','deferred','paused','resume_pending') AND outbound_attempt_at IS NULL",
+        (now, os.getpid(), process_start(os.getpid()), now, phase, bool(task_id), delivery, turn, stamp,
+         generation),
+    ).rowcount
+    if armed != 1:
+        raise ValueError("another send of this request is still on its way; nothing was sent")
+
+
+def observe_shadow(context):
+    """Shadow mode: record what the receiver's final gate would do, and the
+    final's admission, so that a launch under it records its verdict too. It
+    never changes the send: after any failure the send goes out as today."""
+    state = os.environ.get("TELEGRAM_STATE_DIR") or os.path.expanduser("~/.claude/channels/telegram")
+    try:
+        connection = sqlite3.connect(f"file:{state}/messages.db?mode=rw", uri=True, timeout=3)
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            if "superseded_ack" not in {row[1] for row in connection.execute("PRAGMA table_info(delivery_results)")}:
+                return
+            for target in context["targets"]:
+                row = connection.execute(
+                    "SELECT session_id, stamp, turn_id, response_turn_id FROM delivery_results "
+                    "WHERE delivery_id=? AND turn_id=? AND result_generation IS ? "
+                    "AND state IN ('pending','deferred','paused','resume_pending')",
+                    (target["delivery_id"], target["turn_id"], target["result_generation"]),
+                ).fetchone()
+                if row is None:
+                    continue
+                work = scope_work(connection, target["delivery_id"], *row)
+                if work:
+                    record_verdict(connection, "would_refuse_final", target["delivery_id"], target["turn_id"],
+                                   context["chat_id"], None if context["thread_id"] is None
+                                   else str(context["thread_id"]), ", ".join(work))
+                connection.execute(
+                    "UPDATE delivery_results SET final_admitted_generation=result_generation "
+                    "WHERE delivery_id=? AND turn_id=?", (target["delivery_id"], target["turn_id"]))
+                target["admitted"] = True
+            connection.commit()
+        finally:
+            connection.close()
+    except sqlite3.Error:
+        pass
+
+
+def write_terminal_receipt(connection, delivery, turn, chat_id, thread_id, source, message_id, now):
+    """The terminal receipt of a request its final completed, at its current
+    generation, naming the exact native callback it answered."""
+    result = connection.execute(
+        "SELECT session_id,stamp,task_id,response_turn_id,result_generation "
+        "FROM delivery_results WHERE delivery_id=? AND turn_id=?", (delivery, turn),
+    ).fetchone()
+    if not result or not result[1]:
+        return
+    returned = connection.execute(
+        "SELECT return_id FROM delivery_task_returns WHERE session_id=? AND stamp=? "
+        "AND delivery_id=? AND turn_id=? AND task_id=? ORDER BY return_id DESC LIMIT 1",
+        (result[0], result[1], delivery, result[3], result[2]),
+    ).fetchone() if result[2] and result[3] is not None else None
+    connection.execute(
+        "INSERT OR IGNORE INTO delivery_terminal_receipts "
+        "(delivery_id,turn_id,session_id,stamp,chat_id,thread_id,result_generation,"
+        "task_return_id,source,message_id,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        (delivery, turn, result[0], result[1], str(chat_id),
+         str(thread_id) if thread_id is not None else None,
+         result[4], returned[0] if returned else None, source, message_id, now),
+    )
+
+
+def settle_superseded(connection, delivery, turn, generation, chat_id, thread_id, message_id, now):
+    """Under the receiver, the ACK of a final whose generation a later launch
+    moved on; the receiver's settleSupersededFinal() does the same for a reply.
+    Its outcome is known, so its fence clears. By ack_verdict(): while calls of
+    its scope are unresolved, the ACK is kept for their resolutions; with no work
+    open, the request completes with this final, in this transaction; once the
+    superseding call or another call of its scope launched a worker, the answer
+    is acknowledged, non-terminal evidence."""
+    row = connection.execute(
+        "SELECT r.session_id, r.stamp, r.turn_id, r.response_turn_id, l.state FROM delivery_results r "
+        "LEFT JOIN delivery_task_launches l ON l.launch_ref=r.superseded_by "
+        "WHERE r.delivery_id=? AND r.turn_id=? AND r.state IN ('pending','deferred') "
+        "AND r.outbound_attempt_at IS NOT NULL AND r.outbound_attempt_generation IS ?",
+        (delivery, turn, generation),
+    ).fetchone()
+    if row is None:
+        return
+    # With no superseding call on record, a callback or a recovery moved the
+    # generation on: the answer it now owes is not this one.
+    verdict = "evidence" if row[4] in (None, "resolved") else ack_verdict(connection, delivery, *row[:4])
+    if verdict == "keep":
+        connection.execute(
+            "UPDATE delivery_results SET outbound_attempt_at=NULL, outbound_attempt_generation=NULL, "
+            "superseded_ack=?, acknowledged_at=coalesce(acknowledged_at,?), updated_at=? "
+            "WHERE delivery_id=? AND turn_id=?", (f"shell:{message_id}", now, now, delivery, turn),
+        )
+        return
+    complete = verdict == "complete"
+    connection.execute(
+        "UPDATE delivery_results SET outbound_attempt_at=NULL, outbound_attempt_generation=NULL, "
+        "superseded_by=NULL, superseded_ack=NULL, acknowledged_at=coalesce(acknowledged_at,?), updated_at=?, "
+        "state=CASE WHEN ? THEN 'complete' ELSE state END, finished_at=CASE WHEN ? THEN ? ELSE finished_at END "
+        "WHERE delivery_id=? AND turn_id=?", (now, now, complete, complete, now, delivery, turn),
+    )
+    if complete:
+        write_terminal_receipt(connection, delivery, turn, chat_id, thread_id, "shell", message_id, now)
+
+
+def settle_superseded_at_post(connection, session, stamp, launch, launch_turn, launched, now):
+    """PostToolUse of any call in the scope of a request that holds the recorded
+    ACK of a final a launch superseded (R4-1, v6). An attempt still on the
+    network is left to its own ACK. A call that launched a worker leaves the
+    request waiting for it: the ACK becomes non-terminal evidence. Otherwise
+    ack_verdict() decides, in the hook's transaction: the request completes
+    with that final, the ACK waits for the next resolution, or it is evidence.
+    A link to this launch whose attempt ended without an ACK clears."""
+    for delivery, turn, chat_id, thread_id, response, ack in connection.execute(
+            "SELECT delivery_id, turn_id, chat_id, thread_id, response_turn_id, superseded_ack "
+            "FROM delivery_results WHERE session_id=? AND stamp=? "
+            "AND state IN ('pending','deferred') AND outbound_attempt_at IS NULL "
+            "AND (superseded_by=? OR (superseded_ack IS NOT NULL AND (turn_id=? OR response_turn_id=?)))",
+            (session, stamp, launch, launch_turn, launch_turn)).fetchall():
+        verdict = ("evidence" if launched or not ack
+                   else ack_verdict(connection, delivery, session, stamp, turn, response))
+        if verdict == "keep":
+            continue
+        source, _, message = (ack or "").partition(":")
+        complete = verdict == "complete" and message.isdigit()
+        connection.execute(
+            "UPDATE delivery_results SET superseded_by=NULL, superseded_ack=NULL, updated_at=?, "
+            "state=CASE WHEN ? THEN 'complete' ELSE state END, finished_at=CASE WHEN ? THEN ? ELSE finished_at END "
+            "WHERE delivery_id=? AND turn_id=?", (now, complete, complete, now, delivery, turn),
+        )
+        if complete:
+            write_terminal_receipt(connection, delivery, turn, chat_id, thread_id, source, int(message), now)
+
+
+def detach_attempt(context):
+    """Telegram acknowledged the send but its ledger write failed: this sender did
+    not die, its notice was delivered. It takes its PID off the attempt, so the
+    receiver's tick leaves the fence for the startup quarantine (R4-7)."""
+    armed = [target for target in (context or {}).get("targets", []) if target.get("armed")]
+    if not armed:
+        return
+    state = os.environ.get("TELEGRAM_STATE_DIR") or os.path.expanduser("~/.claude/channels/telegram")
+    try:
+        connection = sqlite3.connect(f"file:{state}/messages.db?mode=rw", uri=True, timeout=3)
+        try:
+            for target in armed:
+                connection.execute(
+                    "UPDATE delivery_results SET outbound_attempt_pid=NULL, outbound_attempt_pid_start=NULL "
+                    "WHERE delivery_id=? AND turn_id=? AND outbound_attempt_at IS NOT NULL "
+                    "AND outbound_attempt_pid=?", (target["delivery_id"], target["turn_id"], os.getpid()),
+                )
+            connection.commit()
+        finally:
+            connection.close()
+    except sqlite3.Error:
+        pass
+
+
+def settle_on_signals(context, sent_ids):
+    """Esc (SIGINT) or a Bash timeout (SIGTERM) ends a sender mid-send. It settles its own
+    attempt first, as an unknown outcome, so no chat waits for a restart; a hard kill is left
+    to the receiver's tick."""
+    def settle(signum, _frame):
+        abandon_attempt(context, sent_ids, rejected=False)
+        sys.exit(128 + signum)
+    for signum in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(signum, settle)
+
+
+def abandon_attempt(context, sent_ids, rejected):
+    """A send taken at capture ended short of its whole notice. Telegram rejected
+    its first part, so nothing was delivered: its fence and admission clear.
+    Under the receiver a final whose outcome is unknown, or with only some
+    parts delivered, is quarantined at once and exactly: its own request at its
+    own generation (R4-5); nothing is resent, and the owner hears of it on the
+    receiver's next tick. A progress notice clears its fence; a task notice under
+    the receiver registered nothing, and R4-7 decides whether it may be sent once
+    more: the returned note says so, for the sender's error. Shadow mode only
+    clears the admission it recorded. If this write fails, an armed fence stays
+    for the startup quarantine."""
+    taken = [target for target in (context or {}).get("targets", [])
+             if target.get("armed") or target.get("admitted")]
+    if not taken:
+        return ""
+    retry = (context.get("phase") == "progress" and bool(context.get("task_id"))
+             and any(target.get("armed") for target in taken))
+    safe = context.get("single_part") is True and not sent_ids
+    offered = False
+    quarantine = context.get("phase") == "final" and not (rejected and not sent_ids)
+    state = os.environ.get("TELEGRAM_STATE_DIR") or os.path.expanduser("~/.claude/channels/telegram")
+    try:
+        connection = sqlite3.connect(f"file:{state}/messages.db?mode=rw", uri=True, timeout=3)
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            now = int(time.time() * 1000)
+            for target in taken:
+                key = (target["delivery_id"], target["turn_id"], target["result_generation"])
+                if target.get("admitted"):
+                    connection.execute(
+                        "UPDATE delivery_results SET final_admitted_generation=NULL "
+                        "WHERE delivery_id=? AND turn_id=? AND final_admitted_generation IS ?", key)
+                elif not quarantine:
+                    connection.execute(
+                        "UPDATE delivery_results SET outbound_attempt_at=NULL, outbound_attempt_generation=NULL, "
+                        "final_admitted_generation=NULL, superseded_by=NULL, superseded_ack=NULL "
+                        "WHERE delivery_id=? AND turn_id=? AND outbound_attempt_at IS NOT NULL "
+                        "AND outbound_attempt_generation IS ?", key,
+                    )
+                elif connection.execute(
+                        "UPDATE delivery_results SET state='blocked', recovery_reason='outbound_uncertain', "
+                        "finished_at=NULL, updated_at=? WHERE delivery_id=? AND turn_id=? "
+                        "AND outbound_attempt_at IS NOT NULL AND outbound_attempt_generation IS ? "
+                        "AND state IN ('pending','deferred','paused','resume_pending')", (now, *key)).rowcount:
+                    connection.execute(
+                        "UPDATE delivery_turn_messages SET closed_by='outbound_uncertain', closed_at=? "
+                        "WHERE delivery_id=? AND closed_at IS NULL", (now, key[0]),
+                    )
+                    connection.execute(
+                        "DELETE FROM pending_inbound_deliveries WHERE delivery_id=? AND EXISTS ("
+                        "SELECT 1 FROM delivery_results WHERE delivery_id=? AND request_payload IS NOT NULL)",
+                        (key[0], key[0]),
+                    )
+                if retry and target.get("armed"):
+                    connection.execute(
+                        "UPDATE delivery_results SET progress_retry=CASE WHEN ? AND (progress_retry IS NULL "
+                        "OR progress_retry NOT LIKE result_generation || ':%') THEN result_generation || ':offered' "
+                        "ELSE result_generation || ':closed' END, updated_at=? "
+                        "WHERE delivery_id=? AND turn_id=? AND result_generation IS ?", (safe, now, *key),
+                    )
+                    offered = (connection.execute(
+                        "SELECT progress_retry FROM delivery_results WHERE delivery_id=? AND turn_id=?", key[:2],
+                    ).fetchone() or [""])[0] == f"{key[2]}:offered"
+            connection.commit()
+        finally:
+            connection.close()
+    except sqlite3.Error:
+        offered = False
+    if not retry:
+        return ""
+    delivery = taken[0]["delivery_id"] if len(taken) == 1 else "the original delivery"
+    context["retry_note"] = (
+        "; nothing was registered; if the background task is still running, retry only the progress "
+        f"notice once with the same task_id and delivery_id {delivery}; if its callback arrived, send "
+        "its final result instead; do not start another task" if offered else
+        "; nothing was registered, and this progress notice may not be sent again: the request waits for "
+        "the background task's callback; send its final result then, or stop the task")
+    return context["retry_note"]
 
 
 def token():
@@ -47,6 +534,46 @@ def parse_thread_id(chat_id, value):
     return int(value)
 
 
+def repeated_acknowledgement(connection, targets):
+    """The last receipt of every target of a progress, when each is younger than
+    TG_PROGRESS_REPEAT_WINDOW_MS (ten minutes by default): the receiver's
+    repeatedAcknowledgement(). None otherwise."""
+    try:
+        window = float(os.environ.get("TG_PROGRESS_REPEAT_WINDOW_MS") or "nan")
+    except ValueError:
+        window = float("nan")
+    if not 0 < window < float("inf"):
+        window = 600_000
+    if not targets or "phase" not in {row[1] for row in connection.execute("PRAGMA table_info(delivery_receipts)")}:
+        return None
+    now, last = time.time() * 1000, 0
+    for _, delivery in targets:
+        (at,) = connection.execute("SELECT max(created_at) FROM delivery_receipts WHERE delivery_id=? "
+                                   "AND phase='progress'", (delivery,)).fetchone()
+        if at is None or now - at >= window:
+            return None
+        last = max(last, at)
+    return last
+
+
+def observe_repeat(context, acknowledged):
+    """Shadow mode: the repeated acknowledgement the receiver would refuse. It
+    still goes out."""
+    state = os.environ.get("TELEGRAM_STATE_DIR") or os.path.expanduser("~/.claude/channels/telegram")
+    try:
+        connection = sqlite3.connect(f"file:{state}/messages.db?mode=rw", uri=True, timeout=3)
+        try:
+            for target in context["targets"]:
+                record_verdict(connection, "would_refuse_repeat_progress", target["delivery_id"], target["turn_id"],
+                               context["chat_id"], None if context["thread_id"] is None else str(context["thread_id"]),
+                               f"{int(time.time() * 1000 - acknowledged) // 1000} s since the receipted acknowledgement")
+            connection.commit()
+        finally:
+            connection.close()
+    except sqlite3.Error:
+        pass
+
+
 def capture_delivery(chat_id, thread_id=None):
     """Bind before sending; an empty snapshot must stay empty on later retries."""
     phase = os.environ.get("TG_DELIVERY_PHASE", "final")
@@ -55,36 +582,80 @@ def capture_delivery(chat_id, thread_id=None):
         task_id = None
     delivery_id = os.environ.get("TG_DELIVERY_ID") or None
     stamp = os.environ.get("TG_DELIVERY_STAMP") or None
+    # The worker-obligation gates act only when the receiver settles delivery;
+    # shadow mode records what they would do, and an unknown mode is guard, as
+    # in the receiver.
+    authority = os.environ.get("TG_DELIVERY_AUTHORITY")
+    receiver = authority == "receiver"
     if phase not in ("progress", "final"):
         raise ValueError("TG_DELIVERY_PHASE must be progress or final")
     if task_id and (phase != "progress" or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", task_id)):
         raise ValueError("TG_DELIVERY_TASK_ID requires progress and the exact native background task ID")
     context = {"chat_id": str(chat_id), "thread_id": thread_id, "targets": [],
                "stamp": stamp, "phase": phase, "task_id": task_id}
+    acknowledged = None
     if not stamp:
         if delivery_id or task_id:
             raise ValueError("explicit delivery binding requires the current service stamp")
         return context
     state = os.environ.get("TELEGRAM_STATE_DIR") or os.path.expanduser("~/.claude/channels/telegram")
     try:
-        mode = "rw" if task_id else "ro"
-        connection = sqlite3.connect(f"file:{state}/messages.db?mode={mode}", uri=True, timeout=3)
+        write = bool(task_id) or receiver
+        connection = sqlite3.connect(f"file:{state}/messages.db?mode={'rw' if write else 'ro'}",
+                                     uri=True, timeout=3)
         try:
-            if task_id:
+            if write:
+                # One write transaction: the checks, a registration and the fence.
                 connection.execute("BEGIN IMMEDIATE")
             scope = (str(chat_id), str(thread_id) if thread_id is not None else None, stamp)
             results_present = connection.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='delivery_results'"
             ).fetchone()
+            # A receiver from before the worker-obligation ledger keeps no fence.
+            fence = receiver and results_present and "outbound_attempt_pid_start" in {
+                row[1] for row in connection.execute("PRAGMA table_info(delivery_results)")}
+            # An unbound callback can steal only a request in its own open
+            # chat/topic turn. Other chats stay usable; closing the turn ends
+            # this ambiguity without deleting its historical return row.
+            if not delivery_id and connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='delivery_task_returns'"
+            ).fetchone() and connection.execute(
+                "SELECT 1 FROM delivery_task_returns ret "
+                "JOIN delivery_turns t ON t.turn_id=ret.turn_id AND t.session_id=ret.session_id "
+                "JOIN delivery_sessions s ON s.session_id=ret.session_id "
+                "WHERE t.closed_at IS NULL AND s.stamp=? AND ret.stamp=s.stamp "
+                "AND ret.delivery_id IS NULL AND ("
+                "EXISTS (SELECT 1 FROM delivery_turn_messages m WHERE m.turn_id=t.turn_id "
+                "AND m.chat_id=? AND m.thread_id IS ?) OR "
+                "EXISTS (SELECT 1 FROM delivery_results r WHERE r.response_turn_id=t.turn_id "
+                "AND r.session_id=t.session_id AND r.stamp=s.stamp "
+                "AND r.chat_id=? AND r.thread_id IS ?) OR "
+                "EXISTS (SELECT 1 FROM delivery_results r WHERE r.session_id=t.session_id "
+                "AND r.stamp=s.stamp AND r.task_id=ret.task_id AND r.state='deferred' "
+                "AND r.chat_id=? AND r.thread_id IS ?)) LIMIT 1",
+                (stamp, scope[0], scope[1], scope[0], scope[1], scope[0], scope[1]),
+            ).fetchone():
+                raise ValueError("an unbound native callback is active; pass its exact original TG_DELIVERY_ID")
             if delivery_id:
-                targets = connection.execute(
-                    "SELECT r.turn_id,r.delivery_id FROM delivery_results r "
+                target = connection.execute(
+                    "SELECT r.turn_id,r.delivery_id,r.session_id,r.state,r.response_turn_id FROM delivery_results r "
                     "JOIN delivery_sessions s ON s.session_id=r.session_id AND s.stamp IS r.stamp "
                     "WHERE r.delivery_id=? AND r.chat_id=? AND r.thread_id IS ? AND r.stamp=?",
                     (delivery_id, *scope),
-                ).fetchall() if results_present else []
-                if not targets:
+                ).fetchone() if results_present else None
+                if not target:
                     raise ValueError("TG_DELIVERY_ID does not belong to this chat, topic and service session")
+                turn, delivery, session, status, response_turn = target
+                current = connection.execute(
+                    "SELECT turn_id FROM delivery_turns WHERE session_id=? AND closed_at IS NULL "
+                    "ORDER BY turn_id DESC LIMIT 1", (session,),
+                ).fetchone()
+                owns_current = current is not None and current[0] in (turn, response_turn)
+                if status in ('no_reply', 'cancelled', 'failed', 'blocked') or (status == 'complete' and not owns_current):
+                    raise ValueError("TG_DELIVERY_ID has no unfinished result in this turn")
+                # A deferred result can finish while a newer input is active.
+                # Its explicit origin must never count as that newer answer.
+                targets = [(turn, delivery)]
             else:
                 targets = connection.execute(
                     "SELECT m.turn_id,m.delivery_id FROM delivery_turn_messages m "
@@ -119,7 +690,87 @@ def capture_delivery(chat_id, thread_id=None):
                 if any(row[0] not in {target[1] for target in targets} for row in previous):
                     raise ValueError("Another request still owns TG_DELIVERY_TASK_ID; use its original "
                                      "TG_DELIVERY_ID until its native callback is read, or start a separate task")
+                if not connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='delivery_task_owners'"
+                ).fetchone():
+                    raise ValueError("native task ownership ledger unavailable; no progress sent")
                 for turn, delivery in targets:
+                    session = connection.execute(
+                        "SELECT session_id, turn_id, response_turn_id, result_generation, "
+                        + ("final_admitted_generation, outbound_attempt_at " if fence else "NULL, NULL ")
+                        + ", state FROM delivery_results WHERE delivery_id=? AND turn_id=? "
+                        "AND chat_id=? AND thread_id IS ? AND stamp=?",
+                        (delivery, turn, *scope),
+                    ).fetchone()
+                    if not session:
+                        raise ValueError("background task origin unavailable; no progress sent")
+                    # The fence: a final admitted at this generation may already be on
+                    # the network, and no send of the request overlaps another.
+                    if session[4] is not None and session[4] == session[3]:
+                        raise ValueError("a final answer of this request is already admitted and may be on "
+                                         "its way; this task cannot be registered under it. Read its result "
+                                         "or stop the task; do not resend the final")
+                    if session[5] is not None:
+                        raise ValueError("another send of this request is still on its way; nothing was sent")
+                    epoch = connection.execute(
+                        "SELECT value FROM delivery_runtime WHERE key=?",
+                        (f"callback_ledger_epoch:{stamp}",),
+                    ).fetchone()
+                    try:
+                        epoch_ms = int(epoch[0]) if epoch else 0
+                    except (TypeError, ValueError):
+                        epoch_ms = 0
+                    if epoch_ms <= 0:
+                        raise ValueError("native callback ledger epoch unavailable; no background task registered")
+                    if not connection.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' "
+                        "AND name='delivery_legacy_native_sessions'"
+                    ).fetchone():
+                        raise ValueError("native session safety ledger unavailable; no progress sent")
+                    legacy_session = connection.execute(
+                        "SELECT 1 FROM delivery_legacy_native_sessions WHERE session_id=? LIMIT 1",
+                        (session[0],),
+                    ).fetchone()
+                    known_same_owner = connection.execute(
+                        "SELECT 1 FROM delivery_task_owners WHERE task_id=? "
+                        "AND delivery_id=? LIMIT 1", (task_id, delivery),
+                    ).fetchone()
+                    if legacy_session and not known_same_owner:
+                        raise ValueError("this native session predates callback tracking; "
+                                         "start a fresh agent session for background work")
+                    earlier_owner = connection.execute(
+                        "SELECT 1 FROM delivery_task_owners WHERE task_id=? AND delivery_id IS NOT ? "
+                        "AND NOT (session_id=? AND stamp=?) LIMIT 1", (task_id, delivery, session[0], stamp),
+                    ).fetchone()
+                    if earlier_owner:
+                        raise ValueError("this native task ID belonged to another request, including "
+                                         "a previous service session; start a fresh background task")
+                    # The launch hook wrote this launch's obligation, unowned. Progress
+                    # makes it this request's own, at the same occurrence and launch. Under
+                    # the receiver only the launch of the request's own turns is its to
+                    # claim; a launch made after every request of its turn was answered
+                    # belongs to no request. A task with no recorded launch is owned by
+                    # its request. A receiver from before the launch ledger has no state.
+                    ledger = "launch_ref" in {
+                        row[1] for row in connection.execute("PRAGMA table_info(delivery_task_owners)")}
+                    owner = connection.execute(
+                        "SELECT delivery_id, " + ("state, launched_turn " if ledger else "'owned', NULL ")
+                        + "FROM delivery_task_owners WHERE session_id=? AND stamp=? AND task_id=?",
+                        (session[0], stamp, task_id),
+                    ).fetchone()
+                    # A deferred request may claim a launch of another turn by this explicit
+                    # notice (the coordinator's decision (a), 26.09).
+                    if owner is not None and owner[1] == "unowned" and session[6] != "deferred":
+                        if receiver and owner[2] is None:
+                            raise ValueError("this task was launched after its request was answered, so it "
+                                             "belongs to no request and progress cannot register it. Read its "
+                                             "result when it returns, or stop it")
+                        if receiver and owner[2] not in (session[1], session[2]):
+                            raise ValueError("this task was launched in another request's turn; register it "
+                                             "with that request's TG_DELIVERY_ID, or stop it")
+                    elif owner is not None and owner[1] != "unowned" and owner[0] != delivery:
+                        raise ValueError("this native task ID belonged to another request in this session; "
+                                         "start a fresh background task")
                     returned = connection.execute(
                         "SELECT 1 FROM delivery_unbound_task_returns u "
                         "JOIN delivery_results r ON r.session_id=u.session_id AND r.stamp=u.stamp "
@@ -131,16 +782,92 @@ def capture_delivery(chat_id, thread_id=None):
                     if returned:
                         raise ValueError("task already returned before registration; send its final result with "
                                          "the original TG_DELIVERY_ID, or start a fresh background task")
+                    if fence:
+                        # Under the receiver only the checks run here: the transaction that
+                        # records the last part's acknowledgement writes the registration
+                        # (B0-a). After a failed notice that may not be repeated, or after
+                        # its one resend, no further task notice goes out (R4-7).
+                        retry = connection.execute(
+                            "SELECT progress_retry FROM delivery_results WHERE delivery_id=? AND turn_id=?",
+                            (delivery, turn),
+                        ).fetchone()
+                        if retry and retry[0] == f"{session[3]}:closed":
+                            raise ValueError("a progress notice of this request already failed and may not be "
+                                             "repeated; nothing was sent. The request waits for its background "
+                                             "task: send its final result after the callback, or stop the task")
+                        continue
+                    if owner is None:
+                        connection.execute(
+                            "INSERT INTO delivery_task_owners (session_id,stamp,task_id,delivery_id"
+                            + (",state) VALUES (?,?,?,?,'owned')" if ledger else ") VALUES (?,?,?,?)"),
+                            (session[0], stamp, task_id, delivery),
+                        )
+                        if ledger:
+                            log(f"task {task_id} has no recorded launch; it is owned by request {delivery}")
+                    elif owner[1] == "unowned":
+                        connection.execute(
+                            "UPDATE delivery_task_owners SET state='owned', delivery_id=? "
+                            "WHERE session_id=? AND stamp=? AND task_id=? AND state='unowned'",
+                            (delivery, session[0], stamp, task_id),
+                        )
+                    elif owner[1] in ("returned", "stopped"):
+                        own_again(connection, session[0], stamp, task_id, owner[1], delivery)
                     changed = connection.execute(
-                        "UPDATE delivery_results SET state='deferred', task_id=?, response_turn_id=NULL, updated_at=? "
+                        "UPDATE delivery_results SET state='deferred', task_id=?, response_turn_id=NULL, "
+                        "result_generation=result_generation+1, updated_at=? "
                         "WHERE delivery_id=? AND turn_id=? AND chat_id=? AND thread_id IS ? AND stamp=? "
                         "AND state IN ('pending','deferred')",
                         (task_id, int(time.time()*1000), delivery, turn, *scope),
                     ).rowcount
                     if changed != 1:
                         raise ValueError("background task registration failed; no acknowledgement was sent")
+            # Кнопа 24605 (27.09; NOVSKY 28.09): a second acknowledgement tells the person
+            # nothing new: the receiver's refuseRepeatedAcknowledgement(). Guard and shadow
+            # send it as today and only log what the receiver would do; under the receiver a
+            # plain progress is refused, and one that names a task registers it in this
+            # transaction, with no receipt, no outbound row and no fence, and is not sent.
+            acknowledged = repeated_acknowledgement(connection, targets) if phase == "progress" else None
+            if acknowledged is not None and not (receiver and results_present):
+                log(f"the receiver would refuse a repeated progress of {', '.join(d for _, d in targets)} "
+                    f"({int(time.time() * 1000 - acknowledged) // 1000} s since the receipted acknowledgement)")
+            elif acknowledged is not None:
+                at = time.strftime('%H:%M', time.gmtime(acknowledged / 1000)) + " UTC"
+                refusal = f"вже підтверджено о {at}, продовжуй роботу і відповідай результатом"
+                if not task_id:
+                    raise ValueError(refusal)
+                if not all([register_acknowledged(
+                        connection, {"stamp": stamp, "task_id": task_id},
+                        {"delivery_id": delivery, "turn_id": turn, "result_generation": (connection.execute(
+                            "SELECT result_generation FROM delivery_results WHERE delivery_id=? AND turn_id=?",
+                            (delivery, turn)).fetchone() or [None])[0]},
+                        chat_id, thread_id, int(time.time() * 1000)) for turn, delivery in targets]):
+                    raise ValueError(f"{refusal}; the task {task_id} was not registered")
                 connection.commit()
-            context["targets"] = [{"turn_id": turn, "delivery_id": delivery} for turn, delivery in targets]
+                # Every shell sender captures here: the send ends as a success that sent nothing.
+                print(f"registered; not sent — the author was already acknowledged at {at}; "
+                      "put anything new in the final")
+                raise SystemExit(0)
+            captured = []
+            for turn, delivery in targets:
+                row = connection.execute(
+                    "SELECT session_id, stamp, turn_id, response_turn_id, state, result_generation "
+                    "FROM delivery_results WHERE delivery_id=? AND turn_id=? "
+                    "AND chat_id=? AND thread_id IS ? AND stamp=?",
+                    (delivery, turn, *scope),
+                ).fetchone() if results_present else None
+                target = {"turn_id": turn, "delivery_id": delivery,
+                          "result_generation": row[5] if row else None}
+                if fence and row and row[4] in ("pending", "deferred", "paused", "resume_pending"):
+                    try:
+                        admit(connection, delivery, row, phase, task_id)
+                    except OpenWork as refusal:
+                        connection.rollback()
+                        count_final_refusal(connection, refusal)
+                        raise
+                    target["armed"] = True
+                captured.append(target)
+            connection.commit()
+            context["targets"] = captured
         finally:
             connection.close()
     except sqlite3.Error:
@@ -148,11 +875,163 @@ def capture_delivery(chat_id, thread_id=None):
             raise ValueError("delivery origin unavailable; explicit binding cannot be verified") from None
         # The transport can still send, but cannot claim a request it did not identify.
         print("tg-send: delivery origin unavailable; send will not settle a request", file=sys.stderr)
+    if authority == "shadow" and phase == "final" and context["targets"]:
+        observe_shadow(context)
+    if authority == "shadow" and acknowledged is not None and context["targets"]:
+        observe_repeat(context, acknowledged)
     return context
 
 
-def record_completion(connection, chat_id, thread_id, context, now):
-    """Settle work atomically with its outbound row, before a Stop hook can run."""
+def settle_head(connection, delivery, turn, chat_id, thread_id, now):
+    """Under the receiver a head leaves only by its own proof (B0-b), in the
+    transaction that records it: its final's terminal receipt or its proven
+    deferral. The receiver's settleHead() does the same for a reply."""
+    thread = str(thread_id) if thread_id is not None else None
+    connection.execute(
+        "UPDATE delivery_turn_messages SET closed_by='receipt', closed_at=? WHERE turn_id=? AND delivery_id=? "
+        "AND chat_id=? AND thread_id IS ? AND closed_at IS NULL", (now, turn, delivery, str(chat_id), thread),
+    )
+    connection.execute(
+        "DELETE FROM pending_inbound_deliveries WHERE delivery_id=? AND state IN ('started','recovering')",
+        (delivery,),
+    )
+
+
+def own_again(connection, session, stamp, task_id, state, delivery):
+    """A task of this request that returned or was stopped, registered again with no
+    recorded new launch (a resume the launch hook did not see): the request owns its
+    next round, as a task with no recorded launch; the receiver's ownAgain()."""
+    connection.execute(
+        "UPDATE delivery_task_owners SET state='owned', occurrence=occurrence+1, launch_ref=NULL, "
+        "launched_turn=NULL, silent_notified_at=NULL, final_refusals=0 WHERE session_id=? AND stamp=? AND task_id=? "
+        "AND state=?",
+        (session, stamp, task_id, state),
+    )
+    log(f"task {task_id} has no recorded launch; it is owned by request {delivery}")
+
+
+def register_acknowledged(connection, context, target, chat_id, thread_id, now):
+    """Under the receiver, in the transaction that records the last part of a task
+    notice: the checks run again and the registration of B0-a is written, as the
+    receiver's registerAcknowledged() writes it for a reply. The request is
+    deferred to its task at the next generation and its head leaves the queue; a
+    callback turn stays in its scope while it is open. If a check no longer
+    holds, the notice stays an acknowledged plain progress, and the reason goes
+    to the log. False when nothing was registered."""
+    stamp, task_id = context["stamp"], context["task_id"]
+    delivery, turn = target["delivery_id"], target["turn_id"]
+    row = connection.execute(
+        "SELECT session_id, turn_id, response_turn_id, result_generation, final_admitted_generation, state "
+        "FROM delivery_results WHERE delivery_id=? AND turn_id=? AND stamp=? "
+        "AND state IN ('pending','deferred') AND result_generation IS ?",
+        (delivery, turn, stamp, target.get("result_generation")),
+    ).fetchone()
+    if row is None:
+        return False
+    session, claim_turn, response_turn, generation, admitted, status = row
+    owner = connection.execute(
+        "SELECT delivery_id, state, launched_turn FROM delivery_task_owners WHERE session_id=? AND stamp=? "
+        "AND task_id=?", (session, stamp, task_id),
+    ).fetchone()
+    if admitted is not None and admitted == generation:
+        reason = "a final of this request was admitted meanwhile"
+    elif (owner and owner[1] == "unowned" and status != "deferred"
+            and (owner[2] is None or owner[2] not in (claim_turn, response_turn))):
+        reason = "its launch is not this request's"
+    elif owner and owner[1] != "unowned" and owner[0] != delivery:
+        reason = "the task belongs to another request"
+    elif connection.execute(
+            "SELECT 1 FROM delivery_unbound_task_returns u "
+            "JOIN delivery_results r ON r.session_id=u.session_id AND r.stamp=u.stamp "
+            "LEFT JOIN delivery_turn_messages m ON m.turn_id=r.turn_id AND m.delivery_id=r.delivery_id "
+            "WHERE u.task_id=? AND r.delivery_id=? AND r.turn_id=? AND r.stamp=? "
+            "AND u.observed_at>=COALESCE(m.taken_at,r.created_at)", (task_id, delivery, turn, stamp)).fetchone():
+        reason = "the task returned before its registration"
+    else:
+        reason = None
+    if reason:
+        log(f"progress of {delivery} registers nothing: {reason}")
+        return False
+    if owner is None:
+        connection.execute(
+            "INSERT INTO delivery_task_owners (session_id,stamp,task_id,delivery_id,state) "
+            "VALUES (?,?,?,?,'owned')", (session, stamp, task_id, delivery),
+        )
+        log(f"task {task_id} has no recorded launch; it is owned by request {delivery}")
+    elif owner[1] == "unowned":
+        connection.execute(
+            "UPDATE delivery_task_owners SET state='owned', delivery_id=? "
+            "WHERE session_id=? AND stamp=? AND task_id=? AND state='unowned'", (delivery, session, stamp, task_id),
+        )
+    elif owner[1] in ("returned", "stopped"):
+        own_again(connection, session, stamp, task_id, owner[1], delivery)
+    connection.execute(
+        "UPDATE delivery_results SET state='deferred', task_id=?, response_turn_id=CASE WHEN EXISTS ("
+        "SELECT 1 FROM delivery_turns t WHERE t.turn_id=delivery_results.response_turn_id AND t.closed_at IS NULL) "
+        "THEN response_turn_id ELSE NULL END, result_generation=result_generation+1, "
+        "acknowledged_at=coalesce(acknowledged_at,?), updated_at=?, outbound_attempt_at=NULL, "
+        "outbound_attempt_generation=NULL WHERE delivery_id=? AND turn_id=? AND result_generation=?",
+        (task_id, now, now, delivery, turn, generation),
+    )
+    settle_head(connection, delivery, turn, chat_id, thread_id, now)
+    return True
+
+
+def record_receipt(connection, chat_id, thread_id, message_id, context, now):
+    """The receipt of a bound send, in the transaction that records the send, for
+    every shell sender: an acknowledgement is receipted even when the receiver
+    is gone, or restarts under another stamp, before it would scan the row
+    (Кнопа 24606, 27.09). It writes what the receiver's applyReceipt() writes:
+    under the receiver a request with a result settles only in its result
+    transaction; otherwise the receipt closes that request's message."""
+    stamp = context["stamp"]
+    targets = [target for target in context.get("targets") or [] if isinstance(target, dict)]
+    tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    row = connection.execute(
+        "SELECT id FROM messages WHERE direction='out' AND chat_id=? AND message_id=? ORDER BY id DESC LIMIT 1",
+        (str(chat_id), message_id),
+    ).fetchone()
+    if not targets or not row or not {"delivery_receipts", "delivery_turn_messages"} <= tables:
+        return
+    thread = str(thread_id) if thread_id is not None else None
+    receiver = os.environ.get("TG_DELIVERY_AUTHORITY") == "receiver"
+    for target in targets:
+        delivery, turn = target["delivery_id"], target["turn_id"]
+        if "delivery_results" in tables:
+            connection.execute(
+                "UPDATE delivery_results SET acknowledged_at=coalesce(acknowledged_at,?), updated_at=? "
+                "WHERE delivery_id=? AND turn_id=? AND chat_id=? AND thread_id IS ? AND stamp IS ?",
+                (now, now, delivery, turn, str(chat_id), thread, stamp),
+            )
+            if receiver and connection.execute(
+                    "SELECT 1 FROM delivery_results WHERE delivery_id=? AND turn_id=?", (delivery, turn)).fetchone():
+                continue
+        closed = connection.execute(
+            "UPDATE delivery_turn_messages SET closed_by='receipt', closed_at=? WHERE turn_id=? AND delivery_id=? "
+            "AND chat_id=? AND thread_id IS ? AND closed_at IS NULL", (now, turn, delivery, str(chat_id), thread),
+        ).rowcount
+        if closed and receiver:
+            connection.execute("DELETE FROM pending_inbound_deliveries WHERE delivery_id=? "
+                               "AND state IN ('started','recovering')", (delivery,))
+    phase = {"phase": context.get("phase")} if "phase" in {
+        column[1] for column in connection.execute("PRAGMA table_info(delivery_receipts)")} else {}
+    connection.execute(
+        "INSERT INTO delivery_receipts (chat_id, thread_id, message_id, source, stamp, turn_id, delivery_id, "
+        f"source_row, created_at{''.join(', ' + name for name in phase)}) "
+        f"VALUES (?,?,?,'shell',?,?,?,?,?{',?' * len(phase)})",
+        (str(chat_id), thread, message_id, stamp, targets[0]["turn_id"], targets[0]["delivery_id"], row[0], now,
+         *phase.values()),
+    )
+
+
+def record_completion(connection, chat_id, thread_id, context, now, message_id):
+    """Settle work atomically with its outbound row, before a Stop hook can run.
+
+    An earlier part of a longer send is a receipt, not the end of the send: it
+    neither clears the fence nor settles (R4-3). The last part ends the attempt:
+    its fence and admission clear, and a final completes its request at the
+    admitted generation or, under the receiver, settles as a final a later
+    launch superseded."""
     stamp = os.environ.get("TG_DELIVERY_STAMP") or None
     if (not isinstance(context, dict) or not stamp or context.get("stamp") != stamp
             or os.environ.get("TG_SEND_ORIGIN") == "stop-guard"
@@ -165,16 +1044,51 @@ def record_completion(connection, chat_id, thread_id, context, now):
     ).fetchone():
         return
     phase = context["phase"]
+    last = not context.get("intermediate")
     for target in context.get("targets", []):
-        connection.execute(
+        generation = target.get("result_generation")
+        if phase == "final" and (type(generation) is not int or generation < 0):
+            continue
+        if (last and phase == "progress" and context.get("task_id") and target.get("armed")
+                and register_acknowledged(connection, context, target, chat_id, thread_id, now)):
+            continue
+        changed = connection.execute(
             "UPDATE delivery_results SET acknowledged_at=coalesce(acknowledged_at,?), "
             "updated_at=?, state=coalesce(?,state), finished_at=? "
             "WHERE delivery_id=? AND turn_id=? AND chat_id=? AND thread_id IS ? AND stamp=? "
-            "AND state IN ('pending','deferred')",
+            "AND state IN ('pending','deferred','paused','resume_pending') "
+            "AND (?='progress' OR result_generation=?)",
             (now, now, "complete" if phase == "final" else None,
              now if phase == "final" else None, target["delivery_id"], target["turn_id"],
-             str(chat_id), str(thread_id) if thread_id is not None else None, stamp),
-        )
+             str(chat_id), str(thread_id) if thread_id is not None else None, stamp,
+            phase, generation),
+        ).rowcount
+        armed = bool(target.get("armed"))
+        if last and changed == 1 and (armed or target.get("admitted")):
+            connection.execute(
+                "UPDATE delivery_results SET "
+                "final_admitted_generation=CASE WHEN ?='final' THEN NULL ELSE final_admitted_generation END, "
+                "outbound_attempt_at=CASE WHEN ? AND outbound_attempt_generation IS ? THEN NULL "
+                "ELSE outbound_attempt_at END, "
+                "outbound_attempt_generation=CASE WHEN ? AND outbound_attempt_generation IS ? THEN NULL "
+                "ELSE outbound_attempt_generation END WHERE delivery_id=? AND turn_id=?",
+                (phase, armed, generation, armed, generation, target["delivery_id"], target["turn_id"]),
+            )
+        elif last and armed and phase == "final" and type(message_id) is int and message_id > 0:
+            settle_superseded(connection, target["delivery_id"], target["turn_id"], generation,
+                              chat_id, thread_id, message_id, now)
+        if phase != "final" or changed != 1 or type(message_id) is not int or message_id <= 0:
+            continue
+        if not connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='delivery_terminal_receipts'"
+        ).fetchone():
+            continue  # An older receiver cannot supply a callback-specific sweep proof.
+        write_terminal_receipt(connection, target["delivery_id"], target["turn_id"], chat_id, thread_id,
+                               "shell", message_id, now)
+        if target.get("armed"):
+            settle_head(connection, target["delivery_id"], target["turn_id"], chat_id, thread_id, now)
+    if type(message_id) is int and message_id > 0:
+        record_receipt(connection, chat_id, thread_id, message_id, context, now)
 
 
 def record_outbound(chat_id, text, receipt, task_id="", occurrence="", context=None):
@@ -183,6 +1097,8 @@ def record_outbound(chat_id, text, receipt, task_id="", occurrence="", context=N
         return False
     result = receipt.get("result")
     if not isinstance(result, dict):
+        return False
+    if "is_topic_message" in result and type(result["is_topic_message"]) is not bool:
         return False
     message_id = result.get("message_id")
     chat = result.get("chat")
@@ -208,7 +1124,8 @@ def record_outbound(chat_id, text, receipt, task_id="", occurrence="", context=N
         database = os.path.join(state, "messages.db")
         if not os.path.isfile(database):
             return False
-        connection = sqlite3.connect(database, timeout=0.5)
+        # Its transaction also ends the send's fence: give a busy ledger time.
+        connection = sqlite3.connect(database, timeout=3)
         try:
             # Older non-corporate installations do not yet have the scope columns.
             columns = {row[1] for row in connection.execute("PRAGMA table_info(messages)")}
@@ -234,13 +1151,189 @@ def record_outbound(chat_id, text, receipt, task_id="", occurrence="", context=N
                 (*values.values(), chat_id, message_id),
             )
             if inserted.rowcount:
-                record_completion(connection, chat_id, thread_id, context, values["ts"])
+                record_completion(connection, chat_id, thread_id, context, values["ts"], message_id)
             connection.commit()
             return True
         finally:
             connection.close()
     except Exception:
         return False
+
+
+def quiet_root():
+    root = Path(os.environ.get("ATARAX_TASK_DELIVERY_DIR") or
+                Path.home() / ".atarax/reminders/.quiet-delivery")
+    if root.is_symlink():
+        raise ValueError("quiet delivery directory is a symlink")
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if root.is_symlink() or not root.is_dir() or root.stat().st_mode & 0o077:
+        raise ValueError("quiet delivery directory must be private")
+    return root
+
+
+def quiet_write(path, record):
+    fd, temporary = tempfile.mkstemp(prefix=".quiet-send.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(record, stream, ensure_ascii=False, separators=(",", ":"))
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        directory = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def quiet_load(path):
+    if path.is_symlink():
+        raise ValueError(f"quiet delivery record is a symlink: {path.name}")
+    record = json.loads(path.read_text(encoding="utf-8"))
+    if (not isinstance(record, dict) or record.get("version") != 1
+            or record.get("state") not in {"ready", "sending", "uncertain", "blocked", "delivered"}
+            or not isinstance(record.get("chunks"), list)
+            or not isinstance(record.get("receipts"), list)
+            or not isinstance(record.get("cursor"), int)
+            or not 0 <= record["cursor"] <= len(record["chunks"])
+            or type(record.get("general_topic", False)) is not bool):
+        raise ValueError(f"invalid quiet delivery record: {path.name}")
+    return record
+
+
+def quiet_failure(record, path, code, payload=None):
+    if code == 429:
+        parameters = payload.get("parameters") if isinstance(payload, dict) else None
+        retry_after = parameters.get("retry_after") if isinstance(parameters, dict) else None
+        delay = retry_after if type(retry_after) is int and 1 <= retry_after <= 3600 else 60
+        record["state"] = "ready"
+        record["retry_at"] = int(time.time()) + delay
+    elif type(code) is int and 400 <= code < 500 and code != 408:
+        record["state"] = "blocked"
+    else:
+        record["state"] = "uncertain"
+    quiet_write(path, record)
+
+
+def quiet_send_record(path, record):
+    if record["state"] == "sending":
+        record["state"] = "uncertain"  # a killed sender may have reached Telegram
+        quiet_write(path, record)
+    if record["state"] != "ready" or record.get("retry_at", 0) > time.time():
+        return record["state"]
+    destination = destination_status(record["chat"], record["thread"],
+                                     record.get("general_topic", False), token())
+    if destination is not True:
+        record["state"] = "blocked" if destination is False else "ready"
+        record["retry_at"] = 0 if destination is False else int(time.time()) + 1
+        quiet_write(path, record)
+        return record["state"]
+    while record["cursor"] < len(record["chunks"]):
+        chunk = record["chunks"][record["cursor"]]
+        fields = {"chat_id": record["chat"], "text": chunk}
+        if record["thread"] is not None:
+            fields["message_thread_id"] = record["thread"]
+        request = urllib.request.Request(
+            f"https://api.telegram.org/bot{token()}/sendMessage",
+            data=urllib.parse.urlencode(fields).encode())
+        record["state"] = "sending"
+        quiet_write(path, record)
+        try:
+            with urllib.request.urlopen(request, timeout=15) as response:
+                payload = json.loads(response.read())
+        except urllib.error.HTTPError as error:
+            try:
+                payload = json.loads(error.read())
+            except (ValueError, UnicodeError):
+                payload = None
+            quiet_failure(record, path, error.code, payload)
+            return record["state"]
+        except Exception:
+            quiet_failure(record, path, None)
+            return record["state"]
+        if not isinstance(payload, dict) or payload.get("ok") is not True:
+            quiet_failure(record, path, payload.get("error_code") if isinstance(payload, dict) else None,
+                          payload)
+            return record["state"]
+        result = payload.get("result")
+        chat = result.get("chat") if isinstance(result, dict) else None
+        message_id = result.get("message_id") if isinstance(result, dict) else None
+        returned_thread = result.get("message_thread_id") if isinstance(result, dict) else None
+        if (type(message_id) is not int or message_id < 1 or not isinstance(chat, dict)
+                or type(chat.get("id")) is not int or str(chat["id"]) != record["chat"]
+                or (record["thread"] is None and
+                    (returned_thread is not None or result.get("is_topic_message") is True))
+                or (record["thread"] is not None and
+                    (returned_thread != record["thread"] or result.get("is_topic_message") is not True))):
+            quiet_failure(record, path, None)
+            return record["state"]
+        record["receipts"].append(message_id)
+        record["cursor"] += 1
+        record["state"] = "ready" if record["cursor"] < len(record["chunks"]) else "delivered"
+        record["retry_at"] = 0
+        quiet_write(path, record)
+        # History is useful context, but a database outage cannot cause a resend.
+        record_outbound(record["chat"], chunk, payload, record["task"],
+                        record["occurrence"])
+    return record["state"]
+
+
+def quiet_main(arguments):
+    root = quiet_root()
+    lock = os.open(root / ".lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if arguments == ["--drain-quiet"]:
+            counts = {"delivered": 0, "ready": 0, "uncertain": 0, "blocked": 0}
+            for path in sorted(root.glob("*.json")):
+                try:
+                    state = quiet_send_record(path, quiet_load(path))
+                    counts[state] += 1
+                except (OSError, ValueError, KeyError, TypeError):
+                    counts["uncertain"] += 1
+            print("quiet delivery: " + " ".join(f"{key}={value}" for key, value in counts.items()))
+            return
+        chat_id, text, thread_id, general_topic, watchdog_credit = parse_arguments(arguments)
+        if not watchdog_credit:
+            raise ValueError("quiet delivery does not support --no-watchdog-credit")
+        task = os.environ.get("ATARAX_TASK_ID", "")
+        occurrence = os.environ.get("ATARAX_TASK_OCCURRENCE", "")
+        run_key = os.environ.get("ATARAX_TASK_RUN_KEY", "")
+        if (not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", task)
+                or not re.fullmatch(r"[0-9]{1,20}", occurrence)
+                or (run_key and not re.fullmatch(r"[0-9a-f]{64}", run_key))
+                or not re.fullmatch(r"-?[0-9]{1,20}", chat_id)):
+            raise ValueError("quiet delivery requires a valid task, occurrence and chat")
+        identity = (task, occurrence, chat_id, str(thread_id), text)
+        if run_key:
+            identity = (run_key,) + identity
+        if general_topic:
+            identity += ("general-topic",)
+        digest = hashlib.sha256("\0".join(identity).encode()).hexdigest()
+        path = root / f"{digest}.json"
+        chunks = [text[index:index + 4000] for index in range(0, len(text), 4000)] or [""]
+        if path.exists():
+            record = quiet_load(path)
+            if (record.get("run_key", ""), record["task"], record["occurrence"], record["chat"], record["thread"],
+                    record["chunks"], record.get("general_topic", False)) != (
+                        run_key, task, occurrence, chat_id, thread_id, chunks, general_topic):
+                raise ValueError("quiet delivery record does not match this message")
+        else:
+            record = {"version": 1, "run_key": run_key, "task": task, "occurrence": occurrence,
+                      "chat": chat_id, "thread": thread_id, "general_topic": general_topic,
+                      "chunks": chunks,
+                      "cursor": 0, "receipts": [], "state": "ready", "retry_at": 0}
+            quiet_write(path, record)
+        state = quiet_send_record(path, record)
+        if state == "delivered":
+            print("ok: True")
+        else:
+            print(f"delivery {state}: saved scheduled message; do not send it again")
+    finally:
+        os.close(lock)
 
 
 def main(argv):
@@ -255,6 +1348,12 @@ def main(argv):
     # The one exception is a scheduled QUIET=1 task: it delivers by itself (group
     # topics included) and the scheduler sends nothing of its own.
     quiet_task = os.environ.get("ATARAX_TASK_QUIET") == "1"
+    if quiet_task or argv[1:] == ["--drain-quiet"]:
+        try:
+            quiet_main(argv[1:])
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            sys.exit(f"tg-send: {error}")
+        return
     if os.environ.get("ATARAX_SUPPRESS_TELEGRAM") == "1" and not quiet_task:
         print(
             "not delivered: this session does not send to Telegram. "
@@ -274,25 +1373,21 @@ def main(argv):
         except (ValueError, UnicodeError):
             recorded = False
         sys.exit(0 if recorded else 1)
-    watchdog_credit = True
-    if arguments[:1] == ["--no-watchdog-credit"]:
-        watchdog_credit = False
-        arguments = arguments[1:]
-    thread_id = None
-    if len(arguments) >= 4 and arguments[-2] == "--thread-id":
-        try:
-            thread_id = parse_thread_id(arguments[0], arguments[-1])
-        except ValueError as error:
-            sys.exit(f"tg-send: {error}")
-        arguments = arguments[:-2]
-    if len(arguments) != 2:
-        sys.exit('usage: tg-send [--no-watchdog-credit] <chat_id> "text" [--thread-id <positive_id>]')
-    chat_id, text = arguments
+    chat_id, text, thread_id, general_topic, watchdog_credit = parse_arguments(arguments)
+    if not watchdog_credit and (os.environ.get('TG_DELIVERY_ID') or os.environ.get('TG_DELIVERY_TASK_ID')):
+        sys.exit('tg-send: --no-watchdog-credit cannot bind to an inbound delivery')
+    bot_token = token()
+    ensure_destination(chat_id, thread_id, general_topic, bot_token)
     try:
         context = capture_delivery(chat_id, thread_id) if watchdog_credit else None
     except ValueError as error:
         sys.exit(f"tg-send: {error}")
     starts = list(range(0, len(text), 4000)) or [0]
+    sent_ids = []
+    if isinstance(context, dict):
+        context["single_part"] = len(starts) == 1  # a one-part text notice is safe to repeat (R4-7)
+    settle_on_signals(context, sent_ids)
+    unrecorded = False
     for index, chunk_start in enumerate(starts):
         chunk = text[chunk_start:chunk_start + 4000]
         fields = {"chat_id": chat_id, "text": chunk}
@@ -300,24 +1395,58 @@ def main(argv):
             fields["message_thread_id"] = thread_id
         body = urllib.parse.urlencode(fields).encode()
         req = urllib.request.Request(
-            f"https://api.telegram.org/bot{token()}/sendMessage", data=body)
+            f"https://api.telegram.org/bot{bot_token}/sendMessage", data=body)
         try:
             out = urllib.request.urlopen(req, timeout=15).read().decode()
             payload = json.loads(out)
-            ok = payload.get("ok") is True
-            if not ok:
-                print("ok: False")
-                sys.exit(1)
-            if ok and watchdog_credit:
-                part_context = (context if index == len(starts) - 1 else
-                                {**context, "phase": "progress", "task_id": None})
-                task = ((os.environ.get("ATARAX_TASK_ID", ""), os.environ.get("ATARAX_TASK_OCCURRENCE", ""))
-                        if quiet_task else ("", ""))
-                if not record_outbound(chat_id, chunk, payload, *task, context=part_context):
-                    print("tg-send: history_write_failed; message will not be resent", file=sys.stderr)
-        except Exception as e:
-            print("tg-send error:", type(e).__name__)
-            sys.exit(1)
+        except urllib.error.HTTPError as error:
+            try:
+                payload = json.loads(error.read().decode())
+            except (ValueError, UnicodeError, OSError):
+                payload = None
+            if not (definite_bot_api_rejection(payload) and payload["error_code"] == error.code):
+                note = abandon_attempt(context, sent_ids, rejected=False)
+                print(json.dumps({"status": "delivery_unknown", "sent_ids": sent_ids}))
+                sys.exit("delivery state unknown: transport or response failed; do not retry acknowledged parts"
+                         + note)
+        except Exception:
+            note = abandon_attempt(context, sent_ids, rejected=False)
+            print(json.dumps({"status": "delivery_unknown", "sent_ids": sent_ids}))
+            sys.exit("delivery state unknown: transport or response failed; do not retry acknowledged parts" + note)
+        if not confirmed_receipt(chat_id, payload, thread_id):
+            note = abandon_attempt(context, sent_ids, rejected=definite_bot_api_rejection(payload))
+            if not sent_ids and context and context.get("task_id") and definite_bot_api_rejection(payload):
+                print(json.dumps({"status": "progress_notice_rejected", "sent_ids": sent_ids}))
+                sys.exit(rejected_background_notice(context))
+            print(json.dumps({"status": "delivery_unconfirmed", "sent_ids": sent_ids}))
+            # Telegram's own words tell «press Start» (400 chat not found) from a broken token.
+            # They are untrusted: the token and its secret part are masked, and line breaks and
+            # control characters removed, before anything is cut or printed.
+            reason = ""
+            if definite_bot_api_rejection(payload):
+                words = str(payload.get("description", ""))
+                for secret in (bot_token, bot_token.split(":", 1)[-1]):
+                    if secret:
+                        words = words.replace(secret, "***")
+                words = "".join(ch for ch in " ".join(words.split()) if ch.isprintable())
+                reason = f" Telegram {payload['error_code']}: {words[:200]}"
+            sys.exit("delivery state unknown: Telegram did not prove the requested destination; do not retry "
+                     "acknowledged parts" + reason + note)
+        sent_ids.append(payload["result"]["message_id"])
+        if watchdog_credit:
+            part_context = (context if index == len(starts) - 1 else
+                            {**context, "phase": "progress", "task_id": None, "intermediate": True})
+            if not record_outbound(chat_id, chunk, payload, context=part_context):
+                # Delivered but not recorded: this sender did not die, so the receiver's tick
+                # must leave its fence for the startup quarantine (R4-7).
+                if not unrecorded:
+                    detach_attempt(context)
+                unrecorded = True
+                # Only the receiver holds the request on this fence (U3 review P3-2); under guard and
+                # shadow nothing holds and the model is not told it does.
+                print("tg-send: delivered, not recorded; do not resend"
+                      + (": the request holds until the receiver records or settles it"
+                         if os.environ.get("TG_DELIVERY_AUTHORITY") == "receiver" else ""), file=sys.stderr)
     if watchdog_credit:
         try:
             subprocess.run(
@@ -327,9 +1456,9 @@ def main(argv):
                 stderr=subprocess.DEVNULL,
             )
         except OSError:
-            pass  # A legacy watchdog marker cannot invalidate Telegram acceptance.
-    print("ok:", ok)
-    sys.exit(0 if ok else 1)
+            pass
+    print("ok: True")
+    sys.exit(0)
 
 
 if __name__ == "__main__":

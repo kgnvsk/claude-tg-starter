@@ -21,13 +21,52 @@ import pwd
 import sys
 
 HOME = pathlib.Path(os.environ.get("HOME", "/home/claude"))
-KIT = pathlib.Path(os.environ.get("KIT_DIR", "/opt/claude-tg-starter"))
+DEFAULT_KIT = pathlib.Path("/opt/claude-tg-starter")
+
+
+def product_id(path: pathlib.Path) -> str | None:
+    """productId of a kit folder (PRODUCT.json, else its runtime.json) or of a runtime.json."""
+    candidates = (path / "PRODUCT.json", path / "assets/product/runtime.json") if path.is_dir() else (path,)
+    for candidate in candidates:
+        try:
+            value = json.loads(candidate.read_text(encoding="utf-8")).get("productId")
+        except FileNotFoundError:
+            continue
+        except (OSError, UnicodeError, ValueError, AttributeError):
+            return None
+        return value if isinstance(value, str) and value else None
+    return None
+
+
+def kit_folder() -> pathlib.Path:
+    """Каталог комплекту цього агента.
+
+    Основний агент має /opt/claude-tg-starter, решта — /opt/claude-tg-starter@<користувач>.
+    Каталог основного служить іншому агенту лише до його першого власного
+    оновлення (немає @<користувач>, .new чи .prev) і лише для того самого продукту.
+    """
+    if os.environ.get("KIT_DIR"):
+        return pathlib.Path(os.environ["KIT_DIR"])
+    user = pwd.getpwuid(os.getuid()).pw_name
+    if user == "claude":
+        return DEFAULT_KIT
+    own = pathlib.Path(f"{DEFAULT_KIT}@{user}")
+    if own.is_dir() and not own.is_symlink():
+        return own
+    if any(os.path.lexists(f"{own}{suffix}") for suffix in ("", ".new", ".prev")):
+        raise RuntimeError("комплект цього агента зараз замінюється; повтори перевірку пізніше")
+    product = product_id(DEFAULT_KIT)
+    if product is None or product != product_id(HOME / ".claude/product/runtime.json"):
+        raise RuntimeError("спільний комплект належить іншому продукту; власний комплект агента ставить Novsky")
+    return DEFAULT_KIT
 
 
 def load_update_module():
+    # Root may run this from another agent's or a staged kit: leave no bytecode there.
+    sys.dont_write_bytecode = True
     source_candidate = pathlib.Path(__file__).resolve().parents[1] / "lib/managed_runtime_update.py"
-    installed_candidate = KIT / "assets/lib/managed_runtime_update.py"
-    module_path = source_candidate if source_candidate.is_file() else installed_candidate
+    module_path = (source_candidate if source_candidate.is_file()
+                   else kit_folder() / "assets/lib/managed_runtime_update.py")
     if not module_path.is_file():
         raise RuntimeError("модуль безпечного оновлення не знайдено")
     spec = importlib.util.spec_from_file_location("managed_runtime_update", module_path)
@@ -48,7 +87,11 @@ def digest(path: pathlib.Path) -> str | None:
 
 def legacy_main() -> int:
     as_json = "--json" in sys.argv
-    reference = KIT / "assets/bin"
+    try:
+        reference = kit_folder() / "assets/bin"
+    except RuntimeError as error:
+        print(f"update-safety-check: {error}", file=sys.stderr)
+        return 2
     if not reference.is_dir():
         print(f"чекаут комплекту не знайдено: {reference}", file=sys.stderr)
         return 2

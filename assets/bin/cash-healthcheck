@@ -21,17 +21,42 @@ SESS_DIR="$H/.claude/projects"
 # in /proc/<pid>/cwd. Match the owning user and a direct version directory in
 # this instance's Telegram cache; liveness must not depend on the release that
 # the separate source-replacement verifier supports. readlink resolves escapes.
+# A second bot of the same user can run its poller from this same cache (seen on
+# a client box, 2026-09-26) and would mask a dead one, so the poller must also sit
+# in this unit's system cgroup: .../system.slice/.../$SVC in /proc/<pid>/cgroup (a
+# container without a cgroup namespace prefixes it, e.g. /lxc/<ct>/system.slice).
+# A poller of this HOME outside a unit whose WorkingDirectory is another home is
+# this bot's own: a second bot whose cron line omits CLAUDE_TELEGRAM_SERVICE, so
+# $SVC names the primary. Restarting that unit would hit the primary; note it only.
 TRANSPORT_CACHE_ROOT="$H/.claude/plugins/cache/claude-plugins-official/telegram"
 telegram_poller_alive() {
-  local pid cwd version
+  local pid cwd version cgroups cgroup found="" workdir stamp now last unit="${SVC%.service}.service"
   while IFS= read -r pid; do
     [ -n "$pid" ] || continue
     cwd=$(readlink -f "/proc/$pid/cwd" 2>/dev/null || true)
     [ "${cwd%/*}" = "$TRANSPORT_CACHE_ROOT" ] || continue
     version="${cwd##*/}"
-    [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][[:alnum:]_.-]+)?$ ]] && return 0
+    [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][[:alnum:]_.-]+)?$ ]] || continue
+    # Unreadable cgroup: nothing proves the poller foreign, keep the cwd verdict.
+    cgroups=$(cat "/proc/$pid/cgroup" 2>/dev/null) || return 0
+    while IFS=: read -r _ _ cgroup; do
+      [[ "$cgroup" == */system.slice/* && "${cgroup##*/}" == "$unit" ]] && return 0
+    done < <(printf '%s\n' "$cgroups")
+    found=1
   done < <(pgrep -u "$ME_UID" -f 'bun server.ts$' 2>/dev/null || true)
-  return 1
+  [ -n "$found" ] || return 1
+  workdir=$(systemctl show -p WorkingDirectory --value "$SVC" 2>/dev/null || true)
+  workdir="${workdir#[-!]}"
+  [ "${workdir%/}" = "${H%/}" ] && return 1
+  # This holds on every tick for such a layout: note it at most once an hour.
+  stamp="${STAMP:-$H/logs}/poller-outside-unit.ts"; now=$(date +%s)
+  last=$(cat "$stamp" 2>/dev/null || echo 0)
+  case "$last" in ''|*[!0-9]*) last=0 ;; esac
+  if [ $((now - last)) -ge 3600 ]; then
+    echo "$now" 2>/dev/null > "$stamp"
+    echo "[$(date -u +%FT%TZ)] telegram poller runs outside $SVC (WorkingDirectory ${workdir:-unset}, not $H); not restarting it" >> "${LOG:-/dev/null}"
+  fi
+  return 0
 }
 
 # Cheap facts shared by the early snapshot and the checks below.
@@ -62,7 +87,7 @@ TAIL_BYTES = 4 * 1024 * 1024
 now = time.time()
 count = 0
 auth = 0
-latest = ("", "", "")
+latest = ("", "", "", "")
 try:
     paths = [
         path for path in root.rglob("*.jsonl")
@@ -108,8 +133,9 @@ for path in paths:
         if re.search(r"401|oauth|log ?in|authenticat|refresh", str(text), re.I):
             auth += 1
         if stamp >= latest[0]:
-            latest = (stamp, "" if status is None else str(status), " ".join(str(text).split())[:160])
-print(f"{count}|{auth}|{latest[1]}|{latest[2]}")
+            kind = re.sub(r"[^a-z_]", "", str(event.get("error") or ""))[:40]
+            latest = (stamp, "" if status is None else str(status), kind, " ".join(str(text).split())[:160])
+print(f"{count}|{auth}|{latest[1]}|{latest[2]}|{latest[3]}")
 PY
 }
 
@@ -173,10 +199,6 @@ restart_service_after_preflight() {
   fi
 }
 
-tg_send() {
-  "$H/bin/tg-send" "$@"
-}
-
 LOG=$H/logs/healthcheck.log
 STATE=$H/logs/health-state.json
 ALERT_COOLDOWN=600  # 10 min between repeat alerts
@@ -220,17 +242,52 @@ if [ -x "$H/bin/claude-limit-recovery" ]; then
     # shifted this probe by half a second and 214 lost every tick from then on
     # (2026-09-19). Ask again after a pause before calling the answer unknown.
     for _status_try in 1 2 3; do
-        LIMIT_STATUS_JSON=$(timeout 30 env HOME="$H" "$H/bin/claude-limit-recovery" --status 2>/dev/null || true)
+        _status_rc=0
+        LIMIT_STATUS_JSON=$(timeout 30 env HOME="$H" "$H/bin/claude-limit-recovery" --status 2>/dev/null) || _status_rc=$?
         case "$LIMIT_STATUS_JSON" in
             '{"active":true,"schemaVersion":1}') LIMIT_RECOVERY_STATUS=active; break ;;
             '{"active":false,"schemaVersion":1}') LIMIT_RECOVERY_STATUS=clear; break ;;
         esac
+        # A hung watchdog is not a lost race: asking again only tripled the
+        # wait, and three 30 s probes overran the 110 s cron budget.
+        [ "$_status_rc" -eq 124 ] && break
         [ "$_status_try" -lt 3 ] && sleep 2
     done
     if [ "$LIMIT_RECOVERY_STATUS" = unknown ]; then
         [ -s "$LIMIT_SILENT_STAMP" ] || date +%s > "$LIMIT_SILENT_STAMP" 2>/dev/null || true
     else
         rm -f "$LIMIT_SILENT_STAMP"
+    fi
+fi
+# The limit gate keeps a stuck turn from being restarted into a spent Claude
+# limit, which would only drop the request; a confirmed limit belongs to
+# claude-limit-recovery, which replays it after the reset. Unknown may mean a
+# busy watchdog, but it holds the lifecycle lock for under a minute (its
+# restart action is capped at 40 s): ten minutes are five ticks, fifteen
+# probes in a row. Silent that long it is dead, and waiting on it held chats
+# for hours (Menni 28.08, Mani 01.09, Yasha 01.09 and 04.09). Past the ceiling
+# its stateless --limit-until reads the limit errors in the transcripts: each
+# holds recovery until its own reset, or five hours when the reset cannot be
+# read, unless the account answered since. The request left waiting is
+# usually not the one that hit the limit, so no window is measured from it.
+# A transcript that cannot be read keeps the status unknown and recovery held.
+LIMIT_GATE_CEILING_MIN=10
+if [ "$LIMIT_RECOVERY_STATUS" = unknown ] && [ -s "$LIMIT_SILENT_STAMP" ]; then
+    LIMIT_UNKNOWN_SINCE=$(cat "$LIMIT_SILENT_STAMP" 2>/dev/null || true)
+    case "$LIMIT_UNKNOWN_SINCE" in ''|*[!0-9]*) LIMIT_UNKNOWN_SINCE=$(date +%s) ;; esac
+    if [ $(( $(date +%s) - LIMIT_UNKNOWN_SINCE )) -ge $(( LIMIT_GATE_CEILING_MIN * 60 )) ]; then
+        LIMIT_UNTIL_MS=$(timeout 10 env HOME="$H" "$H/bin/claude-limit-recovery" --limit-until 2>/dev/null || true)
+        case "$LIMIT_UNTIL_MS" in
+            ''|*[!0-9]*) ;;
+            *)
+                if [ "$LIMIT_UNTIL_MS" -gt $(( $(date +%s) * 1000 )) ]; then
+                    LIMIT_RECOVERY_STATUS=active
+                else
+                    LIMIT_RECOVERY_STATUS=clear
+                fi
+                ;;
+        esac
+        echo "[$(date -u +%FT%TZ)] limit watchdog silent past ${LIMIT_GATE_CEILING_MIN} min; its transcripts read the limit as ${LIMIT_RECOVERY_STATUS}" >> "$LOG"
     fi
 fi
 LIFECYCLE_LOCK=$H/logs/transport-lifecycle.lock
@@ -341,11 +398,35 @@ PY
 }
 
 # Alert function (with cooldown per alert-key)
+# What a refused request means for the person who reads the alert: what happened, what to do
+# and where to look (owner, 29.09: «человек должен понимать, что делать и куда смотреть»).
+# The provider's own words stay in the log.
+plain_api_problem() {
+    local status="$1" kind="$2" text="$3" model
+    case "|$kind|$status|$text" in
+        *oauth_org_not_allowed*|*"disabled Claude subscription"*|*"subscription access"*)
+            printf 'Claude Code недоступний для акаунта Claude, під яким я працюю. Власнику акаунта: перевір підписку на claude.ai → Settings → Billing. Якщо підписка активна, а акаунт належить компанії, попроси адміністратора компанії увімкнути доступ до Claude Code. Щойно доступ повернеться, я запрацюю сам; щоб увійти іншим акаунтом, напиши /relogin.' ;;
+        *account_on_hold*|*suspended*|*"on hold"*)
+            printf 'Акаунт Claude, під яким я працюю, призупинено. Власнику акаунта: перевір пошту від Anthropic і стан акаунта на claude.ai.' ;;
+        *verification_required*)
+            printf 'Claude просить підтвердити акаунт, під яким я працюю. Власнику акаунта: увійди на claude.ai, пройди перевірку, потім напиши мені /relogin.' ;;
+        *billing_error*|*"credit balance"*)
+            printf 'На акаунті Claude закінчились кошти. Власнику акаунта: поповни баланс у налаштуваннях Claude на claude.ai.' ;;
+        *"|401|"*|*authentication*|*OAuth*|*"Not logged in"*|*"/login"*)
+            printf 'Мене розлогінило. Напиши /relogin — я надішлю посилання для входу.' ;;
+        *"model:"*|*not_found_error*|*"|404|"*)
+            model=$(printf '%s' "$text" | grep -oE 'claude-[a-z0-9.-]+' | head -1)
+            printf 'Модель%s з моїх налаштувань недоступна для цього акаунта. Напиши нам — треба змінити модель.' "${model:+ $model}" ;;
+        *)
+            printf 'Claude відхиляє мої запити, і перезапуск не допомагає. Напиши нам — ми подивимось.' ;;
+    esac
+}
+
 real_auth_verdict() {
     # Поле "loggedIn" лишається true при простроченому токені, а справжній виклик
     # уже віддає 401. Доказ — останній хід самої сесії за вікно застряглого
     # повідомлення ($1 хвилин), а не пробний виклик моделі зі сторожа.
-    local window_min="${1:-30}" scan status text
+    local window_min="${1:-30}" scan status kind text
     if [ "$LIMIT_RECOVERY_STATUS" = active ]; then
         printf 'Уперся в ліміт акаунта. Він сам відпустить; напиши /health, щоб побачити коли.'
         return
@@ -356,7 +437,13 @@ real_auth_verdict() {
     fi
     scan=$(api_error_scan $((window_min * 60)) any)
     status=$(printf '%s' "$scan" | cut -d'|' -f3)
-    text=$(printf '%s' "$scan" | cut -d'|' -f4-)
+    kind=$(printf '%s' "$scan" | cut -d'|' -f4)
+    text=$(printf '%s' "$scan" | cut -d'|' -f5-)
+    case "$kind" in
+        oauth_org_not_allowed|account_on_hold|verification_required|billing_error)
+            plain_api_problem "$status" "$kind" "$text"
+            return ;;
+    esac
     case "$status $text" in
         *401*|*"OAuth"*|*"Re-authenticate"*|*"Not logged in"*|*"/login"*)
             printf 'Мене розлогінило — потрібен новий вхід. Напиши /relogin, і я надішлю посилання.' ;;
@@ -365,7 +452,7 @@ real_auth_verdict() {
         *529*|*503*|*500*|*Overloaded*|*overloaded*)
             printf 'Це збій на боці Anthropic, не в мене: моделі відповідають помилкою. Я повернусь сам, коли їх полагодять — статус на status.anthropic.com.' ;;
         *)
-            printf 'Логін і ліміт живі — схоже, загубився хід. Перешли повідомлення ще раз або напиши /unstick.' ;;
+            printf 'Логін і ліміт живі — схоже, загубився хід. Напиши /unstick: запит збережено, я візьму його знову, пересилати не треба.' ;;
     esac
 }
 
@@ -395,7 +482,8 @@ alert() {
     # CLI does not know, a revoked key). No restart fixes it; only the owner can.
     # answered-unsettled: the answer went out, the request still holds the
     # queue and nothing here may remove it (22.09, Мартин: 1 h 40 min).
-    case "$key" in browser-down|crash-loop|low-disk|service-down|stuck-escalate|corporate-paused|corporate-unavailable|limit-detector-silent|api-error-turns|answered-unsettled) ;; *) return 0 ;; esac
+    # malformed-tool: the restart that would clear a broken tool-call loop failed.
+    case "$key" in browser-down|crash-loop|low-disk|service-down|stuck-escalate|corporate-paused|corporate-unavailable|limit-detector-silent|api-error-turns|answered-unsettled|malformed-tool) ;; *) return 0 ;; esac
     if [ -n "$scope" ] && ! [[ "$scope" =~ ^-?[0-9]+_[0-9]+$ ]]; then
         return 0
     fi
@@ -470,10 +558,10 @@ if [ "$RESTARTS" -gt 4 ]; then
     if service_mutation_allowed; then
         if sudo systemctl stop "$SVC" 2>/dev/null; then
             echo "[$(date -u +%FT%TZ)] CRASH LOOP — stopped service (${RESTARTS} restarts)" >> "$LOG"
-            alert "crash-loop" "Цикл збоїв: ${RESTARTS} перезапусків за 10 хв. Службу зупинено — потрібна ручна перевірка."
+            alert "crash-loop" "Я падаю одразу після запуску (${RESTARTS} разів за 10 хв), тому зупинився, щоб не крутитися в збоях. Напиши нам — це треба подивитися руками."
         else
             echo "[$(date -u +%FT%TZ)] CRASH LOOP — service stop failed exit=$?" >> "$LOG"
-            alert "crash-loop" "Цикл збоїв: ${RESTARTS} перезапусків за 10 хв. Автоматична зупинка не вдалася — потрібна ручна перевірка."
+            alert "crash-loop" "Я падаю одразу після запуску (${RESTARTS} разів за 10 хв) і не зміг сам зупинитися. Напиши нам — це треба подивитися руками."
         fi
         exit 0
     fi
@@ -572,6 +660,10 @@ fi
 # A model can occasionally emit textual <invoke> markup instead of a real tool call.
 # The Stop hook records a marker after two such failures. Recover outside Claude so a
 # poisoned session cannot keep retrying its own malformed output indefinitely.
+# The restart offers the saved request to the model again, so nobody is asked to
+# repeat it. A restart that failed is for the operator, never for the chat the
+# turn came from: a guest, a team group, people talking to each other (amy 12.09,
+# Пара 22.09, Кнопа 15.09).
 MALFORMED_TOOL_MARKER="$STAMP/malformed-tool-restart.json"
 if [ -s "$MALFORMED_TOOL_MARKER" ]; then
     MALFORMED_TOOL_PROCESSING="$MALFORMED_TOOL_MARKER.processing-$$"
@@ -582,23 +674,8 @@ if [ -s "$MALFORMED_TOOL_MARKER" ]; then
             exit 0
         fi
 
-        MALFORMED_CHAT_ID=$(jq -r '.chat_id // empty' "$MALFORMED_TOOL_PROCESSING" 2>/dev/null)
-        case "$MALFORMED_CHAT_ID" in
-            ''|*[!0-9-]*) MALFORMED_CHAT_ID=$(alert_recipients | head -n 1) ;;
-        esac
-        case "$MALFORMED_CHAT_ID" in
-            ''|*[!0-9-]*)
-                echo "[$(date -u +%FT%TZ)] malformed tool-call recovery has no valid recipient" >> "$LOG"
-                rm -f "$MALFORMED_TOOL_PROCESSING"
-                exit 0
-                ;;
-        esac
-        if restart_service malformed_tool_call_loop; then
-            tg_send "$MALFORMED_CHAT_ID" "Після технічного збою виклику інструментів службу перезапущено; пам’ять збережено. Будь ласка, повтори останнє повідомлення за хвилину." \
-                >/dev/null 2>&1 || true
-        else
-            tg_send "$MALFORMED_CHAT_ID" "Автоперезапуск не спрацював. Збій зафіксовано без повторного спаму; потрібна технічна перевірка." \
-                >/dev/null 2>&1 || true
+        if ! restart_service malformed_tool_call_loop; then
+            alert "malformed-tool" "Я не зміг сам відновитися після збою. Напиши нам — це треба подивитися руками."
             echo "[$(date -u +%FT%TZ)] malformed tool-call recovery restart failed; marker consumed" >> "$LOG"
         fi
         rm -f "$MALFORMED_TOOL_PROCESSING"
@@ -665,7 +742,7 @@ if ! sudo systemctl is-active "$SVC" >/dev/null 2>&1; then
             ;;
     esac
     if [ "$(( $(date -u +%s) - service_down_since ))" -ge "${SERVICE_DOWN_ALERT_AFTER:-300}" ]; then
-        alert "service-down" "Не можу запуститися: служба ${SVC} лежить вже кілька хвилин, автоматичний старт не допомагає. Напиши нам."
+        alert "service-down" "Я не можу запуститися вже кілька хвилин, і автоматичний старт не допомагає. Напиши нам."
     fi
 else
     rm -f "$STAMP/service-down-since.epoch"
@@ -765,7 +842,7 @@ if [ -s "$LIMIT_SILENT_STAMP" ]; then
             LIMIT_SILENT_MIN=$(( ($(date +%s) - LIMIT_SILENT_SINCE) / 60 ))
             if [ "$LIMIT_SILENT_MIN" -ge 30 ]; then
                 echo "[$(date -u +%FT%TZ)] limit watchdog has not answered for ${LIMIT_SILENT_MIN} min" >> "$LOG"
-                alert "limit-detector-silent" "Сторож лімітів Claude не відповідає вже ${LIMIT_SILENT_MIN} хв. Якщо ліміт закінчиться, бот просто замовкне і ніхто не дізнається чому. Напиши нам." 86400
+                alert "limit-detector-silent" "Моя перевірка лімітів Claude не працює вже ${LIMIT_SILENT_MIN} хв. Поки вона мовчить, я можу замовкнути, коли скінчиться ліміт, і ніхто не дізнається чому. Напиши нам." 86400
             fi
             ;;
     esac
@@ -774,7 +851,7 @@ fi
 # 8. Disk space (< 5% free = critical)
 DISK_PCT=$(disk_free_pct)
 if [ "$DISK_PCT" -lt 10 ]; then
-    alert "low-disk" "Мало місця на диску: на /home вільно ${DISK_PCT}%. Перевір /opt/streampost/data та файли браузера."
+    alert "low-disk" "На сервері закінчується місце (вільно ${DISK_PCT}%). Коли воно скінчиться, я перестану працювати. Напиши нам — треба почистити сервер."
 fi
 
 # Corporate work has its own durable queue. Never infer a global Telegram hang
@@ -861,7 +938,7 @@ PY
             while read -r UH_DELIVERY UH_TURN UH_ANSWER UH_RECEIPT UH_AGE; do
                 [[ "$UH_DELIVERY" =~ ^-?[0-9]+:[0-9]+$ ]] || continue
                 echo "[$(date -u +%FT%TZ)] answered but unsettled head ${UH_DELIVERY} turn ${UH_TURN}/${UH_ANSWER} receipt ${UH_RECEIPT}, ${UH_AGE} min" >> "$LOG"
-                alert "answered-unsettled" "Відповідь на повідомлення ${UH_DELIVERY} уже надіслано, але воно ${UH_AGE} хв тримає чергу, і наступні повідомлення чекають. Сам я його не знімаю — потрібна перевірка сторожа доставки." 3600 "${UH_DELIVERY/:/_}"
+                alert "answered-unsettled" "Я відповів на повідомлення, але черга не звільнилась уже ${UH_AGE} хв, і наступні повідомлення чекають. Напиши нам — треба перевірити доставку (код ${UH_DELIVERY})." 3600 "${UH_DELIVERY/:/_}"
             done <<< "$UNSETTLED_HEADS"
             ;;
     esac
@@ -1178,14 +1255,14 @@ if [ -f "$DB" ] && command -v sqlite3 >/dev/null 2>&1; then
         case "$PAUSED_MS" in ''|*[!0-9]*) PAUSED_MS=0 ;; esac
         PAUSED_MIN=$(( ($(date +%s) - PAUSED_MS / 1000) / 60 ))
         if [ "$PAUSE_REASON" != usage_limit ] && [ "$PAUSED_MIN" -ge 10 ]; then
-            alert "corporate-paused" "⏸ Корпоративний приймач на паузі вже ~${PAUSED_MIN} хв (причина: ${PAUSE_REASON:-невідома}) — співробітникам бот не відповідає, твій чат працює. Напиши мені «віднови корпоративний приймач» або через SSH: corporate-control probe --json && corporate-control resume." 3600
+            alert "corporate-paused" "⏸ Співробітникам я не відповідаю вже ~${PAUSED_MIN} хв: корпоративний режим на паузі ($(case "$PAUSE_REASON" in auth) printf 'злетів вхід у Claude' ;; startup) printf 'не вдалося запуститися' ;; manual|owner) printf 'поставлено вручну' ;; *) printf 'причина: %s' "${PAUSE_REASON:-невідома}" ;; esac)). Твій чат працює. Напиши мені «віднови корпоративний приймач»." 3600
         fi
     fi
     if [ "$CORPORATE_ACTIVATED" -eq 0 ]; then
         UNAVAILABLE_15M=$(sqlite3 "$DB" "SELECT COUNT(*) FROM messages WHERE direction='out' AND ts > (strftime('%s','now') - 900) * 1000 AND text LIKE '%Корпоративний режим тимчасово недоступний%';" 2>/dev/null || echo 0)
         case "$UNAVAILABLE_15M" in ''|*[!0-9]*) UNAVAILABLE_15M=0 ;; esac
         if [ "$UNAVAILABLE_15M" -gt 0 ]; then
-            alert "corporate-unavailable" "⚠️ За 15 хв ${UNAVAILABLE_15M} відповідей «Корпоративний режим тимчасово недоступний», хоча корпоративний режим не активовано — гості й групи лишаються без відповіді. Перевір маркер corporate-isolation-activated і таблицю corporate_runtime_state у messages.db (або напиши мені «перевір корпоративний стан»)." 3600
+            alert "corporate-unavailable" "⚠️ За 15 хв я ${UNAVAILABLE_15M} разів відповів гостям і групам «Корпоративний режим тимчасово недоступний», хоча він у тебе не ввімкнений, тож вони лишаються без відповіді. Напиши мені «перевір корпоративний стан» або нам." 3600
         fi
     fi
 fi
@@ -1214,7 +1291,7 @@ LAST_CODEX=$(cat "$CODEX_STAMP" 2>/dev/null || echo 0)
 if [ -x "$H/.npm-global/bin/codex" ] && [ $(( NOW_S - LAST_CODEX )) -ge 1800 ]; then
     echo "$NOW_S" > "$CODEX_STAMP"
     if ! timeout 20 "$H/.npm-global/bin/codex" login status 2>&1 | grep -q "Logged in"; then
-        alert "codex-auth-dead" "Авторизацію Codex втрачено — gpt-image-2 не працює. Потрібно: codex login --device-auth (або скажи десктопному Claude)." 7200
+        alert "codex-auth-dead" "Не працює генерація картинок: злетів вхід у Codex. Напиши нам — ми перелогінимо." 7200
     fi
 fi
 
@@ -1294,19 +1371,26 @@ import json
 import sys
 import time
 from datetime import datetime, timezone
-from heapq import nlargest
 from pathlib import Path
 
 RECENT_SECONDS = 1200
 # Transcripts of headless scheduled tasks and of corporate employee workers are
 # not the owner's session: a Threads-monitoring task that hung for 15 minutes
 # kept the owner's wedged turn looking "busy", and Ilya waited 22 minutes for a
-# restart the watchdog was built to do (Menni, 2026-09-03).
+# restart the watchdog was built to do (Menni, 2026-09-03). Their subagents
+# live deeper in the same project, so the project directory decides.
 IGNORED_SESSION_DIR_PARTS = ("-atarax-agent-task", "corporate-workers")
+# Only conversation records are the turn. Everything else the CLI writes into a
+# transcript is bookkeeping (queue rows for every message that reaches it,
+# last-prompt, mode, pr-link …), and it lands while a tool call hangs too.
+TURN_RECORD_TYPES = {"user", "assistant", "attachment", "system"}
 MAX_RECORD_BYTES = 16 * 1024 * 1024
+MAX_SESSIONS = 20
 
 
-def has_recent_real_turn(path: Path, now: float) -> bool:
+def recent_turn(path: Path, now: float) -> bool | None:
+    """True: a turn record in the last RECENT_SECONDS, or input that cannot be
+    classified; False: the newest turn record is older; None: none at all."""
     try:
         size = path.stat().st_size
         start = max(0, size - MAX_RECORD_BYTES)
@@ -1336,7 +1420,11 @@ def has_recent_real_turn(path: Path, now: float) -> bool:
             return True
         if not isinstance(event, dict):
             return True
-        if event.get("type") == "queue-operation":
+        if event.get("type") not in TURN_RECORD_TYPES:
+            continue
+        # A headless run (`claude -p`, the SDK) in the same project is another
+        # session; the bot's own session and its subagents are interactive.
+        if str(event.get("entrypoint", "")).startswith("sdk"):
             continue
         stamp = event.get("timestamp")
         if not isinstance(stamp, str):
@@ -1350,7 +1438,10 @@ def has_recent_real_turn(path: Path, now: float) -> bool:
             return True
         return age < RECENT_SECONDS
 
-    return truncated
+    # Every line of the window parsed cleanly and none is the bot's session:
+    # no evidence of its work, however large the file (a fresh headless run of
+    # over 16 MB kept a hung turn "busy").
+    return None
 
 
 root = Path(sys.argv[1])
@@ -1358,23 +1449,32 @@ now = time.time()
 try:
     def recent_paths():
         for path in root.rglob("*.jsonl"):
-            if any(part in path.parent.name for part in IGNORED_SESSION_DIR_PARTS):
+            project = path.relative_to(root).parts[0]
+            if any(part in project for part in IGNORED_SESSION_DIR_PARTS):
                 continue
             mtime = path.stat().st_mtime
             if now - mtime < RECENT_SECONDS:
                 yield mtime, path
 
     candidates = [
-        path for _, path in nlargest(20, recent_paths(), key=lambda item: item[0])
+        path for _, path in sorted(recent_paths(), key=lambda item: item[0], reverse=True)
     ]
 except OSError:
     print(root)
     raise SystemExit(0)
 
+# Files without a single turn record do not use up the limit: twenty fresh
+# bookkeeping-only files must not hide a subagent that is still working.
+judged = 0
 for candidate in candidates:
-    if has_recent_real_turn(candidate, now):
+    verdict = recent_turn(candidate, now)
+    if verdict:
         print(candidate)
         break
+    if verdict is not None:
+        judged += 1
+        if judged >= MAX_SESSIONS:
+            break
 PY
     )
     SHOULD_RESTART_STUCK=0
@@ -1466,7 +1566,7 @@ PY
         if [ "$AGE_MIN" -ge 30 ] && [ "$AGE_MIN" -le 1440 ] && [ "$LAST_ESC_IN" != "$FIRST_UNANSWERED" ]; then
             echo "$FIRST_UNANSWERED" > "$ESCALATE_TS"
             AUTH_VERDICT="$(real_auth_verdict "$AGE_MIN")"
-            alert "stuck-escalate" "Не відповідаю вже ${AGE_MIN} хв: вхідне повідомлення не отримало підтвердженої відповіді. ${AUTH_VERDICT}" 10800
+            alert "stuck-escalate" "Не відповідаю вже ${AGE_MIN} хв на повідомлення. ${AUTH_VERDICT}" 10800
         fi
     done <<PRIVATE_CHAT_ACTIVITY_EOF
 $PRIVATE_CHAT_ACTIVITY
@@ -1493,7 +1593,9 @@ API_ERROR_COUNT=$(printf '%s' "$API_ERROR_SCAN" | cut -d'|' -f1)
 API_AUTH_COUNT=$(printf '%s' "$API_ERROR_SCAN" | cut -d'|' -f2)
 case "$API_ERROR_COUNT" in ''|*[!0-9]*) API_ERROR_COUNT=0 ;; esac
 case "$API_AUTH_COUNT" in ''|*[!0-9]*) API_AUTH_COUNT=0 ;; esac
-API_ERROR_TEXT=$(printf '%s' "$API_ERROR_SCAN" | cut -d'|' -f4-)
+API_ERROR_STATUS=$(printf '%s' "$API_ERROR_SCAN" | cut -d'|' -f3)
+API_ERROR_KIND=$(printf '%s' "$API_ERROR_SCAN" | cut -d'|' -f4)
+API_ERROR_TEXT=$(printf '%s' "$API_ERROR_SCAN" | cut -d'|' -f5-)
 if [ "$API_AUTH_COUNT" -ge 2 ] && [ "$CLAUDE_AUTHENTICATED" = true ]; then
     # The session 401s while the on-disk login is valid: another process rotated
     # the refresh token (cron `claude -p`, a corporate worker) and the long-lived
@@ -1509,11 +1611,11 @@ if [ "$API_AUTH_COUNT" -ge 2 ] && [ "$CLAUDE_AUTHENTICATED" = true ]; then
         fi
     else
         echo "[$(date -u +%FT%TZ)] auth errors in 15 min: ${API_AUTH_COUNT} after a credentials restart — ${API_ERROR_TEXT}" >> "$LOG"
-        alert "api-error-turns" "Я відповідаю помилкою входу замість відповіді (${API_AUTH_COUNT} за 15 хв): ${API_ERROR_TEXT}. Перезапуск не допоміг — виконай /relogin." 3600
+        alert "api-error-turns" "Я не можу відповідати: $(plain_api_problem "$API_ERROR_STATUS" "$API_ERROR_KIND" "$API_ERROR_TEXT") Перезапуск не допоміг." 3600
     fi
 elif [ "$API_ERROR_COUNT" -ge 2 ]; then
-    echo "[$(date -u +%FT%TZ)] api-error turns in 15 min: ${API_ERROR_COUNT} — ${API_ERROR_TEXT}" >> "$LOG"
-    alert "api-error-turns" "Я відповідаю помилкою API замість відповіді (${API_ERROR_COUNT} за 15 хв): ${API_ERROR_TEXT}. Перезапуск не допоможе: перевір модель у settings.json або виконай /relogin." 3600
+    echo "[$(date -u +%FT%TZ)] api-error turns in 15 min: ${API_ERROR_COUNT} — ${API_ERROR_STATUS} ${API_ERROR_KIND} ${API_ERROR_TEXT}" >> "$LOG"
+    alert "api-error-turns" "Я не можу відповідати: $(plain_api_problem "$API_ERROR_STATUS" "$API_ERROR_KIND" "$API_ERROR_TEXT")" 3600
 fi
 
 # 9. Write one machine-readable snapshot after both owner and corporate queues

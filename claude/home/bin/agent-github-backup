@@ -25,10 +25,18 @@ from urllib import error as urlerror, request
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
+_NOTICE_SPEC = importlib.util.spec_from_file_location(
+    "agent_notice_locale", Path(__file__).with_name("agent_notice_locale.py")
+)
+_NOTICE_MODULE = importlib.util.module_from_spec(_NOTICE_SPEC)
+_NOTICE_SPEC.loader.exec_module(_NOTICE_MODULE)
+
+
 HOME = Path.home()
 VAULT = HOME / "obsidian-vault"
 STATE_DIR = HOME / ".local/state/agent-github-backup"
 STATE_PATH = STATE_DIR / "state.json"
+NIGHTLY_SLOT_PATH = STATE_DIR / "nightly-slot"
 LOCK_PATH = STATE_DIR / "run.lock"
 KEY_PATH = STATE_DIR / "github-backup-ed25519"
 PROFILE_PATH = HOME / ".agent-profile.env"
@@ -41,7 +49,8 @@ SHA = re.compile(r"^[0-9a-f]{40}$")
 PROFILE_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 TIMEZONE_NAME = re.compile(r"^[A-Za-z0-9._+-]+(?:/[A-Za-z0-9._+-]+)*$")
 SLOT = re.compile(r"^\d{4}-\d{2}-\d{2}T(?:09|21)$")
-MAX_SUCCESS_AGE_SECONDS = 24 * 60 * 60
+# A local-date backup can be 25 hours apart across Lisbon's autumn DST shift.
+MAX_SUCCESS_AGE_SECONDS = 27 * 60 * 60
 
 
 class BackupError(RuntimeError):
@@ -226,6 +235,43 @@ def write_state(state: dict) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def load_nightly_slot() -> str | None:
+    if NIGHTLY_SLOT_PATH.is_symlink():
+        raise BackupError("state-unsafe")
+    if not NIGHTLY_SLOT_PATH.exists():
+        return None
+    metadata = NIGHTLY_SLOT_PATH.lstat()
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_nlink != 1
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or metadata.st_size > 32
+    ):
+        raise BackupError("state-unsafe")
+    try:
+        slot = NIGHTLY_SLOT_PATH.read_text(encoding="ascii").strip()
+        if datetime.fromisoformat(slot).date().isoformat() != slot:
+            raise ValueError("date is not canonical")
+    except (OSError, UnicodeError, ValueError) as error:
+        raise BackupError("state-invalid") from error
+    return slot
+
+
+def write_nightly_slot(slot: str) -> None:
+    ensure_state_dir()
+    descriptor, temporary_name = tempfile.mkstemp(prefix=".nightly-slot.", dir=STATE_DIR)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="ascii") as handle:
+            handle.write(slot + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, NIGHTLY_SLOT_PATH)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def profile_timezone() -> str:
     try:
         descriptor = os.open(
@@ -319,6 +365,33 @@ def git_config_values(name: str) -> list[str]:
     if any(not value for value in values):
         raise BackupError("remote-invalid")
     return values
+
+
+def commit_author(default_name: str, default_email: str) -> tuple[str, str]:
+    # The vault-web module connects this same private repo to Vercel, which
+    # requires an author on the project. Its setup stores that identity locally.
+    marker = VAULT / "vercel.json"
+    if not marker.exists() and not marker.is_symlink():
+        return default_name, default_email
+    if marker.is_symlink() or not marker.is_file():
+        raise BackupError("website-author-missing")
+
+    def configured(name: str) -> str:
+        result = git("config", "--local", "--get-all", name)
+        if result.returncode != 0:
+            raise BackupError("website-author-missing")
+        try:
+            values = result.stdout.decode("utf-8", errors="strict").splitlines()
+        except UnicodeDecodeError as error:
+            raise BackupError("website-author-missing") from error
+        if len(values) != 1 or not values[0].strip() or any(ord(c) < 32 or ord(c) == 127 for c in values[0]):
+            raise BackupError("website-author-missing")
+        return values[0]
+
+    name, email = configured("user.name"), configured("user.email")
+    if len(name) > 256 or len(email) > 254 or not re.fullmatch(r"[^@\s<>]+@[^@\s<>]+", email):
+        raise BackupError("website-author-missing")
+    return name, email
 
 
 def configured_push_remote() -> str:
@@ -596,13 +669,13 @@ def has_staged_changes() -> bool:
     raise BackupError("index-invalid")
 
 
-def commit_backup() -> str:
+def commit_backup(author: tuple[str, str]) -> str:
     message = "Agent backup " + datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     result = git(
         "-c",
-        "user.name=Agent Backup",
+        "user.name=" + author[0],
         "-c",
-        "user.email=agent-backup@localhost",
+        "user.email=" + author[1],
         "-c",
         "core.hooksPath=/dev/null",
         "commit",
@@ -748,6 +821,7 @@ def run_backup() -> dict:
         raise BackupError("not-configured")
     environment = git_environment(remote)
     require_private_repository(identity)
+    author = commit_author("Agent Backup", "agent-backup@localhost")
     backup = load_backup_module()
     existing = git("rev-parse", "--verify", "--quiet", "HEAD")
     if existing.returncode not in (0, 1):
@@ -760,7 +834,7 @@ def run_backup() -> dict:
     try:
         stage_paths(vault_paths | projection_paths, backup)
         changed = has_staged_changes()
-        revision = commit_backup() if changed else head_revision()
+        revision = commit_backup(author) if changed else head_revision()
     except Exception:
         restore_index(snapshot)
         raise
@@ -839,16 +913,16 @@ def backup_status() -> dict:
 
 def scheduled_backup() -> dict:
     now = current_utc_time()
-    local = now.astimezone(ZoneInfo(profile_timezone()))
-    if local.hour not in (9, 21):
+    local = now.astimezone(ZoneInfo("Europe/Lisbon"))
+    if local.hour != 22:
         return {
             "status": "not-due",
             "ran": False,
             "containsSecrets": False,
         }
     slot = local.strftime("%Y-%m-%dT%H")
-    state = load_state()
-    if slot in state["completedSlots"]:
+    load_state()
+    if load_nightly_slot() == local.date().isoformat():
         return {
             "status": "already-ran",
             "ran": False,
@@ -856,14 +930,9 @@ def scheduled_backup() -> dict:
             "containsSecrets": False,
         }
     result = run_backup()
-    state = load_state()
-    slots = state["completedSlots"]
-    slots[slot] = now.isoformat()
-    state["completedSlots"] = {
-        name: slots[name]
-        for name in sorted(slots)[-32:]
-    }
-    write_state(state)
+    # Older versions accept only T09/T21 in completedSlots. Keep their state
+    # readable after rollback by recording the new date in a separate file.
+    write_nightly_slot(local.date().isoformat())
     return {
         "status": "scheduled",
         "ran": True,
@@ -1007,7 +1076,12 @@ def emit(receipt: dict, *, as_json: bool) -> None:
         return
     if receipt["status"] in {"not-due", "already-ran"}:
         return
-    print(messages.get(receipt["status"], "Резервне копіювання не виконано."))
+    status = receipt["status"]
+    print(_NOTICE_MODULE.notice_text(
+        "backup." + status if status in messages else "backup.error",
+        messages.get(status, "Резервне копіювання не виконано."),
+        home=HOME,
+    ))
 
 
 def main() -> int:

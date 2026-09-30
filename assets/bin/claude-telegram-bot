@@ -1,7 +1,48 @@
 #!/bin/bash
 set -eu
+# One bot per home: the kit's services never set AGENT_ROOT. Any other value
+# would hand this launch another bot's --resume session and helpers.
+if [ -n "${AGENT_ROOT:-}" ] && [ "${AGENT_ROOT%/}" != "${HOME%/}" ]; then
+  echo "telegram launcher: FATAL: AGENT_ROOT=$AGENT_ROOT is not this bot's home $HOME; not starting" >&2
+  exit 1
+fi
+# A bot started from another agent's shell inherits that agent's Claude config
+# and Telegram state, loads its token and kills its poller (Lera, 26.09). Keep
+# a caller's path only inside this agent's own ~/.claude — a neighbour's home
+# can sit inside this one — and without a .. segment; "root" also allows
+# ~/.claude itself.
+own_claude_path() {
+  local path="${1%/}"
+  case "/$path/" in */../*) return 1 ;; esac
+  case "$path" in
+    "${HOME%/}/.claude") [ "${2:-}" = root ] ;;
+    "${HOME%/}/.claude/"?*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+ignore_caller_path() {
+  echo "telegram launcher: ignored $1=$2 from the caller; using $3" >&2
+}
+# Unset rather than pointed at ~/.claude: an explicit CLAUDE_CONFIG_DIR would
+# move the CLI's own ~/.claude.json and log the bot out.
+if [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
+  if own_claude_path "$CLAUDE_CONFIG_DIR" root; then
+    export CLAUDE_CONFIG_DIR="${CLAUDE_CONFIG_DIR%/}"
+  else
+    ignore_caller_path CLAUDE_CONFIG_DIR "$CLAUDE_CONFIG_DIR" "$HOME/.claude"
+    unset CLAUDE_CONFIG_DIR
+  fi
+fi
 CLAUDE_CONFIG_ROOT="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
-export TELEGRAM_STATE_DIR="${TELEGRAM_STATE_DIR:-$CLAUDE_CONFIG_ROOT/channels/telegram}"
+STATE_DIR="$CLAUDE_CONFIG_ROOT/channels/telegram"
+if [ -n "${TELEGRAM_STATE_DIR:-}" ]; then
+  if own_claude_path "$TELEGRAM_STATE_DIR"; then
+    STATE_DIR="$TELEGRAM_STATE_DIR"
+  else
+    ignore_caller_path TELEGRAM_STATE_DIR "$TELEGRAM_STATE_DIR" "$STATE_DIR"
+  fi
+fi
+export TELEGRAM_STATE_DIR="$STATE_DIR"
 if [ -f "$TELEGRAM_STATE_DIR/.env" ]; then
   set -a
   . "$TELEGRAM_STATE_DIR/.env"
@@ -22,20 +63,41 @@ export CLAUDE_AUTOCOMPACT_PCT_OVERRIDE="${CLAUDE_AUTOCOMPACT_PCT_OVERRIDE:-90}"
 #   1) онбординг (выбор темы «Choose the text style») — hasCompletedOnboarding/theme
 #   2) «trust this folder?» — projects[cwd].hasTrustDialogAccepted
 #   3) внешний импорт управляемого CLAUDE.premium.md — projects[cwd].hasClaudeMdExternalIncludes*
+#      (также для отдельного cwd фоновых RUN=1 задач)
 #   4) upsell-промпты («Try the new fullscreen renderer? 1.Yes/2.Not now», remote control, passes)
 #      — claude капит их показ на 3; ставим *UpsellSeenCount=3 = «уже видел, не показывай».
 #   5) предложение сделать auto mode режимом по умолчанию — новый экран свежего CLI.
 #      Для бота без человека за терминалом auto mode опасен: классификатор рисков
 #      заблокирует действие, а подтвердить его некому — бот встанет навсегда.
-# Идемпотентно, self-healing на каждый старт. No-op пока не залогинен (нет ~/.claude.json).
-CJ="${CLAUDE_CONFIG_DIR:-$HOME}/.claude.json"  # уважаем per-bot CLAUDE_CONFIG_DIR (мульти-бот фермы)
+# Идемпотентно, self-healing на каждый старт. No-op пока не залогинен.
+# With an isolated CLAUDE_CONFIG_DIR the CLI reads .config.json first when it
+# exists, then .claude.json. The reminder worker uses the same selection.
+CLAUDE_STATE_ROOT="${CLAUDE_CONFIG_DIR:-$HOME}"
+CJ="$CLAUDE_STATE_ROOT/.claude.json"
+if [ -n "${CLAUDE_CONFIG_DIR:-}" ] && [ -f "$CLAUDE_STATE_ROOT/.config.json" ]; then
+  CJ="$CLAUDE_STATE_ROOT/.config.json"
+fi
 if [ -f "$CJ" ]; then
-  python3 - "$CJ" "$HOME" "$HOME/obsidian-vault" <<'PY' 2>/dev/null || true
-import json, sys
-p = sys.argv[1]; trust = sys.argv[2:]
+  python3 - "$CJ" "$HOME" "${AGENT_TASK_DIR:-}" <<'PY' 2>/dev/null || true
+import json, os, pathlib, stat, sys, tempfile
+
+p = pathlib.Path(sys.argv[1])
+home = sys.argv[2]
+task_override = sys.argv[3]
+trust = [home, os.path.join(home, "obsidian-vault"),
+         os.path.join(home, ".atarax", "agent-task")]
+if task_override and os.path.isabs(task_override):
+    trust.append(task_override)
+trust = list(dict.fromkeys(os.path.realpath(path) for path in trust))
+if p.is_symlink():
+    sys.exit(0)
 try:
-    d = json.load(open(p))
-except Exception:
+    with p.open(encoding="utf-8") as source:
+        d = json.load(source)
+    original_mode = stat.S_IMODE(p.stat().st_mode)
+except (OSError, UnicodeError, ValueError):
+    sys.exit(0)
+if not isinstance(d, dict):
     sys.exit(0)
 ch = False
 if d.get("hasCompletedOnboarding") is not True:
@@ -50,9 +112,17 @@ for uk in ("fullscreenUpsellSeenCount", "remoteControlUpsellSeenCount", "passesU
 for offer in ("hasSeenAutoDefaultNudge", "hasResetAutoModeOptInForDefaultOffer"):
     if d.get(offer) is not True:
         d[offer] = True; ch = True
-proj = d.setdefault("projects", {})
+proj = d.get("projects")
+if proj is None:
+    proj = {}
+elif not isinstance(proj, dict):
+    sys.exit(0)
 for k in trust:
-    e = proj.setdefault(k, {})
+    e = proj.get(k)
+    if e is None:
+        e = {}
+    elif not isinstance(e, dict):
+        sys.exit(0)
     if e.get("hasTrustDialogAccepted") is not True:
         e["hasTrustDialogAccepted"] = True; ch = True
     if e.get("hasCompletedProjectOnboarding") is not True:
@@ -61,8 +131,31 @@ for k in trust:
         e["hasClaudeMdExternalIncludesApproved"] = True; ch = True
     if e.get("hasClaudeMdExternalIncludesWarningShown") is not True:
         e["hasClaudeMdExternalIncludesWarningShown"] = True; ch = True
+    proj[k] = e
 if ch:
-    json.dump(d, open(p, "w"), indent=2)
+    d["projects"] = proj
+    fd = None
+    temp = None
+    try:
+        fd, temp = tempfile.mkstemp(prefix=p.name + ".", dir=p.parent)
+        with os.fdopen(fd, "w", encoding="utf-8") as out:
+            fd = None
+            os.fchmod(out.fileno(), original_mode)
+            json.dump(d, out, indent=2)
+            out.write("\n")
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(temp, p)
+    except OSError:
+        pass
+    finally:
+        if fd is not None:
+            os.close(fd)
+        if temp is not None:
+            try:
+                os.unlink(temp)
+            except FileNotFoundError:
+                pass
 PY
 fi
 

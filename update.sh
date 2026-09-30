@@ -8,9 +8,9 @@
 #
 # What it does (all idempotent):
 #   1. validate and use the already staged kit revision
-#   2. update Claude Code and Codex with auth validation and rollback
+#   2. keep installed Claude Code and Codex versions; verify their command surface
 #   3. re-run install-core with the SAME owner inputs (from the saved agent.env)
-#   4. verify/update Telegram plugin 0.0.7 and reconcile the reviewed golden
+#   4. preserve the installed plugin cache and reconcile the reviewed golden
 #   5. leave claude-telegram stopped for the outer transaction to verify and start
 #
 # Usage: follow the stopped transaction in UPGRADING.md. The outer transaction
@@ -19,14 +19,46 @@
 set -euo pipefail
 
 [ "$(id -u)" -eq 0 ] || { echo "FATAL: цей скрипт потрібно запускати від root" >&2; exit 1; }
+# BEGIN owner freeze preflight
+# The owner froze kit updates on this server: refuse before any licence call,
+# package work or managed write. A symlink (even a dangling one) or any other
+# non-regular marker refuses unopened; a regular one shows its first 2000 bytes.
+UPDATES_FROZEN=/etc/claude-tg-starter/updates-frozen
+if [ -L "$UPDATES_FROZEN" ] || [ -e "$UPDATES_FROZEN" ]; then
+  FROZEN_REASON=""
+  if [ ! -L "$UPDATES_FROZEN" ] && [ -f "$UPDATES_FROZEN" ]; then
+    FROZEN_REASON="$(head -c 2000 -- "$UPDATES_FROZEN" 2>/dev/null || true)"
+  fi
+  echo "FATAL: оновлення кита на цьому сервері заморожено власником${FROZEN_REASON:+: $FROZEN_REASON}" >&2
+  exit 3
+fi
+# END owner freeze preflight
 KIT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-H=/home/claude
-ENV_SAVED=/etc/claude-tg-starter/agent.env
+# The target must be selected explicitly for a secondary instance. Never infer
+# it from a shared /opt checkout or silently use the primary agent's saved env.
+AGENT_USER="${AGENT_USER:-claude}"
+[[ "$AGENT_USER" =~ ^[a-z][a-z0-9-]{0,30}$ ]] || {
+  echo "FATAL: некоректне значення AGENT_USER" >&2; exit 1;
+}
+case "$AGENT_USER" in
+  root|claude-browser|streampost)
+    echo "FATAL: зарезервоване значення AGENT_USER" >&2; exit 1 ;;
+esac
+H="/home/$AGENT_USER"
+if [ "$AGENT_USER" = claude ]; then
+  ENV_SAVED=/etc/claude-tg-starter/agent.env
+  AGENT_SERVICE=claude-telegram.service
+  CORPORATE_STOPPED_PREFLIGHT=/run/claude-corporate-stopped-preflight.json
+else
+  ENV_SAVED="/etc/claude-tg-starter/agent-$AGENT_USER.env"
+  AGENT_SERVICE="claude-telegram@$AGENT_USER.service"
+  CORPORATE_STOPPED_PREFLIGHT="/run/claude-corporate-stopped-preflight-$AGENT_USER.json"
+fi
+export AGENT_USER
 RESTART_HOLD="$H/logs/restart-hold.until"
 CORPORATE_STATE_DIR="$H/.claude/channels/telegram"
 CORPORATE_DB="$CORPORATE_STATE_DIR/messages.db"
 CORPORATE_MARKER="$CORPORATE_STATE_DIR/corporate-isolation-activated"
-CORPORATE_STOPPED_PREFLIGHT=/run/claude-corporate-stopped-preflight.json
 CORPORATE_ISOLATION_ACTIVATED=0
 TG_CORPORATE_SESSIONS_LIVE=""
 CLAUDE_UPDATE_MAINTENANCE="${CLAUDE_UPDATE_MAINTENANCE:-0}"
@@ -38,7 +70,22 @@ case "$CLAUDE_UPDATE_MAINTENANCE" in
     ;;
 esac
 export CLAUDE_UPDATE_MAINTENANCE
+NOVSKY_ALLOW_PINNED_LEGACY_SHARED_CONTEXT="${NOVSKY_ALLOW_PINNED_LEGACY_SHARED_CONTEXT:-0}"
+case "$NOVSKY_ALLOW_PINNED_LEGACY_SHARED_CONTEXT" in
+  0|1) ;;
+  *) echo "FATAL: некоректний режим резервного контексту" >&2; exit 1 ;;
+esac
+legacy_context_args=()
+if [ "$NOVSKY_ALLOW_PINNED_LEGACY_SHARED_CONTEXT" = 1 ]; then
+  if [ "$AGENT_USER" != "claude-8709793308" ]; then
+    echo "FATAL: старий спільний контекст дозволено лише для тестового агента" >&2
+    exit 1
+  fi
+  legacy_context_args+=(--allow-pinned-legacy-shared-context)
+fi
+export NOVSKY_ALLOW_PINNED_LEGACY_SHARED_CONTEXT
 
+UPDATE_ACTION="${1:-}"
 case "${1:-}" in
   ""|--license-preflight) ;;
   *) echo "FATAL: unknown update option" >&2; exit 1 ;;
@@ -47,9 +94,9 @@ esac
 
 require_primary_service_stopped() {
   local state status=0
-  state="$(systemctl is-active claude-telegram.service 2>/dev/null)" || status=$?
+  state="$(systemctl is-active "$AGENT_SERVICE" 2>/dev/null)" || status=$?
   if [ "$status" -ne 3 ] || [ "$state" != inactive ]; then
-    echo "FATAL: перед оновленням claude-telegram.service має бути зупинено" >&2
+    echo "FATAL: перед оновленням $AGENT_SERVICE має бути зупинено" >&2
     return 1
   fi
 }
@@ -61,8 +108,8 @@ require_valid_restart_hold() {
     return 1
   fi
   metadata="$(stat -c '%U:%G:%a' -- "$RESTART_HOLD" 2>/dev/null || true)"
-  if [ "$metadata" != "claude:claude:600" ]; then
-    echo "FATAL: $RESTART_HOLD має належати claude:claude і мати режим 600" >&2
+  if [ "$metadata" != "$AGENT_USER:$AGENT_USER:600" ]; then
+    echo "FATAL: $RESTART_HOLD має належати $AGENT_USER:$AGENT_USER і мати режим 600" >&2
     return 1
   fi
   until="$(cat -- "$RESTART_HOLD" 2>/dev/null || true)"
@@ -90,7 +137,7 @@ require_valid_restart_hold() {
 # виконується, і служба стартує. Максимальний час — 24 години, стільки ж
 # дозволяє require_valid_restart_hold.
 # Каталог перекривається лише тестом; на живому боксі це завжди systemd.
-MAINTENANCE_DROPIN_DIR="${MAINTENANCE_DROPIN_DIR:-/etc/systemd/system/claude-telegram.service.d}"
+MAINTENANCE_DROPIN_DIR="${MAINTENANCE_DROPIN_DIR:-/etc/systemd/system/$AGENT_SERVICE.d}"
 MAINTENANCE_DROPIN="$MAINTENANCE_DROPIN_DIR/zz-maintenance-hold.conf"
 
 install_maintenance_dropin() {
@@ -190,7 +237,7 @@ PY
     echo "FATAL: комплект оновлення не має corporate-control" >&2
     return 1
   }
-  runuser -u claude -- env HOME="$H" \
+  runuser -u "$AGENT_USER" -- env HOME="$H" \
     TELEGRAM_STATE_DIR="$CORPORATE_STATE_DIR" \
     CORPORATE_MODULE_DIR="$KIT/modules/telegram-corporate" \
     PATH="$H/.local/bin:$H/.bun/bin:/usr/local/bin:/usr/bin:/bin" \
@@ -203,7 +250,7 @@ PY
 }
 
 validate_kit_checkout() {
-  local foreign_owner origin status
+  local foreign_owner origin status own_kit
   [ "$(stat -c %U "$KIT")" = root ] || {
     echo "FATAL: відмовляюся запускати комплект оновлення, що не належить root: $KIT" >&2
     return 1
@@ -213,6 +260,19 @@ validate_kit_checkout() {
     echo "FATAL: комплект містить шлях, що не належить root: $foreign_owner" >&2
     return 1
   }
+  # Each agent updates only from its own kit folder: the primary from
+  # /opt/claude-tg-starter, a targeted instance from /opt/claude-tg-starter@<user>.
+  # Only the licence preflight runs from a staged kit beside the live one. This
+  # runs before any kit code, so a refusal leaves the folder untouched.
+  if [ "$UPDATE_ACTION" != --license-preflight ]; then
+    own_kit=/opt/claude-tg-starter
+    [ "$AGENT_USER" = claude ] || own_kit="$own_kit@$AGENT_USER"
+    # /opt itself may be a symlink; the kit must be the real folder under it.
+    [ "$(cd "$KIT" && pwd -P)" = "$(cd "${own_kit%/*}" && pwd -P)/${own_kit##*/}" ] || {
+      echo "FATAL: оновлення агента $AGENT_USER запускається лише з його комплекту $own_kit" >&2
+      return 1
+    }
+  fi
   git -C "$KIT" rev-parse --is-inside-work-tree >/dev/null 2>&1 || return 0
   origin="$(git -C "$KIT" remote get-url origin 2>/dev/null || true)"
   # What must match is the repository path, not how the host is spelled. A
@@ -237,10 +297,132 @@ validate_kit_checkout() {
 }
 
 validate_kit_checkout
+# BEGIN instance config preflight
+require_instance_config() {
+  [ "$AGENT_USER" != claude ] || return 0
+  # A secondary bot must never consume the primary bot's root-saved inputs.
+  # The live profile and bot token prove that the saved input belongs to this
+  # exact instance; no credential value is printed on failure.
+  if [ -L "$ENV_SAVED" ] || [ ! -f "$ENV_SAVED" ] || [ ! -r "$ENV_SAVED" ]; then
+    echo "FATAL: відсутні приватні налаштування $ENV_SAVED" >&2
+    return 1
+  fi
+  if [ "$(stat -c '%U:%G:%a' -- "$ENV_SAVED" 2>/dev/null || true)" != root:root:600 ]; then
+    echo "FATAL: небезпечні права на $ENV_SAVED" >&2
+    return 1
+  fi
+  if [ -L "$H" ] || [ ! -d "$H" ] || [ "$(stat -c '%U' -- "$H" 2>/dev/null || true)" != "$AGENT_USER" ]; then
+    echo "FATAL: каталог вибраного агента не належить $AGENT_USER" >&2
+    return 1
+  fi
+  if [ -L "$H/.agent-profile.env" ] || [ ! -f "$H/.agent-profile.env" ] \
+      || [ -L "$CORPORATE_STATE_DIR/.env" ] || [ ! -f "$CORPORATE_STATE_DIR/.env" ]; then
+    echo "FATAL: відсутній поточний профіль або Telegram env для $AGENT_USER" >&2
+    return 1
+  fi
+  local saved_bot live_bot saved_token live_token
+  saved_bot="$(python3 "$KIT/assets/bin/saved-env-export" --value "$ENV_SAVED" BOT_USERNAME)" || return 1
+  live_bot="$(python3 "$KIT/assets/lib/merge-env.py" --value "$H/.agent-profile.env" BOT_USERNAME)" || return 1
+  saved_token="$(python3 "$KIT/assets/bin/saved-env-export" --value "$ENV_SAVED" TELEGRAM_BOT_TOKEN)" || return 1
+  live_token="$(python3 "$KIT/assets/lib/merge-env.py" --value "$CORPORATE_STATE_DIR/.env" TELEGRAM_BOT_TOKEN)" || return 1
+  if [ -z "$saved_bot" ] || [ "$saved_bot" != "$live_bot" ] \
+      || [[ "$saved_token" != *:* ]] || [[ "$live_token" != *:* ]] \
+      || [ "${saved_token%%:*}" != "${live_token%%:*}" ]; then
+    echo "FATAL: збережені налаштування не відповідають агенту $AGENT_USER" >&2
+    return 1
+  fi
+}
+require_instance_config
+# END instance config preflight
+# BEGIN instance service target preflight
+require_instance_service_target() {
+  [ "$AGENT_USER" != claude ] || return 0
+  local details key value unit_id load_state service_user workdir command
+  details="$(systemctl show "$AGENT_SERVICE" \
+    --property=Id,LoadState,User,WorkingDirectory,ExecStart --no-pager 2>/dev/null)" || {
+    echo "FATAL: не вдалося перевірити службу $AGENT_SERVICE" >&2
+    return 1
+  }
+  while IFS='=' read -r key value; do
+    case "$key" in
+      Id) unit_id="$value" ;;
+      LoadState) load_state="$value" ;;
+      User) service_user="$value" ;;
+      WorkingDirectory) workdir="$value" ;;
+      ExecStart) command="$value" ;;
+    esac
+  done <<< "$details"
+  if [ "${unit_id:-}" != "$AGENT_SERVICE" ] || [ "${load_state:-}" != loaded ] \
+      || [ "${service_user:-}" != "$AGENT_USER" ] || [ "${workdir:-}" != "$H" ] \
+      || [[ "${command:-}" != *"$H/bin/claude-telegram-bot"* ]]; then
+    echo "FATAL: служба $AGENT_SERVICE не відповідає вибраному агенту" >&2
+    return 1
+  fi
+}
+require_instance_service_target
+# END instance service target preflight
 # Wrappers call --license-preflight while the agent is still running. Applying
 # an update always verifies again, including retries on existing installations.
 python3 "$KIT/assets/lib/agent-license.py" --saved-env "$ENV_SAVED" \
   --bot-env "$H/.claude/channels/telegram/.env"
+# BEGIN pre-stop persona preflight
+# The outer updater runs --license-preflight while the service is still alive.
+# Check the same rendered personas install-core will check after the stop, using
+# saved inputs overlaid by the owner's current profile. This subshell reads
+# settings as data and leaves no values in the caller's environment.
+preflight_personas_before_stop() (
+  set -euo pipefail
+  local exports_file role_profile action="${1:-check}"
+  exports_file="$(mktemp)"
+  trap 'rm -f "${exports_file:-}"' EXIT
+  python3 "$KIT/assets/bin/saved-env-export" "$ENV_SAVED" \
+    AGENT_NAME OWNER_NAME OWNER_TG_USERNAME OWNER_CHAT_ID BOT_USERNAME \
+    TIMEZONE CALENDAR_EMAIL AGENT_ROLE > "$exports_file"
+  while IFS= read -r -d '' name && IFS= read -r -d '' value; do
+    printf -v "$name" '%s' "$value"
+    export "$name"
+  done < "$exports_file"
+  python3 "$KIT/assets/bin/update-safety-check" profile-export \
+    --home "$H" > "$exports_file"
+  while IFS= read -r -d '' name && IFS= read -r -d '' value; do
+    printf -v "$name" '%s' "$value"
+    export "$name"
+  done < "$exports_file"
+  [ -n "${AGENT_NAME:-}" ] || {
+    echo "FATAL: AGENT_NAME не задано ані в поточному профілі, ані в $ENV_SAVED" >&2
+    return 1
+  }
+  role_profile="$KIT/assets/product/ROLE.md"
+  if [ -n "${AGENT_ROLE:-}" ]; then
+    role_profile="$KIT/assets/roles/$AGENT_ROLE/ROLE.md"
+    [ -f "$role_profile" ] || {
+      echo "FATAL: невідома роль агента; оновлення зупинено" >&2
+      return 1
+    }
+  fi
+  source "$KIT/assets/lib/persona-baseline.sh"
+  check_persona() {
+    local source="$1" destination="$2" baseline="$3"
+    render_template() {
+      local template="$1" output="$2"
+      shift 2
+      runuser -u "$AGENT_USER" -- env \
+        AGENT_NAME="$AGENT_NAME" OWNER_NAME="${OWNER_NAME:-}" \
+        OWNER_TG_USERNAME="${OWNER_TG_USERNAME:-}" OWNER_CHAT_ID="${OWNER_CHAT_ID:-}" \
+        BOT_USERNAME="${BOT_USERNAME:-}" TIMEZONE="${TIMEZONE:-}" \
+        CALENDAR_EMAIL="${CALENDAR_EMAIL:-}" DEPLOY_DATE="$(date +%F)" \
+        AGENT_HOME="$H" AGENT_SERVICE="$AGENT_SERVICE" AGENT_USER="$AGENT_USER" \
+        python3 "$KIT/assets/lib/render-template.py" "$@" "$template" "$output"
+    }
+    guard_managed_persona "$action" "$source" "$destination" "$baseline"
+  }
+  check_persona "$KIT/assets/templates/CLAUDE.md.template" \
+    "$H/.claude/CLAUDE.premium.md" "$H/.claude/product/CLAUDE.premium.sha256"
+  check_persona "$role_profile" \
+    "$H/.claude/CLAUDE.product.md" "$H/.claude/product/CLAUDE.product.sha256"
+)
+preflight_personas_before_stop
+# END pre-stop persona preflight
 if [ "${1:-}" = --license-preflight ]; then
   exit 0
 fi
@@ -248,7 +430,95 @@ if [ "$CLAUDE_UPDATE_MAINTENANCE" != 1 ]; then
   echo "FATAL: update.sh працює лише всередині перевіреного maintenance-вікна з UPGRADING.md" >&2
   exit 1
 fi
+
+# BEGIN optional module maintenance preflight
+# Check persisted flags before the first systemd or runtime write. These three
+# optional installers still have no managed baseline for owner-edited scripts.
+# Updating such an agent requires a separate reviewed module migration.
+[ -r "$ENV_SAVED" ] || {
+  echo "FATAL: не вдалося прочитати збережені налаштування агента: $ENV_SAVED" >&2
+  exit 1
+}
+for optional_name in MODULE_CHANNEL_PUBLISH MODULE_INSTAGRAM_DM MODULE_YOUTUBE_COMMENTS; do
+  optional_value="$(python3 "$KIT/assets/bin/saved-env-export" --value "$ENV_SAVED" "$optional_name")" || {
+    echo "FATAL: не вдалося перевірити $optional_name у збережених налаштуваннях" >&2
+    exit 1
+  }
+  case "$optional_value" in
+    ""|0) ;;
+    1)
+      echo "FATAL: $optional_name увімкнено; потрібна окрема перевірка змін модуля перед оновленням" >&2
+      exit 1
+      ;;
+    *)
+      echo "FATAL: $optional_name має некоректне значення у збережених налаштуваннях" >&2
+      exit 1
+      ;;
+  esac
+done
+# END optional module maintenance preflight
+
+# The module installer swaps its whole static tree. Detect owner changes before
+# update.sh makes its first change, then let install.sh recheck before the swap.
+if python3 "$KIT/assets/lib/product-config.py" --file "$KIT/assets/product/runtime.json" \
+  has-feature telegram-corporate-sessions; then
+  runuser -u "$AGENT_USER" -- env HOME="$H" python3 \
+    "$KIT/modules/telegram-corporate/module-update-guard.py" check \
+    "$KIT/modules/telegram-corporate" \
+    "$H/.local/share/claude-telegram-corporate" \
+    "$H/.claude/product/corporate-module-baseline.json" "$KIT"
+else
+  feature_status=$?
+  [ "$feature_status" -eq 1 ] || {
+    echo "FATAL: не вдалося перевірити corporate module feature" >&2
+    exit 2
+  }
+fi
+# Root backup collector, policy and cron are outside the agent-home rollback.
+# Ordinary maintenance may continue only if this staged kit can leave every
+# existing system-context path untouched. Check before the first updater write.
 require_valid_restart_hold
+python3 -B "$KIT/assets/lib/install-backup-context.py" --check-current \
+  --allow-maintenance-hold "${legacy_context_args[@]}" \
+  --home "$H" --user "$AGENT_USER" --unit "$AGENT_SERVICE" --engine claude >/dev/null || {
+    echo "FATAL: backup context needs a reviewed migration before kit maintenance" >&2
+    exit 2
+  }
+# Check the installed CLIs before this updater creates a systemd drop-in or
+# changes any live file. A kit update never installs an unpinned CLI release.
+env AGENT_USER="$AGENT_USER" bash "$KIT/assets/bin/update-agent-clis" --check
+require_primary_service_stopped
+# A changed managed-plugin policy needs a separate migration with its own
+# rollback plan. A normal kit update keeps the installed CLI/plugin cache and
+# checks the local pinned source before install-core changes any live file.
+python3 "$KIT/assets/lib/preflight-maintenance-plugins.py" "$KIT" "$H"
+# With an unchanged golden, use the staged verifier. When this kit advances
+# only its reviewed golden, the installed verifier must inspect the old local
+# contract before install-core installs the new one.
+if cmp -s "$KIT/assets/product/telegram-plugin-compat.json" \
+    "$H/.claude/product/telegram-plugin-compat.json"; then
+  PREFLIGHT_RECONCILER="$KIT/assets/bin/reconcile-telegram-plugin"
+else
+  PREFLIGHT_RECONCILER="$H/bin/reconcile-telegram-plugin"
+fi
+runuser -u "$AGENT_USER" -- env HOME="$H" \
+  /usr/bin/timeout --foreground 30s \
+  "$KIT/assets/bin/plugin-doctor" --json >/dev/null || {
+    echo "FATAL: встановлені плагіни не відповідають чинному контракту; оновлення не розпочато" >&2
+    exit 2
+  }
+runuser -u "$AGENT_USER" -- env HOME="$H" \
+  /usr/bin/timeout --foreground 30s \
+  "$PREFLIGHT_RECONCILER" --marketplace-source-check >/dev/null || {
+    echo "FATAL: локальне джерело Telegram plugin не відповідає зафіксованій версії" >&2
+    exit 2
+  }
+runuser -u "$AGENT_USER" -- env HOME="$H" \
+  /usr/bin/timeout --foreground 30s \
+  "$PREFLIGHT_RECONCILER" --json >/dev/null || {
+    echo "FATAL: встановлений Telegram plugin не сумісний із комплектом" >&2
+    exit 2
+  }
 install_maintenance_dropin
 # Обробник сигналу сам по собі не зупиняє скрипт: без явного виходу ми б зняли
 # drop-in і поїхали оновлювати далі вже без захисту. Тому INT і TERM виходять,
@@ -345,7 +615,7 @@ if [ "$CORPORATE_ISOLATION_ACTIVATED" = 1 ]; then
     echo "FATAL: активована корпоративна ізоляція не має corporate-control" >&2
     exit 2
   }
-  corporate_status="$(runuser -u claude -- env HOME="$H" \
+  corporate_status="$(runuser -u "$AGENT_USER" -- env HOME="$H" \
     PATH="$H/.local/bin:$H/.bun/bin:/usr/local/bin:/usr/bin:/bin" \
     "$H/bin/corporate-control" status --json)" || {
       echo "FATAL: не вдалося перевірити корпоративну ізоляцію" >&2
@@ -387,7 +657,12 @@ fi
 # Keep one transaction-local, root-only SQLite recovery source before the first
 # code/package replacement. The outer restore manifest remains authoritative.
 if [ -f "$CORPORATE_DB" ]; then
-  CORPORATE_BACKUP_DIR="/var/backups/claude-agent/update-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+  if [ "$AGENT_USER" = claude ]; then
+    CORPORATE_BACKUP_ROOT=/var/backups/claude-agent
+  else
+    CORPORATE_BACKUP_ROOT="/var/backups/claude-agent/$AGENT_USER"
+  fi
+  CORPORATE_BACKUP_DIR="$CORPORATE_BACKUP_ROOT/update-$(date -u +%Y%m%dT%H%M%SZ)-$$"
   install -d -m 700 -o root -g root "$CORPORATE_BACKUP_DIR"
   sqlite3 "$CORPORATE_DB" ".backup '$CORPORATE_BACKUP_DIR/messages.db'" || {
     echo "FATAL: не вдалося створити узгоджену резервну копію messages.db" >&2
@@ -401,8 +676,15 @@ echo "==> Оновлення з комплекту — $KIT"
 # ---- 1. use the verified staged kit ----
 echo "[1/5] режим обслуговування: використовую перевірену підготовлену ревізію"
 
-echo "[2/5] оновлюю Claude Code і Codex"
-env CLAUDE_UPDATE_MAINTENANCE="$CLAUDE_UPDATE_MAINTENANCE" bash "$KIT/assets/bin/update-agent-clis"
+echo "[2/5] зберігаю встановлені Claude Code і Codex"
+# BEGIN stale codex link
+# Older kits linked /usr/local/bin/codex to the primary's own CLI. Root never
+# runs it and every agent's helper finds its own copy; remove only that link.
+if [ "$AGENT_USER" = claude ] && [ -L /usr/local/bin/codex ] \
+    && [ "$(readlink /usr/local/bin/codex)" = /home/claude/.npm-global/bin/codex ]; then
+  rm -f /usr/local/bin/codex
+fi
+# END stale codex link
 
 # Retire installed experimental multi-user transport before install-core can
 # restart the stable poller. Existing deployments already have this root-owned
@@ -428,7 +710,7 @@ if [[ -f "$LEGACY_MULTI_STATE_DIR/enabled" || -f "$LEGACY_MULTI_STATE_DIR/transi
   transition_tmp="$LEGACY_MULTI_STATE_DIR/.transitioning.$$"
   printf 'direction=disabling\nstarted_at=%s\n' "$(date +%s)" > "$transition_tmp"
   chmod 0600 "$transition_tmp"
-  chown claude:claude "$transition_tmp"
+  chown "$AGENT_USER:$AGENT_USER" "$transition_tmp"
   mv -f "$transition_tmp" "$LEGACY_MULTI_STATE_DIR/transitioning"
   "$LEGACY_RECONCILE" reconcile
   if [[ -f "$LEGACY_MULTI_STATE_DIR/enabled" \
@@ -522,7 +804,7 @@ if [ "${MODULE_TELEGRAM_CORPORATE:-1}" = 1 ] && python3 "$KIT/assets/lib/product
     echo "FATAL: комплект вибрав корпоративні сесії, але corporate-control не встановлено" >&2
     exit 2
   }
-  runuser -u claude -- env HOME="$H" \
+  runuser -u "$AGENT_USER" -- env HOME="$H" \
     PATH="$H/.local/bin:$H/.bun/bin:/usr/local/bin:/usr/bin:/bin" \
     "$H/bin/corporate-control" migrate --no-start || {
       echo "FATAL: не вдалося виконати інертну міграцію корпоративної схеми" >&2
@@ -536,37 +818,16 @@ else
   }
 fi
 
-# install-core converges settings and the managed-plugin policy. Apply that
-# policy through Claude CLI as well so stale kit-managed plugin caches and
-# marketplaces are removed during Premium-to-role or role-to-role updates.
-echo "      узгоджую керовані плагіни Claude"
-runuser -u claude -- env HOME="$H" CLAUDE_UPDATE_MAINTENANCE="$CLAUDE_UPDATE_MAINTENANCE" "$H/bin/install-plugins"
-
 # ---- 3. converge only the reviewed official Telegram 0.0.7 boundary ----
 echo "[4/5] перевіряю Telegram plugin 0.0.7 і накладаю сумісний golden"
 require_primary_service_stopped
-run_telegram_plugin_cli() {
-  local label="$1" status=0
-  shift
-  runuser -u claude -- env HOME="$H" \
-    /usr/bin/timeout --foreground 120s "$@" || status=$?
-  if [ "$status" -eq 124 ]; then
-    echo "FATAL: $label перевищило 120 секунд; Telegram plugin не оновлено" >&2
-    return 1
-  fi
-  if [ "$status" -ne 0 ]; then
-    echo "FATAL: $label завершилося з кодом $status" >&2
-    return 1
-  fi
-}
-run_telegram_plugin_cli "оновлення marketplace Telegram" \
-  "$H/.local/bin/claude" plugin marketplace update claude-plugins-official
-runuser -u claude -- env HOME="$H" \
-  "$H/bin/reconcile-telegram-plugin" --marketplace-source-check
-run_telegram_plugin_cli "оновлення Telegram plugin" \
-  "$H/.local/bin/claude" plugin update telegram@claude-plugins-official --scope user
+runuser -u "$AGENT_USER" -- env HOME="$H" \
+  "$H/bin/plugin-doctor" --json >/dev/null || {
+    echo "FATAL: стан плагінів змінився під час install-core" >&2
+    exit 2
+  }
 TELEGRAM_RECONCILE_RECEIPT="$(
-  runuser -u claude -- env HOME="$H" \
+  runuser -u "$AGENT_USER" -- env HOME="$H" \
     "$H/bin/reconcile-telegram-plugin" --apply --json
 )"
 schema_relative="$(
@@ -601,7 +862,7 @@ fi
   echo "FATAL: середовище виконання Bun не знайдено в $H/.local/bin або $H/.bun/bin" >&2
   exit 1
 }
-runuser -u claude -- env HOME="$H" \
+runuser -u "$AGENT_USER" -- env HOME="$H" \
   CLAUDE_UPDATE_MAINTENANCE="$CLAUDE_UPDATE_MAINTENANCE" \
   ATARAX_SUPPRESS_TELEGRAM=1 \
   timeout 15s "$BUN" "$schema_server" </dev/null >/dev/null || {
@@ -620,8 +881,8 @@ reconcile_transport_daemon() {
   config="$KIT/assets/lib/product-config.py"
   runtime="$KIT/assets/product/runtime.json"
   installer="$KIT/modules/transport-daemon/install.sh"
-  RECEIVER_DROPIN="${RECEIVER_DROPIN:-/etc/systemd/system/claude-telegram.service.d/transport-daemon.conf}"
-  agent_uid="$(id -u claude)"
+  RECEIVER_DROPIN="${RECEIVER_DROPIN:-/etc/systemd/system/$AGENT_SERVICE.d/transport-daemon.conf}"
+  agent_uid="$(id -u "$AGENT_USER")"
   user_manager="${RECEIVER_USER_MANAGER:-/run/user/$agent_uid/systemd/private}"
   user_unit="$H/.config/systemd/user/cash-tg-receiver.service"
   user_dropin="$H/.config/systemd/user/cash-tg-receiver.service.d/instance.conf"
@@ -638,7 +899,7 @@ reconcile_transport_daemon() {
     }
     echo "      оновлюю вибраний daemon приймання Telegram"
     env CLAUDE_UPDATE_MAINTENANCE="$CLAUDE_UPDATE_MAINTENANCE" \
-      bash "$installer" enable claude
+      bash "$installer" enable "$AGENT_USER"
     return
   else
     feature_status=$?
@@ -653,7 +914,7 @@ reconcile_transport_daemon() {
     [ ! -e "$path" ] || stale_daemon=1
   done
   if [ -e "$user_manager" ]; then
-    if runuser -u claude -- env HOME="$H" XDG_RUNTIME_DIR="/run/user/$agent_uid" \
+    if runuser -u "$AGENT_USER" -- env HOME="$H" XDG_RUNTIME_DIR="/run/user/$agent_uid" \
         systemctl --user is-active --quiet cash-tg-receiver.service; then
       stale_daemon=1
     else
@@ -671,9 +932,9 @@ reconcile_transport_daemon() {
 
   echo "      видаляю невибраний daemon приймання Telegram"
   if [ -e "$user_manager" ]; then
-    runuser -u claude -- env HOME="$H" XDG_RUNTIME_DIR="/run/user/$agent_uid" \
+    runuser -u "$AGENT_USER" -- env HOME="$H" XDG_RUNTIME_DIR="/run/user/$agent_uid" \
       systemctl --user disable --now cash-tg-receiver.service >/dev/null 2>&1 || true
-    if runuser -u claude -- env HOME="$H" XDG_RUNTIME_DIR="/run/user/$agent_uid" \
+    if runuser -u "$AGENT_USER" -- env HOME="$H" XDG_RUNTIME_DIR="/run/user/$agent_uid" \
         systemctl --user is-active --quiet cash-tg-receiver.service; then
       echo "FATAL: невибраний daemon приймання Telegram досі активний" >&2
       return 1
@@ -690,7 +951,7 @@ reconcile_transport_daemon() {
   fi
   rm -f "$user_dropin" "$user_unit" "$daemon_code" "$RECEIVER_DROPIN"
   if [ -e "$user_manager" ]; then
-    runuser -u claude -- env HOME="$H" XDG_RUNTIME_DIR="/run/user/$agent_uid" \
+    runuser -u "$AGENT_USER" -- env HOME="$H" XDG_RUNTIME_DIR="/run/user/$agent_uid" \
       systemctl --user daemon-reload
   fi
 }
@@ -702,7 +963,7 @@ reconcile_transport_daemon
 # poller started by the outer transaction must inherit this exact token before
 # `resume` can reopen employee admission.
 if [ "$CORPORATE_ISOLATION_ACTIVATED" = 1 ]; then
-  runuser -u claude -- env HOME="$H" \
+  runuser -u "$AGENT_USER" -- env HOME="$H" \
     PATH="$H/.local/bin:$H/.bun/bin:/usr/local/bin:/usr/bin:/bin" \
     "$H/bin/corporate-control" live-enable || {
       echo "FATAL: не вдалося підготувати live corporate cutover token" >&2

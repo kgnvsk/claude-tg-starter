@@ -34,7 +34,11 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     home = Path.home()
-    db = home / ".claude/channels/telegram/messages.db"
+    # The same history the receiver writes: its state dir, not always ~/.claude.
+    state = os.environ.get("TELEGRAM_STATE_DIR") or Path(
+        os.environ.get("CLAUDE_CONFIG_DIR") or home / ".claude"
+    ) / "channels/telegram"
+    db = Path(state) / "messages.db"
     transcribe = home / "bin/transcribe"
 
     try:
@@ -61,10 +65,17 @@ def main() -> int:
 
     with sqlite3.connect(db, timeout=5) as conn:
         conn.execute("PRAGMA busy_timeout=5000")
+        # A forwarded recording keeps the line that says whose voice it is.
+        row = conn.execute(
+            "SELECT text FROM messages WHERE chat_id=? AND direction='in' AND message_id=?",
+            (args.chat_id, args.message_id),
+        ).fetchone()
+        stored = (row[0] or "") if row else ""
+        lead = stored.split("\n", 1)[0] + "\n" if stored.startswith("Переслано від ") else ""
         changed = conn.execute(
             "UPDATE messages SET text=? "
             "WHERE chat_id=? AND direction='in' AND message_id=?",
-            (transcript, args.chat_id, args.message_id),
+            (lead + transcript, args.chat_id, args.message_id),
         ).rowcount
         if changed == 0:
             print("matching Telegram history row not found", file=sys.stderr)

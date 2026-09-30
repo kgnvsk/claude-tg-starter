@@ -3,11 +3,13 @@
 
 import argparse
 import fcntl
+import json
 import os
 import re
 import shutil
 import sys
 import tempfile
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,9 +19,13 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 HEADER_RE = re.compile(r"^([A-Z][A-Z0-9_]*)=(.*)$")
 TASK_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 CHAT_RE = re.compile(r"^-?[0-9]{1,20}$")
+ACTOR_RE = re.compile(r"^[1-9][0-9]{0,19}$")
 UINT_RE = re.compile(r"^[0-9]{1,18}$")
 QUIET_RE = re.compile(r"^(?:[01][0-9]|2[0-3]):[0-5][0-9]$")
 PARSE_VALUES = {"text", "markdown", "markdownv2", "html"}
+DELIVERY_STATES = {"running", "ready", "sending", "uncertain", "blocked", "cancelled",
+                   "agent_failed"}
+DELIVERY_KEY_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 class TaskError(Exception):
@@ -52,6 +58,21 @@ def task_id(value):
 def chat_id(value):
     if not CHAT_RE.fullmatch(value) or int(value) == 0:
         raise TaskError(f"invalid CHAT: {value}")
+    return value
+
+
+def thread_id(value, chat):
+    if value is None:
+        return None
+    number = uint(value, "THREAD_ID", positive=True)
+    if not chat.startswith("-"):
+        raise TaskError("THREAD_ID requires a group CHAT")
+    return str(number)
+
+
+def actor_id(value):
+    if not ACTOR_RE.fullmatch(value):
+        raise TaskError(f"invalid ACTOR: {value}")
     return value
 
 
@@ -125,6 +146,9 @@ def validate_record(record, expected_task):
     task_id(headers["TASK"])
     epoch = uint(headers.get("EPOCH", ""), "EPOCH", positive=True)
     chat_id(headers.get("CHAT", ""))
+    thread_id(headers.get("THREAD_ID"), headers["CHAT"])
+    if "ACTOR" in headers:
+        actor_id(headers["ACTOR"])
     parse = headers.get("PARSE", "text")
     if parse not in PARSE_VALUES:
         raise TaskError(f"invalid PARSE in {record.path}")
@@ -134,6 +158,10 @@ def validate_record(record, expected_task):
     if repeat is not None:
         uint(repeat, "REPEAT_SECONDS", positive=True)
         uint(headers.get("COUNT", "0"), "COUNT")
+        if "CADENCE_EPOCH" in headers:
+            anchor = uint(headers["CADENCE_EPOCH"], "CADENCE_EPOCH", positive=True)
+            if anchor > epoch:
+                raise TaskError(f"CADENCE_EPOCH follows EPOCH in {record.path}")
         timezone = timezone_name(headers.get("TIMEZONE"))
         quiet_pair(headers.get("QUIET_START"), headers.get("QUIET_END"), timezone)
         if "UNTIL_EPOCH" in headers:
@@ -141,7 +169,8 @@ def validate_record(record, expected_task):
             if until < epoch:
                 raise TaskError(f"UNTIL_EPOCH precedes EPOCH in {record.path}")
     else:
-        forbidden = {"COUNT", "TIMEZONE", "QUIET_START", "QUIET_END", "UNTIL_EPOCH"}
+        forbidden = {"COUNT", "TIMEZONE", "QUIET_START", "QUIET_END", "UNTIL_EPOCH",
+                     "CADENCE_EPOCH"}
         if forbidden.intersection(headers):
             raise TaskError(f"repeat-only header without REPEAT_SECONDS in {record.path}")
 
@@ -168,6 +197,10 @@ def infer_mode(records, task):
     if sequence_marked:
         if len(sequence_marked) != len(records):
             raise TaskError(f"partial sequence state for {task}")
+        destinations = {(record.headers["CHAT"], record.headers.get("THREAD_ID"),
+                         record.headers.get("ACTOR")) for record in records}
+        if len(destinations) != 1:
+            raise TaskError(f"mixed sequence destination for {task}")
         totals = {int(record.headers["SEQUENCE_COUNT"]) for record in records}
         indexes = [int(record.headers["SEQUENCE_INDEX"]) for record in records]
         if len(totals) != 1:
@@ -193,8 +226,17 @@ def task_records(rem_dir, task):
     return records
 
 
+def require_scope(records, actor, chat):
+    if actor is None:
+        return
+    for record in records:
+        if record.headers.get("ACTOR") != actor or record.headers.get("CHAT") != chat:
+            raise TaskError("task is outside this actor and chat")
+
+
 def require_equivalent(records, args, requested_mode):
     actual_mode, _ = infer_mode(records, args.task)
+    require_scope(records, args.actor, args.chat)
     if actual_mode != requested_mode:
         raise TaskError(
             f"existing task mode mismatch: requested {requested_mode}, found {actual_mode}"
@@ -205,8 +247,11 @@ def require_equivalent(records, args, requested_mode):
         expected = {
             "EPOCH": str(args.at),
             "CHAT": args.chat,
+            "THREAD_ID": args.thread_id,
             "PARSE": "text",
             "RUN": "1" if getattr(args, "run", False) else None,
+            "RETRY_SAFE": "1" if getattr(args, "retry_safe", False) else None,
+            "ACTOR": args.actor,
         }
         if any(record.headers.get(key) != value for key, value in expected.items()):
             raise TaskError(f"existing task arguments differ: {args.task}")
@@ -218,12 +263,15 @@ def require_equivalent(records, args, requested_mode):
         record = records[0]
         expected = {
             "CHAT": args.chat,
+            "THREAD_ID": args.thread_id,
             "PARSE": "text",
             "RUN": "1" if getattr(args, "run", False) else None,
+            "RETRY_SAFE": "1" if getattr(args, "retry_safe", False) else None,
             "REPEAT_SECONDS": str(args.every),
             "TIMEZONE": args.timezone,
             "QUIET_START": args.quiet_start,
             "QUIET_END": args.quiet_end,
+            "ACTOR": args.actor,
         }
         until = record.headers.get("UNTIL_EPOCH")
         if any(record.headers.get(key) != value for key, value in expected.items()):
@@ -245,22 +293,33 @@ def require_equivalent(records, args, requested_mode):
         if (
             record.headers["EPOCH"] != str(epoch)
             or record.headers["CHAT"] != args.chat
+            or record.headers.get("THREAD_ID") != args.thread_id
             or record.headers.get("PARSE", "text") != "text"
+            or record.headers.get("ACTOR") != args.actor
             or record.body != text
         ):
             raise TaskError(f"existing sequence checkpoint {index} differs: {args.task}")
 
 
-def verified_status(rem_dir, task):
+def verified_status(rem_dir, task, actor=None, chat=None):
+    if any(small_text(journal / "state") == "cancelled"
+           for journal in delivery_journals(rem_dir, task)):
+        raise TaskError(f"cancellation in progress for {task}; retry cancel")
     records = task_records(rem_dir, task)
     mode, epochs = infer_mode(records, task)
+    require_scope(records, actor, chat)
     records.sort(key=lambda record: (int(record.headers["EPOCH"]), record.path.name))
     fields = [f"task={task}", f"mode={mode}", f"files={len(records)}"]
     if mode == "sequence":
         fields.append("schedule=" + ",".join(str(epoch) for epoch in sorted(epochs)))
+        fields.append(f"chat={records[0].headers['CHAT']}")
+        if "THREAD_ID" in records[0].headers:
+            fields.append(f"thread={records[0].headers['THREAD_ID']}")
     else:
         record = records[0]
         fields.extend([f"at={record.headers['EPOCH']}", f"chat={record.headers['CHAT']}"])
+        if "THREAD_ID" in record.headers:
+            fields.append(f"thread={record.headers['THREAD_ID']}")
         if mode == "repeat":
             headers = record.headers
             fields.extend(
@@ -275,6 +334,184 @@ def verified_status(rem_dir, task):
             if "UNTIL_EPOCH" in headers:
                 fields.append(f"until={headers['UNTIL_EPOCH']}")
     return "VERIFIED " + " ".join(fields)
+
+
+def small_text(path):
+    """Read journal metadata only; never print or follow a saved task/result."""
+    try:
+        if path.is_symlink() or not path.is_file():
+            return None
+        with path.open("rb") as handle:
+            raw = handle.read(257)
+        return raw.decode("utf-8").strip() if len(raw) <= 256 else None
+    except (OSError, UnicodeError):
+        return None
+
+
+def saved_run_headers(path):
+    try:
+        if path.is_symlink() or not path.is_file():
+            return {}
+        with path.open("rb") as handle:
+            prefix = handle.read(4096).decode("utf-8")
+    except (OSError, UnicodeError):
+        return {}
+    headers = {}
+    for line in prefix.splitlines():
+        match = HEADER_RE.fullmatch(line)
+        if not match:
+            break
+        headers.setdefault(*match.groups())
+    return headers
+
+
+def delivery_journals(rem_dir, task):
+    root = rem_dir / ".run-delivery"
+    if root.is_symlink() or (root.exists() and not root.is_dir()):
+        raise TaskError("scheduled delivery journal is not a directory")
+    if not root.exists():
+        return []
+    return [journal for journal in sorted(root.iterdir())
+            if DELIVERY_KEY_RE.fullmatch(journal.name)
+            and not journal.is_symlink() and journal.is_dir()
+            and saved_run_headers(journal / "source.rem").get("TASK") == task]
+
+
+def replace_text(path, value):
+    fd, temporary = tempfile.mkstemp(prefix=".reminder-task.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(value + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+
+def delivery_status(rem_dir, task, actor=None, chat=None):
+    """Show unresolved scheduled occurrences and sends without printing payloads."""
+    journal_root = rem_dir / ".run-delivery"
+    rows = []
+    if journal_root.is_symlink():
+        raise TaskError("scheduled delivery journal is not a directory")
+    if journal_root.exists() and not journal_root.is_dir():
+        raise TaskError("scheduled delivery journal is not a directory")
+    for journal in sorted(journal_root.iterdir()) if journal_root.exists() else ():
+        if not DELIVERY_KEY_RE.fullmatch(journal.name) or journal.is_symlink() or not journal.is_dir():
+            continue
+        source = journal / "source.rem"
+        headers = saved_run_headers(source)
+        name = headers.get("TASK")
+        if not name or not TASK_RE.fullmatch(name):
+            name = small_text(journal / "name")
+        name = name if name and TASK_RE.fullmatch(name) else "unknown"
+        if name != task:
+            continue
+        if actor is not None and (headers.get("ACTOR") != actor or headers.get("CHAT") != chat):
+            continue
+        occurrence = headers.get("EPOCH", "unknown")
+        if not UINT_RE.fullmatch(occurrence):
+            occurrence = "unknown"
+        state = small_text(journal / "state") or "invalid"
+        if state not in DELIVERY_STATES:
+            state = "invalid"
+        cursor = small_text(journal / "cursor")
+        cursor = cursor if cursor and UINT_RE.fullmatch(cursor) else "unknown"
+        if state == "cancelled":
+            next_step = "retry_cancel"
+        elif state in {"blocked", "uncertain", "invalid"}:
+            next_step = "manual_review"
+        elif state in {"running", "sending"}:
+            next_step = "check_worker"
+        elif (cursor == "unknown" or source.is_symlink() or not source.is_file()
+              or (journal / "result.txt").is_symlink()
+              or not (journal / "result.txt").is_file()):
+            next_step = "manual_review"
+        else:
+            next_step = "worker_retry"
+        rows.append((name, occurrence, journal.name,
+                     f"PENDING task={name} occurrence={occurrence} state={state} "
+                     f"confirmed_chunks={cursor} next={next_step} record={journal.name}"))
+
+    quiet_runs = rem_dir / ".quiet-runs"
+    if quiet_runs.is_symlink() or (quiet_runs.exists() and not quiet_runs.is_dir()):
+        raise TaskError("quiet run journal is not a directory")
+    run_records = []
+    for journal in sorted(quiet_runs.iterdir()) if quiet_runs.exists() else ():
+        if not DELIVERY_KEY_RE.fullmatch(journal.name) or journal.is_symlink() or not journal.is_dir():
+            continue
+        headers = saved_run_headers(journal / "source.rem")
+        name = headers.get("TASK") or small_text(journal / "name")
+        if name != task:
+            continue
+        if actor is not None and (headers.get("ACTOR") != actor or headers.get("CHAT") != chat):
+            continue
+        occurrence = headers.get("EPOCH", "unknown")
+        if not UINT_RE.fullmatch(occurrence):
+            occurrence = "unknown"
+        state = small_text(journal / "state") or "invalid"
+        if state not in {"running", "finished", "agent_failed", "uncertain"}:
+            state = "invalid"
+        run_records.append((journal.name, occurrence, state))
+
+    quiet_root = rem_dir / ".quiet-delivery"
+    if quiet_root.is_symlink() or (quiet_root.exists() and not quiet_root.is_dir()):
+        raise TaskError("quiet delivery journal is not a directory")
+    visible_runs = {key: occurrence for key, occurrence, _ in run_records}
+    evidence = set()
+    for kind, directory in (("quiet_text", quiet_root),
+                            ("quiet_file", quiet_root / "files")):
+        if directory.is_symlink() or (directory.exists() and not directory.is_dir()):
+            raise TaskError("quiet delivery journal is not a directory")
+        for path in sorted(directory.glob("*.json")) if directory.exists() else ():
+            if not DELIVERY_KEY_RE.fullmatch(path.stem) or path.is_symlink() or not path.is_file():
+                continue
+            try:
+                with path.open("rb") as handle:
+                    raw = handle.read(16 * 1024 * 1024 + 1)
+                if len(raw) > 16 * 1024 * 1024:
+                    continue
+                record = json.loads(raw)
+            except (OSError, ValueError, UnicodeError):
+                continue
+            if not isinstance(record, dict) or record.get("task") != task:
+                continue
+            occurrence = record.get("occurrence")
+            if not isinstance(occurrence, str) or not UINT_RE.fullmatch(occurrence):
+                continue
+            run_key = record.get("run_key", "")
+            if not isinstance(run_key, str):
+                continue
+            if actor is not None and visible_runs.get(run_key) != occurrence:
+                continue
+            if run_key in visible_runs and visible_runs[run_key] == occurrence:
+                evidence.add(run_key)
+            state = record.get("state")
+            if state == "delivered":
+                continue
+            if not isinstance(state, str) or state not in {"ready", "sending", "uncertain", "blocked"}:
+                state = "invalid"
+            cursor = record.get("cursor", 0) if kind == "quiet_text" else 0
+            cursor = str(cursor) if type(cursor) is int and cursor >= 0 else "unknown"
+            next_step = ("worker_retry" if state == "ready" else
+                         "check_worker" if state == "sending" else "manual_review")
+            rows.append((task, occurrence, path.stem,
+                         f"PENDING task={task} occurrence={occurrence} kind={kind} "
+                         f"state={state} confirmed_chunks={cursor} "
+                         f"next={next_step} record={path.stem}"))
+
+    for key, occurrence, state in run_records:
+        if state == "finished" and key in evidence:
+            continue
+        shown_state = "no_delivery" if state == "finished" else state
+        next_step = "check_worker" if state == "running" else "manual_review"
+        rows.append((task, occurrence, key,
+                     f"PENDING task={task} occurrence={occurrence} kind=quiet_run "
+                     f"state={shown_state} next={next_step} record={key}"))
+    if not rows:
+        return "NO_PENDING_DELIVERY_RECORDS (not proof of delivery)"
+    return "\n".join(row[3] for row in sorted(rows))
 
 
 def render(headers, body):
@@ -303,15 +540,21 @@ def create_single(rem_dir, args, repeat=False):
     existing = task_records(rem_dir, args.task)
     if existing:
         require_equivalent(existing, args, "repeat" if repeat else "one")
-        return verified_status(rem_dir, args.task)
+        return verified_status(rem_dir, args.task, args.actor, args.chat)
     headers = [
         ("EPOCH", str(args.at)),
         ("CHAT", args.chat),
         ("PARSE", "text"),
         ("TASK", args.task),
     ]
+    if args.thread_id is not None:
+        headers.append(("THREAD_ID", args.thread_id))
+    if args.actor is not None:
+        headers.append(("ACTOR", args.actor))
     if getattr(args, "run", False):
         headers.append(("RUN", "1"))
+    if getattr(args, "retry_safe", False):
+        headers.append(("RETRY_SAFE", "1"))
     if repeat:
         headers.extend(
             [
@@ -328,7 +571,7 @@ def create_single(rem_dir, args, repeat=False):
     destination = rem_dir / f"{args.at}-{args.task}.rem"
     atomic_write(rem_dir, destination, content)
     try:
-        return verified_status(rem_dir, args.task)
+        return verified_status(rem_dir, args.task, args.actor, args.chat)
     except Exception:
         destination.unlink(missing_ok=True)
         raise
@@ -338,7 +581,7 @@ def create_sequence(rem_dir, args):
     existing = task_records(rem_dir, args.task)
     if existing:
         require_equivalent(existing, args, "sequence")
-        return verified_status(rem_dir, args.task)
+        return verified_status(rem_dir, args.task, args.actor, args.chat)
     stage = Path(tempfile.mkdtemp(prefix=f".{args.task}.stage.", dir=rem_dir))
     published = []
     staged = []
@@ -353,6 +596,10 @@ def create_sequence(rem_dir, args):
                 ("SEQUENCE_COUNT", str(total)),
                 ("SEQUENCE_INDEX", str(index)),
             ]
+            if args.thread_id is not None:
+                headers.append(("THREAD_ID", args.thread_id))
+            if args.actor is not None:
+                headers.append(("ACTOR", args.actor))
             staged_path = stage / f"{epoch}-{args.task}-{index}.pending"
             with staged_path.open("x", encoding="utf-8") as handle:
                 handle.write(render(headers, text))
@@ -375,7 +622,7 @@ def create_sequence(rem_dir, args):
             os.replace(source, destination)
             published.append(destination)
         stage.rmdir()
-        result = verified_status(rem_dir, args.task)
+        result = verified_status(rem_dir, args.task, args.actor, args.chat)
         if "mode=sequence" not in result or f"files={total}" not in result:
             raise TaskError("published sequence did not verify")
         return result
@@ -386,12 +633,45 @@ def create_sequence(rem_dir, args):
         raise
 
 
-def cancel_task(rem_dir, task):
+def cancel_task(rem_dir, task, actor=None, chat=None):
+    records = task_records(rem_dir, task)
+    journals = delivery_journals(rem_dir, task)
+    if actor is not None and records:
+        infer_mode(records, task)
+        require_scope(records, actor, chat)
+    stoppable = []
+    unresolved = []
+    for journal in journals:
+        headers = saved_run_headers(journal / "source.rem")
+        if actor is not None and (headers.get("ACTOR") != actor or headers.get("CHAT") != chat):
+            raise TaskError("task is outside this actor and chat")
+        state = small_text(journal / "state")
+        if state == "cancelled":
+            continue
+        topic = headers.get("THREAD_ID", "")
+        safe_topic = (headers.get("RUN") != "1" and headers.get("CHAT", "").startswith("-")
+                      and UINT_RE.fullmatch(topic) and int(topic) > 0
+                      and small_text(journal / "cursor") == "0")
+        if safe_topic and (state == "prepared" or
+                           (state == "ready" and small_text(journal / "settled") == "1")):
+            stoppable.append(journal)
+        else:
+            unresolved.append(journal)
+    # Commit cancellation before removing queued files. A crash after this
+    # marker cannot deliver the saved topic occurrence on recovery.
+    for journal in stoppable:
+        replace_text(journal / "state", "cancelled")
     for path in list(rem_dir.glob("*.rem")):
         if path.is_file() and peek_task(path) == task:
             path.unlink()
     if task_records(rem_dir, task):
         raise TaskError(f"task remains queued: {task}")
+    for journal in journals:
+        if small_text(journal / "state") == "cancelled":
+            shutil.rmtree(journal)
+    if unresolved:
+        return (f"PENDING task={task} future_files=0 unresolved_delivery={len(unresolved)}; "
+                "inspect delivery-status for the earlier occurrence")
     return f"VERIFIED task={task} mode=cancelled files=0"
 
 
@@ -399,8 +679,26 @@ def cancel_task(rem_dir, task):
 def queue_lock(rem_dir, lock_file):
     rem_dir.mkdir(parents=True, exist_ok=True)
     lock_file.parent.mkdir(parents=True, exist_ok=True)
-    with lock_file.open("a+", encoding="utf-8") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    # The tick may replace a lock an orphan still holds: a new file at the same path. A waiter
+    # re-opens the path while it waits and keeps only a lock on the file the path names now, so
+    # it neither waits for the orphan nor runs beside the new holder (Codex, 28.09).
+    while True:
+        handle = lock_file.open("a+", encoding="utf-8")
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            handle.close()
+            time.sleep(0.2)
+            continue
+        try:
+            current = os.stat(lock_file)
+        except FileNotFoundError:
+            current = None
+        held = os.fstat(handle.fileno())
+        if current is not None and (current.st_dev, current.st_ino) == (held.st_dev, held.st_ino):
+            break
+        handle.close()
+    with handle:
         yield
 
 
@@ -423,15 +721,20 @@ def parser():
 
     def identity(command):
         command.add_argument("--task", required=True)
+        command.add_argument("--actor")
 
     def message(command):
         identity(command)
         command.add_argument("--chat", required=True)
+        command.add_argument("--thread-id", help="Telegram forum topic ID from the current message; group --chat only")
         command.add_argument("--at", required=True)
         command.add_argument("--text", required=True)
         # The body stops being a note to the owner and becomes work the agent
         # performs headless; what arrives in the chat is the result.
         command.add_argument("--run", action="store_true")
+        # A run that dies is run once more only when the task says a replay is
+        # safe: it reads and reports, and acts on nothing outside.
+        command.add_argument("--retry-safe", action="store_true")
 
     one = commands.add_parser("one", help="create one durable reminder")
     message(one)
@@ -447,19 +750,36 @@ def parser():
     sequence = commands.add_parser("sequence", help="create durable checkpoints")
     identity(sequence)
     sequence.add_argument("--chat", required=True)
+    sequence.add_argument("--thread-id", help="Telegram forum topic ID from the current message; group --chat only")
     sequence.add_argument("--checkpoint", action="append", required=True, type=checkpoint)
 
     status = commands.add_parser("status", help="verify queued task state")
     identity(status)
+    status.add_argument("--chat")
+
+    delivery = commands.add_parser("delivery-status", help="show one task's unresolved result delivery")
+    identity(delivery)
+    delivery.add_argument("--chat", help="filter by the corporate chat ID")
     cancel = commands.add_parser("cancel", help="remove every queued file for a task")
     identity(cancel)
+    cancel.add_argument("--chat")
     return root
 
 
 def normalize(args):
     args.task = task_id(args.task)
+    if args.actor is not None:
+        args.actor = actor_id(args.actor)
     if args.command in {"one", "repeat", "sequence"}:
         args.chat = chat_id(args.chat)
+        args.thread_id = thread_id(args.thread_id, args.chat)
+    else:
+        if (args.actor is None) != (args.chat is None):
+            raise TaskError("ACTOR and CHAT must be provided together")
+        if args.chat is not None:
+            args.chat = chat_id(args.chat)
+    if getattr(args, "retry_safe", False) and not args.run:
+        raise TaskError("--retry-safe needs --run: only a task the scheduler runs can run again")
     if args.command in {"one", "repeat"}:
         args.at = uint(args.at, "EPOCH", positive=True)
         args.text = body_text(args.text)
@@ -490,6 +810,11 @@ def main():
             "REM_DIR", str(Path.home() / ".atarax/reminders")
         )
         rem_dir = Path(rem_dir_value)
+        if args.command == "delivery-status":
+            # A headless task can hold the queue lock for minutes. Journal fields
+            # are published atomically, so this read-only view never waits for it.
+            print(delivery_status(rem_dir, args.task, args.actor, args.chat))
+            return 0
         lock_file = Path(
             os.environ.get("LOCK_FILE", f"{rem_dir_value}.worker.lock")
         )
@@ -501,11 +826,11 @@ def main():
             elif args.command == "sequence":
                 result = create_sequence(rem_dir, args)
             elif args.command == "status":
-                result = verified_status(rem_dir, args.task)
+                result = verified_status(rem_dir, args.task, args.actor, args.chat)
             else:
-                result = cancel_task(rem_dir, args.task)
+                result = cancel_task(rem_dir, args.task, args.actor, args.chat)
         print(result)
-        return 0
+        return 2 if result.startswith("PENDING ") else 0
     except (TaskError, OSError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1

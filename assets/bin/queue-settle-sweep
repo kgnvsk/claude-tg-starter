@@ -12,8 +12,9 @@ once, so the guard is right and only its timing was wrong.
 This decides nothing about delivery: when a head has been sitting longer than
 QUEUE_SETTLE_AFTER_SECONDS it calls the same guard again over the finished
 transcript and lets it apply all of its own proofs. A refusal leaves the input
-untouched. With a durable request ledger this entire legacy sweep is inert:
-the receiver owns recovery and any decision to resume unfinished work.
+untouched. With a durable request ledger, unfinished work remains the receiver's
+responsibility. The only exception is an old guard-owned carrier whose exact
+final reply receipt and closed turn already prove completion.
 """
 import fcntl
 import json
@@ -25,6 +26,7 @@ import subprocess
 import sys
 import time
 import uuid
+from contextlib import closing
 
 AGENT_ROOT = pathlib.Path(os.environ.get("AGENT_ROOT") or os.environ.get("HOME") or "/home/claude")
 STATE_DIR = pathlib.Path(os.environ.get("TELEGRAM_STATE_DIR") or AGENT_ROOT / ".claude/channels/telegram")
@@ -262,11 +264,199 @@ def log_retained_delivery(delivery_id: str, age: int, note: str) -> None:
     log(f"{delivery_id} sat {age}s — retained for receiver recovery: {note or 'no confirmed output'}")
 
 
+def settle_completed_durable_head() -> None:
+    """Retire only an old guard-owned carrier with a proven final reply.
+
+    The durable receiver records completion before the Stop guard can inspect
+    its transcript. If that guard misses the closing record, its started carrier
+    blocks FIFO forever even though the reply was delivered. This proof is
+    deliberately narrower than the guard's general completion decision.
+    """
+    lock = None
+    try:
+        LIFECYCLE_LOCK.parent.mkdir(parents=True, exist_ok=True)
+        lock = LIFECYCLE_LOCK.open("a")
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (OSError, BlockingIOError):
+        if lock is not None:
+            lock.close()
+        return
+    try:
+        with closing(sqlite3.connect(STATE_DIR / "messages.db", timeout=5)) as connection, connection:
+            connection.execute("BEGIN IMMEDIATE")
+            # A completed result can still have a later native callback. An
+            # older receiver has no immutable callback ledger, so it cannot
+            # prove that retiring this carrier is safe.
+            callback_columns = {item[1] for item in connection.execute(
+                "PRAGMA table_info(delivery_task_returns)"
+            )}
+            if not {"session_id", "stamp", "turn_id", "delivery_id", "observed_at"} <= callback_columns:
+                return
+            # The receiver snapshots pre-ledger native sessions before it can
+            # rebind a retained request. An old request timestamp says nothing
+            # about whether the newly claimed native session is safe.
+            if not connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='delivery_legacy_native_sessions'"
+            ).fetchone():
+                return
+            if not connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='delivery_task_owners'"
+            ).fetchone():
+                return
+            # An owner without a request is an unresolved conflict only when it is
+            # legacy. A launch no request has claimed yet (unowned) is not one: this
+            # guard-mode sweep reads the launch ledger as if it did not exist.
+            obligations = "state" in {
+                item[1] for item in connection.execute("PRAGMA table_info(delivery_task_owners)")}
+            unclaimed = ("(own.delivery_id IS NULL AND own.state='legacy')" if obligations
+                         else "own.delivery_id IS NULL")
+            row = connection.execute(
+                "SELECT delivery_id, state, coalesce(started_at, created_at) "
+                "FROM pending_inbound_deliveries ORDER BY created_at, rowid LIMIT 1"
+            ).fetchone()
+            if row is None or row[1] != "started":
+                return
+            delivery_id, _, marked = row
+            now = int(time.time() * 1000)
+            marked_ms = marked if marked and marked > 10 ** 11 else (marked or 0) * 1000
+            if now - marked_ms < STUCK_SECONDS * 1000:
+                return
+            # A restart resumes the same native session under a new service
+            # stamp; the result's own stamp still binds its receipt and epoch.
+            retired = connection.execute(
+                "DELETE FROM pending_inbound_deliveries WHERE delivery_id=? AND state='started' "
+                "AND EXISTS (SELECT 1 FROM delivery_results r "
+                "JOIN delivery_sessions s ON s.session_id=r.session_id AND s.stamp IS NOT NULL "
+                "JOIN delivery_runtime epoch ON epoch.key='callback_ledger_epoch:'||r.stamp "
+                "AND epoch.value=CAST(CAST(epoch.value AS INTEGER) AS TEXT) "
+                "AND CAST(epoch.value AS INTEGER)>100000000000 "
+                "JOIN delivery_turns orig ON orig.turn_id=r.turn_id AND orig.session_id=r.session_id "
+                "JOIN delivery_turns ans ON ans.turn_id=coalesce(r.response_turn_id,r.turn_id) "
+                "AND ans.session_id=r.session_id "
+                "JOIN delivery_turn_messages m ON m.turn_id=r.turn_id AND m.delivery_id=r.delivery_id "
+                "AND m.chat_id=r.chat_id AND m.thread_id IS r.thread_id "
+                "JOIN delivery_receipts c ON c.delivery_id=r.delivery_id AND c.turn_id=r.turn_id "
+                "AND c.chat_id=r.chat_id AND c.thread_id IS r.thread_id AND c.stamp=r.stamp "
+                "AND c.source='reply' "
+                "WHERE r.delivery_id=? AND r.state='complete' AND r.task_id IS NULL "
+                "AND r.created_at>0 AND r.finished_at>0 "
+                "AND r.finished_at<=? AND r.stamp IS NOT NULL AND r.stamp<>'' "
+                "AND orig.closed_at IS NOT NULL AND ans.closed_at IS NOT NULL "
+                "AND m.closed_at IS NOT NULL AND m.closed_by='receipt' "
+                "AND NOT EXISTS (SELECT 1 FROM delivery_legacy_native_sessions legacy "
+                "WHERE legacy.session_id=r.session_id) "
+                "AND NOT EXISTS (SELECT 1 FROM delivery_task_owners own "
+                "WHERE own.session_id=r.session_id AND own.stamp=r.stamp "
+                f"AND (own.delivery_id=r.delivery_id OR {unclaimed})) "
+                "AND NOT EXISTS (SELECT 1 FROM delivery_task_returns ret "
+                "WHERE ret.session_id=r.session_id AND ret.stamp=r.stamp "
+                "AND (ret.delivery_id=r.delivery_id OR "
+                "(ret.delivery_id IS NULL AND ret.observed_at>=r.created_at))))",
+                (delivery_id, delivery_id, now - 30_000),
+            ).rowcount
+            if retired == 1:
+                log(f"{delivery_id} — completed durable reply retired its stale started carrier")
+                return
+            terminal_columns = {item[1] for item in connection.execute(
+                "PRAGMA table_info(delivery_terminal_receipts)"
+            )}
+            if not {"delivery_id", "turn_id", "session_id", "stamp", "chat_id", "thread_id",
+                    "result_generation", "task_return_id", "source", "message_id", "created_at"} <= terminal_columns:
+                return
+            # A bound native callback is safe only if the *whole* final send and the
+            # result completion committed at its exact generation. Every worker the
+            # request owns returned or stopped, each return bound before that final;
+            # a legacy obligation keeps the carrier. A later callback, re-launch,
+            # retry, cancellation or unknown return invalidates the proof. Without
+            # the obligation ledger the request had one task. Other shapes stay in HOLD.
+            # A worker of its turns that no progress registered, or a launch not
+            # resolved yet, would keep it under the receiver; this sweep runs under
+            # guard and shadow only, where nothing new may block (NOVSKY, 27.09),
+            # so it logs would_block_unowned_worker and retires as before.
+            if obligations:
+                other_work = "own.delivery_id=r.delivery_id AND own.state NOT IN ('returned','stopped')"
+                later_return = "other.observed_at>terminal.created_at"
+                unknown_return = "unknown.delivery_id IS NULL AND unknown.occurrence IS NULL"
+                launches = connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='delivery_task_launches'").fetchone()
+                unowned = [row[0] for row in connection.execute(
+                    "SELECT 'task ' || own.task_id || ' launch=' || coalesce(own.launch_ref, '') "
+                    "FROM delivery_task_owners own JOIN delivery_results r ON r.session_id=own.session_id "
+                    "AND r.stamp=own.stamp WHERE r.delivery_id=? AND own.state='unowned' "
+                    "AND own.launched_turn IN (r.turn_id, r.response_turn_id)"
+                    + (" UNION ALL SELECT 'launch ' || l.launch_ref FROM delivery_task_launches l "
+                       "JOIN delivery_results r ON r.session_id=l.session_id AND r.stamp=l.stamp "
+                       "WHERE r.delivery_id=? AND l.state='launching' "
+                       "AND l.launched_turn IN (r.turn_id, r.response_turn_id)" if launches else ""),
+                    (delivery_id, delivery_id) if launches else (delivery_id,))]
+            else:
+                other_work = "own.delivery_id=r.delivery_id AND own.task_id<>r.task_id"
+                later_return = "other.return_id<>ret.return_id"
+                unknown_return = "unknown.delivery_id IS NULL"
+                unowned = []
+            retired = connection.execute(
+                "DELETE FROM pending_inbound_deliveries WHERE delivery_id=? AND state='started' "
+                "AND EXISTS (SELECT 1 FROM delivery_results r "
+                "JOIN delivery_runtime epoch ON epoch.key='callback_ledger_epoch:'||r.stamp "
+                "AND epoch.value=CAST(CAST(epoch.value AS INTEGER) AS TEXT) "
+                "AND CAST(epoch.value AS INTEGER)>100000000000 "
+                "JOIN delivery_turns orig ON orig.turn_id=r.turn_id AND orig.session_id=r.session_id "
+                "JOIN delivery_turns ans ON ans.turn_id=r.response_turn_id AND ans.session_id=r.session_id "
+                "JOIN delivery_turn_messages m ON m.turn_id=r.turn_id AND m.delivery_id=r.delivery_id "
+                "AND m.chat_id=r.chat_id AND m.thread_id IS r.thread_id "
+                "JOIN delivery_terminal_receipts terminal ON terminal.delivery_id=r.delivery_id "
+                "AND terminal.turn_id=r.turn_id AND terminal.session_id=r.session_id "
+                "AND terminal.stamp=r.stamp AND terminal.chat_id=r.chat_id "
+                "AND terminal.thread_id IS r.thread_id "
+                "AND terminal.result_generation=r.result_generation "
+                "AND terminal.created_at=r.finished_at AND terminal.message_id>0 "
+                "AND terminal.source IN ('reply','shell') "
+                "JOIN delivery_task_returns ret ON ret.return_id=terminal.task_return_id "
+                "AND ret.session_id=r.session_id AND ret.stamp=r.stamp "
+                "AND ret.delivery_id=r.delivery_id AND ret.turn_id=r.response_turn_id "
+                "AND ret.task_id=r.task_id AND ret.observed_at>=r.created_at "
+                "WHERE r.delivery_id=? AND r.state='complete' AND r.task_id IS NOT NULL "
+                "AND r.response_turn_id IS NOT NULL AND r.request_payload IS NOT NULL "
+                "AND r.result_generation>0 AND r.created_at>0 AND r.finished_at>0 "
+                "AND r.finished_at<=? AND terminal.created_at>=ret.observed_at "
+                "AND r.stamp IS NOT NULL AND r.stamp<>'' "
+                "AND orig.closed_at IS NOT NULL AND ans.closed_at IS NOT NULL "
+                "AND m.closed_at IS NOT NULL AND m.closed_by='receipt' "
+                "AND NOT EXISTS (SELECT 1 FROM delivery_legacy_native_sessions legacy "
+                "WHERE legacy.session_id=r.session_id) "
+                "AND NOT EXISTS (SELECT 1 FROM delivery_task_owners own "
+                "WHERE own.session_id=r.session_id AND own.stamp=r.stamp "
+                f"AND ({unclaimed} OR {other_work})) "
+                "AND EXISTS (SELECT 1 FROM delivery_receipts c WHERE c.delivery_id=r.delivery_id "
+                "AND c.turn_id=r.turn_id AND c.chat_id=r.chat_id AND c.thread_id IS r.thread_id "
+                "AND c.stamp=r.stamp AND c.source=terminal.source) "
+                "AND NOT EXISTS (SELECT 1 FROM delivery_task_returns other "
+                "WHERE other.session_id=r.session_id AND other.stamp=r.stamp "
+                f"AND other.delivery_id=r.delivery_id AND {later_return} "
+                "AND other.observed_at>=r.created_at) "
+                "AND NOT EXISTS (SELECT 1 FROM delivery_task_returns unknown "
+                "WHERE unknown.session_id=r.session_id AND unknown.stamp=r.stamp "
+                f"AND {unknown_return} AND unknown.observed_at>=r.created_at))",
+                (delivery_id, delivery_id, now - 30_000),
+            ).rowcount
+            if retired == 1:
+                log(f"{delivery_id} — exact terminal native callback receipt retired stale started carrier")
+                if unowned:
+                    log(f"{delivery_id} — would_block_unowned_worker: {', '.join(unowned)}")
+    except sqlite3.Error as error:
+        log(f"durable completed-head check deferred: {error}")
+    finally:
+        lock.close()
+
+
 def main() -> int:
     if not GUARD.is_file() or not (STATE_DIR / "messages.db").exists():
         return 0
     if durable_recovery():
-        log("durable requests: receiver owns recovery — sweep inert")
+        if delivery_authority() != "receiver":
+            settle_completed_durable_head()
         return 0
     if delivery_authority() == "receiver":
         log("delivery authority is receiver: the receiver settles its own queue — sweep inert")

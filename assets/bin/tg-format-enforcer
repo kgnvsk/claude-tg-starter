@@ -1,26 +1,19 @@
 #!/usr/bin/env python3
 """tg-format-enforcer — PreToolUse hook на mcp__plugin_telegram_telegram__reply.
 
-Две проверки (обе → block если триггер):
-
 A) DOUBLE-ESCAPE GUARD (added 2026-06-23 после повторных проёбов):
    Reply-tool с 2026-06-23 САМ всегда прогоняет text через ~/bin/tg-escape.
    Если модель отдала уже заэкранированный text (`\\.`, `\\-`, `\\(`, `\\+` ...),
    tool сделает escape ВТОРОЙ раз → парсер падает → улетает plain с литеральными *.
    Блокируем, если видим backslash перед reserved-символом в `text`.
+   Только для format='markdownv2': plain и legacy markdown tool не экранирует,
+   там слеши — часть текста (regex, пути Windows).
 
-B) LIST-LIKE WITHOUT MARKDOWNV2:
-   Если text выглядит list-like, но format=text (plain) — блокируем.
-   Пользователь видит plain-полотно вместо структуры.
-
-Триггеры list-like:
-- ≥4 буллетов ИЛИ
-- ≥3 нумерованных ИЛИ
-- ≥2 *bold* секций ИЛИ
-- (≥3 ссылки И ≥5 строк) ИЛИ
-- text > 400 символов И есть хотя бы 2 признака структуры
-
-Короткие реплики ("ок", "погнали", статусы "🔄 ...") НЕ триггерят.
+B) RAW MARKUP IN PLAIN TEXT: format='text' пропускает любую структуру — списки,
+   нумерацию, длинный текст (plain — запасной путь, когда у человека форматированные
+   сообщения пустые, кейс 1.23). Блок только за оставшиеся *bold*/**bold** и
+   [текст](url): в plain они видны сырыми. Код в `...` и URL не проверяются,
+   `a*b` в формулах не bold. Причина называет исправление в один шаг.
 
 Одноразовий bypass (не довше 5 хв):
 touch ~/.claude/state/tg-format-enforcer.bypass
@@ -35,6 +28,10 @@ AGENT_ROOT = os.environ.get("AGENT_ROOT") or os.path.expanduser("~")
 LOG_FILE = os.path.join(AGENT_ROOT, ".claude/state/tg-format-enforcer.log")
 BYPASS_FILE = os.path.join(AGENT_ROOT, ".claude/state/tg-format-enforcer.bypass")
 BYPASS_MAX_AGE_SECONDS = 300
+BOLD_MARKUP = re.compile(r"(?<![\w*])\*[^\s*][^*\n]{2,}[^\s*]\*(?![\w*])"
+                         r"|(?<![\w*])\*\*[^\s*][^*\n]{2,}[^\s*]\*\*(?![\w*])")
+LINK_MARKUP = re.compile(r"\[[^\]\n]+\]\([^)\n]+\)")
+LITERAL_SPANS = re.compile(r"```.*?```|`[^`\n]*`|https?://[^\s)]+", re.S)
 
 
 def log(msg: str) -> None:
@@ -75,29 +72,6 @@ def is_bypassed() -> bool:
     return True
 
 
-def count_bullets(text: str) -> int:
-    return len(re.findall(r"(?m)^\s*[•\-\*]\s+\S", text))
-
-
-def count_numbered(text: str) -> int:
-    return len(re.findall(r"(?m)^\s*\d+[\.\)]\s+\S", text))
-
-
-def count_bold_sections(text: str) -> int:
-    # *bold* или **bold** (минимум 3 символа внутри)
-    single = len(re.findall(r"(?<!\*)\*[^\s*][^*\n]{2,}[^\s*]\*(?!\*)", text))
-    double = len(re.findall(r"\*\*[^\s*][^*\n]{2,}[^\s*]\*\*", text))
-    return single + double
-
-
-def count_links(text: str) -> int:
-    return len(re.findall(r"\[[^\]]+\]\([^\)]+\)", text))
-
-
-def count_lines(text: str) -> int:
-    return len([l for l in text.split("\n") if l.strip()])
-
-
 def has_double_escape(text: str) -> tuple[bool, str]:
     """Детектит backslash-эскейпы, которые модель НЕ должна была ставить.
     Reply-tool сам прогонит через tg-escape — мой `\\.` станет `\\\\.` и парсер падает.
@@ -109,40 +83,6 @@ def has_double_escape(text: str) -> tuple[bool, str]:
     if len(hits) >= 3:
         return True, f"{len(hits)} ручних escape-послідовностей (\\. \\- \\( ...)"
     return False, ""
-
-
-def is_list_like(text: str) -> tuple[bool, str]:
-    """Возвращает (block?, reason)."""
-    if not text:
-        return False, "empty"
-
-    b = count_bullets(text)
-    n = count_numbered(text)
-    bold = count_bold_sections(text)
-    links = count_links(text)
-    lines = count_lines(text)
-
-    # Чек 1: явный список буллетами
-    if b >= 4:
-        return True, f"{b} маркерів списку — list-like"
-
-    # Чек 2: нумерация
-    if n >= 3:
-        return True, f"{n} нумерованих пунктів"
-
-    # Чек 3: множественные bold-заголовки = структурное сообщение
-    if bold >= 2:
-        return True, f"{bold} bold-секцій — структуроване повідомлення"
-
-    # Чек 4: много ссылок + много строк = отчёт/research
-    if links >= 3 and lines >= 5:
-        return True, f"{links} посилань + {lines} рядків — звіт"
-
-    # Чек 5: длинное сообщение со структурой
-    if len(text) > 400 and (b + n + bold) >= 2:
-        return True, f"{len(text)} символів + {b+n+bold} ознак структури"
-
-    return False, "ok"
 
 
 def main() -> None:
@@ -164,7 +104,7 @@ def main() -> None:
     fmt = tool_input.get("format") or "markdownv2"  # tool default since 2026-06-23
 
     # ПРОВЕРКА A: двойной escape (модель сама заэкранировала, tool сделает второй раз).
-    de_block, de_reason = has_double_escape(text)
+    de_block, de_reason = has_double_escape(text) if fmt == "markdownv2" else (False, "")
     if de_block:
         log(f"BLOCK double-escape: {de_reason} len={len(text)} fmt={fmt}")
         msg = (
@@ -185,45 +125,37 @@ def main() -> None:
             f"3. Передай у reply з format='markdownv2' (або без format — "
             f"це значення за замовчуванням). Tool сам коректно виконає екранування ОДИН раз.\n"
             f"\n"
-            f"Правило в ~/CLAUDE.md, розділ 'КОРЕНЕВЕ РІШЕННЯ' (updated 2026-06-23).\n"
-            f"Одноразовий bypass (діє не довше 5 хв): "
-            f"touch ~/.claude/state/tg-format-enforcer.bypass"
+            f"Якщо зворотні слеші — частина змісту (регулярний вираз, шлях Windows), "
+            f"надішли з format='text': там нічого не екранується.\n"
+            f"\n"
+            f"Правило в ~/CLAUDE.md, розділ 'КОРЕНЕВЕ РІШЕННЯ' (updated 2026-06-23)."
         )
         print(json.dumps({"decision": "block", "reason": msg}))
         sys.exit(0)
 
-    # ПРОВЕРКА B: markdownv2/markdown — структурное форматирование заявлено, пропускаем.
-    if fmt in ("markdownv2", "markdown"):
-        log(f"pass: format={fmt} len={len(text)}")
+    # ПРОВЕРКА B: plain text с разметкой, которую Telegram покажет сырыми символами.
+    scan = LITERAL_SPANS.sub(" ", text) if fmt not in ("markdownv2", "markdown") else ""
+    bold = len(BOLD_MARKUP.findall(scan))
+    links = len(LINK_MARKUP.findall(scan))
+    if bold or links:
+        found = ", ".join(part for part in (
+            f"bold-маркерів: {bold}" if bold else "",
+            f"markdown-посилань: {links}" if links else "",
+        ) if part)
+        log(f"BLOCK raw-markup: {found} len={len(text)} fmt={fmt}")
+        msg = (
+            f"❌ FORMAT ENFORCER: у format='{fmt}' лишилася розмітка ({found}) — "
+            f"Telegram покаже її сирими символами.\n"
+            f"\n"
+            f"Зроби одне з двох і повтори один раз:\n"
+            f"1. Plain-текст: прибери `*` і `**` навколо слів, а [текст](url) заміни на «текст: url».\n"
+            f"2. Або надішли з format='markdownv2' (значення за замовчуванням) — "
+            f"тоді розмітка відрендериться."
+        )
+        print(json.dumps({"decision": "block", "reason": msg}))
         sys.exit(0)
 
-    block, reason = is_list_like(text)
-    if not block:
-        log(f"pass: {reason} len={len(text)}")
-        sys.exit(0)
-
-    # Блокируем — list-like без markdownv2.
-    log(f"BLOCK list-like: {reason} len={len(text)} fmt={fmt}")
-
-    msg = (
-        f"❌ FORMAT ENFORCER: reply заблоковано — {reason}, але format='{fmt}'.\n"
-        f"\n"
-        f"Це list-like повідомлення МАЄ надсилатися як markdownv2 "
-        f"із жирними заголовками та маркерами списку. Plain-полотно заборонено "
-        f"(правило CLAUDE.md + обговорення 2026-06-23).\n"
-        f"\n"
-        f"ЩО РОБИТИ:\n"
-        f"1. Перепиши текст із *bold* заголовками та маркерами `-` або `•`.\n"
-        f"2. БЕЗ ручного екранування (жодних \\. \\- \\( тощо).\n"
-        f"3. Передай у reply з format='markdownv2'. Tool сам усе екранує.\n"
-        f"\n"
-        f"Якщо hook помилився (це справді не list-like), створи одноразовий "
-        f"bypass (діє не довше 5 хв): touch "
-        f"~/.claude/state/tg-format-enforcer.bypass і повтори один раз. "
-        f"Файл буде спожито автоматично."
-    )
-
-    print(json.dumps({"decision": "block", "reason": msg}))
+    log(f"pass: format={fmt} len={len(text)}")
     sys.exit(0)
 
 

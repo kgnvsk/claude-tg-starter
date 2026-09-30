@@ -45,8 +45,8 @@ TOKEN_RE = re.compile(
     r'|(?P<code>`[^`\n]*?`)'
     r'|(?P<link>\[[^\]\n]*?\]\([^)\n]*?\))'
     r'|(?P<bold>\*[^*\n]+?\*)'
-    r'|(?P<underline>__[^_\n]+?__)'
-    r'|(?P<italic>_[^_\n]+?_)'
+    r'|(?P<underline>(?<!\w)__[^_\n]+?__(?!\w))'
+    r'|(?P<italic>(?<!\w)_[^_\n]+?_(?!\w))'
     r'|(?P<spoiler>\|\|[^|\n]+?\|\|)'
     r'|(?P<strike>~[^~\n]+?~)',
     re.DOTALL,

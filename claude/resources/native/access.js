@@ -457,7 +457,8 @@ function isSharedSubject(subject) {
 }
 var AGENT_DEFAULT_SUBJECT = "agent:default";
 function isInstalledAgentSubject(subject) {
-  return /^agent:installed:[A-Za-z0-9_-]{1,100}:[1-9]\d{2,9}$/.test(subject);
+  const match = /^agent:installed:[A-Za-z0-9_-]{1,100}:([1-9]\d{0,18})$/.exec(subject);
+  return match !== null && BigInt(match[1]) <= 9223372036854775807n;
 }
 function isValidSubject(subject) {
   return subject === AGENT_DEFAULT_SUBJECT || isInstalledAgentSubject(subject) || /^user:\d+$/.test(subject) || /^group:-?\d+$/.test(subject) || /^topic:-?\d+:\d+$/.test(subject);
@@ -1668,7 +1669,7 @@ async function bounded(stream, limitBytes = OUTPUT_LIMIT) {
 }
 var runBoundedCommand = async (spec, signal) => {
   if (signal.aborted)
-    return { exitCode: 130, stdout: "", stderr: "" };
+    return { exitCode: 130, stdout: "", stderr: "", started: false };
   let child;
   try {
     child = Bun.spawn(spec.argv, {
@@ -2541,6 +2542,34 @@ function boundedInt(value, fallback, maximum) {
     return fallback;
   return Number.isSafeInteger(value) && Number(value) >= 1 && Number(value) <= maximum ? Number(value) : null;
 }
+function googleRejection(stderr) {
+  const body = stderr.search(/\{\s*"error"\s*:/);
+  if (body >= 0) {
+    try {
+      const { code, message } = JSON.parse(stderr.slice(body, stderr.lastIndexOf("}") + 1)).error;
+      if (Number.isSafeInteger(code))
+        return { status: code, message: typeof message === "string" ? message : "" };
+    } catch {}
+  }
+  const line = /(?:Google API error \((\d{3})\b[^)]*\)|googleapi: Error (\d{3})):\s*(.*)/.exec(stderr);
+  return line == null ? null : { status: Number(line[1] ?? line[2]), message: line[3] };
+}
+var SIGN_IN_FAILURE = /^No auth for [\w:.-]+ |\btoken source: get token for \S+: read token: |\boauth2: (?:"invalid_grant"|"invalid_client"|token expired and refresh token is not set)|Secret not found in keyring \(refresh token missing\)/m;
+function googleSignInFailure(stderr) {
+  return googleRejection(stderr)?.status === 401 || SIGN_IN_FAILURE.test(stderr);
+}
+function signInRefused(stderr) {
+  return {
+    ok: false,
+    code: "failed",
+    failureCode: "google_auth_no_write",
+    message: `Google \u043D\u0435 \u043F\u0440\u0438\u0439\u043D\u044F\u0432 \u0432\u0445\u0456\u0434 \u0446\u044C\u043E\u0433\u043E \u0440\u0435\u0441\u0443\u0440\u0441\u0443, \u0442\u043E\u043C\u0443 \u0437\u0430\u043F\u0438\u0441 \u043D\u0435 \u043F\u043E\u0447\u0438\u043D\u0430\u0432\u0441\u044F: \xAB${scrub(stderr)}\xBB. ` + "\u041F\u043E\u0442\u0440\u0456\u0431\u043D\u043E \u0437\u0430\u043D\u043E\u0432\u043E \u043F\u0456\u0434\u043A\u043B\u044E\u0447\u0438\u0442\u0438 Google \u0434\u043B\u044F \u0446\u044C\u043E\u0433\u043E \u0440\u0435\u0441\u0443\u0440\u0441\u0443; \u0434\u043E \u0442\u043E\u0433\u043E \u0437\u0430\u043F\u0438\u0441 \u043D\u0435 \u043F\u043E\u0432\u0442\u043E\u0440\u044E\u0439."
+  };
+}
+function scrub(value) {
+  return value.replace(/[\w.+-]+@[\w.-]+\.\w+/g, "<email>").replace(/\/[\w./-]*\/(gog|home|claude)[\w./-]*/g, "<path>").replace(/\b(ya29|1\/\/|AIza)[\w.-]+/g, "<token>").split(`
+`).map((line) => line.trim()).filter((line) => line.length > 0).join("; ").slice(0, 300);
+}
 function optionalFlag(args, flag, value, max = 200) {
   if (value == null)
     return true;
@@ -2645,6 +2674,7 @@ class GoogleAdapter {
     const isSheetReadFormat = request.capability === "google.sheets.read" && request.operation === "read_format";
     const isSheetLayout = request.capability === "google.sheets.read" && request.operation === "read_layout";
     const isSheetBatch = request.capability === "google.sheets.write" && request.operation === "batch_update";
+    const isSheetUpdate = request.capability === "google.sheets.write" && request.operation === "update_cells";
     const isDocRead = request.capability === "google.docs.read" && request.operation === "get";
     const configuredRecipient = isSheetCreate ? request.resource.config.createShareEmail : undefined;
     const recipient = configuredRecipient === undefined ? null : text2(configuredRecipient, 254);
@@ -2655,6 +2685,62 @@ class GoogleAdapter {
       if (signal.aborted)
         return { ok: false, code: "unavailable" };
       return this.searchRegisteredFiles(request);
+    }
+    if (isSheetUpdate && request.arguments.range.includes("!")) {
+      const invalidRange = {
+        ok: false,
+        code: "invalid",
+        failureCode: "sheet_range_invalid_no_write",
+        message: "\u0412\u043A\u043B\u0430\u0434\u043A\u0443 \u0430\u0431\u043E \u0434\u0456\u0430\u043F\u0430\u0437\u043E\u043D \u043D\u0435 \u0437\u043D\u0430\u0439\u0434\u0435\u043D\u043E. \u0417\u0430\u043F\u0438\u0441 \u043D\u0435 \u043F\u043E\u0447\u0438\u043D\u0430\u0432\u0441\u044F."
+      };
+      const unavailable = {
+        ok: false,
+        code: "unavailable",
+        failureCode: "sheet_preflight_unavailable_no_write",
+        message: "\u041D\u0435 \u0432\u0434\u0430\u043B\u043E\u0441\u044F \u043F\u0435\u0440\u0435\u0432\u0456\u0440\u0438\u0442\u0438 \u0432\u043A\u043B\u0430\u0434\u043A\u0443 \u043F\u0435\u0440\u0435\u0434 \u0437\u0430\u043F\u0438\u0441\u043E\u043C. \u0417\u0430\u043F\u0438\u0441 \u043D\u0435 \u043F\u043E\u0447\u0438\u043D\u0430\u0432\u0441\u044F; \u0441\u043F\u0440\u043E\u0431\u0443\u0439 \u043F\u0456\u0437\u043D\u0456\u0448\u0435."
+      };
+      try {
+        if (signal.aborted)
+          return unavailable;
+        const spreadsheetId = request.arguments.spreadsheetId;
+        const probe = await this.run({
+          argv: [
+            join4(this.home, "bin", "gog"),
+            "--no-input",
+            "--json",
+            "--readonly",
+            "--enable-commands-exact=api.call,api.sheets.spreadsheets.get",
+            "api",
+            "call",
+            "sheets",
+            "v4",
+            "spreadsheets.get",
+            "--params",
+            JSON.stringify({
+              spreadsheetId,
+              ranges: [request.arguments.range],
+              fields: "spreadsheetId,sheets(properties(sheetId,title))"
+            }),
+            "--scope",
+            "https://www.googleapis.com/auth/spreadsheets.readonly"
+          ],
+          cwd: this.home,
+          env: { HOME: this.home, PATH: "/usr/local/bin:/usr/bin:/bin", GOG_ACCOUNT: account },
+          timeoutMs: 30000
+        }, signal);
+        if (probe.exitCode !== 0) {
+          return /unable to parse range/i.test(probe.stderr) ? invalidRange : googleSignInFailure(probe.stderr) ? signInRefused(probe.stderr) : unavailable;
+        }
+        if (probe.stdoutTruncated === true)
+          return unavailable;
+        const metadata = JSON.parse(probe.stdout);
+        if (metadata.spreadsheetId !== spreadsheetId || !Array.isArray(metadata.sheets) || metadata.sheets.length > 1)
+          return unavailable;
+        if (metadata.sheets.length === 0)
+          return invalidRange;
+      } catch {
+        return unavailable;
+      }
     }
     const stdin = isSheetBatch ? JSON.stringify({ requests: request.arguments.requests, includeSpreadsheetInResponse: false }) : request.capability === "google.docs.write" && (request.operation === "replace" || request.operation === "append") && typeof request.arguments.content === "string" ? request.arguments.content : undefined;
     const command = {
@@ -2768,8 +2854,26 @@ class GoogleAdapter {
         receiptId
       };
     }
-    if (isWrite && (result.exitCode === 124 || isSheetBatch && result.exitCode === 130))
+    if (result.exitCode === 130 && result.started === false)
+      return { ok: false, code: "unavailable" };
+    if (isWrite && (result.exitCode === 124 || result.exitCode === 130))
       return { ok: false, code: "uncertain" };
+    const atomicSheetWrite = request.capability === "google.sheets.write" && ["update_cells", "add_tab", "batch_update"].includes(request.operation);
+    const rejection = atomicSheetWrite ? googleRejection(result.stderr ?? "") : null;
+    if (rejection?.status === 400 || rejection?.status === 404) {
+      return {
+        ok: false,
+        code: "failed",
+        failureCode: "provider_rejected_no_write",
+        message: `Google \u0432\u0456\u0434\u0445\u0438\u043B\u0438\u0432 \u0437\u0430\u043F\u0438\u0442 (HTTP ${rejection.status}) \u0456 \u043D\u0456\u0447\u043E\u0433\u043E \u043D\u0435 \u0437\u043C\u0456\u043D\u0438\u0432: \xAB${scrub(rejection.message)}\xBB. ` + "\u0412\u0438\u043F\u0440\u0430\u0432 \u0437\u0430\u043F\u0438\u0442 \u0437\u0430 \u0446\u0438\u043C \u043F\u043E\u044F\u0441\u043D\u0435\u043D\u043D\u044F\u043C; \u0431\u0435\u0437 \u0437\u043C\u0456\u043D \u0439\u043E\u0433\u043E \u043D\u0435 \u043F\u043E\u0432\u0442\u043E\u0440\u044E\u0439."
+      };
+    }
+    const signInExpired = isWrite && googleSignInFailure(result.stderr ?? "");
+    if (atomicSheetWrite && signInExpired)
+      return signInRefused(result.stderr ?? "");
+    if (isWrite) {
+      return { ok: false, code: "uncertain", message: `${this.failureMessage(result.exitCode, result.stderr)} ` + "\u0417\u0430\u043F\u0438\u0441 \u043C\u0456\u0433 \u0432\u0438\u043A\u043E\u043D\u0430\u0442\u0438\u0441\u044F: \u043D\u0435 \u043F\u043E\u0432\u0442\u043E\u0440\u044E\u0439 \u0439\u043E\u0433\u043E \u0430\u0432\u0442\u043E\u043C\u0430\u0442\u0438\u0447\u043D\u043E, \u0441\u043F\u0435\u0440\u0448\u0443 \u043F\u0435\u0440\u0435\u0432\u0456\u0440 \u0440\u0435\u0437\u0443\u043B\u044C\u0442\u0430\u0442." + (signInExpired ? " \u0421\u0445\u043E\u0436\u0435, \u0432\u0445\u0456\u0434 Google \u0434\u043B\u044F \u0446\u044C\u043E\u0433\u043E \u0440\u0435\u0441\u0443\u0440\u0441\u0443 \u043F\u0440\u043E\u0441\u0442\u0440\u043E\u0447\u0435\u043D\u043E \u0430\u0431\u043E \u0432\u0456\u0434\u043A\u043B\u0438\u043A\u0430\u043D\u043E: \u043C\u043E\u0436\u0435 \u0437\u043D\u0430\u0434\u043E\u0431\u0438\u0442\u0438\u0441\u044F \u0437\u0430\u043D\u043E\u0432\u043E \u043F\u0456\u0434\u043A\u043B\u044E\u0447\u0438\u0442\u0438 Google." : "") };
+    }
     if (result.exitCode === 130)
       return { ok: false, code: "unavailable" };
     if (result.exitCode === 124)
@@ -2781,8 +2885,7 @@ class GoogleAdapter {
     };
   }
   failureMessage(exitCode, stderr) {
-    const scrubbed = (stderr ?? "").replace(/[\w.+-]+@[\w.-]+\.\w+/g, "<email>").replace(/\/[\w./-]*\/(gog|home|claude)[\w./-]*/g, "<path>").replace(/\b(ya29|1\/\/|AIza)[\w.-]+/g, "<token>").split(`
-`).map((line) => line.trim()).filter((line) => line.length > 0).join("; ").slice(0, 300);
+    const scrubbed = scrub(stderr ?? "");
     return scrubbed.length > 0 ? `Google CLI \u043F\u043E\u0432\u0435\u0440\u043D\u0443\u0432 \u043F\u043E\u043C\u0438\u043B\u043A\u0443 (\u043A\u043E\u0434 ${exitCode}): ${scrubbed}` : `Google CLI \u043F\u043E\u0432\u0435\u0440\u043D\u0443\u0432 \u043F\u043E\u043C\u0438\u043B\u043A\u0443 (\u043A\u043E\u0434 ${exitCode}) \u0431\u0435\u0437 \u043F\u043E\u044F\u0441\u043D\u0435\u043D\u043D\u044F.`;
   }
   argumentDenial(request) {

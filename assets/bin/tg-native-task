@@ -1,0 +1,447 @@
+#!/usr/bin/env python3
+# Claude hook that records every native background launch in the Telegram
+# plugin's messages.db, so each launch becomes its own obligation. The Stop
+# guard's transcript parser (native_background_work) stays the reference for
+# what counts as a launch; this hook takes exactly the same Bash, Agent and
+# SendMessage launches.
+#
+# PreToolUse (matcher Bash|Agent|SendMessage): a call that can start background
+# work (Bash with run_in_background, Agent unless run_in_background is false,
+# every SendMessage) writes a durable `launching` intent keyed by its
+# tool_use_id before the tool runs. Under the receiver, if the ledger cannot
+# record it, the call is denied: nothing launches without a durable record.
+# Guard and shadow let the call run, log it and record `launch_unrecorded`
+# where the ledger still takes a write. With no ledger at all (no messages.db,
+# or a receiver from before the launch table) every mode lets the call run and
+# logs it. The mode is TG_DELIVERY_AUTHORITY, read like the receiver reads it:
+# an unknown value is guard. Any other call, and any call a subagent makes,
+# exits after parsing and never opens the database.
+#
+# PostToolUse and PostToolUseFailure (matcher Bash|Agent|SendMessage|TaskStop)
+# resolve that intent in one transaction: a background ID resolves it and writes
+# the launch's obligation, a foreground result marks it `foreground`, a failure
+# marks it `failed`. A call its Pre did not record went to the background
+# after its Pre (a Bash moved there by its timeout or by an incoming message,
+# an Agent with run_in_background false that returned isAsync), or had a Pre
+# that could not write under guard or shadow: its Post writes the intent and
+# the obligation in one transaction, before the model reads the result. A
+# background-shaped response without its ID and a ledger failure write
+# nothing. Under the receiver they exit 2: the intent stays `launching`, which
+# keeps the request's final shut. Guard and shadow log them and exit 0, like a
+# missing ledger in every mode. A TaskStop closes its task's open obligation
+# as `stopped` only on the PostToolUse that proves it.
+#
+# PostToolBatch (no matcher, once per batch, after every Post of the batch): a
+# call denied after its Pre wrote the intent (a PreToolUse deny from another
+# hook, or the permission layer) got no Post, and neither did one whose Post
+# could not write. CLI 2.1.280 lists it in the batch with its result text, the
+# deny reason for a denied call. Unless that text shows a launch, nothing was
+# launched: the intent becomes `failed`, and a final it superseded is decided in
+# the same transaction. PostToolBatch always exits 0, since exit 2 there stops
+# the agent loop; a failure only goes to the log.
+#
+# Under receiver authority the PreToolUse transaction also supersedes a final
+# admitted in the launch turn, and the PostToolUse of a foreground or failed
+# call repairs it (DESIGN R4-1, v5 and v6); shadow mode records the verdict.
+#
+# An obligation has no delivery_id until progress registers it. It keeps its
+# launch turn while a request of that turn is open, and belongs to that
+# request; a launch after every request of its turn was answered is
+# request-less (launched_turn NULL). A resume is the next occurrence of the
+# same task ID. The receiver owns the schema.
+import json
+import os
+import re
+import runpy
+import sqlite3
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+CONFIG_ROOT = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
+TELEGRAM_STATE = Path(
+    os.environ.get("TELEGRAM_STATE_DIR") or CONFIG_ROOT / "channels" / "telegram"
+)
+DB = TELEGRAM_STATE / "messages.db"
+AGENT_ROOT = Path(os.environ.get("AGENT_ROOT", str(Path.home())))
+LOG = AGENT_ROOT / "logs" / "tg-native-task.log"
+DB_TIMEOUT = 3.0
+TASK_ID = re.compile(r"[A-Za-z0-9_-]{1,128}")
+# A tool result that shows a launch: Bash in the background, an async Agent, a
+# resumed agent. A denied or failed call's result shows none of them.
+LAUNCH_TEXT = re.compile(r"Command running in background with ID:|moved to the background \(ID:|"
+                         r"Async agent launched successfully|resumedAgentId|Resuming agent")
+# Where each launch form carries its task ID (CLI probes of 2.1.280 and 2.1.282).
+ID_FIELD = {"Bash": "backgroundTaskId", "Agent": "agentId", "SendMessage": "resumedAgentId"}
+# A request in any other state still owes its answer.
+ANSWERED = ("complete", "no_reply", "cancelled")
+AUTHORITY = os.environ.get("TG_DELIVERY_AUTHORITY")
+if AUTHORITY not in ("guard", "shadow", "receiver"):
+    AUTHORITY = "guard"
+
+
+class NotRecorded(Exception):
+    """The ledger holds nothing new for this call."""
+
+
+def log(message: str) -> None:
+    try:
+        LOG.parent.mkdir(parents=True, exist_ok=True)
+        with LOG.open("a", encoding="utf-8") as handle:
+            handle.write(f"{datetime.now().astimezone().isoformat(timespec='seconds')} {message}\n")
+    except OSError:
+        pass
+
+
+def launch_capable(tool: object, arguments: dict) -> bool:
+    if tool == "Bash":
+        return arguments.get("run_in_background") is True
+    if tool == "Agent":
+        return arguments.get("run_in_background") is not False
+    return tool == "SendMessage"
+
+
+def launched_task(tool: str, arguments: dict, response: dict) -> str | None:
+    """The background task this call started; None for a foreground call."""
+    if tool == "SendMessage":
+        # A mailbox send to a running agent resumes nothing.
+        if response.get("success") is not True or not response.get("resumedAgentId"):
+            return None
+        task = response.get("resumedAgentId")
+    else:
+        if not (arguments.get("run_in_background") is True or response.get("isAsync") is True
+                or response.get("backgroundTaskId")):
+            return None
+        task = response.get("backgroundTaskId") or (
+            response.get("agentId") if response.get("isAsync") is True else None)
+    if not isinstance(task, str) or not TASK_ID.fullmatch(task):
+        raise NotRecorded(f"the background launch returned no valid {ID_FIELD[tool]}")
+    return task
+
+
+def connect() -> sqlite3.Connection:
+    # Autocommit: every write below is one explicit BEGIN IMMEDIATE, and closing
+    # the connection before COMMIT rolls it back.
+    return sqlite3.connect(f"file:{DB}?mode=rw", uri=True, timeout=DB_TIMEOUT, isolation_level=None)
+
+
+def record_intent(session: str, stamp: str, call: str, tool: str) -> None:
+    conn = connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        turn = conn.execute(
+            "SELECT turn_id FROM delivery_turns WHERE session_id=? AND closed_at IS NULL "
+            "ORDER BY turn_id DESC LIMIT 1", (session,),
+        ).fetchone()
+        now = int(time.time() * 1000)
+        recorded = conn.execute(
+            "INSERT INTO delivery_task_launches "
+            "(launch_ref,session_id,stamp,launched_turn,tool_name,state,created_at) "
+            "VALUES (?,?,?,?,?,'launching',?) ON CONFLICT(launch_ref) DO NOTHING",
+            (call, session, stamp, turn[0] if turn else None, tool, now),
+        ).rowcount
+        # R4-1: a final already admitted in this turn may be on the network. Under
+        # the receiver the launch supersedes it: the admission clears and the
+        # generation moves on, so its ACK is non-terminal evidence; the attempt
+        # keeps its own generation and stays linked to this launch until its
+        # outcome is known. Shadow mode records the verdict; guard does nothing.
+        admitted = conn.execute(
+            "SELECT delivery_id, turn_id, chat_id, thread_id FROM delivery_results "
+            "WHERE session_id=? AND stamp=? AND state IN ('pending','deferred') "
+            "AND final_admitted_generation=result_generation AND (turn_id=? OR response_turn_id=?)",
+            (session, stamp, turn[0], turn[0]),
+        ).fetchall() if recorded and turn and AUTHORITY in ("receiver", "shadow") else []
+        if admitted and AUTHORITY == "receiver":
+            conn.execute(
+                "UPDATE delivery_results SET final_admitted_generation=NULL, "
+                "result_generation=result_generation+1, state='pending', superseded_by=?, updated_at=? "
+                "WHERE session_id=? AND stamp=? AND state IN ('pending','deferred') "
+                "AND final_admitted_generation=result_generation AND (turn_id=? OR response_turn_id=?)",
+                (call, now, session, stamp, turn[0], turn[0]),
+            )
+        elif admitted:
+            try:  # a verdict is an observation: it never decides whether the call runs
+                sender = runpy.run_path(str(Path(__file__).with_name("tg-send")))
+                for delivery, delivery_turn, chat, thread in admitted:
+                    sender["record_verdict"](conn, "would_supersede_final", delivery, delivery_turn,
+                                             chat, thread, call)
+            except Exception as error:
+                log(f"PreToolUse {tool} {call}: shadow verdict not recorded: {error!r}")
+        conn.execute("COMMIT")
+    finally:
+        conn.close()
+
+
+def resolve_intent(session: str, stamp: str, call: str, tool: str, arguments: dict, response: dict,
+                   failed: bool) -> None:
+    conn = connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        now = int(time.time() * 1000)
+        task = None if failed else launched_task(tool, arguments, response)
+        intent = conn.execute(
+            "SELECT stamp, launched_turn FROM delivery_task_launches "
+            "WHERE launch_ref=? AND session_id=? AND state='launching'", (call, session),
+        ).fetchone()
+        if intent is None:
+            # No intent from Pre: a call that launched nothing is done, and a
+            # launch is recorded here, resolved, in the turn open now.
+            if task is None or conn.execute(
+                    "SELECT 1 FROM delivery_task_launches WHERE launch_ref=?", (call,)).fetchone():
+                return
+            opened = conn.execute(
+                "SELECT turn_id FROM delivery_turns WHERE session_id=? AND closed_at IS NULL "
+                "ORDER BY turn_id DESC LIMIT 1", (session,),
+            ).fetchone()
+            turn = opened[0] if opened else None
+            conn.execute(
+                "INSERT INTO delivery_task_launches (launch_ref,session_id,stamp,launched_turn,tool_name,"
+                "state,task_id,created_at,resolved_at) VALUES (?,?,?,?,?,'resolved',?,?,?)",
+                (call, session, stamp, turn, tool, task, now, now),
+            )
+        else:
+            stamp, turn = intent
+            conn.execute(
+                "UPDATE delivery_task_launches SET state=?, task_id=?, resolved_at=? WHERE launch_ref=?",
+                ("failed" if failed else "resolved" if task else "foreground", task, now, call),
+            )
+        if task:
+            owed = turn is not None and conn.execute(
+                "SELECT 1 FROM delivery_results WHERE session_id=? AND (turn_id=? OR response_turn_id=?) "
+                f"AND state NOT IN ({','.join('?' * len(ANSWERED))}) LIMIT 1",
+                (session, turn, turn, *ANSWERED),
+            ).fetchone() is not None
+            # A resume starts the next occurrence of the same task ID. An open
+            # obligation keeps its request and state: a task ID is never handed
+            # to another request. A returned or stopped one starts over, unowned,
+            # and nothing its earlier round was released for carries over.
+            # A legacy obligation has no launch to compare with and is never replaced.
+            restart = "".join(
+                f"{column}=CASE WHEN delivery_task_owners.state IN ('returned','stopped') THEN {fresh} "
+                f"ELSE delivery_task_owners.{column} END, "
+                for column, fresh in (("silent_notified_at", "NULL"), ("final_refusals", "0"))
+                if column in {row[1] for row in conn.execute("PRAGMA table_info(delivery_task_owners)")})
+            written = conn.execute(
+                "INSERT INTO delivery_task_owners "
+                "(session_id,stamp,task_id,delivery_id,occurrence,state,launch_ref,launched_turn) "
+                "VALUES (?,?,?,NULL,1,'unowned',?,?) ON CONFLICT(session_id,stamp,task_id) DO UPDATE SET "
+                + restart +
+                "occurrence=delivery_task_owners.occurrence+1, launch_ref=excluded.launch_ref, "
+                "delivery_id=CASE WHEN delivery_task_owners.state IN ('returned','stopped') THEN NULL "
+                "ELSE delivery_task_owners.delivery_id END, "
+                "launched_turn=CASE WHEN delivery_task_owners.state IN ('returned','stopped') "
+                "THEN excluded.launched_turn ELSE delivery_task_owners.launched_turn END, "
+                "state=CASE WHEN delivery_task_owners.state IN ('returned','stopped') THEN 'unowned' "
+                "ELSE delivery_task_owners.state END "
+                "WHERE delivery_task_owners.state<>'legacy'",
+                (session, stamp, task, call, turn if owed else None),
+            ).rowcount
+            if written != 1:
+                raise NotRecorded(f"task {task} has a legacy obligation that no launch may replace")
+            # A launch the receiver already released for silence (its owner notice sent, reserved
+            # or due) stays released when its delayed Post arrives: the obligation it resolves to
+            # carries that release, so the final is not refused again nor the owner told twice
+            # (Codex re-review of U, 28.09).
+            if "silent_notified_at" in {row[1] for row in conn.execute("PRAGMA table_info(delivery_task_launches)")}:
+                released = conn.execute(
+                    "SELECT silent_notified_at FROM delivery_task_launches WHERE launch_ref=?", (call,)).fetchone()
+                if released and released[0] is not None:
+                    conn.execute(
+                        "UPDATE delivery_task_owners SET silent_notified_at=? WHERE session_id=? AND stamp=? "
+                        "AND task_id=? AND launch_ref=? AND silent_notified_at IS NULL",
+                        (released[0], session, stamp, task, call))
+        if conn.execute("SELECT 1 FROM delivery_results WHERE session_id=? AND stamp=? AND (superseded_by=? "
+                        "OR (superseded_ack IS NOT NULL AND (turn_id=? OR response_turn_id=?))) LIMIT 1",
+                        (session, stamp, call, turn, turn)).fetchone():
+            # The final this launch superseded, or a delivered one of its turn that waits for
+            # every call of that turn; the repair shares the shell sender's ledger code.
+            sender = runpy.run_path(str(Path(__file__).with_name("tg-send")))
+            sender["settle_superseded_at_post"](conn, session, stamp, call, turn, task is not None, now)
+        conn.execute("COMMIT")
+    finally:
+        conn.close()
+
+
+def ledger_missing() -> bool:
+    """No messages.db, or no launch table: a receiver from before the launch
+    ledger, or one not reconciled yet. A database that is there but cannot be
+    read now is a failed write, not a missing ledger."""
+    try:
+        conn = sqlite3.connect(f"file:{DB}?mode=ro", uri=True, timeout=DB_TIMEOUT)
+    except sqlite3.Error:
+        return True
+    try:
+        return conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
+                            "AND name='delivery_task_launches'").fetchone() is None
+    except sqlite3.Error:
+        return False
+    finally:
+        conn.close()
+
+
+def record_unrecorded(session: object, call: object, tool: str, error: Exception) -> None:
+    """Guard and shadow let a launch the ledger could not record run. Where the
+    ledger still takes a write, delivery_shadow keeps the fact for the shadow
+    report, once per turn."""
+    try:
+        conn = connect()
+        try:
+            turn = conn.execute(
+                "SELECT turn_id FROM delivery_turns WHERE session_id=? AND closed_at IS NULL "
+                "ORDER BY turn_id DESC LIMIT 1", (session,),
+            ).fetchone()
+            conn.execute(
+                "INSERT OR IGNORE INTO delivery_shadow (created_at,class,turn_id,detail) VALUES (?,?,?,?)",
+                (int(time.time() * 1000), "launch_unrecorded", turn[0] if turn else None, f"{tool} {call}: {error}"),
+            )
+        finally:
+            conn.close()
+    except sqlite3.Error as failure:
+        log(f"{tool} {call}: launch_unrecorded not recorded either: {failure!r}")
+
+
+def result_text(value: object) -> str:
+    """A tool result as PostToolBatch carries it: text, content blocks or an object."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return " ".join(result_text(block.get("text") if isinstance(block, dict) else block) for block in value)
+    return json.dumps(value) if value is not None else ""
+
+
+def resolve_batch(session: str, calls: list) -> None:
+    """The intents of the batch that no Post resolved, in one transaction."""
+    conn = connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        now = int(time.time() * 1000)
+        for item in calls:
+            call = item.get("tool_use_id")
+            intent = conn.execute(
+                "SELECT stamp, launched_turn FROM delivery_task_launches "
+                "WHERE launch_ref=? AND session_id=? AND state='launching'", (call, session),
+            ).fetchone()
+            if intent is None or LAUNCH_TEXT.search(result_text(item.get("tool_response"))):
+                continue
+            stamp, turn = intent
+            conn.execute("UPDATE delivery_task_launches SET state='failed', resolved_at=? "
+                         "WHERE launch_ref=? AND state='launching'", (now, call))
+            if conn.execute("SELECT 1 FROM delivery_results WHERE session_id=? AND stamp=? AND (superseded_by=? "
+                            "OR (superseded_ack IS NOT NULL AND (turn_id=? OR response_turn_id=?))) LIMIT 1",
+                            (session, stamp, call, turn, turn)).fetchone():
+                sender = runpy.run_path(str(Path(__file__).with_name("tg-send")))
+                sender["settle_superseded_at_post"](conn, session, stamp, call, turn, False, now)
+        conn.execute("COMMIT")
+    finally:
+        conn.close()
+
+
+def record_stop(session: str, stamp: str, arguments: dict, response: dict) -> None:
+    task = arguments.get("task_id")
+    if not (isinstance(task, str) and TASK_ID.fullmatch(task) and response.get("task_id") == task
+            and re.match(r"Successfully stopped task: " + re.escape(task) + r"(?![A-Za-z0-9_-])",
+                         str(response.get("message", "")))):
+        return  # not a proven stop: the obligation stays open
+    conn = connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        stopped = conn.execute(
+            "SELECT launch_ref, launched_turn FROM delivery_task_owners WHERE session_id=? AND stamp=? "
+            "AND task_id=? AND state IN ('unowned','owned')", (session, stamp, task),
+        ).fetchone()
+        conn.execute(
+            "UPDATE delivery_task_owners SET state='stopped' WHERE session_id=? AND stamp=? AND task_id=? "
+            "AND state IN ('unowned','owned')", (session, stamp, task),
+        )
+        if stopped and conn.execute(
+                "SELECT 1 FROM delivery_results WHERE session_id=? AND stamp=? AND superseded_ack IS NOT NULL "
+                "AND (turn_id=? OR response_turn_id=?) LIMIT 1", (session, stamp, stopped[1], stopped[1])).fetchone():
+            # A resolution in the scope of a kept ACK decides it too (P2-2).
+            sender = runpy.run_path(str(Path(__file__).with_name("tg-send")))
+            sender["settle_superseded_at_post"](conn, session, stamp, stopped[0], stopped[1], False,
+                                                int(time.time() * 1000))
+        conn.execute("COMMIT")
+    finally:
+        conn.close()
+
+
+def main() -> int:
+    # Nested claude -p workers and cron sessions must not touch Telegram.
+    if os.environ.get("ATARAX_SUPPRESS_TELEGRAM") == "1":
+        return 0
+    try:
+        data = json.loads(sys.stdin.read() or "{}")
+    except ValueError:
+        data = {}
+    if not isinstance(data, dict) or data.get("agent_id"):
+        # A subagent's own call: its notification returns to that subagent, and
+        # the Stop guard's parser, which reads only the main thread, counts none.
+        return 0
+    event, tool = data.get("hook_event_name"), data.get("tool_name")
+    arguments = data.get("tool_input") if isinstance(data.get("tool_input"), dict) else {}
+    response = data.get("tool_response") if isinstance(data.get("tool_response"), dict) else {}
+    if event == "PostToolBatch":
+        listed = data.get("tool_calls")
+        calls = [item for item in (listed if isinstance(listed, list) else []) if isinstance(item, dict)
+                 and launch_capable(item.get("tool_name"), item.get("tool_input") if isinstance(
+                     item.get("tool_input"), dict) else {})]
+        session = data.get("session_id")
+        if calls and os.environ.get("TG_DELIVERY_STAMP") and isinstance(session, str) and session:
+            try:
+                resolve_batch(session, calls)
+            except Exception as error:
+                log(f"PostToolBatch {[item.get('tool_use_id') for item in calls]}: {error!r}")
+        return 0
+    if event not in ("PreToolUse", "PostToolUse", "PostToolUseFailure"):
+        return 0
+    if tool == "TaskStop" and event != "PostToolUse":
+        return 0  # a failed or batched stop closes nothing
+    if tool != "TaskStop" and not launch_capable(tool, arguments) and not (
+            event == "PostToolUse" and tool in ("Bash", "Agent")
+            and (response.get("backgroundTaskId") or response.get("isAsync") is True)):
+        return 0  # Pre goes by the input; a Post also takes a call that went to the background anyway
+    stamp = os.environ.get("TG_DELIVERY_STAMP")
+    if not stamp:
+        return 0  # not the bot's service session: no request can own this work
+    session, call = data.get("session_id"), data.get("tool_use_id")
+    try:
+        if not isinstance(session, str) or not session:
+            raise NotRecorded("the hook input has no session_id")
+        if tool == "TaskStop":
+            record_stop(session, stamp, arguments, response)
+            return 0
+        if not isinstance(call, str) or not call:
+            raise NotRecorded("the hook input has no tool_use_id")
+        if event == "PreToolUse":
+            record_intent(session, stamp, call, tool)
+        else:
+            resolve_intent(session, stamp, call, tool, arguments, response, event == "PostToolUseFailure")
+    except Exception as error:  # every failure here means the ledger holds nothing new
+        log(f"{event} {tool} {call}: {error!r}")
+        missing = ledger_missing()
+        if missing or AUTHORITY != "receiver":
+            # Only the receiver's gates read this record: outside it, and with no
+            # ledger at all, the call goes on as it would without this hook.
+            if not missing and tool != "TaskStop":
+                record_unrecorded(session, call, tool, error)
+            return 0
+        if event == "PreToolUse":
+            print(json.dumps({"hookSpecificOutput": {
+                "hookEventName": "PreToolUse", "permissionDecision": "deny",
+                "permissionDecisionReason": (
+                    f"The Telegram launch ledger could not record this background launch ({error}), "
+                    "so it was not started. Run the work in the foreground, or start it again after "
+                    "the Telegram service restarts."),
+            }}))
+            return 0
+        consequence = ("" if tool == "TaskStop" else " Its request does not wait for it."
+                       if not launch_capable(tool, arguments) else " The launch stays unresolved, and the "
+                       "final answer of its request is refused until it is resolved.")
+        print(f"tg-native-task: {tool} {call} is not recorded: {error}.{consequence}", file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

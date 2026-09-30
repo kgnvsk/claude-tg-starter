@@ -13,11 +13,15 @@
 # shadow modes the Stop guard is the authority: standalone Stop invocations
 # do nothing. The guard invokes this helper with --guard-accepted only after
 # accepting the Stop, since independent native Stop hooks may run in parallel.
+# Before a turn closes, the calls no launch hook resolved are read from its
+# transcript (resolve_from_transcript) and resolved by the launch hook's code.
 #
 # Reads hook JSON from stdin. Fails open: any error is logged to
 # <AGENT_ROOT>/logs/tg-turn-end.log and the hook exits 0.
 import json
 import os
+import re
+import runpy
 import sqlite3
 import sys
 import time
@@ -37,6 +41,8 @@ DB = TELEGRAM_STATE / "messages.db"
 AGENT_ROOT = Path(os.environ.get("AGENT_ROOT", str(Path.home())))
 LOG = AGENT_ROOT / "logs" / "tg-turn-end.log"
 DB_TIMEOUT = 3.0
+# The transcript tail read for calls the launch hook did not resolve.
+TRANSCRIPT_TAIL_BYTES = 8_000_000
 LEDGER_TABLES = ("delivery_sessions", "delivery_turns", "delivery_turn_messages")
 CLOSE_KIND = {"Stop": "stop", "StopFailure": "stop_failure"}
 # StopFailure carries a provider class (including the observed rate_limit),
@@ -48,6 +54,24 @@ BOUNCE_REASON = (
     "A Telegram request in this turn still needs its final result. A progress reply only acknowledges it: "
     "send the result with reply phase=final and its delivery_id, or explicitly defer that delivery "
     "to its registered background task_id. Call no_reply only for a group message that needs no answer."
+)
+# B4 (receipts-b4-forgot-reply NOTE v2): what a turn that still owes a result
+# closed on. The receiver uses it only when the request's one recovery turn also
+# ends without an answer: an `answer` may be forwarded to a private chat, and
+# anything else gets a line saying the request was taken. The Stop guard's own
+# forwarding filter tells working notes and silence apart; a promise is one of a
+# few phrases or a text under 60 characters. A plan («перевірю», «надішлю»), a
+# note that the answer went already, or reasoning about the user is no answer
+# either (B4v2 review M1). A false positive costs that line and an owner alert,
+# never a forward. The text is kept whole: a long answer is forwarded in parts,
+# never cut short.
+PROMISE = re.compile(
+    r"працюю|зараз зроблю|зараз надішлю|работаю|сейчас сделаю|сейчас пришлю|"
+    r"working on it|one moment|give me a (?:moment|minute)|"
+    r"надішлю|перевірю|допишу|відповідь уже|вже відповів|"
+    r"пришлю|проверю|ответ уже|уже ответил|"
+    r"already (?:answered|replied|sent)|\bI should\b|\bthe user\b|\bI(?:'ll| will) (?:send|check)\b",
+    re.IGNORECASE,
 )
 
 
@@ -73,6 +97,17 @@ def session_columns(conn: sqlite3.Connection) -> set[str]:
     # A receiver from before the service stamp has neither column; the session
     # is still recorded, just without them.
     return {row[1] for row in conn.execute("PRAGMA table_info(delivery_sessions)")}
+
+
+def quarantine_unknown_native(conn: sqlite3.Connection, session_id: str, now: int) -> None:
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS delivery_legacy_native_sessions ("
+        "session_id TEXT PRIMARY KEY, marked_at INTEGER NOT NULL)"
+    )
+    conn.execute(
+        "INSERT OR IGNORE INTO delivery_legacy_native_sessions "
+        "(session_id,marked_at) VALUES (?,?)", (session_id, now),
+    )
 
 
 def error_class(data: dict) -> str | None:
@@ -128,6 +163,155 @@ def has_outcome(
     return False
 
 
+# Background work still open in a request's scope, of its own stamp: the same
+# list as tg-send's SCOPE_WORK and the receiver's scopeWork().
+SCOPE_WORK = (
+    "SELECT 1 FROM delivery_task_launches WHERE session_id=:session AND stamp=:stamp AND state='launching' "
+    "AND launched_turn IN (:turn, :response){released} UNION ALL SELECT 1 FROM delivery_task_owners "
+    "WHERE session_id=:session AND stamp=:stamp AND ((state IN ('owned','legacy') AND delivery_id=:delivery) "
+    "OR (state='unowned' AND launched_turn IN (:turn, :response))){released} LIMIT 1"
+)
+
+
+def owes_now(conn: sqlite3.Connection, session_id: str, turn_id: int) -> bool:
+    """A pending request of this turn that the bounce is for. One whose worker still
+    runs in its scope, registered or not, waits for that worker like a deferred
+    one, unless its failed progress notice was offered its one resend (R4-7)."""
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(delivery_results)")}
+    if "progress_retry" not in columns or not conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='delivery_task_launches'").fetchone():
+        return conn.execute(
+            "SELECT 1 FROM delivery_results WHERE session_id=? AND state='pending' "
+            "AND COALESCE(response_turn_id, turn_id)=? LIMIT 1", (session_id, turn_id),
+        ).fetchone() is not None
+    # A worker the owner was told about no longer counts: it stops blocking (NOVSKY 27.09).
+    released = "silent_notified_at" in {row[1] for row in conn.execute("PRAGMA table_info(delivery_task_launches)")}
+    scope_work = SCOPE_WORK.format(released=" AND silent_notified_at IS NULL" if released else "")
+    for delivery, stamp, turn, response, generation, retry in conn.execute(
+            "SELECT delivery_id, stamp, turn_id, response_turn_id, result_generation, progress_retry "
+            "FROM delivery_results WHERE session_id=? AND state='pending' AND COALESCE(response_turn_id, turn_id)=?",
+            (session_id, turn_id)).fetchall():
+        if retry == f"{generation}:offered" or not conn.execute(scope_work, {
+                "session": session_id, "stamp": stamp, "turn": turn, "response": response,
+                "delivery": delivery}).fetchone():
+            return True
+    return False
+
+
+def final_text_kind(text: str) -> str:
+    text = text.strip()
+    if not text:
+        return "empty"
+    try:
+        guard = runpy.run_path(str(Path(__file__).with_name("tg-reply-stop-guard")))
+    except Exception as error:
+        log(f"Stop: the guard's forwarding filter is unavailable, so nothing will be forwarded: {error!r}")
+        return "notes"
+    if guard["DECLARED_SILENCE"].search(text):
+        return "silence"
+    if guard["UNSAFE_FALLBACK_TEXT"].search(text):
+        return "notes"
+    return "promise" if len(text) < 60 or PROMISE.search(text) else "answer"
+
+
+def transcript_calls(path: str) -> tuple[dict, dict]:
+    """tool_use ID -> (position, tool, input) and tool_use ID -> (position, result
+    block, the CLI's toolUseResult), from the main thread of the transcript's tail."""
+    uses: dict[str, tuple[int, object, dict]] = {}
+    results: dict[str, tuple[int, dict, object]] = {}
+    with open(path, "rb") as handle:
+        handle.seek(0, 2)
+        size = handle.tell()
+        handle.seek(max(0, size - TRANSCRIPT_TAIL_BYTES))
+        lines = handle.read().split(b"\n")
+    for position, line in enumerate(lines[1:] if size > TRANSCRIPT_TAIL_BYTES else lines):
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        content = (event.get("message") or {}).get("content") if isinstance(event, dict) else None
+        if not isinstance(content, list) or event.get("isSidechain") is True:
+            continue
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "tool_use" and isinstance(block.get("id"), str):
+                arguments = block.get("input")
+                uses[block["id"]] = (position, block.get("name"), arguments if isinstance(arguments, dict) else {})
+            elif block.get("type") == "tool_result" and isinstance(block.get("tool_use_id"), str):
+                results[block["tool_use_id"]] = (position, block, event.get("toolUseResult"))
+    return uses, results
+
+
+def resolve_from_transcript(session_id: str, transcript_path: str | None) -> None:
+    """The calls no launch hook resolved, from the transcript, before the turn closes.
+
+    A call denied after its PreToolUse wrote the intent (a deny from another
+    hook, the permission layer) gets no Post; PostToolBatch resolves it, and when
+    that hook did not run or could not write, the transcript still marks the
+    call is_error. Such an intent becomes failed, and a final it superseded is
+    decided in the same transaction. An intent whose Post did not write is
+    resolved from its tool result. A TaskStop whose PostToolUse did not write
+    stops the obligation it proves when it comes after that obligation's current
+    launch. Each resolution is the launch hook's own transaction.
+    """
+    stamp = os.environ.get("TG_DELIVERY_STAMP")
+    if not stamp or not transcript_path:
+        return
+    try:
+        conn = sqlite3.connect(f"file:{DB}?mode=ro", uri=True, timeout=DB_TIMEOUT)
+        try:
+            if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
+                                "AND name='delivery_task_launches'").fetchone():
+                return
+            intents = dict(conn.execute(
+                "SELECT launch_ref, tool_name FROM delivery_task_launches "
+                "WHERE session_id=? AND stamp=? AND state='launching'", (session_id, stamp)).fetchall())
+            running = dict(conn.execute(
+                "SELECT task_id, launch_ref FROM delivery_task_owners WHERE session_id=? AND stamp=? "
+                "AND state IN ('owned','unowned') AND launch_ref IS NOT NULL", (session_id, stamp)).fetchall())
+        finally:
+            conn.close()
+        if not intents and not running:
+            return
+        uses, results = transcript_calls(transcript_path)
+    except (OSError, sqlite3.Error) as error:
+        log(f"Stop: calls not read from the transcript: {error!r}")
+        return
+    hook = None
+    for call, tool in intents.items():
+        if call not in results or call not in uses:
+            continue
+        _, block, native = results[call]
+        hook = hook or runpy.run_path(str(Path(__file__).with_name("tg-native-task")))
+        try:
+            hook["resolve_intent"](session_id, stamp, call, tool, uses[call][2],
+                                   native if isinstance(native, dict) else {}, block.get("is_error") is True)
+            log(f"Stop: {tool} {call} resolved from the transcript"
+                + (" as failed" if block.get("is_error") is True else ""))
+        except Exception as error:
+            log(f"Stop: {tool} {call} not resolved from the transcript: {error!r}")
+    for task, launch in running.items():
+        launched = uses.get(launch)
+        for call, (position, tool, arguments) in uses.items():
+            result = results.get(call)
+            if (tool != "TaskStop" or arguments.get("task_id") != task or launched is None
+                    or position <= launched[0] or result is None or result[1].get("is_error") is True):
+                continue
+            native = result[2]
+            if not isinstance(native, dict):
+                try:
+                    native = json.loads(result[1].get("content"))
+                except (TypeError, ValueError):
+                    native = {}
+            hook = hook or runpy.run_path(str(Path(__file__).with_name("tg-native-task")))
+            try:
+                hook["record_stop"](session_id, stamp, arguments, native if isinstance(native, dict) else {})
+                log(f"Stop: TaskStop {call} of {task} read from the transcript")
+            except Exception as error:
+                log(f"Stop: TaskStop {call} of {task} not recorded from the transcript: {error!r}")
+
+
 def bounce_once(conn: sqlite3.Connection, session_id: str) -> bool:
     """Receiver mode, Stop: the current turn still owes a result — bounce once.
     A schema this hook does not know fails open: the turn closes as usual."""
@@ -143,11 +327,7 @@ def bounce_once(conn: sqlite3.Connection, session_id: str) -> bool:
         results_present = conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='delivery_results'"
         ).fetchone() is not None
-        pending = results_present and conn.execute(
-            "SELECT 1 FROM delivery_results WHERE session_id=? AND state='pending' "
-            "AND COALESCE(response_turn_id, turn_id)=? LIMIT 1",
-            (session_id, turn_id),
-        ).fetchone() is not None
+        pending = results_present and owes_now(conn, session_id, turn_id)
         legacy_filter = (
             "AND NOT EXISTS (SELECT 1 FROM delivery_results r "
             "WHERE r.delivery_id=m.delivery_id AND r.turn_id=m.turn_id)"
@@ -190,18 +370,57 @@ def main() -> None:
         transcript_path = None
     now = int(time.time() * 1000)
     bounced = False
+    if event in CLOSE_KIND:
+        resolve_from_transcript(session_id, transcript_path)
 
     conn = None
     try:
         conn = sqlite3.connect(f"file:{DB}?mode=rw", uri=True, timeout=DB_TIMEOUT, isolation_level=None)
         conn.execute("BEGIN IMMEDIATE")
         if not ledger_present(conn):
-            log(f"{event}: ledger tables missing; nothing recorded")
+            if event == "SessionStart" and data.get("source") in ("resume", "compact"):
+                # On the first upgrade there may be no turn ledger yet. Keep
+                # the unknown resumed ID closed across that migration.
+                quarantine_unknown_native(conn, session_id, now)
+                log(f"{event}: turn ledger missing; unknown native session quarantined")
+            else:
+                log(f"{event}: ledger tables missing; nothing recorded")
         elif event == "Stop" and AUTHORITY == "receiver" and bounce_once(conn, session_id):
             # The turn stays open: the model continues it with the hint below.
             bounced = True
         elif event == "SessionStart":
             source = data.get("source") if isinstance(data.get("source"), str) else None
+            columns_present = session_columns(conn)
+            # SessionStart replaces the mutable row even for --resume. Save its
+            # first known origin before that replacement, so receiver startup
+            # can tell an already-tracked ID from a genuinely pre-ledger one.
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS delivery_native_session_origins ("
+                "session_id TEXT PRIMARY KEY, started_at INTEGER NOT NULL, "
+                "stamp TEXT, source TEXT, inherited INTEGER NOT NULL)"
+            )
+            old_stamp = "stamp" if "stamp" in columns_present else "NULL"
+            conn.execute(
+                "INSERT OR IGNORE INTO delivery_native_session_origins "
+                "(session_id,started_at,stamp,source,inherited) "
+                f"SELECT session_id,started_at,{old_stamp},source,1 "
+                "FROM delivery_sessions WHERE session_id=?",
+                (session_id,),
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO delivery_native_session_origins "
+                "(session_id,started_at,stamp,source,inherited) VALUES (?,?,?,?,0)",
+                (session_id, now, os.environ.get("TG_DELIVERY_STAMP") or None, source),
+            )
+            origin = conn.execute(
+                "SELECT source,inherited FROM delivery_native_session_origins WHERE session_id=?",
+                (session_id,),
+            ).fetchone()
+            if origin and origin[0] in ("resume", "compact") and origin[1] == 0:
+                # A resumed ID with no older session row has no proof that its
+                # earlier native tasks were tracked. This hook may run after
+                # receiver startup, so quarantine it here as well.
+                quarantine_unknown_native(conn, session_id, now)
             # A compaction keeps the session and its turn alive; any other start
             # is a CLI process start, so the session's clock moves to now and the
             # receiver closes every turn opened before it. The launcher resumes
@@ -212,7 +431,7 @@ def main() -> None:
             verb = "INSERT OR IGNORE" if source == "compact" else "INSERT OR REPLACE"
             columns = ["session_id", "started_at", "transcript_path", "source"]
             values = [session_id, now, transcript_path, source]
-            if "stamp" in session_columns(conn):
+            if "stamp" in columns_present:
                 columns.append("stamp")
                 values.append(os.environ.get("TG_DELIVERY_STAMP") or None)
             conn.execute(
@@ -221,11 +440,28 @@ def main() -> None:
                 values,
             )
         else:
+            owing = []
+            if event == "Stop" and AUTHORITY == "receiver" and {"final_text", "final_text_kind"} <= {
+                    row[1] for row in conn.execute("PRAGMA table_info(delivery_turns)")}:
+                owing = [row[0] for row in conn.execute(
+                    "SELECT t.turn_id FROM delivery_turns t WHERE t.session_id=? AND t.closed_at IS NULL "
+                    "AND EXISTS (SELECT 1 FROM delivery_results r WHERE r.session_id=t.session_id "
+                    "AND r.state='pending' AND COALESCE(r.response_turn_id, r.turn_id)=t.turn_id)",
+                    (session_id,),
+                )]
             conn.execute(
                 "UPDATE delivery_turns SET closed_at=?, close_kind=?, close_detail=? "
                 "WHERE session_id=? AND closed_at IS NULL",
                 (now, CLOSE_KIND[event], error_class(data) if event == "StopFailure" else None, session_id),
             )
+            if owing:
+                text = data.get("last_assistant_message")
+                text = text if isinstance(text, str) else ""
+                kind = final_text_kind(text)
+                conn.executemany(
+                    "UPDATE delivery_turns SET final_text=?, final_text_kind=? WHERE turn_id=?",
+                    [(text, kind, turn_id) for turn_id in owing],
+                )
             # The turn boundary is recorded even when no turn was open (the
             # start hook failed): the receiver needs it to tell a second reply
             # of the same turn from the next turn's reply.

@@ -3,6 +3,20 @@
 set -euo pipefail
 
 [ "$(id -u)" -eq 0 ] || { echo "FATAL: запусти від root" >&2; exit 1; }
+# BEGIN owner freeze preflight
+# The owner froze kit updates on this server: refuse before any licence call,
+# package work or managed write. A symlink (even a dangling one) or any other
+# non-regular marker refuses unopened; a regular one shows its first 2000 bytes.
+UPDATES_FROZEN=/etc/claude-tg-starter/updates-frozen
+if [ -L "$UPDATES_FROZEN" ] || [ -e "$UPDATES_FROZEN" ]; then
+  FROZEN_REASON=""
+  if [ ! -L "$UPDATES_FROZEN" ] && [ -f "$UPDATES_FROZEN" ]; then
+    FROZEN_REASON="$(head -c 2000 -- "$UPDATES_FROZEN" 2>/dev/null || true)"
+  fi
+  echo "FATAL: оновлення кита на цьому сервері заморожено власником${FROZEN_REASON:+: $FROZEN_REASON}" >&2
+  exit 3
+fi
+# END owner freeze preflight
 KIT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PRODUCT_CONFIG="$KIT/assets/lib/product-config.py"
 CONFIG_DIR=/etc/claude-tg-starter
@@ -145,7 +159,7 @@ write_env_value() {
 # reset integrations or module choices that were configured earlier.
 ALERT_COPY_CHAT_IDS="${ALERT_COPY_CHAT_IDS:-}"
 PRESERVE_NAMES=(
-  ADDITIONAL_ADMIN_CHAT_IDS ALERT_COPY_CHAT_IDS OWNER_EMAIL CALENDAR_EMAIL
+  ADDITIONAL_ADMIN_CHAT_IDS ALERT_COPY_CHAT_IDS OWNER_EMAIL CALENDAR_EMAIL OWNER_NOTICE_LOCALE
   TELEGRAM_BOT_TOKEN NOVSKY_LICENSE_KEY OPENAI_API_KEY MEMORY_EMBEDDINGS_OPENAI
   RECALL_API_KEY RECALL_REGION TG_DROP_PENDING_ON_BOOT
   MODULE_DESIGN_PACK MODULE_CHANNEL_PUBLISH MODULE_SOCIAL_BROWSER
@@ -439,6 +453,7 @@ if product_check_declared sec_edgar && [ -z "$OWNER_EMAIL" ]; then
   ask_required OWNER_EMAIL "Контактний email для SEC EDGAR" "SEC вимагає справжній контакт у User-Agent автоматичних запитів. Ключ або пароль не потрібен." validate_email
 fi
 VAULT_LOCALE="${VAULT_LOCALE:-en-US}"
+OWNER_NOTICE_LOCALE="${OWNER_NOTICE_LOCALE:-uk}"
 
 printf '\nПеревір без секретів:\n'
 printf '  Асистент: %s\n  Власник: %s (%sid %s)\n' "$AGENT_NAME" "$OWNER_NAME" "${OWNER_TG_USERNAME:+@$OWNER_TG_USERNAME, }" "$OWNER_CHAT_ID"
@@ -495,7 +510,7 @@ umask 077
 for name in AGENT_NAME OWNER_NAME OWNER_TG_USERNAME OWNER_CHAT_ID ADDITIONAL_ADMIN_CHAT_IDS ALERT_COPY_CHAT_IDS OWNER_EMAIL \
             BOT_USERNAME TIMEZONE TELEGRAM_BOT_TOKEN NOVSKY_LICENSE_KEY OPENAI_API_KEY VOICE_SETUP_STATUS \
             MEMORY_EMBEDDINGS_OPENAI \
-            RECALL_API_KEY RECALL_REGION CALENDAR_EMAIL VAULT_LOCALE TG_DROP_PENDING_ON_BOOT \
+            RECALL_API_KEY RECALL_REGION CALENDAR_EMAIL VAULT_LOCALE OWNER_NOTICE_LOCALE TG_DROP_PENDING_ON_BOOT \
             MODULE_DESIGN_PACK MODULE_CHANNEL_PUBLISH MODULE_SOCIAL_BROWSER \
             MODULE_TRANSPORT_DAEMON MODULE_VAULT_WEB MODULE_INSTAGRAM_DM \
             MODULE_YOUTUBE_COMMENTS CHANNEL_ID SITE_PASSWORD; do
@@ -506,7 +521,7 @@ umask "$env_umask"
 
 export AGENT_NAME OWNER_NAME OWNER_TG_USERNAME OWNER_CHAT_ID ADDITIONAL_ADMIN_CHAT_IDS ALERT_COPY_CHAT_IDS OWNER_EMAIL
 export BOT_USERNAME TIMEZONE TELEGRAM_BOT_TOKEN OPENAI_API_KEY VOICE_SETUP_STATUS MEMORY_EMBEDDINGS_OPENAI
-export RECALL_API_KEY RECALL_REGION CALENDAR_EMAIL VAULT_LOCALE TG_DROP_PENDING_ON_BOOT
+export RECALL_API_KEY RECALL_REGION CALENDAR_EMAIL VAULT_LOCALE OWNER_NOTICE_LOCALE TG_DROP_PENDING_ON_BOOT
 export MODULE_DESIGN_PACK MODULE_CHANNEL_PUBLISH MODULE_SOCIAL_BROWSER
 export MODULE_TRANSPORT_DAEMON MODULE_VAULT_WEB MODULE_INSTAGRAM_DM MODULE_YOUTUBE_COMMENTS
 export CHANNEL_ID SITE_PASSWORD

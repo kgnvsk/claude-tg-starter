@@ -9,6 +9,51 @@ set -euo pipefail
 KIT=/opt/claude-tg-starter
 REMOTE=https://github.com/kgnvsk/claude-tg-starter.git
 
+# Кожен агент має власний каталог комплекту: основний /opt/claude-tg-starter,
+# решта /opt/claude-tg-starter@<користувач>. Каталог основного служить іншому
+# агенту лише до його першого власного оновлення й лише для того самого продукту.
+user="$(id -un)"
+if [ "$user" != claude ]; then
+  own="$KIT@$user"
+  if [ -d "$own" ] && [ ! -L "$own" ]; then
+    KIT="$own"
+  else
+    for candidate in "$own" "$own.new" "$own.prev"; do
+      if [ -e "$candidate" ] || [ -L "$candidate" ]; then
+        echo "Комплект цього агента зараз замінюється; перевір оновлення пізніше."
+        exit 1
+      fi
+    done
+    if ! python3 - "$KIT" "$HOME/.claude/product/runtime.json" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+
+def product(path):
+    path = Path(path)
+    candidates = (path / "PRODUCT.json", path / "assets/product/runtime.json") if path.is_dir() else (path,)
+    for candidate in candidates:
+        try:
+            value = json.loads(candidate.read_text(encoding="utf-8")).get("productId")
+        except FileNotFoundError:
+            continue
+        except (OSError, UnicodeError, ValueError, AttributeError):
+            return None
+        return value if isinstance(value, str) and value else None
+    return None
+
+
+kit, home = product(sys.argv[1]), product(sys.argv[2])
+raise SystemExit(0 if kit is not None and kit == home else 1)
+PY
+    then
+      echo "Спільний комплект у $KIT належить іншому продукту; власний комплект цього агента ставить Novsky."
+      exit 1
+    fi
+  fi
+fi
+
 if [ ! -d "$KIT/.git" ]; then
   echo "Комплект у $KIT не є git-клоном."
   echo "Адміністратору root: розгорніть продуктовий репозиторій за інструкцією DEPLOY.md."

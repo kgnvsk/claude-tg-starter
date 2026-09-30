@@ -33,6 +33,8 @@ different account (or the login process finishing successfully) does.
 
 import json
 import hashlib
+import importlib.machinery
+import importlib.util
 from contextlib import closing, contextmanager
 import fcntl
 import os
@@ -219,6 +221,26 @@ def owner_chat() -> str:
     return str(allow[0]) if allow else ""
 
 
+def manual_relogin_chat(chat: str) -> bool:
+    """A manually chosen OAuth recipient must hold the role right now."""
+    if not re.fullmatch(r"[1-9]\d{0,19}", chat):
+        return False
+    try:
+        primary = owner_chat()
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+    if chat == primary:
+        return True
+    try:
+        access = json.loads(ACCESS_FILE.read_text(encoding="utf-8"))
+        admins, admitted, superadmins = (access[key] for key in ("admins", "allowFrom", "superadmins"))
+        return all(isinstance(items, list) and all(isinstance(item, str) for item in items)
+                   for items in (admins, admitted, superadmins)) and all(
+                       chat in items for items in (admins, admitted, superadmins))
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+
+
 def send(token: str, chat: str, text: str) -> None:
     body = urllib.parse.urlencode({"chat_id": chat, "text": text}).encode()
     req = urllib.request.Request(
@@ -402,6 +424,51 @@ def settle_auth_control_deliveries(chat: str, auth_code: str = "", since_ms: int
         return count
 
 
+def distinct_account(before: str | None, after: str | None) -> bool:
+    """An account switch that proves a different identity; a same or unknown login keeps its limit."""
+    return bool(before) and bool(after) and after != before
+
+
+def release_limit_hold() -> int:
+    """End the previous account's limit hold; the transport is stopped and the lifecycle lock held.
+
+    The receiver keeps requests paused until the old account's reset, and the limit
+    watchdog closes its incident only after a reply that the paused queue never lets
+    through (Кеш, 29.09: accounts switched at 17:25 UTC, the queue waited for the
+    17:42 reset). The watchdog's own reader and writer keep its state valid.
+    """
+    now = int(time.time() * 1000)
+    released = 0
+    if MESSAGES_DB.exists():
+        with closing(sqlite3.connect(f"file:{MESSAGES_DB}?mode=rw", uri=True, timeout=5)) as db, db:
+            tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            if {"delivery_results", "pending_inbound_deliveries", "delivery_runtime"} <= tables:
+                db.execute("BEGIN IMMEDIATE")
+                paused = [row[0] for row in db.execute(
+                    "SELECT delivery_id FROM delivery_results WHERE state='paused' "
+                    "AND recovery_reason='provider_limit' AND resume_after>?", (now,))]
+                for delivery_id in paused:
+                    db.execute("UPDATE delivery_results SET resume_after=? WHERE delivery_id=? "
+                               "AND state='paused' AND recovery_reason='provider_limit'", (now, delivery_id))
+                    db.execute("UPDATE pending_inbound_deliveries SET next_attempt_at=? WHERE delivery_id=? "
+                               "AND state='recovering' AND next_attempt_at>?", (now, delivery_id, now))
+                db.execute("UPDATE delivery_runtime SET value=?, updated_at=? WHERE key='provider_pause_until' "
+                           "AND CAST(value AS INTEGER)>?", (str(now), now, now))
+                released = len(paused)
+    watchdog = Path(__file__).resolve().with_name("claude-limit-recovery")
+    state_path = AGENT_ROOT / "logs/claude-limit-recovery.json"
+    if watchdog.is_file() and state_path.is_file():
+        loader = importlib.machinery.SourceFileLoader("claude_limit_recovery", str(watchdog))
+        limits = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+        loader.exec_module(limits)
+        state = limits.load_state(state_path)
+        incident = state["incident"]
+        if incident is not None and not incident["resolved"] and not incident["expired"]:
+            incident["resolved"] = True
+            limits.atomic_write_state(state_path, state)
+    return released
+
+
 def finish_recovery(
     token: str,
     chat: str,
@@ -410,6 +477,7 @@ def finish_recovery(
     success_log: str,
     auth_code: str = "",
     since_ms: int = 0,
+    account_switched: bool = False,
 ) -> int:
     """Complete OAuth recovery only when Telegram transport is live."""
     mark_auth_established()
@@ -420,12 +488,18 @@ def finish_recovery(
             finally:
                 # Even if settlement fails, do not leave a stopped service behind.
                 recovered = restart_and_verify_transport()
+            # Another account has its own limit: once the transport is proven live, still under
+            # the lifecycle lock, the old one's saved requests go now. A failed restart keeps
+            # the hold and its incident as evidence (Codex, task 48).
+            released = release_limit_hold() if account_switched and recovered else 0
     except (OSError, sqlite3.Error, RuntimeError, subprocess.SubprocessError):
         log("auth restored but auth-control queue settlement failed; retained")
         send(token, chat, "⚠️ Вхід відновлено, але черга ще потребує перевірки. Запити збережено.")
         return 1
     if settled:
         log(f"settled {settled} auth-control deliveries; business requests preserved")
+    if account_switched and recovered:
+        log(f"previous account's limit hold released; {released} paused request(s) resume now")
     try:
         STATE_FILE.unlink()
     except OSError:
@@ -478,9 +552,11 @@ def acquire_lock() -> int | None:
 
 
 def wait_code_from_owner(chat: str, since_ms: int, state: str = "",
-                         switching_from: str = "") -> str | None:
+                         switching_from: str = "", manual_target: bool = False) -> str | None:
     deadline = time.time() + CODE_TIMEOUT_S
     while time.time() < deadline:
+        if manual_target and not manual_relogin_chat(chat):
+            return ""
         # A desktop operator may complete a separate login while this rescue is
         # waiting on its own OAuth code. Stop immediately instead of sending a
         # false "still logged out / link expired" alert ten minutes later.
@@ -514,11 +590,35 @@ def wait_code_from_owner(chat: str, since_ms: int, state: str = "",
     return ""
 
 
-def main(force: bool = False) -> int:
+def login_outcome(switching_from: str, switched_to: str, warn: str,
+                  show_identity: bool = True) -> tuple[str, str]:
+    """The owner's message and the log line for a login that landed. Only a distinct account
+    is a switch: the same one, or one we could not identify, keeps its limit (Codex, task 48 P2).
+    Only the owner's chat sees account identities, as everywhere else in this flow."""
+    queued = "Службу перезапущено, збережені запити залишаються в черзі." + warn
+    if not switching_from:
+        return "✅ Вхід у Claude відновлено. " + queued, "rescue OK, transport verified"
+    if distinct_account(switching_from, switched_to):
+        return (f"✅ Обліковий запис Claude змінено: тепер {switched_to if show_identity else 'новий вхід'}. " + queued,
+                "account switched, transport verified")
+    if switched_to == switching_from:
+        return (f"✅ Вхід виконано, але це той самий обліковий запис Claude ({switched_to if show_identity else 'приховано'}): якщо його "
+                "ліміт вичерпано, відповіді підуть після скидання. " + queued,
+                "same account logged in again, transport verified")
+    return ("✅ Вхід у Claude виконано, але не вдалося перевірити, який це обліковий запис, тому пауза "
+            "через ліміт, якщо вона була, лишається до скидання. " + queued,
+            "login landed, account unverified, transport verified")
+
+
+def main(force: bool = False, chat_override: str | None = None) -> int:
     lock_descriptor = acquire_lock()
     if lock_descriptor is None:
         log("another rescue flow is active")
         return 0
+    if chat_override is not None and (not force or not manual_relogin_chat(chat_override)):
+        log("manual relogin recipient no longer authorized")
+        os.close(lock_descriptor)
+        return 1
     # force = owner typed /relogin: send a fresh link now, even if the current
     # login still looks alive and regardless of the auto-debounce.
     if not force:
@@ -555,10 +655,11 @@ def main(force: bool = False) -> int:
     save_state()
 
     token = bot_token()
-    chat = owner_chat()
+    chat = chat_override or owner_chat()
     if not token or not chat:
         log("no bot token or owner chat — cannot assist")
         return 1
+    show_account_identity = chat == owner_chat()
 
     # /relogin while the login is alive = the owner switches accounts (a burnt
     # weekly limit, a shared login). Nothing below may read `loggedIn` as
@@ -601,10 +702,14 @@ def main(force: bool = False) -> int:
     state = state_match.group(1) if state_match else ""
 
     since_ms = int(time.time() * 1000)
+    if chat_override is not None and not manual_relogin_chat(chat):
+        os.kill(pid, signal.SIGKILL)
+        log("manual relogin recipient revoked before link delivery")
+        return 1
     publish_auth_input(chat, state, since_ms)
     if switching_from:
         send(token, chat,
-             f"🔐 Перемикаю обліковий запис Claude за твоєю командою. Поточний вхід ({switching_from}) "
+             f"🔐 Перемикаю обліковий запис Claude за твоєю командою. Поточний вхід ({switching_from if show_account_identity else 'приховано'}) "
              "працює, доки не завершиш новий:\n"
              "1) Відкрий посилання нижче та увійди до ПОТРІБНОГО облікового запису Claude.\n"
              "2) Скопіюй код зі сторінки.\n"
@@ -621,9 +726,9 @@ def main(force: bool = False) -> int:
              f"{url}\n\n"
              "⏳ Чекаю код 10 хвилин. Якщо не встигнеш або посилання втратить чинність — просто напиши мені "
              "/relogin, і я відразу надішлю свіже (скільки завгодно разів).")
-    log("oauth url sent to owner; waiting for code")
+    log("oauth url sent to authorized chat; waiting for code")
 
-    code = wait_code_from_owner(chat, since_ms, state, switching_from)
+    code = wait_code_from_owner(chat, since_ms, state, switching_from, chat_override is not None)
     if code is None:
         try:
             os.kill(pid, signal.SIGKILL)
@@ -633,13 +738,14 @@ def main(force: bool = False) -> int:
             token,
             chat,
             success_message=(
-                f"✅ Обліковий запис Claude вже змінено іншим способом: тепер {auth_email() or 'новий вхід'}. "
+                f"✅ Обліковий запис Claude вже змінено іншим способом: тепер {(auth_email() or 'новий вхід') if show_account_identity else 'новий вхід'}. "
                 "Службу перезапущено, збережені запити залишаються в черзі."
                 if switching_from else
                 "✅ Вхід у Claude вже відновлено іншим способом. "
                 "Службу перезапущено, збережені запити залишаються в черзі."
             ),
             success_log="rescue completed by another login flow; transport verified",
+            account_switched=distinct_account(switching_from, auth_email()),
         )
     if not code:
         os.kill(pid, signal.SIGKILL)
@@ -691,29 +797,24 @@ def main(force: bool = False) -> int:
         succeeded = bool(logged_in())
     if succeeded:
         zombies = env_token_zombies()
-        warn = (f"\n⚠️ У {ENV_FILE} залишився {zombies} — старий токен перекриває "
+        warn = (f"\n⚠️ У {ENV_FILE if show_account_identity else 'налаштуваннях'} залишився {zombies} — старий токен перекриває "
                 "нову авторизацію (бот отримає 401). Видали цей рядок і перезапусти мене."
                 if zombies else "")
+        success_message, success_log = login_outcome(switching_from, switched_to, warn, show_account_identity)
         return finish_recovery(
             token,
             chat,
-            success_message=(
-                f"✅ Обліковий запис Claude змінено: тепер {switched_to or 'новий вхід'}. "
-                "Службу перезапущено, збережені запити залишаються в черзі." + warn
-                if switching_from else
-                "✅ Вхід у Claude відновлено. Службу перезапущено, "
-                "збережені запити залишаються в черзі." + warn
-            ),
-            success_log=("account switched, transport verified" if switching_from
-                         else "rescue OK, transport verified"),
+            success_message=success_message,
+            success_log=success_log,
             auth_code=code,
             since_ms=since_ms,
+            account_switched=distinct_account(switching_from, switched_to),
         )
 
     if switching_from:
         send(token, chat,
              "❌ Код не підійшов (або надісланий із зайвим текстом). "
-             f"Залишаюся на {switching_from}. "
+             f"Залишаюся на {switching_from if show_account_identity else 'попередньому вході'}. "
              "Напиши /relogin — надішлю свіже посилання, спробуємо ще раз.")
         log("code rejected — account unchanged")
         return 1
@@ -725,4 +826,11 @@ def main(force: bool = False) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main("--force" in sys.argv))
+    args = sys.argv[1:]
+    if args == []:
+        sys.exit(main())
+    if args == ["--force"]:
+        sys.exit(main(force=True))
+    if len(args) != 3 or args[:2] != ["--force", "--chat"]:
+        sys.exit(2)
+    sys.exit(main(force=True, chat_override=args[2]))

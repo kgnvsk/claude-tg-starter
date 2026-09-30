@@ -6,6 +6,7 @@
 #   EPOCH=<unix_timestamp_when_to_fire>
 #   CHAT=<chat_id>
 # Optional headers:
+#   THREAD_ID=<positive_forum_topic_id> (requires a group CHAT)
 #   PARSE=<markdown|markdownv2|html|text>  (default: text)
 #   RUN=1  → the body is a task for the agent, not a message for the owner:
 #            run it headless and send the RESULT. Everything else (repeat,
@@ -13,6 +14,8 @@
 #   QUIET=1 (with RUN=1) → the task delivers by itself with tg-send/tg-send-file,
 #            e.g. into group topics; its returned text only goes to the log, and
 #            a failure notice goes to the owner's private chat, not into CHAT.
+#   RETRY_SAFE=1 (with RUN=1) → the task only reads and reports, so a run that
+#            died is run once more; its result reaches CHAT with a late line.
 #   TASK=<stable_task_identifier>
 #   REPEAT_SECONDS=<positive_interval>
 #   TIMEZONE=<safe_IANA_timezone>
@@ -20,46 +23,157 @@
 #   QUIET_END=<hour_or_HH:MM>
 #   UNTIL_EPOCH=<last_allowed_send_boundary>
 #   COUNT=<successful_send_count>
+#   CADENCE_EPOCH=<original_repeat_grid_start> (internal, set on quiet deferral)
 # Header lines form the leading KEY=value block. Everything after that block
 # is the message body. Unknown optional headers are preserved but not sent.
 
 set -u
+umask 077
 
 REM_DIR="${REM_DIR:-$HOME/.atarax/reminders}"
 LOG="${LOG:-$HOME/logs/reminder-tick.log}"
 TOKEN_FILE="${TOKEN_FILE:-$HOME/.claude/channels/telegram/.env}"
 PROFILE_FILE="${PROFILE_FILE:-$HOME/.agent-profile.env}"
 LOCK_FILE="${LOCK_FILE:-${REM_DIR}.worker.lock}"
+RUN_DELIVERY_DIR="$REM_DIR/.run-delivery"
+QUIET_RUN_DIR="$REM_DIR/.quiet-runs"
 
 mkdir -p "$REM_DIR" "$(dirname "$LOG")"
 
 # macOS has no flock(1), while Python's non-blocking kernel flock is portable
 # across macOS and Ubuntu. The inheritable fd survives exec and remains held by
 # curl if the Bash worker dies during delivery.
+# The tick that takes the lock records itself (PID and start time). A lock kept
+# by something else, such as a child of a killed run, made every later tick skip
+# every task. Once the lock has been busy longer than any tick may live while its
+# recorded holder is gone, a fresh lock file replaces it. Nothing is killed: the
+# child keeps a lock nobody waits on, and the owner is told once.
 if [ "${REMINDER_TICK_LOCK_HELD:-0}" != "1" ]; then
   exec python3 - "$LOCK_FILE" "$0" "$@" <<'PY'
 import fcntl
 import os
+import subprocess
 import sys
+import time
 
 lock_path, worker, *worker_args = sys.argv[1:]
-os.makedirs(os.path.dirname(lock_path) or ".", exist_ok=True)
-lock = open(lock_path, "a+", encoding="utf-8")
-try:
-    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-except BlockingIOError:
-    lock.close()
-    raise SystemExit(0)
+holder_path, busy_path = lock_path + ".holder", lock_path + ".busy-since"
+now = int(os.environ.get("NOW_EPOCH") or time.time())
+# ponytail: cron caps a tick at 960 s; a lock busy longer is nobody's live work.
+STALE_AFTER = 1020
 
+
+def started(pid):
+    # UTC, so a tick started with another TZ (cron's owner zone vs a hand-started
+    # tick) reads the same process the same way.
+    env = {**os.environ, "LC_ALL": "C", "TZ": "UTC"}
+    return subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True,
+                          text=True, env=env).stdout.strip()
+
+
+def fields(path):
+    try:
+        with open(path, encoding="utf-8") as source:
+            return dict(line.split("=", 1) for line in source.read().splitlines() if "=" in line)
+    except (OSError, UnicodeError, ValueError):
+        return {}
+
+
+def record(path, text):
+    temporary = f"{path}.{os.getpid()}.tmp"
+    with open(temporary, "w", encoding="utf-8") as out:
+        out.write(text)
+    os.replace(temporary, path)
+
+
+def holds(record):
+    # Whether the process a record names is still the one that wrote it.
+    pid, start, at = record.get("PID", ""), record.get("START", ""), record.get("AT", "")
+    if not pid.isdigit():
+        return False
+    if record.get("TZ") == "UTC":
+        return bool(start) and start == started(pid)
+    # A record from before 28.09 (unreleased builds only) has its writer's local START, which
+    # proves nothing across zones (Codex, 28.09). AT does: a process that reused the PID
+    # started after the recorded one wrote it.
+    import calendar
+    try:
+        begun = calendar.timegm(time.strptime(" ".join(started(pid).split()), "%a %b %d %H:%M:%S %Y"))
+    except ValueError:
+        return False
+    return at.isdigit() and begun <= int(at)
+
+
+def take():
+    handle = open(lock_path, "a+", encoding="utf-8")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        return None
+    # A lock on a file the path no longer names (replaced meanwhile) is no lock at all.
+    try:
+        current = os.stat(lock_path)
+    except FileNotFoundError:
+        current = None
+    held = os.fstat(handle.fileno())
+    if current is None or (current.st_dev, current.st_ino) != (held.st_dev, held.st_ino):
+        handle.close()
+        return None
+    return handle
+
+
+os.makedirs(os.path.dirname(lock_path) or ".", exist_ok=True)
+lock = take()
+broken = ""
+if lock is None:
+    holder = fields(holder_path)
+    pid = holder.get("PID", "")
+    if holds(holder):
+        raise SystemExit(0)  # the recorded tick is still at work
+    since = fields(busy_path).get("SINCE", "")
+    if not since.isdigit():
+        record(busy_path, f"SINCE={now}\n")
+        raise SystemExit(0)
+    if now - int(since) < STALE_AFTER:
+        raise SystemExit(0)
+    guard = open(lock_path + ".break", "a+", encoding="utf-8")
+    try:
+        fcntl.flock(guard, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise SystemExit(0)
+    lock = take()
+    if lock is None:
+        os.unlink(lock_path)
+        lock = take()
+        if lock is None:
+            raise SystemExit(0)
+        broken = f"{since} {pid or 'unknown'}"
+    guard.close()
+try:
+    os.unlink(busy_path)
+except FileNotFoundError:
+    pass
+record(holder_path, f"PID={os.getpid()}\nSTART={started(os.getpid())}\nTZ=UTC\nAT={now}\n")
 os.set_inheritable(lock.fileno(), True)
 env = os.environ.copy()
 env["REMINDER_TICK_LOCK_HELD"] = "1"
+env["REMINDER_TICK_LOCK_BROKEN"] = broken
 os.execvpe("bash", ["bash", worker, *worker_args], env)
 PY
 fi
 
 log_message() {
   printf '%s %s\n' "$(date '+%F %T')" "$*" >> "$LOG"
+}
+
+atomic_text() {
+  local path="$1" value="$2" temp
+  temp=$(mktemp "${path}.tmp.XXXXXX") || return 1
+  if ! printf '%s\n' "$value" > "$temp" || ! mv -f "$temp" "$path"; then
+    rm -f "$temp"
+    return 1
+  fi
 }
 
 header_value() {
@@ -138,8 +252,8 @@ timezone_date() {
   fi
 }
 
-next_quiet_end_epoch() {
-  local now="$1" timezone="$2" end_minutes="$3" tomorrow="$4"
+local_boundary_epoch() {
+  local now="$1" timezone="$2" boundary_minutes="$3" tomorrow="$4"
   local local_date target_date hour minute
 
   if date -d '@0' '+%s' >/dev/null 2>&1; then
@@ -149,8 +263,8 @@ next_quiet_end_epoch() {
     else
       target_date="$local_date"
     fi
-    hour=$((end_minutes / 60))
-    minute=$((end_minutes % 60))
+    hour=$((boundary_minutes / 60))
+    minute=$((boundary_minutes % 60))
     timezone_date "$timezone" -d "$(printf '%s %02d:%02d:00' "$target_date" "$hour" "$minute")" '+%s'
   else
     local_date=$(timezone_date "$timezone" -r "$now" '+%Y-%m-%d') || return 1
@@ -159,18 +273,18 @@ next_quiet_end_epoch() {
     else
       target_date="$local_date"
     fi
-    hour=$((end_minutes / 60))
-    minute=$((end_minutes % 60))
+    hour=$((boundary_minutes / 60))
+    minute=$((boundary_minutes % 60))
     timezone_date "$timezone" -j -f '%Y-%m-%d %H:%M:%S' \
       "$(printf '%s %02d:%02d:00' "$target_date" "$hour" "$minute")" '+%s'
   fi
 }
 
 atomic_update_repeat() {
-  local file="$1" next_epoch="$2" next_count="$3" temp
+  local file="$1" next_epoch="$2" next_count="$3" anchor="${4:-}" temp
   temp=$(mktemp "${file}.tmp.XXXXXX") || return 1
-  if ! awk -v next_epoch="$next_epoch" -v next_count="$next_count" '
-    BEGIN { headers = 1; count_written = 0 }
+  if ! awk -v next_epoch="$next_epoch" -v next_count="$next_count" -v anchor="$anchor" '
+    BEGIN { headers = 1; count_written = 0; anchor_written = 0 }
     headers && /^EPOCH=/ {
       print "EPOCH=" next_epoch
       next
@@ -180,14 +294,22 @@ atomic_update_repeat() {
       count_written = 1
       next
     }
+    headers && /^CADENCE_EPOCH=/ {
+      if (!anchor_written) print
+      anchor_written = 1
+      next
+    }
     headers && !/^[A-Z][A-Z0-9_]*=/ {
       if (!count_written) print "COUNT=" next_count
+      if (anchor != "" && !anchor_written) print "CADENCE_EPOCH=" anchor
       count_written = 1
+      anchor_written = 1
       headers = 0
     }
     { print }
     END {
       if (headers && !count_written) print "COUNT=" next_count
+      if (headers && anchor != "" && !anchor_written) print "CADENCE_EPOCH=" anchor
     }
   ' "$file" > "$temp"; then
     rm -f "$temp"
@@ -219,11 +341,15 @@ settle_reminder() {
     log_message "fired $(basename "$f") → chat=$chat"
     return 0
   fi
-  # The next slot stays on the reminder's own grid (EPOCH + n*REPEAT): advancing
+  # The next slot stays on the reminder's original grid (anchor + n*REPEAT): advancing
   # from the send time drifted a daily 09:30 reminder to 09:37 over 58 runs.
   # Skipping every slot that is already past keeps an overdue repeat to one send.
-  local missed=$(( (now - epoch) / repeat ))
-  local next_epoch=$(( epoch + (missed + 1) * repeat ))
+  local anchor="$epoch"
+  if [ "${run_mode:-}" = "1" ] && [ -z "$until" ] && [ -n "$cadence_epoch" ]; then
+    anchor="$cadence_epoch"
+  fi
+  local missed=$(( (now - anchor) / repeat ))
+  local next_epoch=$(( anchor + (missed + 1) * repeat ))
   local next_count=$((count + 1))
   if [ -n "$until" ] && [ "$next_epoch" -gt "$until" ]; then
     if ! rm -f "$f"; then
@@ -265,8 +391,105 @@ failure_reason() {
   esac
 }
 
+# A headless run loads the agent's @-imported persona and rules only when its
+# own folder is approved for external imports; CLI 2.1.280 skips them without
+# asking otherwise. The Telegram launcher approves this folder at each start,
+# but a worker updated before the next start, or running beside a custom
+# launcher, found no approval: its reports lost the persona and opened in
+# English (Martin, Maximus, 17-21.09). So the worker approves its folder itself.
+# Claude saves this file under "<file>.lock" and re-reads it there; taking the
+# same lock keeps a live Claude's save and this one from dropping each other.
+approve_task_project() {
+  local workdir="$1" config_root="${CLAUDE_CONFIG_DIR:-$HOME}" config_file
+  config_file="$config_root/.claude.json"
+  if [ -n "${CLAUDE_CONFIG_DIR:-}" ] && [ -f "$config_root/.config.json" ]; then
+    config_file="$config_root/.config.json"
+  fi
+  [ -f "$config_file" ] || return 1
+  python3 - "$config_file" "$workdir" <<'PY'
+import json
+import os
+import stat
+import sys
+import tempfile
+import time
+
+path, folder = sys.argv[1], os.path.realpath(sys.argv[2])
+# Only keys the CLI keeps: 2.1.280 deletes hasCompletedProjectOnboarding from
+# every project whenever it saves this file, so requiring it refused each task
+# minutes after a service start, and writing it back rewrote the file per run.
+FLAGS = ("hasTrustDialogAccepted", "hasClaudeMdExternalIncludesApproved",
+         "hasClaudeMdExternalIncludesWarningShown")
+
+
+def load():
+    with open(path, encoding="utf-8") as source:
+        data = json.load(source)
+    projects = data.setdefault("projects", {}) if isinstance(data, dict) else None
+    entry = projects.setdefault(folder, {}) if isinstance(projects, dict) else None
+    if not isinstance(entry, dict):
+        raise ValueError("unexpected Claude config")
+    return data, entry
+
+
+try:
+    data, entry = load()
+except (OSError, UnicodeError, ValueError):
+    sys.exit(1)
+if all(entry.get(flag) is True for flag in FLAGS):
+    sys.exit(0)
+lock = path + ".lock"
+for _ in range(20):
+    try:
+        os.mkdir(lock)
+        break
+    except FileExistsError:
+        # A saving Claude refreshes its lock; one untouched for 10 s was left by
+        # a Claude killed mid-save, and the CLI itself takes it over then.
+        try:
+            if time.time() - os.stat(lock).st_mtime > 10:
+                os.rmdir(lock)
+                continue
+        except OSError:
+            pass
+        time.sleep(0.1)
+    except OSError:
+        sys.exit(1)
+else:
+    sys.exit(1)
+temp = None
+try:
+    if os.path.islink(path):
+        sys.exit(1)
+    data, entry = load()
+    entry.update(dict.fromkeys(FLAGS, True))
+    mode = stat.S_IMODE(os.stat(path).st_mode)
+    fd, temp = tempfile.mkstemp(prefix=os.path.basename(path) + ".", dir=os.path.dirname(path))
+    with os.fdopen(fd, "w", encoding="utf-8") as out:
+        os.fchmod(out.fileno(), mode)
+        json.dump(data, out, indent=2)
+        out.write("\n")
+        out.flush()
+        os.fsync(out.fileno())
+    os.replace(temp, path)
+    temp = None
+except (OSError, UnicodeError, ValueError):
+    sys.exit(1)
+finally:
+    if temp is not None:
+        try:
+            os.unlink(temp)
+        except OSError:
+            pass
+    try:
+        os.rmdir(lock)
+    except OSError:
+        pass
+PY
+}
+
 run_agent_task() {
-  local file="$1" prompt="$2" out rc
+  local file="$1" prompt="$2" out rc destination="чат ${chat}"
   local workdir="${AGENT_TASK_DIR:-$HOME/.atarax/agent-task}"
   mkdir -p "$workdir"
   # `timeout` is missing on macOS, where the tests also run; the cap is a
@@ -291,7 +514,8 @@ run_agent_task() {
 
 ${prompt}"
   else
-    prompt="Це автоматичне завдання планувальника. Напиши лише текст результату мовою завдання: планувальник сам доставить його в чат ${chat}. Файли надсилай через tg-send-file.
+    [ -z "${thread_id:-}" ] || destination="чат ${chat}, тему ${thread_id}"
+    prompt="Це автоматичне завдання планувальника. Напиши лише текст результату мовою завдання: планувальник сам доставить його в ${destination}. Файли надсилай через tg-send-file${thread_id:+ з --thread-id ${thread_id}}.
 
 ${prompt}"
   fi
@@ -299,15 +523,19 @@ ${prompt}"
   # request with its own sends: it runs without the service's delivery binding.
   out=$(cd "$workdir" &&
     export TG_DELIVERY_STAMP= TG_DELIVERY_ID= TG_DELIVERY_TASK_ID= TG_DELIVERY_PHASE=final \
-      ATARAX_TASK_QUIET="$quiet" ATARAX_TASK_ID="${task_id:-$(basename "$file" .rem)}" ATARAX_TASK_OCCURRENCE="$epoch" &&
+      ATARAX_TASK_QUIET="$quiet" ATARAX_TASK_ID="${task_id:-$(basename "$file" .rem)}" \
+      ATARAX_TASK_OCCURRENCE="$epoch" ATARAX_TASK_RUN_KEY="${quiet_run_key:-}" \
+      ATARAX_TASK_DELIVERY_DIR="$REM_DIR/.quiet-delivery" &&
     ATARAX_SUPPRESS_TELEGRAM=1 ATARAX_TASK_DELIVERY=1 $limit "$HOME/.local/bin/claude" -p --output-format text <<<"$prompt" 2>&1)
   rc=$?
   if [ $rc -ne 0 ]; then
     log_message "run $(basename "$file"): помилка виконання rc=$rc: $(printf '%s' "$out" | tail -c 200 | tr '\n' ' ')"
-    # The owner hears about it rather than facing silence.
+    # The owner hears about it rather than facing silence. Status 4 marks the
+    # printed notice as the owner's, never the task's chat: that can be a group
+    # or a client.
     printf '⚠️ Автоматичне завдання «%s» не виконано: %s.' \
       "$task_id" "$(failure_reason "$rc" "$out")"
-    return 0
+    return 4
   fi
   out=$(printf '%s' "$out" | sed -e 's/[[:space:]]*$//')
   if [ "$quiet" -eq 1 ]; then
@@ -319,7 +547,7 @@ ${prompt}"
     # cannot be retried into silence — say so instead.
     log_message "run $(basename "$file") produced nothing"
     printf '⚠️ Автоматичне завдання «%s» не виконано: агент нічого не відповів.' "$task_id"
-    return 0
+    return 4
   fi
   # The whole result: delivery below splits it into messages Telegram accepts.
   printf '%s' "$out"
@@ -350,26 +578,75 @@ delivered() {
   printf '%s' "$1" | grep -Eq '"ok"[[:space:]]*:[[:space:]]*true'
 }
 
+message_confirmed() {
+  local chat="$1" thread="$2" response="$3"
+  printf '%s' "$response" | python3 -c '
+import json, sys
+chat, thread = sys.argv[1:]
+try:
+    data = json.load(sys.stdin)
+    result = data["result"]
+    good = (data.get("ok") is True and type(result.get("message_id")) is int
+            and result["message_id"] > 0 and type(result.get("chat", {}).get("id")) is int
+            and str(result["chat"]["id"]) == chat)
+    if thread:
+        good = (good and result.get("is_topic_message") is True
+                and type(result.get("message_thread_id")) is int
+                and str(result["message_thread_id"]) == thread)
+except (ValueError, KeyError, TypeError, AttributeError):
+    good = False
+sys.exit(0 if good else 1)
+' "$chat" "$thread"
+}
+
+definite_markup_rejection() {
+  printf '%s' "$1" | python3 -c '
+import json, sys
+try:
+    response = json.load(sys.stdin)
+    good = response.get("ok") is False and response.get("error_code") == 400
+except (ValueError, AttributeError):
+    good = False
+sys.exit(0 if good else 1)
+'
+}
+
 # One message to one chat. Telegram rejects the WHOLE message when the markup
 # does not parse, and a single stray `_` inside a word like bot_id is enough.
 # Markup is decoration; the reminder is the point. Any refusal of a formatted
 # message therefore gets one plain retry — no error-code archaeology,
 # formatting is never worth a lost reminder. Prints Telegram's last answer.
 send_text() {
-  local chat="$1" text="$2" parse="$3" resp
+  local chat="$1" text="$2" parse="$3" thread="${4:-}" strict_receipt="${5:-0}" resp confirmed=0
   local args=(-s -m 10 -X POST "https://api.telegram.org/bot${token}/sendMessage"
               --data-urlencode "chat_id=${chat}"
               --data-urlencode "text=${text}")
+  [ -z "$thread" ] || args+=(--data-urlencode "message_thread_id=${thread}")
   if [ -n "${parse:-}" ] && [ "$parse" != "text" ]; then
     args+=(--data-urlencode "parse_mode=${parse}")
   fi
   resp=$(curl "${args[@]}" 2>&1)
-  if ! delivered "$resp" && [ -n "${parse:-}" ] && [ "$parse" != "text" ]; then
+  if [ -n "$thread" ]; then
+    if ! message_confirmed "$chat" "$thread" "$resp" &&
+       [ -n "${parse:-}" ] && [ "$parse" != "text" ] &&
+       definite_markup_rejection "$resp"; then
+      resp=$(curl -s -m 10 -X POST "https://api.telegram.org/bot${token}/sendMessage" \
+             --data-urlencode "chat_id=${chat}" --data-urlencode "text=${text}" \
+             --data-urlencode "message_thread_id=${thread}" 2>&1)
+      message_confirmed "$chat" "$thread" "$resp" &&
+        log_message "delivered $(basename "$f") as plain text (markup rejected)"
+    fi
+  elif ! delivered "$resp" && [ -n "${parse:-}" ] && [ "$parse" != "text" ]; then
     resp=$(curl -s -m 10 -X POST "https://api.telegram.org/bot${token}/sendMessage" \
            --data-urlencode "chat_id=${chat}" --data-urlencode "text=${text}" 2>&1)
     delivered "$resp" && log_message "delivered $(basename "$f") as plain text (markup rejected)"
   fi
-  if delivered "$resp"; then
+  if [ -n "$thread" ] || [ "$strict_receipt" = 1 ]; then
+    message_confirmed "$chat" "$thread" "$resp" && confirmed=1
+  else
+    delivered "$resp" && confirmed=1
+  fi
+  if [ "$confirmed" -eq 1 ]; then
     local recorder="$(dirname "${BASH_SOURCE[0]}")/tg-send" history_task=""
     [ -f "$recorder" ] || recorder="$HOME/bin/tg-send"
     if [ "${run_mode:-}" = "1" ]; then
@@ -383,7 +660,490 @@ send_text() {
     fi
   fi
   printf '%s' "$resp"
-  delivered "$resp"
+  [ "$confirmed" -eq 1 ]
+}
+
+# RUN=1 may perform external actions, so it must never be re-executed just
+# because Telegram rejected the answer. Keep the completed answer outside the
+# .rem queue and retry its delivery only. A "sending" record left by a killed
+# worker is uncertain: Telegram may have accepted the message before the worker
+# died, so another automatic send could duplicate it.
+run_delivery_key() {
+  python3 -c 'import hashlib,sys; print(hashlib.sha256("\0".join(sys.argv[1:]).encode()).hexdigest())' "$1" "$2"
+}
+
+run_delivery_response_class() {
+  python3 -c '
+import json,sys
+try:
+    response=json.load(sys.stdin)
+except (ValueError, UnicodeError):
+    print("uncertain")
+else:
+    if isinstance(response,dict) and response.get("ok") is False:
+        code=response.get("error_code")
+        # Telegram can fail internally after accepting a message. A 5xx is
+        # ambiguous without a confirmed message ID and must not be resent.
+        if code==429:
+            print("retry")
+        elif isinstance(code,int) and 500<=code<=599:
+            print("uncertain")
+        else:
+            print("blocked")
+    else:
+        print("uncertain")
+'
+}
+
+owner_chat_id() {
+  grep '^OWNER_CHAT_ID=' "$PROFILE_FILE" 2>/dev/null | head -n1 | cut -d= -f2- | tr -d "\"'"
+}
+
+# owner_notice KEY UKRAINIAN [NAME=VALUE...]: the notice in OWNER_NOTICE_LOCALE,
+# chosen by the shared helper the way claude-limit-recovery loads it. Ukrainian
+# stays the default, and the fallback whenever the helper fails to load or its
+# copy does not fill in: an empty notice would lose the alert.
+owner_notice() {
+  python3 - "$(dirname "${BASH_SOURCE[0]}")/agent_notice_locale.py" "$HOME" "$@" <<'PY'
+import importlib.util
+import sys
+from pathlib import Path
+
+helper, home, key, ukrainian, *pairs = sys.argv[1:]
+values = dict(pair.split("=", 1) for pair in pairs)
+try:
+    spec = importlib.util.spec_from_file_location("agent_notice_locale", helper)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    text = module.notice_text(key, ukrainian, home=Path(home)).format(**values)
+except Exception:
+    text = ukrainian.format(**values)
+print(text, end="")
+PY
+}
+
+# A running occurrence's record names the tick doing the run: its PID and that
+# process's start time, so a PID reused by another process never passes for the
+# run (AALL, 25.09: a run died 33 s in and nothing ever reclaimed it).
+process_start() {
+  TZ=UTC LC_ALL=C ps -o lstart= -p "$1" 2>/dev/null | sed -e 's/^ *//' -e 's/ *$//'
+}
+
+mark_run_started() {
+  local journal="$1" attempt="$2" temp
+  temp=$(mktemp "$journal/runner.tmp.XXXXXX") || return 1
+  if ! printf 'PID=%s\nSTART=%s\nTZ=UTC\nAT=%s\nTASK=%s\nATTEMPT=%s\n' "$$" "$(process_start $$)" \
+         "$now" "${task_id:-$(cat "$journal/name" 2>/dev/null)}" "$attempt" > "$temp" ||
+     ! mv -f "$temp" "$journal/runner"; then
+    rm -f "$temp"
+    return 1
+  fi
+}
+
+run_is_alive() {
+  local runner="$1/runner" pid start at begun
+  [ -f "$runner" ] || return 1
+  pid=$(header_value "$runner" PID)
+  start=$(header_value "$runner" START)
+  is_uint "$pid" || return 1
+  if [ "$(header_value "$runner" TZ)" = UTC ]; then
+    [ -n "$start" ] && [ "$(process_start "$pid")" = "$start" ]
+    return
+  fi
+  # A run recorded before 28.09 (unreleased builds only) carries its writer's local start,
+  # which proves nothing across zones (Codex, 28.09). AT does: a process that reused the PID
+  # started after the run wrote it.
+  at=$(header_value "$runner" AT)
+  start=$(process_start "$pid")
+  is_uint "$at" && [ -n "$start" ] || return 1
+  begun=$(python3 -c 'import calendar, sys, time
+print(calendar.timegm(time.strptime(" ".join(sys.argv[1].split()), "%a %b %d %H:%M:%S %Y")))' "$start" 2>/dev/null) &&
+    [ "$begun" -le "$(decimal_value "$at")" ]
+}
+
+# Only a task that says a replay is safe (it reads and reports) runs once more.
+# Anything else may act twice, so it waits for the owner.
+retry_allowed() {
+  local source="$1/source.rem"
+  [ ! -e "$1/retried" ] && [ -f "$1/runner" ] &&
+    [ "$(header_value "$source" RETRY_SAFE)" = 1 ] && [ "$(header_value "$source" QUIET)" != 1 ] &&
+    [ "$(header_value "$1/runner" ATTEMPT)" = 1 ]
+}
+
+# True while the task's own quiet hours cover this tick, in its timezone. A late
+# retry keeps them, as a normal occurrence does.
+in_quiet_hours() {
+  local source="$1" start end zone clock minutes
+  has_header "$source" QUIET_START && has_header "$source" QUIET_END || return 1
+  start=$(quiet_minutes "$(header_value "$source" QUIET_START)") || return 1
+  end=$(quiet_minutes "$(header_value "$source" QUIET_END)") || return 1
+  zone=$(header_value "$source" TIMEZONE)
+  valid_timezone "$zone" ||
+    zone=$(grep '^TIMEZONE=' "$PROFILE_FILE" 2>/dev/null | head -n1 | cut -d= -f2- | tr -d "\"'")
+  valid_timezone "$zone" || zone=""
+  if date -d '@0' '+%s' >/dev/null 2>&1; then
+    clock=$(timezone_date "$zone" -d "@$tick_now" '+%H %M')
+  else
+    clock=$(timezone_date "$zone" -r "$tick_now" '+%H %M')
+  fi
+  minutes=$((10#${clock% *} * 60 + 10#${clock#* }))
+  if [ "$start" -lt "$end" ]; then
+    [ "$minutes" -ge "$start" ] && [ "$minutes" -lt "$end" ]
+  else
+    [ "$minutes" -ge "$start" ] || [ "$minutes" -lt "$end" ]
+  fi
+}
+
+# An epoch as the owner reads it: day and time in the profile's timezone.
+clock_time() {
+  local zone
+  zone=$(grep '^TIMEZONE=' "$PROFILE_FILE" 2>/dev/null | head -n1 | cut -d= -f2- | tr -d "\"'")
+  valid_timezone "$zone" || zone=""
+  if date -d '@0' '+%s' >/dev/null 2>&1; then
+    timezone_date "$zone" -d "@$1" '+%d.%m %H:%M'
+  else
+    timezone_date "$zone" -r "$1" '+%d.%m %H:%M'
+  fi
+}
+
+# A scheduled occurrence that ends blocked, uncertain or failed tells the owner,
+# in the owner's own chat. Only topics used to: a daily task cut off mid-run or
+# refused by Telegram stayed in this log, and the client was the one who asked
+# why the news had stopped (Яша Директ, 29-30.08).
+alert_owner_issue() {
+  local journal="$1" source="$1/source.rem" owner notice alert_state resp response_class issue
+  local f="$source" epoch thread_id task_id chat where="" run_mode="" pause last started
+  issue=$(cat "$journal/state" 2>/dev/null) || return 0
+  case "$issue" in
+    blocked|uncertain) ;;
+    agent_failed) [ -f "$journal/failure.txt" ] || return 0 ;;
+    *) return 0 ;;
+  esac
+  [ -f "$source" ] || return 0
+  alert_state=$(cat "$journal/owner-alert.state" 2>/dev/null) || alert_state=""
+  # A previous version recorded only the send attempt. Its outcome is unknown.
+  if [ -e "$journal/owner-alert.attempted" ] && [ -z "$alert_state" ]; then
+    atomic_text "$journal/owner-alert.state" uncertain
+    return 0
+  fi
+  case "$alert_state" in
+    sent|uncertain|paused|stale) return 0 ;;
+    sending)
+      atomic_text "$journal/owner-alert.state" uncertain
+      log_message "UNCERTAIN owner alert $(basename "$journal"): send interrupted"
+      return 0 ;;
+    ""|ready) ;;
+    *) log_message "UNCERTAIN owner alert $(basename "$journal"): invalid state"; return 0 ;;
+  esac
+  epoch=$(header_value "$source" EPOCH)
+  thread_id=$(header_value "$source" THREAD_ID)
+  task_id=$(header_value "$source" TASK)
+  [ -n "$task_id" ] || task_id=$(cat "$journal/name" 2>/dev/null)
+  chat=$(header_value "$source" CHAT)
+  is_uint "$epoch" || return 0
+  # ponytail: a day's cut-off counted from the failure (the state's mtime), not
+  # from EPOCH, so a run late after downtime is still told while records left
+  # by older versions stay in delivery-status instead of arriving as a burst.
+  if [ -z "$(find "$journal/state" -mmin -1440 2>/dev/null)" ]; then
+    atomic_text "$journal/owner-alert.state" stale
+    return 0
+  fi
+  owner=$(owner_chat_id)
+  if [ -z "$owner" ]; then
+    log_message "$issue occurrence $(basename "$journal"): no OWNER_CHAT_ID for alert"
+    return 0
+  fi
+  # One alert per task a day, runs that worked in between included: a task
+  # failing every ten minutes alerted 144 times a day, one failing every other
+  # run about 72.
+  pause="$REM_DIR/.owner-alerts/$(run_delivery_key owner-alert "$task_id")"
+  # A failed retry is its own event with its own daily pause: at most two alerts
+  # a task a day, however often its runs die.
+  [ -e "$journal/retried" ] && pause="$pause.retry"
+  last=$(cat "$pause" 2>/dev/null) || last=""
+  if is_uint "$last" && [ $((tick_now - $(decimal_value "$last"))) -lt 86400 ]; then
+    atomic_text "$journal/owner-alert.state" paused
+    log_message "$issue occurrence $(basename "$journal"): owner already told about ${task_id} within a day"
+    return 0
+  fi
+  # Record intent before calling Telegram: only a definite refusal may retry.
+  atomic_text "$journal/owner-alert.state" sending || return 1
+  [ "$chat" = "$owner" ] || where=$(owner_notice schedule.chat " у чат {chat}" chat="$chat")
+  if [ "$issue" = agent_failed ]; then
+    notice=$(cat "$journal/failure.txt")
+  elif [ "$issue" = uncertain ] && [ ! -f "$journal/result.txt" ]; then
+    # The owner learns when the dead run started, and whether it runs again.
+    started=""
+    [ -f "$journal/runner" ] && started=$(header_value "$journal/runner" AT)
+    is_uint "$started" || started="$epoch"
+    started=$(clock_time "$(decimal_value "$started")")
+    if retry_allowed "$journal"; then
+      notice=$(owner_notice schedule.interrupted_retry "⚠️ Автоматичне завдання «{task}» перервалося, не завершившись (запуск {time}). Воно лише збирає й надсилає дані, тож запускаю його ще раз." task="$task_id" time="$started")
+    else
+      notice=$(owner_notice schedule.interrupted "⚠️ Автоматичне завдання «{task}» перервалося, не завершившись (запуск {time}). Автоматично не перезапускаю, щоб не повторити його дії; перевір, що встигло надійти." task="$task_id" time="$started")
+    fi
+  elif [ -n "$thread_id" ] && [ "$issue" = blocked ]; then
+    notice="⚠️ Не вдалося доставити заплановане повідомлення в тему ${thread_id} (завдання ${task_id}). Telegram відхилив його. У загальний чат повідомлення не надсилалося; перевір тему та завдання."
+  elif [ -n "$thread_id" ]; then
+    notice="⚠️ Не вдалося підтвердити доставку запланованого повідомлення в тему ${thread_id} (завдання ${task_id}). Воно могло надійти, тому автоматично не повторюватиму, щоб не створити дубль. У загальний чат його не пересилали; перевір тему та завдання."
+  elif [ "$issue" = blocked ]; then
+    notice=$(owner_notice schedule.refused "⚠️ Не вдалося доставити результат завдання «{task}»{where}: Telegram відхилив його. Автоматично не повторюю; перевір чат і завдання." task="$task_id" where="$where")
+  else
+    notice=$(owner_notice schedule.unconfirmed "⚠️ Не вдалося підтвердити доставку результату завдання «{task}»{where}. Він міг надійти, тому автоматично не повторюю, щоб не створити дубль." task="$task_id" where="$where")
+  fi
+  if resp=$(send_text "$owner" "$notice" text "" 1); then
+    atomic_text "$journal/owner-alert.state" sent || return 1
+  else
+    response_class=$(printf '%s' "$resp" | run_delivery_response_class)
+    if [ "$response_class" = retry ]; then
+      atomic_text "$journal/owner-alert.state" ready || return 1
+    else
+      atomic_text "$journal/owner-alert.state" uncertain || return 1
+    fi
+    log_message "$issue occurrence $(basename "$journal"): owner alert status=$response_class"
+  fi
+  # A definite 429 retries next tick; anything else may have reached the owner.
+  [ "$(cat "$journal/owner-alert.state" 2>/dev/null)" = ready ] ||
+    { mkdir -p -m 700 "$REM_DIR/.owner-alerts" && atomic_text "$pause" "$tick_now"; }
+}
+
+reconcile_prepared_topic() {
+  local journal="$1" source="$1/source.rem" source_name current
+  local before_epoch after_epoch before_count after_count
+  source_name=$(cat "$journal/source-name" 2>/dev/null) || source_name=""
+  if [[ ! "$source_name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*\.rem$ ]] ||
+     [ ! -f "$source" ]; then
+    atomic_text "$journal/state" uncertain
+    log_message "UNCERTAIN topic occurrence $(basename "$journal"): missing source name"
+    return
+  fi
+  current="$REM_DIR/$source_name"
+  if [ -L "$current" ]; then
+    atomic_text "$journal/state" uncertain
+    log_message "UNCERTAIN topic occurrence $(basename "$journal"): queue path changed"
+    return
+  fi
+  if [ "$(cat "$journal/settled" 2>/dev/null)" = 1 ]; then
+    if [ -f "$current" ]; then
+      before_epoch=$(header_value "$source" EPOCH)
+      after_epoch=$(header_value "$current" EPOCH)
+      before_count=$(header_value "$source" COUNT)
+      after_count=$(header_value "$current" COUNT)
+      [ -n "$before_count" ] || before_count=0
+      if ! has_header "$source" REPEAT_SECONDS ||
+         ! is_uint "$before_epoch" || ! is_uint "$after_epoch" ||
+         ! is_uint "$before_count" || ! is_uint "$after_count" ||
+         [ "$(decimal_value "$after_epoch")" -le "$(decimal_value "$before_epoch")" ] ||
+         [ "$(decimal_value "$after_count")" -ne "$(( $(decimal_value "$before_count") + 1 ))" ]; then
+        atomic_text "$journal/state" uncertain
+        log_message "UNCERTAIN topic occurrence $(basename "$journal"): settlement marker conflicts with queue"
+        return
+      fi
+    fi
+    atomic_text "$journal/state" ready || return
+    return
+  fi
+  if [ -f "$current" ] && cmp -s "$source" "$current"; then
+    # Still queued: the due-file loop below will settle it under the lock.
+    return
+  fi
+  # Missing or advanced queue alone cannot prove settlement: cancel also does
+  # that. Never send without the settlement marker.
+  atomic_text "$journal/state" uncertain
+  log_message "UNCERTAIN topic occurrence $(basename "$journal"): no settlement proof"
+}
+
+deliver_saved_run() {
+  local journal="$1" state source result cursor chunk index resp response_class saved_parse
+  state=$(cat "$journal/state" 2>/dev/null) || return 1
+  source="$journal/source.rem"
+  result="$journal/result.txt"
+  if [ "$state" = running ] && [ -f "$result" ]; then
+    # The complete result was renamed into place just before a crash.
+    atomic_text "$journal/state" ready || return 1
+    state=ready
+  fi
+  # A run still in progress belongs to the tick doing it.
+  [ "$state" = running ] && run_is_alive "$journal" && return 0
+  if [ "$state" = running ] || [ "$state" = sending ]; then
+    # Decided before the alert that promises it, so a crash between them keeps it.
+    [ "$state" = running ] && retry_allowed "$journal" && : > "$journal/retry-pending"
+    atomic_text "$journal/state" uncertain || return 1
+    log_message "UNCERTAIN scheduled run $(basename "$journal"): stopped before it finished; inspect saved occurrence"
+    alert_owner_issue "$journal"
+    [ -e "$journal/retry-pending" ] && retry_dead_run "$journal"
+    return 0
+  fi
+  if [ "$state" = blocked ] || [ "$state" = uncertain ]; then
+    alert_owner_issue "$journal"
+    # A retry promised before a crash, or held back by quiet hours, runs now.
+    [ -e "$journal/retry-pending" ] && retry_dead_run "$journal"
+    return 0
+  fi
+  if [ "$state" = agent_failed ]; then
+    # Nothing is left to deliver. The record stays until its alert is sent, may
+    # have been, or another one today already covered the task: without an
+    # OWNER_CHAT_ID the failure used to survive only in the log.
+    alert_owner_issue "$journal"
+    case "$(cat "$journal/owner-alert.state" 2>/dev/null)" in
+      sent|uncertain|paused) rm -rf -- "$journal" ;;
+    esac
+    return 0
+  fi
+  [ "$state" = ready ] || return 0
+  [ -f "$source" ] && [ -f "$result" ] || {
+    atomic_text "$journal/state" uncertain
+    log_message "UNCERTAIN scheduled run $(basename "$journal"): missing saved source or result"
+    return 1
+  }
+
+  f="$source"
+  chat=$(header_value "$source" CHAT)
+  thread_id=$(header_value "$source" THREAD_ID)
+  saved_parse=$(header_value "$source" PARSE)
+  [ "$(header_value "$source" RUN)" = "1" ] && saved_parse=text
+  epoch=$(header_value "$source" EPOCH)
+  task_id=$(header_value "$source" TASK)
+  [ -n "$task_id" ] || task_id=$(cat "$journal/name" 2>/dev/null)
+  run_mode=1
+  [ -n "$chat" ] && is_uint "$epoch" || {
+    atomic_text "$journal/state" uncertain
+    log_message "UNCERTAIN scheduled run $(basename "$journal"): invalid saved destination"
+    return 1
+  }
+  if [ -n "$thread_id" ] && { ! is_uint "$thread_id" ||
+     [ "$(decimal_value "$thread_id")" -eq 0 ] || [[ "$chat" != -* ]]; }; then
+    atomic_text "$journal/state" uncertain
+    log_message "UNCERTAIN scheduled run $(basename "$journal"): invalid saved topic"
+    return 1
+  fi
+  cursor=$(cat "$journal/cursor" 2>/dev/null) || return 1
+  is_uint "$cursor" || {
+    atomic_text "$journal/state" uncertain
+    log_message "UNCERTAIN scheduled run $(basename "$journal"): invalid chunk cursor"
+    return 1
+  }
+  cursor=$(decimal_value "$cursor")
+  if [ "$cursor" -eq 0 ] && [ "$(tr -d '[:space:]' < "$result")" = NO_REPLY ]; then
+    # A task with nothing to report ends with the silence sentinel. It is not a
+    # message, yet it reached the owner as one (Мартин, 23 and 25.09).
+    log_message "scheduled run $(basename "$journal") returned NO_REPLY; nothing to send"
+    rm -rf -- "$journal"
+    return 0
+  fi
+  index=0
+  while IFS= read -r -d '' chunk || [ -n "$chunk" ]; do
+    if [ "$index" -lt "$cursor" ]; then
+      index=$((index + 1))
+      continue
+    fi
+    atomic_text "$journal/state" sending || return 1
+    if resp=$(send_text "$chat" "$chunk" "$saved_parse" "$thread_id"); then
+      index=$((index + 1))
+      atomic_text "$journal/cursor" "$index" || return 1
+      atomic_text "$journal/state" ready || return 1
+      continue
+    fi
+    response_class=$(printf '%s' "$resp" | run_delivery_response_class)
+    if [ "$response_class" = retry ]; then
+      atomic_text "$journal/state" ready || return 1
+    else
+      atomic_text "$journal/state" "$response_class" || return 1
+      alert_owner_issue "$journal"
+    fi
+    log_message "FAILED saved scheduled result $(basename "$journal") chunk=$index status=$response_class: $(printf '%s' "$resp" | tr '\n' ' ' | cut -c1-180)"
+    return 0
+  done < <(split_chunks < "$result")
+  rm -rf -- "$journal"
+}
+
+# The lock wrapper replaced a lock kept by a gone tick's child; the owner hears
+# it once, from this tick.
+alert_broken_lock() {
+  local since="${REMINDER_TICK_LOCK_BROKEN%% *}" holder="${REMINDER_TICK_LOCK_BROKEN#* }"
+  local owner notice f="" epoch="" run_mode="" task_id=""
+  log_message "replaced the worker lock busy since $since: its recorded holder (pid $holder) is gone; nothing was killed"
+  owner=$(owner_chat_id)
+  [ -n "$owner" ] && is_uint "$since" || return 0
+  notice=$(owner_notice schedule.lock_broken "⚠️ Планувальник завдань стояв з {time}: його замок тримав процес від перерваного запуску. Замок замінено, нічого не зупиняючи; завдання знову виконуються." time="$(clock_time "$since")")
+  send_text "$owner" "$notice" text "" 1 >/dev/null ||
+    log_message "owner alert about the replaced lock not confirmed"
+}
+
+# Runs a scheduled occurrence under its record and hands the outcome to
+# delivery. LATE, for a retried run, is the line its result opens with.
+run_occurrence() {
+  local journal="$1" file="$2" body="$3" attempt="$4" late="${5:-}" result_temp rc
+  result_temp=$(mktemp "$journal/result.tmp.XXXXXX") || {
+    log_message "UNCERTAIN scheduled run $(basename "$journal"): cannot save result"
+    return
+  }
+  mark_run_started "$journal" "$attempt" ||
+    log_message "scheduled run $(basename "$journal"): in-progress record not saved"
+  if [ "$attempt" = 2 ]; then
+    # The one retry is used only now that it really starts: a failure or a death before this
+    # leaves it owed to the next tick (Codex, 28.09). If it fails too, that is a new event the
+    # owner hears even within the day's pause: at most two alerts a task a day.
+    rm -f "$journal/owner-alert.state"
+    : > "$journal/retried"
+    rm -f "$journal/retry-pending"
+  fi
+  run_agent_task "$file" "$body" > "$result_temp"
+  rc=$?
+  # The run has ended and its outcome follows, so nobody may take it for dead.
+  rm -f "$journal/runner"
+  case $rc in
+    0) ;;
+    4) # A failure notice is the owner's alert, never this task's chat.
+       if mv "$result_temp" "$journal/failure.txt" &&
+          atomic_text "$journal/state" agent_failed; then
+         deliver_saved_run "$journal"
+       else
+         rm -f "$result_temp"
+         log_message "UNCERTAIN scheduled run $(basename "$journal"): failure notice not saved"
+       fi
+       return ;;
+    *) rm -f "$result_temp"
+       atomic_text "$journal/state" uncertain
+       log_message "UNCERTAIN scheduled run $(basename "$journal"): agent exited without a savable result"
+       return ;;
+  esac
+  if [ -n "$late" ] && [ "$(tr -d '[:space:]' < "$result_temp")" != NO_REPLY ]; then
+    { printf '%s\n\n' "$late" && cat "$result_temp"; } > "$result_temp.late" &&
+      mv -f "$result_temp.late" "$result_temp"
+  fi
+  if [ ! -s "$result_temp" ] || ! mv "$result_temp" "$journal/result.txt" ||
+     ! atomic_text "$journal/state" ready; then
+    rm -f "$result_temp"
+    log_message "UNCERTAIN scheduled run $(basename "$journal"): result could not be committed"
+    return
+  fi
+  deliver_saved_run "$journal"
+}
+
+# A run that died runs once more when its task is retry-safe. The recipient's
+# copy opens with one line saying it is late; no notice goes out before it.
+retry_dead_run() {
+  local journal="$1" source="$1/source.rem" late
+  local f chat thread_id epoch task_id run_mode=1 quiet_run="" quiet_run_key=""
+  retry_allowed "$journal" || { rm -f "$journal/retry-pending"; return 0; }
+  if in_quiet_hours "$source"; then
+    : > "$journal/retry-pending"
+    log_message "retry of scheduled run $(basename "$journal") waits for the task's quiet hours to end"
+    return 0
+  fi
+  f="$source"
+  chat=$(header_value "$source" CHAT)
+  thread_id=$(header_value "$source" THREAD_ID)
+  epoch=$(header_value "$source" EPOCH)
+  task_id=$(header_value "$source" TASK)
+  [ -n "$task_id" ] || task_id=$(cat "$journal/name" 2>/dev/null)
+  late=$(owner_notice schedule.late "Нагадування запізнилося — ось воно:")
+  # The promise stays durable until the retry is really under way (run_occurrence marks it
+  # used): a failed write here leaves it owed (Codex, 28.09).
+  atomic_text "$journal/state" running || return 0
+  log_message "retrying scheduled run $(basename "$journal") once: its task is retry-safe"
+  run_occurrence "$journal" "$source" "$(message_body "$source")" 2 "$late"
 }
 
 [ -d "$REM_DIR" ] || exit 0
@@ -398,11 +1158,56 @@ if ! is_uint "$now"; then
   exit 0
 fi
 now=$(decimal_value "$now")
+tick_now="$now"
+if [ -n "${REMINDER_TICK_LOCK_BROKEN:-}" ]; then
+  alert_broken_lock
+  # A task in this tick that runs the worker again must not tell the owner twice.
+  export REMINDER_TICK_LOCK_BROKEN=""
+fi
+
+# Retry only saved QUIET=1 text after a definite 429 refusal. The helper owns
+# each message's sending/uncertain state; this tick never restarts the agent.
+if [ -d "$REM_DIR/.quiet-delivery" ]; then
+  quiet_sender="$(dirname "${BASH_SOURCE[0]}")/tg-send"
+  [ -f "$quiet_sender" ] || quiet_sender="$HOME/bin/tg-send"
+  ATARAX_TASK_DELIVERY_DIR="$REM_DIR/.quiet-delivery" TG_DELIVERY_STAMP= \
+    python3 "$quiet_sender" --drain-quiet >> "$LOG" 2>&1 ||
+    log_message "quiet delivery scan failed"
+  quiet_file_sender="$(dirname "${BASH_SOURCE[0]}")/tg-send-file"
+  [ -f "$quiet_file_sender" ] || quiet_file_sender="$HOME/bin/tg-send-file"
+  ATARAX_TASK_DELIVERY_DIR="$REM_DIR/.quiet-delivery" TG_DELIVERY_STAMP= \
+    python3 "$quiet_file_sender" --drain-quiet >> "$LOG" 2>&1 ||
+    log_message "quiet file delivery scan failed"
+fi
 
 shopt -s nullglob
+if [ -d "$QUIET_RUN_DIR" ] && [ ! -L "$QUIET_RUN_DIR" ]; then
+  for journal in "$QUIET_RUN_DIR"/*; do
+    [ -d "$journal" ] && [ ! -L "$journal" ] || continue
+    if [ "$(cat "$journal/state" 2>/dev/null)" = running ]; then
+      run_is_alive "$journal" && continue
+      atomic_text "$journal/state" uncertain || continue
+      log_message "UNCERTAIN quiet scheduled run $(basename "$journal"): agent stopped before completing; never rerun automatically"
+    fi
+    alert_owner_issue "$journal"
+  done
+fi
+for journal in "$RUN_DELIVERY_DIR"/*; do
+  [ -d "$journal" ] || continue
+  if [ "$(cat "$journal/state" 2>/dev/null)" = prepared ]; then
+    reconcile_prepared_topic "$journal"
+  fi
+  deliver_saved_run "$journal"
+done
+
+joined=$'\n'
 for f in "$REM_DIR"/*.rem; do
+  # Already sent, or tried, inside another reminder's message this tick.
+  case "$joined" in *$'\n'"$f"$'\n'*) continue ;; esac
+  now="$tick_now"
   epoch=$(header_value "$f" EPOCH)
   chat=$(header_value "$f" CHAT)
+  thread_id=$(header_value "$f" THREAD_ID)
   parse=$(header_value "$f" PARSE)
   run_mode=$(header_value "$f" RUN)
   quiet_run=$(header_value "$f" QUIET)
@@ -410,9 +1215,15 @@ for f in "$REM_DIR"/*.rem; do
   # runs, and its failure message still has to name the task.
   task_id=$(header_value "$f" TASK)
   settled=0
+  quiet_run_key=""
 
   if [ -z "$epoch" ] || [ -z "$chat" ]; then
     log_message "skip $f: missing header"
+    continue
+  fi
+  if [ -n "$thread_id" ] && { ! is_uint "$thread_id" ||
+     [ "$(decimal_value "$thread_id")" -eq 0 ] || [[ "$chat" != -* ]]; }; then
+    log_message "skip $f: invalid THREAD_ID"
     continue
   fi
   if ! is_uint "$epoch"; then
@@ -433,6 +1244,18 @@ for f in "$REM_DIR"/*.rem; do
     repeat=$(decimal_value "$repeat")
   fi
 
+  cadence_epoch=""
+  if has_header "$f" CADENCE_EPOCH; then
+    cadence_epoch=$(header_value "$f" CADENCE_EPOCH)
+    if [ "$repeat_job" -ne 1 ] || ! is_uint "$cadence_epoch" ||
+       [ "$(decimal_value "$cadence_epoch")" -eq 0 ] ||
+       [ "$(decimal_value "$cadence_epoch")" -gt "$epoch" ]; then
+      log_message "skip $f: invalid CADENCE_EPOCH"
+      continue
+    fi
+    cadence_epoch=$(decimal_value "$cadence_epoch")
+  fi
+
   count=0
   if has_header "$f" COUNT; then
     count=$(header_value "$f" COUNT)
@@ -451,6 +1274,18 @@ for f in "$REM_DIR"/*.rem; do
       continue
     fi
     until=$(decimal_value "$until")
+  fi
+
+  # Another RUN may have occupied the preceding tick for minutes. Refresh the
+  # clock for the new no-deadline quiet gate; deadline-bound runs keep their
+  # existing scheduling path until owner notice delivery is designed.
+  if [ "${run_mode:-}" = "1" ] && [ "$repeat_job" -eq 1 ] &&
+     [ -z "$until" ] && [ -z "${NOW_EPOCH:-}" ]; then
+    now=$(date +%s)
+  fi
+  defer_anchor=""
+  if [ "${run_mode:-}" = "1" ] && [ "$repeat_job" -eq 1 ] && [ -z "$until" ]; then
+    defer_anchor="${cadence_epoch:-$epoch}"
   fi
 
   quiet_start=""
@@ -536,19 +1371,50 @@ for f in "$REM_DIR"/*.rem; do
         [ "$local_minutes" -ge "$quiet_start" ] && quiet_end_tomorrow=1
       fi
       if [ "$in_quiet" -eq 1 ]; then
-        if ! next_epoch=$(next_quiet_end_epoch "$now" "$timezone" "$quiet_end" "$quiet_end_tomorrow"); then
+        if ! next_epoch=$(local_boundary_epoch "$now" "$timezone" "$quiet_end" "$quiet_end_tomorrow"); then
           log_message "skip $f: failed to calculate quiet end"
           continue
         fi
         if [ -n "$until" ] && [ "$next_epoch" -gt "$until" ]; then
           log_message "expired $(basename "$f") before next quiet end, removing"
           rm -f "$f"
-        elif atomic_update_repeat "$f" "$next_epoch" "$count"; then
+        elif atomic_update_repeat "$f" "$next_epoch" "$count" "$defer_anchor"; then
           log_message "deferred $(basename "$f") to quiet end EPOCH=$next_epoch"
         else
           log_message "FAILED to defer $(basename "$f"): atomic update failed"
         fi
         continue
+      fi
+
+      if [ "${run_mode:-}" = "1" ] && [ -z "$until" ]; then
+        # A headless run may send by itself (QUIET=1) or return text for this
+        # worker to send. The installed cron caps the entire tick, including
+        # Telegram delivery, at 960 seconds. Defer the intact occurrence when
+        # that cap could cross quiet start. The inner Claude timeout is shorter.
+        # Deadline-bound runs keep the legacy path until a durable owner notice
+        # exists for an occurrence that cannot finish before quiet hours. Manual
+        # or detached sends outside this worker are not covered by this gate.
+        runway=960
+        quiet_start_tomorrow=0
+        [ "$local_minutes" -lt "$quiet_start" ] || quiet_start_tomorrow=1
+        if ! next_quiet_start=$(local_boundary_epoch "$now" "$timezone" "$quiet_start" "$quiet_start_tomorrow"); then
+          log_message "skip $f: failed to calculate quiet start"
+          continue
+        fi
+        if [ "$next_quiet_start" -le $((now + runway)) ]; then
+          quiet_end_tomorrow=0
+          [ "$quiet_start" -lt "$quiet_end" ] || quiet_end_tomorrow=1
+          if ! next_epoch=$(local_boundary_epoch "$next_quiet_start" "$timezone" "$quiet_end" "$quiet_end_tomorrow"); then
+            log_message "skip $f: failed to calculate quiet end"
+            continue
+          fi
+          if atomic_update_repeat "$f" "$next_epoch" "$count" "$defer_anchor"; then
+            log_message "deferred $(basename "$f") before quiet start to EPOCH=$next_epoch"
+          else
+            log_message "FAILED to defer $(basename "$f"): atomic update failed"
+          fi
+          continue
+        fi
       fi
     fi
   elif [ "$now" -lt "$epoch" ]; then
@@ -558,39 +1424,195 @@ for f in "$REM_DIR"/*.rem; do
   fi
 
   body=$(message_body "$f")
-  if [ "${run_mode:-}" = "1" ]; then
-    # A headless run takes minutes; cron caps the whole tick. Settling the
-    # reminder BEFORE the run is what stops a killed tick from starting the same
-    # task again a minute later: that loop spent a client's session limit on ~50
-    # reruns of one job and silenced the bot for an hour (2026-08-06).
+  if [ -n "$thread_id" ] && [ "${run_mode:-}" != "1" ]; then
+    # A topic receipt must prove the exact thread. Save the occurrence before
+    # sending so an ambiguous reply cannot be retried into another topic.
+    if ! mkdir -p -m 700 "$RUN_DELIVERY_DIR"; then
+      log_message "FAILED to prepare topic delivery directory"
+      continue
+    fi
+    key=$(run_delivery_key "$f" "$epoch") || continue
+    journal="$RUN_DELIVERY_DIR/$key"
+    if [ -e "$journal" ] || [ -L "$journal" ]; then
+      if [ -d "$journal" ] &&
+         [ "$(cat "$journal/state" 2>/dev/null)" = prepared ] &&
+         cmp -s "$f" "$journal/source.rem"; then
+        if settle_reminder && atomic_text "$journal/settled" 1 &&
+           atomic_text "$journal/state" ready; then
+          deliver_saved_run "$journal"
+        else
+          log_message "UNCERTAIN prepared topic $(basename "$journal"): settlement incomplete"
+        fi
+        continue
+      fi
+      log_message "skip $(basename "$f"): occurrence already has a delivery record"
+      continue
+    fi
+    stage=$(mktemp -d "$RUN_DELIVERY_DIR/.stage.XXXXXX") || continue
+    if ! cp "$f" "$stage/source.rem" ||
+       ! printf '%s\n' "$body" > "$stage/result.txt" ||
+       ! atomic_text "$stage/name" "$(basename "$f" .rem)" ||
+       ! atomic_text "$stage/source-name" "$(basename "$f")" ||
+       ! atomic_text "$stage/cursor" 0 ||
+       ! atomic_text "$stage/state" prepared ||
+       ! mv "$stage" "$journal"; then
+      rm -rf -- "$stage"
+      log_message "FAILED to prepare topic occurrence $(basename "$f")"
+      continue
+    fi
     if ! settle_reminder; then
+      log_message "UNCERTAIN prepared topic $(basename "$journal"): settlement incomplete"
+      continue
+    fi
+    if ! atomic_text "$journal/settled" 1; then
+      log_message "UNCERTAIN prepared topic $(basename "$journal"): settlement proof not saved"
+      continue
+    fi
+    if ! atomic_text "$journal/state" ready; then
+      log_message "UNCERTAIN prepared topic $(basename "$journal"): ready state not saved"
+      continue
+    fi
+    deliver_saved_run "$journal"
+    continue
+  fi
+  # The task folder is approved before the occurrence is spent: a refusal leaves
+  # it due for the next tick instead of skipping the day, and only the owner
+  # hears, once per occurrence. The task's chat can be a group or a client
+  # (review of the self-approval, 26.09).
+  if [ "${run_mode:-}" = "1" ]; then
+    task_dir="${AGENT_TASK_DIR:-$HOME/.atarax/agent-task}"
+    if ! mkdir -p "$task_dir" || ! approve_task_project "$task_dir"; then
+      log_message "hold $(basename "$f"): task cwd is not approved in Claude config; next tick retries"
+      if [ "$(cat "$f.unapproved" 2>/dev/null)" != "$epoch" ]; then
+        owner=$(grep '^OWNER_CHAT_ID=' "$PROFILE_FILE" 2>/dev/null | head -n1 | cut -d= -f2- | tr -d "\"'")
+        if [ -n "$owner" ] && send_text "$owner" "$(printf '⚠️ Автоматичне завдання «%s» ще не виконано: потрібно оновити доступ Claude для планувальника. Повторю, щойно доступ оновиться.' "$task_id")" text >/dev/null; then
+          printf '%s\n' "$epoch" > "$f.unapproved"
+        fi
+      fi
+      continue
+    fi
+    rm -f "$f.unapproved"
+  fi
+  if [ "${run_mode:-}" = "1" ] && [ "${quiet_run:-}" != "1" ]; then
+    if ! mkdir -p -m 700 "$RUN_DELIVERY_DIR"; then
+      log_message "FAILED to prepare scheduled delivery directory"
+      continue
+    fi
+    key=$(run_delivery_key "$f" "$epoch") || continue
+    journal="$RUN_DELIVERY_DIR/$key"
+    if [ -e "$journal" ] || [ -L "$journal" ]; then
+      log_message "skip $(basename "$f"): occurrence already has a delivery record"
+      continue
+    fi
+    stage=$(mktemp -d "$RUN_DELIVERY_DIR/.stage.XXXXXX") || continue
+    if ! cp "$f" "$stage/source.rem" ||
+       ! atomic_text "$stage/name" "$(basename "$f" .rem)" ||
+       ! atomic_text "$stage/cursor" 0 ||
+       ! atomic_text "$stage/state" running ||
+       ! mv "$stage" "$journal"; then
+      rm -rf -- "$stage"
+      log_message "FAILED to prepare scheduled occurrence $(basename "$f")"
+      continue
+    fi
+    if ! settle_reminder; then
+      rm -rf -- "$journal"
       log_message "skip $(basename "$f"): RUN occurrence was not durably settled"
       continue
     fi
+    run_occurrence "$journal" "$f" "$body" 1
+    continue
+  fi
+  if [ "${run_mode:-}" = "1" ] && [ "${quiet_run:-}" = "1" ]; then
+    # Publish an occurrence before removing .rem. Claude may die before it calls
+    # either sender, so the senders' outbox alone cannot prove it ran or failed.
+    if [ -L "$QUIET_RUN_DIR" ] || ! mkdir -p -m 700 "$QUIET_RUN_DIR"; then
+      log_message "FAILED to prepare quiet scheduled run directory"
+      continue
+    fi
+    quiet_run_key=$(run_delivery_key "$f" "$epoch") || continue
+    journal="$QUIET_RUN_DIR/$quiet_run_key"
+    if [ -e "$journal" ]; then
+      log_message "skip $(basename "$f"): occurrence already has a quiet run record"
+      continue
+    fi
+    stage=$(mktemp -d "$QUIET_RUN_DIR/.stage.XXXXXX") || continue
+    if ! cp "$f" "$stage/source.rem" ||
+       ! atomic_text "$stage/name" "$(basename "$f" .rem)" ||
+       ! atomic_text "$stage/state" running ||
+       ! mv "$stage" "$journal"; then
+      rm -rf -- "$stage"
+      log_message "FAILED to prepare quiet occurrence $(basename "$f")"
+      continue
+    fi
+    if ! settle_reminder; then
+      rm -rf -- "$journal"
+      log_message "skip $(basename "$f"): RUN occurrence was not durably settled"
+      continue
+    fi
+    mark_run_started "$journal" 1 ||
+      log_message "quiet scheduled run $(basename "$journal"): in-progress record not saved"
     body=$(run_agent_task "$f" "$body")
-    case $? in
-      0) ;;
-      3) continue ;;  # a quiet task delivered by itself; the log keeps its words
-      *) log_message "FAILED to run $(basename "$f"): agent returned nothing"
+    quiet_rc=$?
+    rm -f "$journal/runner"
+    case $quiet_rc in
+      3) atomic_text "$journal/state" finished ||
+           log_message "UNCERTAIN quiet run $(basename "$journal"): could not save completion"
+         continue ;;
+      # The failure notice is for the owner, not the group, with the same pause
+      # as every other scheduled failure.
+      4) printf '%s' "$body" > "$journal/failure.txt" &&
+           atomic_text "$journal/state" agent_failed && alert_owner_issue "$journal"
+         continue ;;
+      *) atomic_text "$journal/state" uncertain
+         log_message "UNCERTAIN quiet run $(basename "$journal"): agent returned no savable outcome"
          continue ;;
     esac
-    parse=text
-    if [ "${quiet_run:-}" = "1" ]; then
-      # Only a failure notice is left, and it is for the owner, not for the group
-      # whose topics the task writes into.
-      chat=$(grep '^OWNER_CHAT_ID=' "$PROFILE_FILE" 2>/dev/null | head -n1 | cut -d= -f2- | tr -d "\"'")
-      if [ -z "$chat" ]; then
-        log_message "quiet $(basename "$f"): failure notice not sent, no OWNER_CHAT_ID"
-        continue
+  fi
+  # One event, one message. Two requests each queued a reminder for the same
+  # meeting, and this loop sent both a second apart (Мартин, 17.09 09:15). Every
+  # due one-shot for this chat less than a minute from this one joins its
+  # message, while that still fits one Telegram message: a merge split in two
+  # would resend the first reminder whenever the second part is refused. A text
+  # already in it is not repeated.
+  merged=()
+  if [ "$repeat_job" -eq 0 ] && [ "${run_mode:-}" != "1" ] && [ -z "$thread_id" ]; then
+    texts=("$body")
+    for other in "$REM_DIR"/*.rem; do
+      [ "$other" != "$f" ] && [ -f "$other" ] || continue
+      case "$joined" in *$'\n'"$other"$'\n'*) continue ;; esac
+      other_epoch=$(header_value "$other" EPOCH)
+      is_uint "$other_epoch" || continue
+      other_epoch=$(decimal_value "$other_epoch")
+      delta=$((other_epoch - epoch))
+      [ "${delta#-}" -lt 60 ] && [ "$other_epoch" -le "$now" ] || continue
+      other_parse=$(header_value "$other" PARSE)
+      [ "$(header_value "$other" CHAT)" = "$chat" ] &&
+        [ "${other_parse:-text}" = "${parse:-text}" ] &&
+        [ -z "$(header_value "$other" THREAD_ID)" ] &&
+        [ "$(header_value "$other" RUN)" != "1" ] &&
+        ! has_header "$other" REPEAT_SECONDS || continue
+      other_body=$(message_body "$other")
+      [ -n "$other_body" ] || continue
+      seen=0
+      for text in "${texts[@]}"; do
+        [ "$text" != "$other_body" ] || seen=1
+      done
+      if [ "$seen" -eq 0 ]; then
+        # split_chunks cuts at 3500 characters; one that does not fit goes alone.
+        [ $(( ${#body} + 2 + ${#other_body} )) -le 3500 ] || continue
+        texts+=("$other_body")
+        body+=$'\n\n'"$other_body"
       fi
-    fi
+      merged+=("$other")
+      joined+="$other"$'\n'
+    done
   fi
   # Every piece must land, in order; the first refusal stops the rest and is
   # what the retry/give-up path below sees.
   resp=""
   sent=0
   while IFS= read -r -d '' chunk || [ -n "$chunk" ]; do
-    if resp=$(send_text "$chat" "$chunk" "${parse:-}"); then
+    if resp=$(send_text "$chat" "$chunk" "${parse:-}" "$thread_id"); then
       sent=1
     else
       sent=0
@@ -601,6 +1623,10 @@ for f in "$REM_DIR"/*.rem; do
   if [ "$sent" -eq 1 ]; then
     [ "$settled" -eq 1 ] || settle_reminder
     rm -f "$f.attempts"
+    for other in ${merged[@]+"${merged[@]}"}; do
+      rm -f "$other" "$other.attempts" &&
+        log_message "fired $(basename "$other") → chat=$chat in one message with $(basename "$f")"
+    done
   else
     attempts=$(( $(cat "$f.attempts" 2>/dev/null || echo 0) + 1 ))
     printf '%s\n' "$attempts" > "$f.attempts"
@@ -612,9 +1638,13 @@ for f in "$REM_DIR"/*.rem; do
       log_message "giving up on $(basename "$f") after $attempts attempts"
       [ "$settled" -eq 1 ] || settle_reminder
       rm -f "$f.attempts"
+      # The owner hears it: the chat that refused five times rarely takes a sixth.
+      give_up_chat=$(owner_chat_id)
+      notice=$(owner_notice reminder.undelivered "⚠️ Не вдалося доставити нагадування «{name}». Telegram відхилив: {reason}" \
+        name="$(basename "$f" .rem)" reason="$(printf '%s' "$resp" | tr -d '\n' | cut -c1-180)")
       curl -s -m 10 -X POST "https://api.telegram.org/bot${token}/sendMessage" \
-        --data-urlencode "chat_id=${chat}" \
-        --data-urlencode "text=⚠️ Не вдалося доставити нагадування «$(basename "$f" .rem)». Telegram відхилив: $(printf '%s' "$resp" | tr -d '\n' | cut -c1-180)" \
+        --data-urlencode "chat_id=${give_up_chat:-$chat}" \
+        --data-urlencode "text=${notice}" \
         >/dev/null 2>&1
     fi
   fi

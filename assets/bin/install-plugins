@@ -23,8 +23,7 @@ POLICY="${CLAUDE_MANAGED_PLUGINS_POLICY:-}"
 if [ -z "$POLICY" ]; then
   for candidate in \
     "$SCRIPT_DIR/../product/managed-plugins.json" \
-    "$HOME/.claude/product/managed-plugins.json" \
-    "/opt/claude-tg-starter/assets/product/managed-plugins.json"; do
+    "$HOME/.claude/product/managed-plugins.json"; do
     if [ -f "$candidate" ]; then
       POLICY="$candidate"
       break

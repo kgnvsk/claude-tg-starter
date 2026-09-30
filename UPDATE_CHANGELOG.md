@@ -1,9 +1,9 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-09-23.0f238690421d`
+- Реліз: `2026-09-30.5ebe8232a381`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `0f238690421d766eb3a2634526f6dcc68fcd22b3`
-- Дата релізу: `2026-09-23`
+- Ревізія вихідного комплекту: `5ebe8232a3814ae7328dfa0879bac545af7bc9a4`
+- Дата релізу: `2026-09-30`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
 
@@ -19,7 +19,46 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    Extend superadmin business resource setup
+    An account switch ends the old account's limit hold; the same or an unknown account keeps it (task 48)
+    Add failing checks that an account switch ends the old account's limit hold, and only a distinct account counts (task 48)
+    Tests: an unknown bookkeeping attachment is judged the same with a cosmetic duplicate (v10 rule)
+    Receiver: a request's own legacy obligation still waits for exact proof
+    Tests: the canary's stalled user now ends delivered with its explanation
+    Company runtime: the blocked alert's footer drops the uncertain_action rerun sentence
+    Owner 29.09 (Codex, task 49 round 2 P2): the blocked alert no longer promises an unknown-result rerun (red)
+    Tests: the fake curl may take longer than 2 s to start on a loaded Mac
+    Stop guard: a person's local media by any media word, not two labels
+    Owner 29.09 (Codex, task 47 v9 P0): a person's local media stops the search by any media word (red)
+    Receiver: under guard and shadow a legacy worker moves to the request that registered it
+    Owner 29.09 (Codex, task 46 round 3 P0): a worker rebuilt from history answers the request that took it (red)
+    Company runtime: an unknown result is told in one commit through the durable reply path
+    Owner 29.09 (Codex, task 49 round 2): an unknown result's explanation survives refusals, crashes and restarts (red)
+    Receiver: under guard and shadow a reused worker moves to the request that registered it
+    Owner 29.09 (Codex, task 46 round 2 P0): a reused worker's callback answers the request that took it (red)
+    Stop guard: unknown bookkeeping continues the turn; task notices by kind; silence needs terminal proof
+    Owner 29.09: the Stop guard reads Claude's records by kind, never by exact wording (red)
+    Company runtime: only a result nobody knows is told and closed; other repeated failures keep their check
+    Company runtime: an unknown action result ends the request with the truth told, never a rerun or a hold
+    Owner 29.09: an unknown action result is told to its author at once and nothing waits for /unstick (red)
+    Receiver golden for the receiver-only worker refusals and hang cap
+    Receipt machinery refuses worker IDs only under the receiver; the three-hang cap is the receiver's policy
+    Codex task 46 P0-1/P0-2: under guard and shadow a reused worker ID still defers its request, and a request that hangs a third time is recovered as before K (red)
+    Receiver golden for the shadow-parity fix
+    Shadow changes nothing live: an upgraded session keeps its background work under guard and shadow, and the «Отримано, зараз закінчую…» notice is gone (owner, 29.09)
+    Owner 29.09: a message waiting behind long work gets no «Отримано, зараз закінчую…» notice (red)
+    Knopa 29.09: a session resumed across the upgrade must keep handing work to its background task under guard and shadow (red)
+    A second, different image in one employee request no longer holds the employee's chat: the bot says the next image comes with a new message
+    Add failing checks that a second, different image in one employee request is refused as a proven no-write, so it never holds the employee's chat
+    The alert about refused Claude Code access names both causes: the subscription, or a company administrator who switched access off
+    Add failing checks that the alert about refused Claude Code access names both the subscription and the company administrator
+    Owner alerts say in plain words what happened, what to do and where to look; the provider's own error text stays in the log
+    Add failing checks that owner alerts about a refused request say in plain words what happened and what to do
+    Gate checks follow the assembled receiver: a live lock stays fresh under load, a request in a topic names the bot, an offered message keeps its turn after a restart, and the reply harness knows the worker gates
+    Reliability and settlement checks follow the assembled receiver: the edit reader, the configurable offer retry, the named video, the repeated-acknowledgement stub and the owner's limit line
+    Company intake checks follow the receiver: a video reaches the worker named, and an unrecognized voice is refused to its author
+    A frozen server refuses a standalone Codex install before its license, packages or bootstrap
+    Add a failing check that a frozen server refuses a standalone Codex install before its license, packages or bootstrap
+    Pin the receiver that keeps an owner's group off on promotion; history comments without trailing spaces
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не
@@ -92,6 +131,14 @@ persona/policy, керовані manifest skills, plugins, runtime, hooks, cron 
 і golden Telegram runtime. Джерела правди — `PRODUCT.json` та перелічені вище
 керовані JSON projections.
 
+Звичайне оновлення зберігає встановлені Claude/Codex CLI та кеш плагінів.
+Перед першою мутацією `update.sh` вимагає байтової тотожності встановленої й
+нової managed-plugin policy та plugin contract, незмінності зафіксованого
+upstream Telegram і успішної локальної перевірки наявних плагінів. Перевірений
+golden Telegram може оновитися без заміни плагіна чи його marketplace.
+Воно не оновлює marketplace чи plugin через CLI. Зміна цих контрактів потребує
+окремої перевіреної міграції зі знімком і відкатом, а не звичайного `update.sh`.
+
 Запланований worker повинен використовувати детерміноване виконання та
 фільтрування scheduled-worker і не запускати другий блокуючий процес Claude.
 
@@ -129,6 +176,8 @@ legacy `/opt/claude-tg-starter/PRODUCT.json` сам по собі не є збо
   poller;
 - власні правки перетинають керований шлях чи назву, а безпечне злиття не
   доведено;
+- plugin policy/contract або зафіксоване джерело Telegram не збігаються з установленими
+  або локальна перевірка встановлених плагінів не пройшла;
 - архів неповний, пошкоджений, підмінений або не проходить перевірку цілісності.
 
 Жорстка зупинка означає: не запускай installer/update, не зупиняй службу й не

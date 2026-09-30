@@ -1,0 +1,128 @@
+#!/usr/bin/env python3
+"""Run one configured GitHub backup each Lisbon evening."""
+
+from __future__ import annotations
+
+from datetime import datetime, timezone
+import argparse
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import subprocess
+import sys
+import tempfile
+from zoneinfo import ZoneInfo
+
+
+LISBON = ZoneInfo("Europe/Lisbon")
+
+
+def lisbon_date_at_22(now: datetime) -> str | None:
+    local = now.astimezone(LISBON)
+    return local.date().isoformat() if local.hour == 22 else None
+
+
+def private_json(path: Path) -> dict:
+    if not path.exists() and not path.is_symlink():
+        return {}
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    with os.fdopen(descriptor, "rb") as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > 64 * 1024:
+            raise ValueError("state-invalid")
+        data = json.loads(stream.read(64 * 1024 + 1))
+    if not isinstance(data, dict):
+        raise ValueError("state-invalid")
+    return data
+
+
+def selected_command(home: Path) -> list[str] | None:
+    private = private_json(home / ".local/state/agent-github-backup/state.json")
+    if private.get("remoteIdentity") and private.get("privateConfirmed") is True:
+        return [str(home / "bin/agent-github-backup"), "scheduled", "--json"]
+    full = home / ".local/state/agent-full-backup"
+    config = private_json(full / "config.json")
+    if (config.get("enabled") is True and config.get("repositoryId")
+            and config.get("keySavedAt") and (full / "github-token").is_file()):
+        return [str(home / "bin/agent-full-backup"), "--home", str(home), "scheduled"]
+    return None
+
+
+def invoke(command: list[str], home: Path) -> int:
+    environment = {**os.environ, "HOME": str(home)}
+    result = subprocess.run(command, env=environment, capture_output=True, check=False)
+    if result.returncode:
+        code = "backend-failed"
+        try:
+            receipt = json.loads(result.stdout)
+            candidate = receipt.get("status") or receipt.get("error")
+            if isinstance(candidate, str) and re.fullmatch(r"[a-z][a-z0-9-]{0,80}", candidate):
+                code = candidate
+        except (ValueError, AttributeError, UnicodeError):
+            pass
+        print(f"nightly GitHub backup failed ({Path(command[0]).name}: {code})", file=sys.stderr)
+    return result.returncode
+
+
+def run(home: Path, now: datetime | None = None, runner=None) -> str:
+    now = now or datetime.now(timezone.utc)
+    date = lisbon_date_at_22(now)
+    if date is None:
+        return "not-due"
+    state_dir = home / ".local/state/agent-nightly-github-backup"
+    if state_dir.is_symlink():
+        return "failed"
+    state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(state_dir, 0o700)
+    lock = os.open(state_dir / "run.lock", os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    try:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return "busy"
+        marker = state_dir / "state.json"
+        if private_json(marker).get("lastCompletedDate") == date:
+            return "already-ran"
+        command = selected_command(home)
+        if command is None:
+            return "not-configured"
+        selected_runner = runner or (lambda args: invoke(args, home))
+        if selected_runner(command) != 0:
+            return "failed"
+        descriptor, temporary = tempfile.mkstemp(prefix=".state-", dir=state_dir)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                json.dump({"lastCompletedDate": date}, stream)
+                stream.write("\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.chmod(temporary, 0o600)
+            os.replace(temporary, marker)
+        finally:
+            Path(temporary).unlink(missing_ok=True)
+        return "ran"
+    except (OSError, ValueError, json.JSONDecodeError):
+        return "failed"
+    finally:
+        os.close(lock)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--home", type=Path, default=Path.home())
+    args = parser.parse_args()
+    result = run(args.home.absolute())
+    if result == "not-configured":
+        print("nightly GitHub backup not configured", file=sys.stderr)
+        return 1
+    if result == "failed":
+        print("nightly GitHub backup failed", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

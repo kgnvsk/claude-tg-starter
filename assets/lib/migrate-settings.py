@@ -10,12 +10,17 @@ import tempfile
 
 # {H} is the agent home, derived from the settings path at migrate() time: on
 # multi-instance boxes each bot lives under its own /home/<user>.
-DEPRECATED_COMMANDS = (
-    "{H}/bin/vault-index",
-    "{H}/bin/cash-thread-capture",
-    "{H}/bin/tg-thread-snapshot",
-    "{H}/bin/graphify-vault",
-    "/opt/claude-graphify/bin/graphify",
+# These are the old kit registrations, including their event and matcher.
+# A user's command may mention one of the same helpers for a different job.
+DEPRECATED_HOOKS = (
+    ("SessionStart", None, "{H}/bin/vault-index"),
+    ("UserPromptSubmit", None, "{H}/bin/cash-thread-capture"),
+    ("PostToolUse", "mcp__plugin_telegram_telegram__(reply|edit_message)",
+     "{H}/bin/tg-thread-snapshot"),
+    ("PostToolUse", "Write|Edit|MultiEdit",
+     "jq -r '.tool_input.file_path // .tool_response.filePath // \"\"' "
+     "| grep -q \"^{H}/obsidian-vault/\" && {H}/bin/vault-sync &"),
+    ("SessionStart", None, "/opt/claude-graphify/bin/graphify hook-guard read"),
 )
 MANAGED_HOOKS = (
     ("PreCompact", None, "{H}/bin/tg-compaction-notice", 10),
@@ -27,7 +32,10 @@ MANAGED_HOOKS = (
     ("PreToolUse", "Bash|Read|Edit|Write|MultiEdit", "{H}/bin/no-secrets-guard", 5),
     ("PreToolUse", "Bash|Edit|Write|MultiEdit", "{H}/bin/memory-budget-guard", 5),
     ("PreToolUse", "Bash|Edit|Write|MultiEdit", "{H}/bin/settings-model-guard", 90),
-    ("PostToolUse", "Write|Edit|MultiEdit", "jq -r '.tool_input.file_path // .tool_response.filePath // \"\"' | grep -q \"^{H}/obsidian-vault/\" && {H}/bin/vault-sync &", 5),
+    ("PreToolUse", "Bash|Agent|SendMessage", "{H}/bin/tg-native-task", 10),
+    ("PostToolUse", "Bash|Agent|SendMessage|TaskStop", "{H}/bin/tg-native-task", 10),
+    ("PostToolUseFailure", "Bash|Agent|SendMessage|TaskStop", "{H}/bin/tg-native-task", 10),
+    ("PostToolBatch", None, "{H}/bin/tg-native-task", 10),
     ("Stop", None, "{H}/bin/tg-reply-stop-guard", 35),
     ("Stop", None, "{H}/bin/tg-turn-end", 5),
     ("StopFailure", None, "{H}/bin/tg-turn-end", 5),
@@ -113,10 +121,11 @@ def migrate(
     # Deprecated entries are matched against BOTH the derived home and the
     # historical /home/claude literal, so legacy hooks are still cleaned up on
     # settings files that moved to another instance home.
-    deprecated_commands = tuple(dict.fromkeys(
-        [v.format(H=home) for v in DEPRECATED_COMMANDS]
-        + [v.format(H="/home/claude") for v in DEPRECATED_COMMANDS]
-    ))
+    deprecated_hooks = {
+        (event, matcher, command.format(H=agent_home))
+        for agent_home in (home, "/home/claude")
+        for event, matcher, command in DEPRECATED_HOOKS
+    }
     managed_hooks = tuple(
         (event, matcher, command.format(H=home), timeout)
         for event, matcher, command, timeout in MANAGED_HOOKS
@@ -155,9 +164,13 @@ def migrate(
                 kept_entries.append(entry)
                 continue
             kept_actions = [
-                action
-                for action in actions
-                if not any(old in hook_command(action) for old in deprecated_commands)
+                action for action in actions
+                if not (
+                    isinstance(action, dict)
+                    and action.get("type") == "command"
+                    and (event, entry.get("matcher"), hook_command(action))
+                    in deprecated_hooks
+                )
             ]
             if kept_actions:
                 entry["hooks"] = kept_actions

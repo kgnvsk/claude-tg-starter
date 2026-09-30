@@ -85,6 +85,51 @@
           }
         ],
         "matcher": "Bash|Edit|Write|MultiEdit"
+      },
+      {
+        "matcher": "Bash|Agent|SendMessage",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "{{AGENT_HOME}}/bin/tg-native-task",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash|Agent|SendMessage|TaskStop",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "{{AGENT_HOME}}/bin/tg-native-task",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "matcher": "Bash|Agent|SendMessage|TaskStop",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "{{AGENT_HOME}}/bin/tg-native-task",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolBatch": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "{{AGENT_HOME}}/bin/tg-native-task",
+            "timeout": 10
+          }
+        ]
       }
     ],
     "PreCompact": [
@@ -124,18 +169,6 @@
             "type": "command",
             "command": "{{AGENT_HOME}}/bin/tg-turn-end",
             "timeout": 5
-          }
-        ]
-      }
-    ],
-    "PostToolUse": [
-      {
-        "matcher": "Write|Edit|MultiEdit",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "jq -r '.tool_input.file_path // .tool_response.filePath // \"\"' | grep -q \"^{{AGENT_HOME}}/obsidian-vault/\" && {{AGENT_HOME}}/bin/vault-sync &",
-            "timeout": 10
           }
         ]
       }

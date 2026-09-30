@@ -27,10 +27,11 @@ import tarfile
 import tempfile
 import time
 from urllib import request
+from zoneinfo import ZoneInfo
 
 VERSION = 1
 PRIVACY_POLICY = "no-secrets-v1"
-INTERVAL = 12 * 3600
+INTERVAL = 24 * 3600
 AGE_VERSION = "v1.3.2"
 AGE_DIGESTS = {
     "linux-amd64": "cbe24006683f8eb669266162894b9a522a1af52f2665fbc63a4bb032ed26ac10",
@@ -96,6 +97,19 @@ def process(args, **kwargs):
     if result.returncode:
         raise BackupError("command-failed")
     return result.stdout
+
+
+def private_git_configured(home: Path) -> bool:
+    path = home / ".local/state/agent-github-backup/state.json"
+    if not path.exists() and not path.is_symlink():
+        return False
+    try:
+        state = json.loads(protected_read(path, 64 * 1024))
+    except (OSError, ValueError, UnicodeError, json.JSONDecodeError) as error:
+        raise BackupError("private-backup-state-invalid") from error
+    if not isinstance(state, dict):
+        raise BackupError("private-backup-state-invalid")
+    return bool(state.get("remoteIdentity") and state.get("privateConfirmed") is True)
 
 
 def age_tools(state_dir: Path):
@@ -338,14 +352,14 @@ class Backup:
             self.save(self.config_path, config)
             return
         label = "com.novsky.agent-backup." + config["installationId"]
-        script = str(Path(__file__).resolve())
+        script = str(self.home / "bin/agent-nightly-github-backup")
         if platform.system() == "Darwin":
             directory = Path(pwd.getpwuid(os.geteuid()).pw_dir) / "Library/LaunchAgents"
             if any(p.is_symlink() for p in (directory, *directory.parents)):
                 raise BackupError("schedule-path-unsafe")
             directory.mkdir(parents=True, exist_ok=True)
             path = directory / (label + ".plist")
-            data = {"Label": label, "ProgramArguments": [sys.executable, script, "--home", str(self.home), "scheduled"],
+            data = {"Label": label, "ProgramArguments": [sys.executable, script, "--home", str(self.home)],
                     "StartInterval": 3600, "RunAtLoad": False,
                     "EnvironmentVariables": {"HOME": str(self.home)},
                     "StandardOutPath": str(self.directory / "scheduled.log"),
@@ -360,9 +374,8 @@ class Backup:
             lines = current.stdout.decode().splitlines()
             marker = "# " + label
             lines = [line for line in lines if marker not in line]
-            minute = int(config["installationId"][:4], 16) % 60
-            command = shlex.join([sys.executable, script, "--home", str(self.home), "scheduled"])
-            lines.append(f"{minute} * * * * {command} >>{shlex.quote(str(self.directory / 'scheduled.log'))} 2>&1 {marker}")
+            command = shlex.join([sys.executable, script, "--home", str(self.home)])
+            lines.append(f"0 * * * * {command} >>{shlex.quote(str(self.directory / 'scheduled.log'))} 2>&1 {marker}")
             # Re-read before replacing so concurrent configuration is not knowingly lost.
             latest = subprocess.run(["crontab", "-l"], capture_output=True, timeout=15)
             if latest.stdout != current.stdout or latest.returncode != current.returncode:
@@ -381,8 +394,10 @@ class Backup:
             if scheduled:
                 return {"status": "setup-required"}
             raise BackupError("setup-required")
-        current_policy = (state.get("lastSnapshot") or {}).get("privacyPolicy") == PRIVACY_POLICY
-        if scheduled and (not config.get("enabled") or current_policy and now - (state.get("lastSuccessAt") or 0) < INTERVAL):
+        slot = datetime.fromtimestamp(now, timezone.utc).astimezone(ZoneInfo("Europe/Lisbon")) if scheduled else None
+        if scheduled and private_git_configured(self.home):
+            return {"status": "not-due"}
+        if scheduled and (not config.get("enabled") or slot.hour != 22 or state.get("lastNightlySlot") == slot.date().isoformat()):
             return {"status": "not-due"}
         state.update(lastAttemptAt=now, running=True, lastError=None)
         self.save(self.state_path, state)
@@ -410,6 +425,8 @@ class Backup:
             state.update(lastSuccessAt=int(time.time()), lastPublication=publication,
                          lastSnapshot={k: metadata.get(k) for k in ("sha256", "size", "files", "createdAt", "privacyPolicy")},
                          running=False, lastError=None)
+            if scheduled:
+                state["lastNightlySlot"] = slot.date().isoformat()
             self.save(self.state_path, state)
             return {"status": "verified", "repository": config["repository"], "publication": publication,
                     "snapshot": state["lastSnapshot"]}
@@ -479,7 +496,7 @@ class Backup:
                 "privacyPolicy": PRIVACY_POLICY, "lastCopyMatchesPolicy": current_policy,
                 "repository": config.get("repository"), "keySaved": bool(config.get("keySavedAt")),
                 "lastSuccessAt": last, "lastAttemptAt": state.get("lastAttemptAt"),
-                "lastError": state.get("lastError"), "fresh": bool(current_policy and last and time.time() - last < INTERVAL + 3600),
+                "lastError": state.get("lastError"), "fresh": bool(current_policy and last and time.time() - last < INTERVAL + 3 * 3600),
                 "lastPublication": state.get("lastPublication"), "lastSnapshot": state.get("lastSnapshot")}
 
 

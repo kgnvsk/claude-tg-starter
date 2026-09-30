@@ -3,6 +3,20 @@
 set -euo pipefail
 
 [ "$(id -u)" -eq 0 ] || { echo "FATAL: install-core потрібно запускати від root" >&2; exit 1; }
+# BEGIN owner freeze preflight
+# The owner froze kit updates on this server: refuse before any licence call,
+# package work or managed write. A symlink (even a dangling one) or any other
+# non-regular marker refuses unopened; a regular one shows its first 2000 bytes.
+UPDATES_FROZEN=/etc/claude-tg-starter/updates-frozen
+if [ -L "$UPDATES_FROZEN" ] || [ -e "$UPDATES_FROZEN" ]; then
+  FROZEN_REASON=""
+  if [ ! -L "$UPDATES_FROZEN" ] && [ -f "$UPDATES_FROZEN" ]; then
+    FROZEN_REASON="$(head -c 2000 -- "$UPDATES_FROZEN" 2>/dev/null || true)"
+  fi
+  echo "FATAL: оновлення кита на цьому сервері заморожено власником${FROZEN_REASON:+: $FROZEN_REASON}" >&2
+  exit 3
+fi
+# END owner freeze preflight
 KIT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PRODUCT_CONFIG="$KIT/assets/lib/product-config.py"
 CLAUDE_UPDATE_MAINTENANCE="${CLAUDE_UPDATE_MAINTENANCE:-0}"
@@ -37,6 +51,19 @@ case "$AGENT_USER" in
     echo "FATAL: значення AGENT_USER '$AGENT_USER' зарезервовано" >&2; exit 1 ;;
 esac
 H=/home/$AGENT_USER
+NOVSKY_ALLOW_PINNED_LEGACY_SHARED_CONTEXT="${NOVSKY_ALLOW_PINNED_LEGACY_SHARED_CONTEXT:-0}"
+case "$NOVSKY_ALLOW_PINNED_LEGACY_SHARED_CONTEXT" in
+  0|1) ;;
+  *) echo "FATAL: некоректний режим резервного контексту" >&2; exit 1 ;;
+esac
+legacy_context_args=()
+if [ "$NOVSKY_ALLOW_PINNED_LEGACY_SHARED_CONTEXT" = 1 ]; then
+  if [ "$CLAUDE_UPDATE_MAINTENANCE" != 1 ] || [ "$AGENT_USER" != "claude-8709793308" ]; then
+    echo "FATAL: старий спільний контекст дозволено лише для обслуговування тестового агента" >&2
+    exit 1
+  fi
+  legacy_context_args+=(--allow-pinned-legacy-shared-context)
+fi
 CONFIG_DIR=/etc/claude-tg-starter
 if [ "$AGENT_USER" = claude ]; then
   AGENT_SERVICE=claude-telegram.service
@@ -65,6 +92,11 @@ TG_DELIVERY_AUTHORITY="${TG_DELIVERY_AUTHORITY:-guard}"
 CALENDAR_EMAIL="${CALENDAR_EMAIL:-}"
 OWNER_EMAIL="${OWNER_EMAIL:-}"
 VAULT_LOCALE="${VAULT_LOCALE:-en-US}"
+OWNER_NOTICE_LOCALE="${OWNER_NOTICE_LOCALE:-uk}"
+case "$OWNER_NOTICE_LOCALE" in
+  uk|ru) ;;
+  *) echo "FATAL: OWNER_NOTICE_LOCALE має бути uk або ru" >&2; exit 1 ;;
+esac
 if [ -z "${VOICE_SETUP_STATUS:-}" ]; then
   if [ -n "$OPENAI_API_KEY" ]; then
     VOICE_SETUP_STATUS=configured
@@ -131,6 +163,19 @@ if [ "$MODULE_CHANNEL_PUBLISH" = 1 ]; then
     exit 1
   }
 fi
+# BEGIN optional module maintenance guard
+# These installers write outside managed-runtime.json and have no recorded
+# previous-kit baseline. Replaying them would silently replace owner edits.
+# Individual module migration needs its own reviewed comparison first.
+if [ "$CLAUDE_UPDATE_MAINTENANCE" = 1 ]; then
+  for optional_name in MODULE_CHANNEL_PUBLISH MODULE_INSTAGRAM_DM MODULE_YOUTUBE_COMMENTS; do
+    if [ "${!optional_name:-0}" = 1 ]; then
+      echo "FATAL: $optional_name увімкнено; оновлення комплекту потребує окремої перевірки змін модуля" >&2
+      exit 1
+    fi
+  done
+fi
+# END optional module maintenance guard
 # The daemon transport is retired. On Claude Code 2.1.208+ the channel plugin no
 # longer starts in that mode: the daemon keeps filing incoming updates and nothing
 # ever drains them, so the bot answers nobody while sending (crons, alerts) still
@@ -148,7 +193,7 @@ fi
 export AGENT_NAME OWNER_NAME OWNER_TG_USERNAME OWNER_CHAT_ID ALERT_COPY_CHAT_IDS BOT_USERNAME TIMEZONE CALENDAR_EMAIL DEPLOY_DATE AGENT_USER AGENT_SERVICE
 
 validate_install_kit() {
-  local foreign_owner linked_path
+  local foreign_owner linked_path own_kit
   [ "$(stat -c %U "$KIT")" = root ] || {
     echo "FATAL: комплект розгортання має належати root: $KIT" >&2
     return 1
@@ -163,9 +208,130 @@ validate_install_kit() {
     echo "FATAL: комплект розгортання містить символічне посилання: $linked_path" >&2
     return 1
   }
+  # One kit folder per agent: the primary runs /opt/claude-tg-starter and every
+  # other agent /opt/claude-tg-starter@<user>, so no bot runs a neighbour's kit.
+  own_kit=/opt/claude-tg-starter
+  [ "$AGENT_USER" = claude ] || own_kit="$own_kit@$AGENT_USER"
+  # /opt itself may be a symlink; the kit must be the real folder under it.
+  [ "$(cd "$KIT" && pwd -P)" = "$(cd "${own_kit%/*}" && pwd -P)/${own_kit##*/}" ] || {
+    echo "FATAL: комплект агента $AGENT_USER має запускатися з $own_kit; оновіть Novsky до останньої версії" >&2
+    return 1
+  }
 }
 
 validate_install_kit
+
+render_template() {
+  local source="$1" destination="$2"
+  shift 2
+  runuser -u "$AGENT_USER" -- env \
+    AGENT_NAME="$AGENT_NAME" OWNER_NAME="$OWNER_NAME" \
+    OWNER_TG_USERNAME="$OWNER_TG_USERNAME" OWNER_CHAT_ID="$OWNER_CHAT_ID" \
+    BOT_USERNAME="$BOT_USERNAME" TIMEZONE="$TIMEZONE" \
+    CALENDAR_EMAIL="$CALENDAR_EMAIL" DEPLOY_DATE="$DEPLOY_DATE" \
+    AGENT_HOME="$H" AGENT_SERVICE="$AGENT_SERVICE" AGENT_USER="$AGENT_USER" \
+    python3 "$KIT/assets/lib/render-template.py" "$@" "$source" "$destination"
+}
+source "$KIT/assets/lib/persona-baseline.sh"
+
+# BEGIN instance persona preflight
+# Keep separate hashes for rendered primary personas. A missing hash permits
+# only an exact current-template match; a changed template needs proof that
+# the installed copy is still the last accepted managed copy.
+PERSONA_BASELINE_CLAUDE="$H/.claude/product/CLAUDE.premium.sha256"
+PERSONA_BASELINE_PRODUCT="$H/.claude/product/CLAUDE.product.sha256"
+PERSONA_EXISTING=0
+if [ "$CLAUDE_UPDATE_MAINTENANCE" = 1 ] \
+    || [ -e "$H/.claude/CLAUDE.premium.md" ] || [ -L "$H/.claude/CLAUDE.premium.md" ] \
+    || [ -e "$H/.claude/CLAUDE.product.md" ] || [ -L "$H/.claude/CLAUDE.product.md" ]; then
+  PERSONA_EXISTING=1
+fi
+ROLE_PROFILE="$KIT/assets/product/ROLE.md"
+if [ -n "${AGENT_ROLE:-}" ]; then
+  ROLE_PROFILE="$KIT/assets/roles/$AGENT_ROLE/ROLE.md"
+  [ -f "$ROLE_PROFILE" ] || {
+    echo "FATAL: невідома роль агента; оновлення зупинено" >&2
+    exit 1
+  }
+fi
+if [ "$PERSONA_EXISTING" = 1 ]; then
+  guard_managed_persona check "$KIT/assets/templates/CLAUDE.md.template" \
+    "$H/.claude/CLAUDE.premium.md" "$PERSONA_BASELINE_CLAUDE"
+  guard_managed_persona check "$ROLE_PROFILE" \
+    "$H/.claude/CLAUDE.product.md" "$PERSONA_BASELINE_PRODUCT"
+fi
+# END instance persona preflight
+
+# BEGIN shared browser helper preflight
+# The helper and its state belong to the primary and serve every bot on the
+# server. Another bot's update never writes them; it only warns when the host
+# copy differs from its own kit's.
+warn_shared_browser_helper() {
+  [ -d /var/lib/claude-browser/recovery ] \
+    && [ ! -L /var/lib/claude-browser/recovery ] \
+    && [ -f /usr/local/sbin/claude-browser-recover ] \
+    && [ ! -L /usr/local/sbin/claude-browser-recover ] \
+    && cmp -s "${KIT}/assets/bin/claude-browser-recover" /usr/local/sbin/claude-browser-recover \
+    || echo "WARN: спільний browser helper відрізняється від комплекту агента $AGENT_USER; ним керує основний агент, оновлення триває" >&2
+}
+if product_has_feature browser; then
+  [ ! -L /var/lib/claude-browser/recovery ] || {
+    echo "FATAL: каталог стану відновлення браузера не може бути символічним посиланням" >&2
+    exit 1
+  }
+fi
+if [ "$CLAUDE_UPDATE_MAINTENANCE" = 1 ] && [ "$AGENT_USER" != claude ] \
+    && product_has_feature browser; then
+  warn_shared_browser_helper
+fi
+# END shared browser helper preflight
+
+# BEGIN instance system context preflight
+SYSTEMD_DIR=/etc/systemd/system
+INSTANCE_UNIT_TARGET="$SYSTEMD_DIR/$AGENT_SERVICE"
+INSTANCE_LOGROTATE_TARGET="/etc/logrotate.d/cash-$AGENT_USER"
+verify_instance_system_context() {
+  [ "$CLAUDE_UPDATE_MAINTENANCE" = 1 ] && [ "$AGENT_USER" != claude ] || return 0
+  local fragment candidate
+  candidate="$KIT/assets/systemd/claude-telegram@.service"
+  fragment="$(systemctl show "$AGENT_SERVICE" --property=FragmentPath --value --no-pager 2>/dev/null)" || return 1
+  case "$fragment" in
+    "$SYSTEMD_DIR/claude-telegram@.service"|"$INSTANCE_UNIT_TARGET") ;;
+    *) echo "FATAL: служба instance має неочікуване джерело" >&2; return 1 ;;
+  esac
+  if [ ! -f "$fragment" ] || [ -L "$fragment" ] || ! cmp -s "$candidate" "$fragment"; then
+    echo "FATAL: unit instance відрізняється від комплекту; потрібне ручне узгодження" >&2
+    return 1
+  fi
+  if [ -e "$INSTANCE_UNIT_TARGET" ] || [ -L "$INSTANCE_UNIT_TARGET" ]; then
+    if [ ! -f "$INSTANCE_UNIT_TARGET" ] || [ -L "$INSTANCE_UNIT_TARGET" ] \
+        || ! cmp -s "$candidate" "$INSTANCE_UNIT_TARGET"; then
+      echo "FATAL: налаштування unit instance змінено; перезапис заборонено" >&2
+      return 1
+    fi
+  fi
+  if [ -e "$INSTANCE_LOGROTATE_TARGET" ] || [ -L "$INSTANCE_LOGROTATE_TARGET" ]; then
+    if [ ! -f "$INSTANCE_LOGROTATE_TARGET" ] || [ -L "$INSTANCE_LOGROTATE_TARGET" ] \
+        || ! sed "s|/home/claude|$H|g" "$KIT/assets/systemd/logrotate-cash" \
+             | cmp -s - "$INSTANCE_LOGROTATE_TARGET"; then
+      echo "FATAL: налаштування logrotate instance змінено; перезапис заборонено" >&2
+      return 1
+    fi
+  fi
+}
+verify_instance_system_context
+# END instance system context preflight
+
+# Maintenance cannot rewrite the shared root backup context: those paths are
+# outside the agent-home rollback. Fail before this installer writes anything.
+if [ "$CLAUDE_UPDATE_MAINTENANCE" = 1 ]; then
+  python3 -B "$KIT/assets/lib/install-backup-context.py" --check-current \
+    --allow-maintenance-hold "${legacy_context_args[@]}" --home "$H" --user "$AGENT_USER" \
+    --unit "$AGENT_SERVICE" --engine claude >/dev/null || {
+      echo "FATAL: backup context needs a reviewed migration before kit maintenance" >&2
+      exit 2
+    }
+fi
 
 # Check the installed runtime identity before writing templates, credentials or
 # cron entries. A wizard may already have replaced the root input agent.env.
@@ -185,6 +351,115 @@ if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "$AGENT_S
   echo "FATAL: перед зміною ядра зупини $AGENT_SERVICE через maintenance-оновлення (UPGRADING.md)" >&2
   exit 1
 fi
+
+# BEGIN Vercel maintenance preflight
+# A kit update preserves the owner's installed CLI. Check it before package or
+# runtime writes; replacing a missing/broken executable is a separate operation.
+verify_preserved_vercel_cli() {
+  [ "$CLAUDE_UPDATE_MAINTENANCE" = 1 ] || return 0
+  local feature_status=0 version cli="$H/.npm-global/bin/vercel"
+  if product_has_feature vercel; then
+    :
+  else
+    feature_status=$?
+    [ "$feature_status" -eq 1 ] && return 0
+    return "$feature_status"
+  fi
+  [ -x "$cli" ] || {
+    echo "FATAL: встановлений Vercel CLI відсутній або не виконується; оновлення комплекту зупинено" >&2
+    return 1
+  }
+  version="$(runuser -u "$AGENT_USER" -- env HOME="$H" \
+    VERCEL_TELEMETRY_DISABLED=1 NO_UPDATE_NOTIFIER=1 \
+    /usr/bin/timeout --foreground 30s "$cli" --version 2>/dev/null)" || {
+      echo "FATAL: встановлений Vercel CLI не відповідає; оновлення комплекту зупинено" >&2
+      return 1
+    }
+  [[ "$version" =~ [0-9]+\.[0-9]+\.[0-9]+ ]] || {
+    echo "FATAL: версію встановленого Vercel CLI не вдалося перевірити" >&2
+    return 1
+  }
+}
+verify_preserved_vercel_cli
+# END Vercel maintenance preflight
+
+# BEGIN maintenance dependency preflight
+# Maintenance keeps the owner's installed tools. A missing dependency is a
+# separate repair, not a reason to fetch a moving package halfway through an
+# agent update. Run this before any runtime or configuration writes.
+maintenance_require_command() {
+  command -v "$1" >/dev/null 2>&1 || {
+    echo "FATAL: для оновлення відсутня команда $1; віднови її окремо і повтори" >&2
+    return 1
+  }
+}
+maintenance_require_python() {
+  local name="$1" import_check="$2" python="$H/.venvs/$1/bin/python"
+  [ -x "$python" ] || {
+    echo "FATAL: для оновлення відсутнє середовище $name; віднови його окремо і повтори" >&2
+    return 1
+  }
+  runuser -u "$AGENT_USER" -- "$python" -I -B -c "$import_check" >/dev/null 2>&1 || {
+    echo "FATAL: середовище $name не працює; оновлення комплекту зупинено" >&2
+    return 1
+  }
+}
+verify_maintenance_dependencies() {
+  [ "$CLAUDE_UPDATE_MAINTENANCE" = 1 ] || return 0
+  maintenance_require_command gh || return 1
+  maintenance_require_command sqlite3 || return 1
+  /usr/bin/python3 -B -c 'import numpy, markdown' >/dev/null 2>&1 || {
+    echo "FATAL: системні Python-залежності пам’яті відсутні; оновлення комплекту зупинено" >&2
+    return 1
+  }
+  if product_has_feature telegram-corporate-sessions; then
+    maintenance_require_python heif 'from PIL import Image; from pillow_heif import register_heif_opener' || return 1
+    if [ "$MODULE_TELEGRAM_CORPORATE" = 1 ]; then
+      maintenance_require_command bwrap || return 1
+      maintenance_require_command socat || return 1
+    fi
+  fi
+  if product_has_feature sql-readonly; then
+    maintenance_require_python bigquery 'from google.cloud import bigquery' || return 1
+  fi
+  if product_has_feature finance-data; then
+    maintenance_require_python finance 'import yfinance' || return 1
+  fi
+  if product_has_feature spreadsheets; then
+    maintenance_require_python spreadsheets 'import openpyxl, xlsxwriter' || return 1
+  fi
+  if product_has_feature media-downloads; then
+    [ -x "$H/.local/bin/yt-dlp" ] && [ -x "$H/.local/bin/deno" ] || {
+      echo "FATAL: yt-dlp або Deno відсутній; оновлення комплекту зупинено" >&2
+      return 1
+    }
+  fi
+  if [ "$MODULE_INSTAGRAM_DM" = 1 ]; then
+    maintenance_require_python instagram-dm 'import fastapi, uvicorn' || return 1
+  fi
+  if product_has_feature video-edit; then
+    AGENT_USER="$AGENT_USER" CLAUDE_UPDATE_MAINTENANCE=1 \
+      bash "$KIT/scripts/install-video-edit.sh" --preflight-maintenance || return 1
+  fi
+}
+verify_maintenance_dependencies
+# END maintenance dependency preflight
+
+# BEGIN external side-effect maintenance preflight
+# The retired Graphify extension may contain owner data, and a missing gog
+# would make the installer download into /usr/local/bin. Neither action belongs
+# to a kit update. Decide before package, runtime, or configuration writes.
+if [ "$CLAUDE_UPDATE_MAINTENANCE" = 1 ]; then
+  if [ -e /opt/claude-graphify ] || [ -L /opt/claude-graphify ]; then
+    echo "FATAL: Graphify вже встановлено; перевір його дані окремо перед оновленням комплекту" >&2
+    exit 1
+  fi
+  if product_has_feature google-workspace && ! command -v gog >/dev/null 2>&1; then
+    echo "FATAL: gog відсутній; віднови Google CLI окремо перед оновленням комплекту" >&2
+    exit 1
+  fi
+fi
+# END external side-effect maintenance preflight
 
 # BEGIN Starter foundation preflight
 STARTER_FOUNDATION_REQUIRED=0
@@ -218,12 +493,16 @@ validate_starter_foundation
 # check would dead-end a customer install; take the package ourselves (we are
 # root here) and only fail when it is still unavailable afterwards.
 if ! command -v gh >/dev/null 2>&1; then
-  DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 update -qq
-  DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 install -y -q gh
+  if [ "$CLAUDE_UPDATE_MAINTENANCE" != 1 ]; then
+    DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 update -qq
+    DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 install -y -q gh
+  fi
 fi
 
 if ! command -v sqlite3 >/dev/null 2>&1; then
-  DEBIAN_FRONTEND=noninteractive apt-get install -y -q sqlite3 >/dev/null 2>&1 || true
+  if [ "$CLAUDE_UPDATE_MAINTENANCE" != 1 ]; then
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -q sqlite3 >/dev/null 2>&1 || true
+  fi
   command -v sqlite3 >/dev/null 2>&1 || {
     echo "FATAL: sqlite3 відсутній, і його не вдалося встановити; виконай apt-get install -y sqlite3" >&2
     exit 1
@@ -234,7 +513,9 @@ fi
 # runtime packages for those kits only; host security policy is not changed here.
 if product_has_feature telegram-corporate-sessions && [ "$MODULE_TELEGRAM_CORPORATE" = 1 ]; then
   if ! command -v bwrap >/dev/null 2>&1 || ! command -v socat >/dev/null 2>&1; then
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -q bubblewrap socat >/dev/null 2>&1 || true
+    if [ "$CLAUDE_UPDATE_MAINTENANCE" != 1 ]; then
+      DEBIAN_FRONTEND=noninteractive apt-get install -y -q bubblewrap socat >/dev/null 2>&1 || true
+    fi
   fi
   for dependency in bwrap socat; do
     command -v "$dependency" >/dev/null 2>&1 || {
@@ -258,7 +539,9 @@ fi
 # guided clean installs; this convergence path also covers direct product
 # installs and upgrades from releases that predate vector search.
 if ! /usr/bin/python3 -c 'import numpy' >/dev/null 2>&1; then
-  DEBIAN_FRONTEND=noninteractive apt-get install -y -q python3-numpy >/dev/null 2>&1 || true
+  if [ "$CLAUDE_UPDATE_MAINTENANCE" != 1 ]; then
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -q python3-numpy >/dev/null 2>&1 || true
+  fi
 fi
 /usr/bin/python3 -c 'import numpy' >/dev/null 2>&1 || {
   echo "FATAL: python3-numpy відсутній, і його не вдалося встановити" >&2
@@ -268,7 +551,9 @@ fi
 # Веб-звіт рендерить нотатки вольта в HTML. Системний Python на 24.04 зовнішньо
 # керований, тому пакет ставимо тут, а не pip-ом під час першого запуску.
 if ! /usr/bin/python3 -c 'import markdown' >/dev/null 2>&1; then
-  DEBIAN_FRONTEND=noninteractive apt-get install -y -q python3-markdown >/dev/null 2>&1 || true
+  if [ "$CLAUDE_UPDATE_MAINTENANCE" != 1 ]; then
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -q python3-markdown >/dev/null 2>&1 || true
+  fi
 fi
 /usr/bin/python3 -c 'import markdown' >/dev/null 2>&1 || {
   echo "FATAL: python3-markdown відсутній, і його не вдалося встановити" >&2
@@ -296,16 +581,6 @@ copy_tree_no_clobber() {
   fi
 }
 
-render_template() {
-  local source="$1" destination="$2"
-  runuser -u "$AGENT_USER" -- env \
-    AGENT_NAME="$AGENT_NAME" OWNER_NAME="$OWNER_NAME" \
-    OWNER_TG_USERNAME="$OWNER_TG_USERNAME" OWNER_CHAT_ID="$OWNER_CHAT_ID" \
-    BOT_USERNAME="$BOT_USERNAME" TIMEZONE="$TIMEZONE" \
-    CALENDAR_EMAIL="$CALENDAR_EMAIL" DEPLOY_DATE="$DEPLOY_DATE" \
-    AGENT_HOME="$H" AGENT_SERVICE="$AGENT_SERVICE" AGENT_USER="$AGENT_USER" \
-    python3 "$KIT/assets/lib/render-template.py" "$source" "$destination"
-}
 
 # BEGIN limit recovery initialization helpers
 # Absorb a short scheduler-boundary overlap, but never let installation advance
@@ -354,6 +629,15 @@ install -d -o "$AGENT_USER" -g "$AGENT_USER" -m 700 \
   "$H/.cache/video-edit" \
   "$H/obsidian-vault/learning/pending" "$H/obsidian-vault/learning/history"
 install -d -m 700 "$CONFIG_DIR"
+if [ "$PERSONA_EXISTING" = 1 ]; then
+  # Preflight proved both files before the first managed runtime write. Seed
+  # hashes only from an exact former kit render, then let the normal guard
+  # reconcile them with the candidate template.
+  guard_managed_persona seed "$KIT/assets/templates/CLAUDE.md.template" \
+    "$H/.claude/CLAUDE.premium.md" "$PERSONA_BASELINE_CLAUDE"
+  guard_managed_persona seed "$ROLE_PROFILE" \
+    "$H/.claude/CLAUDE.product.md" "$PERSONA_BASELINE_PRODUCT"
+fi
 if [ "$STARTER_FOUNDATION_REQUIRED" = 1 ]; then
   install -m 600 /dev/null "$H/.claude/product/starter-foundation-pending"
 fi
@@ -377,7 +661,9 @@ fi
 # cannot write to. Claude Code's self-updater targets that prefix, so every
 # attempt failed and installs froze on whatever version shipped that day — one
 # customer sat 11 releases behind for 19 days and only saw it as a UI warning.
-runuser -u "$AGENT_USER" -- env HOME="$H" npm config set prefix "$H/.local" >/dev/null
+if [ "$CLAUDE_UPDATE_MAINTENANCE" != 1 ]; then
+  runuser -u "$AGENT_USER" -- env HOME="$H" npm config set prefix "$H/.local" >/dev/null
+fi
 
 for runtime in bun claude; do
   [ -x "$H/.local/bin/$runtime" ] || {
@@ -394,14 +680,15 @@ python3 "$KIT/assets/bin/update-safety-check" apply \
   --baseline "$H/.claude/product/managed-runtime-baseline.json" \
   --owner "$AGENT_USER" \
   --defer-baseline
+# BEGIN browser helper install
 if product_has_feature browser; then
-  [ ! -L /var/lib/claude-browser/recovery ] || {
-    echo "FATAL: каталог стану відновлення браузера не може бути символічним посиланням" >&2
-    exit 1
-  }
-  install -d -m 700 -o root -g root /var/lib/claude-browser/recovery
-  install -m 755 -o root -g root "${KIT}/assets/bin/claude-browser-recover" /usr/local/sbin/claude-browser-recover
+  # Only the primary writes the shared helper; another bot keeps its sudoers line.
+  if [ "$AGENT_USER" = claude ]; then
+    install -d -m 700 -o root -g root /var/lib/claude-browser/recovery
+    install -m 755 -o root -g root "${KIT}/assets/bin/claude-browser-recover" /usr/local/sbin/claude-browser-recover
+  fi
 fi
+# END browser helper install
 python3 "$KIT/assets/lib/reconcile-managed-runtime.py" \
   "$H" "$KIT/assets/product/managed-runtime.json" \
   "$H/.claude/product/managed-runtime.json"
@@ -413,21 +700,24 @@ rm -f "$H/bin/cash-thread-capture" \
   "$H/bin/pm-digest"
 
 # Retire the removed optional graph-memory extension from existing installs.
-# This compatibility tombstone can be deleted after all managed servers have
-# upgraded beyond the release that removed the extension.
-if [ -x /opt/claude-graphify/bin/graphify ]; then
-  (
-    cd "$H/obsidian-vault"
-    runuser -u "$AGENT_USER" -- env HOME="$H" \
-      /opt/claude-graphify/bin/graphify uninstall --platform claude --purge
-  ) >/dev/null 2>&1 || true
+# A maintenance update must never purge an existing owner's graph data;
+# keep this compatibility tombstone on fresh installs only.
+if [ "$CLAUDE_UPDATE_MAINTENANCE" != 1 ]; then
+  if [ -x /opt/claude-graphify/bin/graphify ]; then
+    (
+      cd "$H/obsidian-vault"
+      runuser -u "$AGENT_USER" -- env HOME="$H" \
+        /opt/claude-graphify/bin/graphify uninstall --platform claude --purge
+    ) >/dev/null 2>&1 || true
+  fi
+  rm -rf "$H/bin/graphify-vault" \
+    "$H/.claude/skills/graphify" \
+    "$H/obsidian-vault/graphify-out"
+  # The extension itself is shared by the server; only the primary removes it.
+  [ "$AGENT_USER" != claude ] || rm -rf /opt/claude-graphify
+  python3 "$KIT/assets/lib/remove-markdown-section.py" \
+    "$H/.claude/CLAUDE.md" "## graphify"
 fi
-rm -rf /opt/claude-graphify \
-  "$H/bin/graphify-vault" \
-  "$H/.claude/skills/graphify" \
-  "$H/obsidian-vault/graphify-out"
-python3 "$KIT/assets/lib/remove-markdown-section.py" \
-  "$H/.claude/CLAUDE.md" "## graphify"
 
 install -m 644 -o "$AGENT_USER" -g "$AGENT_USER" "$KIT/assets/telegram-server-fixed.ts" "$H/telegram-server-fixed.ts"
 install -m 600 -o "$AGENT_USER" -g "$AGENT_USER" \
@@ -436,6 +726,7 @@ install -m 600 -o "$AGENT_USER" -g "$AGENT_USER" \
 # BEGIN selected agent systemd unit
 # A concrete instance unit keeps a targeted install from changing the shared
 # template used by every other secondary agent on this host.
+verify_instance_system_context
 if [ "$AGENT_USER" = claude ]; then
   install -m 644 "$KIT/assets/systemd/claude-telegram.service" "/etc/systemd/system/$AGENT_SERVICE"
 else
@@ -475,51 +766,67 @@ bash "$KIT/assets/lib/activate-role-subagents.sh" "$KIT" "$H" "$AGENT_USER" "${A
 
 if product_has_feature telegram-corporate-sessions; then
   if [ ! -x "$H/.venvs/heif/bin/python" ]; then
-    runuser -u "$AGENT_USER" -- python3 -m venv "$H/.venvs/heif" || {
-      echo "FATAL: для HEIF-конвертера потрібен python3-venv" >&2
-      exit 1
-    }
+    if [ "$CLAUDE_UPDATE_MAINTENANCE" != 1 ]; then
+      runuser -u "$AGENT_USER" -- python3 -m venv "$H/.venvs/heif" || {
+        echo "FATAL: для HEIF-конвертера потрібен python3-venv" >&2
+        exit 1
+      }
+    fi
   fi
-  runuser -u "$AGENT_USER" -- "$H/.venvs/heif/bin/python" -m pip \
-    install -q --requirement "$KIT/assets/requirements/heif.txt"
+  if [ "$CLAUDE_UPDATE_MAINTENANCE" != 1 ]; then
+    runuser -u "$AGENT_USER" -- "$H/.venvs/heif/bin/python" -m pip \
+      install -q --requirement "$KIT/assets/requirements/heif.txt"
+  fi
   runuser -u "$AGENT_USER" -- "$H/.venvs/heif/bin/python" -I \
     -c 'from PIL import Image; from pillow_heif import register_heif_opener; register_heif_opener(thumbnails=False)'
 fi
 
 if product_has_feature sql-readonly; then
   if [ ! -x "$H/.venvs/bigquery/bin/python" ]; then
-    runuser -u "$AGENT_USER" -- python3 -m venv "$H/.venvs/bigquery" || {
-      echo "FATAL: для sql-readonly потрібен python3-venv" >&2
-      exit 1
-    }
+    if [ "$CLAUDE_UPDATE_MAINTENANCE" != 1 ]; then
+      runuser -u "$AGENT_USER" -- python3 -m venv "$H/.venvs/bigquery" || {
+        echo "FATAL: для sql-readonly потрібен python3-venv" >&2
+        exit 1
+      }
+    fi
   fi
-  runuser -u "$AGENT_USER" -- "$H/.venvs/bigquery/bin/python" -m pip \
-    install -q --requirement "$KIT/assets/requirements/bigquery.txt"
+  if [ "$CLAUDE_UPDATE_MAINTENANCE" != 1 ]; then
+    runuser -u "$AGENT_USER" -- "$H/.venvs/bigquery/bin/python" -m pip \
+      install -q --requirement "$KIT/assets/requirements/bigquery.txt"
+  fi
   runuser -u "$AGENT_USER" -- "$H/.venvs/bigquery/bin/python" \
     -c 'from google.cloud import bigquery'
 fi
 
 if product_has_feature finance-data; then
   if [ ! -x "$H/.venvs/finance/bin/python" ]; then
-    runuser -u "$AGENT_USER" -- python3 -m venv --system-site-packages "$H/.venvs/finance" || {
-      echo "FATAL: для finance-data потрібен python3-venv" >&2
-      exit 1
-    }
+    if [ "$CLAUDE_UPDATE_MAINTENANCE" != 1 ]; then
+      runuser -u "$AGENT_USER" -- python3 -m venv --system-site-packages "$H/.venvs/finance" || {
+        echo "FATAL: для finance-data потрібен python3-venv" >&2
+        exit 1
+      }
+    fi
   fi
-  runuser -u "$AGENT_USER" -- "$H/.venvs/finance/bin/pip" install -q --upgrade yfinance
+  if [ "$CLAUDE_UPDATE_MAINTENANCE" != 1 ]; then
+    runuser -u "$AGENT_USER" -- "$H/.venvs/finance/bin/pip" install -q --upgrade yfinance
+  fi
   runuser -u "$AGENT_USER" -- "$H/.venvs/finance/bin/python" -c 'import yfinance'
 fi
 
 if product_has_feature spreadsheets; then
   if [ ! -x "$H/.venvs/spreadsheets/bin/python" ]; then
-    runuser -u "$AGENT_USER" -- python3 -m venv --system-site-packages \
-      "$H/.venvs/spreadsheets" || {
-        echo "FATAL: для spreadsheets потрібен python3-venv" >&2
-        exit 1
-      }
+    if [ "$CLAUDE_UPDATE_MAINTENANCE" != 1 ]; then
+      runuser -u "$AGENT_USER" -- python3 -m venv --system-site-packages \
+        "$H/.venvs/spreadsheets" || {
+          echo "FATAL: для spreadsheets потрібен python3-venv" >&2
+          exit 1
+        }
+    fi
   fi
-  runuser -u "$AGENT_USER" -- "$H/.venvs/spreadsheets/bin/pip" \
-    install -q --upgrade openpyxl xlsxwriter
+  if [ "$CLAUDE_UPDATE_MAINTENANCE" != 1 ]; then
+    runuser -u "$AGENT_USER" -- "$H/.venvs/spreadsheets/bin/pip" \
+      install -q --upgrade openpyxl xlsxwriter
+  fi
   runuser -u "$AGENT_USER" -- "$H/.venvs/spreadsheets/bin/python" \
     -c 'import openpyxl, xlsxwriter'
 fi
@@ -572,24 +879,40 @@ chmod 440 "$SUDOERS_FILE"
 visudo -cf "$SUDOERS_FILE" >/dev/null
 
 echo "[3/7] формую керовані шаблони"
+# BEGIN persona file mode preservation
+set_managed_persona_mode() {
+  local target="$1" current_mode
+  if [ "$PERSONA_EXISTING" = 1 ]; then
+    current_mode="$(stat -c '%a' -- "$target")" || return 1
+    case "$current_mode" in
+      600) return 0 ;; # Keep an existing private persona private.
+      644) ;;
+      *) echo "FATAL: неочікувані права на особистість агента" >&2; return 1 ;;
+    esac
+  fi
+  runuser -u "$AGENT_USER" -- chmod 644 "$target"
+}
+# END persona file mode preservation
 MANAGED_CLAUDE="$H/.claude/CLAUDE.premium.md"
 MANAGED_IMPORT="@$H/.claude/CLAUDE.premium.md"
-render_template "$KIT/assets/templates/CLAUDE.md.template" "$MANAGED_CLAUDE"
-runuser -u "$AGENT_USER" -- chmod 644 "$MANAGED_CLAUDE"
+if [ "$PERSONA_EXISTING" = 1 ]; then
+  render_template "$KIT/assets/templates/CLAUDE.md.template" "$MANAGED_CLAUDE" \
+    --apply-baseline "$PERSONA_BASELINE_CLAUDE"
+else
+  render_template "$KIT/assets/templates/CLAUDE.md.template" "$MANAGED_CLAUDE"
+fi
+set_managed_persona_mode "$MANAGED_CLAUDE"
 MANAGED_PRODUCT="$H/.claude/CLAUDE.product.md"
 PRODUCT_IMPORT="@$H/.claude/CLAUDE.product.md"
 # A second instance may be one of the kit's roles as its own bot
 # (AGENT_ROLE=<slug> in its saved env): its persona is that role's profile.
-ROLE_PROFILE="$KIT/assets/product/ROLE.md"
-if [ -n "${AGENT_ROLE:-}" ]; then
-  ROLE_PROFILE="$KIT/assets/roles/$AGENT_ROLE/ROLE.md"
-  if [ ! -f "$ROLE_PROFILE" ]; then
-    echo "FATAL: AGENT_ROLE=$AGENT_ROLE, але в комплекті немає assets/roles/$AGENT_ROLE/ROLE.md (роль як окремий бот є лише в повному комплекті)" >&2
-    exit 1
-  fi
+if [ "$PERSONA_EXISTING" = 1 ]; then
+  render_template "$ROLE_PROFILE" "$MANAGED_PRODUCT" \
+    --apply-baseline "$PERSONA_BASELINE_PRODUCT"
+else
+  render_template "$ROLE_PROFILE" "$MANAGED_PRODUCT"
 fi
-render_template "$ROLE_PROFILE" "$MANAGED_PRODUCT"
-runuser -u "$AGENT_USER" -- chmod 644 "$MANAGED_PRODUCT"
+set_managed_persona_mode "$MANAGED_PRODUCT"
 runuser -u "$AGENT_USER" -- python3 "$KIT/assets/lib/sync-managed-claude.py" \
   "$H/CLAUDE.md" "$MANAGED_IMPORT" "$PRODUCT_IMPORT"
 ACCESS_FILE="$H/.claude/channels/telegram/access.json"
@@ -710,7 +1033,7 @@ for name in AGENT_NAME OWNER_NAME OWNER_TG_USERNAME OWNER_CHAT_ID ADDITIONAL_ADM
   OWNER_EMAIL BOT_USERNAME TIMEZONE TELEGRAM_BOT_TOKEN NOVSKY_LICENSE_KEY OPENAI_API_KEY VOICE_SETUP_STATUS \
   MEMORY_EMBEDDINGS_OPENAI \
   RECALL_API_KEY RECALL_REGION TG_DROP_PENDING_ON_BOOT TG_CORPORATE_SESSIONS \
-  CALENDAR_EMAIL VAULT_LOCALE MODULE_DESIGN_PACK MODULE_CHANNEL_PUBLISH \
+  CALENDAR_EMAIL VAULT_LOCALE OWNER_NOTICE_LOCALE MODULE_DESIGN_PACK MODULE_CHANNEL_PUBLISH \
   MODULE_SOCIAL_BROWSER MODULE_TRANSPORT_DAEMON MODULE_VAULT_WEB \
   MODULE_INSTAGRAM_DM MODULE_YOUTUBE_COMMENTS MODULE_TELEGRAM_CORPORATE \
   CHANNEL_ID SITE_PASSWORD ACTIVE_ROLES AGENT_ROLE; do
@@ -721,14 +1044,16 @@ chmod 600 "$CONFIG_FILE"
 PROFILE_FILE="$H/.agent-profile.env"
 : > "$PROFILE_FILE"
 for name in AGENT_NAME OWNER_NAME OWNER_TG_USERNAME OWNER_CHAT_ID ADDITIONAL_ADMIN_CHAT_IDS ALERT_COPY_CHAT_IDS \
-  OWNER_EMAIL BOT_USERNAME TIMEZONE CALENDAR_EMAIL VAULT_LOCALE \
+  OWNER_EMAIL BOT_USERNAME TIMEZONE CALENDAR_EMAIL VAULT_LOCALE OWNER_NOTICE_LOCALE \
   TG_DROP_PENDING_ON_BOOT TG_CORPORATE_SESSIONS; do
   write_shell_value "$PROFILE_FILE" "$name"
 done
 chown "$AGENT_USER:$AGENT_USER" "$PROFILE_FILE"
 chmod 600 "$PROFILE_FILE"
 umask "${secrets_umask:-022}"
-rm -f /home/claude/.cash-agent.env
+if [ "$AGENT_USER" = claude ]; then
+  rm -f /home/claude/.cash-agent.env
+fi
 
 if [ -n "$RECALL_API_KEY" ]; then
   MEETING_SETUP_STATUS=configured
@@ -785,11 +1110,11 @@ install_managed_crontab() {
   # and every job runs twice — Cash was firing reminders, the watchdog, vault-sync,
   # relogin-watch and the memory index twice over (found 2026-07-28). Drop any
   # unmanaged line that invokes a job this block owns.
-  # A retired helper leaves the owned list, so its copy outside the block goes
-  # through the same filter the maintenance run uses.
+  # Retired backup jobs use exact legacy lines in the shared filter below, so
+  # an owner's manual backup cron is left alone.
   unmanaged_crontab="$(printf '%s\n' "$existing_crontab" | drop_retired_managed_jobs | awk \
     -v legacy_health="$H/bin/cash-health-evening" \
-    -v owned="$H/bin/cash-reminder-tick $H/bin/cash-healthcheck $H/bin/claude-limit-recovery $H/bin/relogin-watch $H/bin/unstick-watch $H/bin/queue-settle-sweep $H/bin/telegram-inbox-prune $H/bin/vault-sync $H/bin/memory-index $H/bin/learning-review $H/bin/onboarding-reminder $H/bin/skill-brief $H/bin/agent-github-backup" '
+    -v owned="$H/bin/cash-reminder-tick $H/bin/cash-healthcheck $H/bin/claude-limit-recovery $H/bin/relogin-watch $H/bin/unstick-watch $H/bin/queue-settle-sweep $H/bin/telegram-inbox-prune $H/bin/memory-index $H/bin/learning-review $H/bin/onboarding-reminder $H/bin/skill-brief" '
     BEGIN { split(owned, jobs, " ") }
     $0 == "# BEGIN claude-tg-starter" { managed=1; next }
     $0 == "# END claude-tg-starter" { managed=0; next }
@@ -826,25 +1151,19 @@ managed_crontab_block() {
   echo "* * * * * /usr/bin/timeout 90 $H/bin/queue-settle-sweep"
   echo "17 4 * * * /usr/bin/timeout 30 $H/bin/telegram-inbox-prune"
   echo "23 4 * * * find $H/telegram-outbox -xdev -type f -mtime +7 -delete"
-  echo "*/5 * * * * /usr/bin/timeout 60 $H/bin/vault-sync"
   # The prompt hook searches with --no-refresh to keep Telegram latency low, so
   # this recurring pass must include both vault notes and new Telegram history.
   echo "*/10 * * * * /usr/bin/timeout 60 $H/bin/memory-index index >/dev/null"
-  # The helper itself maps UTC to the owner's declared timezone and records each
-  # 09:00/21:00 slot, so DST and repeated installer runs cannot duplicate a backup.
-  echo "7 * * * * /usr/bin/timeout 300 $H/bin/agent-github-backup scheduled >/dev/null 2>&1"
+  # GitHub is handled by one root-provisioned hourly local check. Only its
+  # 22:00 Europe/Lisbon slot selects one configured backend and sends data.
   # Daily tick; the helper spaces the nudges itself (a day after install, then weekly).
   echo "13 11 * * * /usr/bin/timeout 30 $H/bin/onboarding-reminder"
   echo "# END claude-tg-starter"
 }
 
-# A maintenance run must not rewrite a quiesced crontab, but update.sh always
-# runs this installer in maintenance mode — so a job a newer kit schedules would
-# otherwise only ever reach a fresh install, and every agent already in the field
-# would keep running yesterday's set. That is how the queue sweep missed the
-# whole fleet. Add the missing lines to the block that is already there, remove
-# nothing, and leave the file completely alone when the block itself is gone:
-# that is an UPGRADING window deliberately holding every schedule.
+# Kept for an explicit, reviewed cron migration only. Routine maintenance below
+# never calls this helper: even a missing kit job must not rewrite a paused or
+# owner-customized crontab in the middle of an update transaction.
 add_missing_managed_jobs() {
   local existing missing
   existing="$(crontab -u "$AGENT_USER" -l 2>/dev/null || true)"
@@ -874,18 +1193,18 @@ add_missing_managed_jobs() {
   echo "      додано керованих завдань: $(printf '%s\n' "$missing" | grep -c .)"
 }
 
-# The cron lines this kit has retired, in the same normalized form
-# add_missing_managed_jobs derives: the helper and its first option, without
-# the schedule, the timeout cap or a redirect — e.g. "$H/bin/<helper> --option".
+# The cron lines this kit has retired. A complete line removes only that exact
+# legacy entry; a helper key removes any matching managed entry, as before.
 # An empty list changes nothing; a line the block still writes never belongs here.
 retired_managed_jobs() {
-  :
+  echo "*/5 * * * * /usr/bin/timeout 60 $H/bin/vault-sync"
+  echo "7 * * * * /usr/bin/timeout 300 $H/bin/agent-github-backup scheduled >/dev/null 2>&1"
 }
 
-# Prints the crontab on stdin without retired lines. Inside the managed block
-# any retired key drops the line; outside it only a key naming the kit's own
-# path ($H/bin/…) does, because a maintenance run never calls
-# install_managed_crontab and an unmanaged copy has no other way out. Every
+# Prints the crontab on stdin without retired lines. A full cron line is
+# removed only on exact match, including outside the block. Helper keys keep
+# the older managed-job behavior: inside the block they match by substring;
+# outside it only a key naming the kit's own path ($H/bin/…) does. Every
 # other line outside the block is the owner's.
 drop_retired_managed_jobs() {
   # Tab-joined: BSD awk refuses a newline inside a -v value, and no key holds a tab.
@@ -894,16 +1213,19 @@ drop_retired_managed_jobs() {
     $0 == "# BEGIN claude-tg-starter" { managed=1 }
     $0 == "# END claude-tg-starter" { managed=0 }
     {
-      for (i = 1; i <= n; i++)
-        if (keys[i] != "" && index($0, keys[i]) && (managed || index(keys[i], own) == 1)) next
+      for (i = 1; i <= n; i++) {
+        if (keys[i] == "") continue
+        if (keys[i] ~ /^[*0-9@]/) {
+          if ($0 == keys[i]) next
+        } else if (index($0, keys[i]) && (managed || index(keys[i], own) == 1)) next
+      }
       print
     }
   '
 }
 
-# Maintenance used to only add, so a line the kit retired kept running on every
-# installed box (R15). No block means an UPGRADING window that stopped every
-# schedule on purpose: leave it alone.
+# Also reserved for an explicit, reviewed cron migration. A normal maintenance
+# run leaves retired lines untouched, even when the managed block is present.
 remove_retired_managed_jobs() {
   local existing pruned
   existing="$(crontab -u "$AGENT_USER" -l 2>/dev/null || true)"
@@ -914,26 +1236,32 @@ remove_retired_managed_jobs() {
   echo "      знято керованих завдань: $(( $(printf '%s\n' "$existing" | wc -l) - $(printf '%s\n' "$pruned" | wc -l) ))"
 }
 
-echo "[5/7] зберігаю наявний crontab; замінюю лише керований блок"
-python3 "$KIT/assets/lib/install-backup-context.py" \
-  --home "$H" --user "$AGENT_USER" --unit "$AGENT_SERVICE" --engine claude
-# Add first, then retire: if a retired line is still in the block, retirement wins.
+echo "[5/7] crontab"
+if [ "$CLAUDE_UPDATE_MAINTENANCE" != 1 ]; then
+  python3 "$KIT/assets/lib/install-backup-context.py" \
+    --home "$H" --user "$AGENT_USER" --unit "$AGENT_SERVICE" --engine claude
+fi
 if [ "$CLAUDE_UPDATE_MAINTENANCE" = 1 ]; then
-  echo "      режим обслуговування: наявний crontab зберігаю — додаю нові керовані завдання, прибираю зняті комплектом"
-  add_missing_managed_jobs
-  remove_retired_managed_jobs
+  echo "      режим обслуговування: crontab не змінюю"
 else
+  echo "      нова інсталяція: замінюю лише керований блок"
   install_managed_crontab
 fi
 
 # The command menu has to match what actually works, or the owner is guessing —
 # Cash ran for months with an empty menu while /fix and /relogin existed.
-runuser -u "$AGENT_USER" -- env HOME="$H" "$H/bin/set-tg-commands" || \
-  echo "      WARN: не вдалося опублікувати меню команд Telegram (повтор: ~/bin/set-tg-commands)"
+if [ "$CLAUDE_UPDATE_MAINTENANCE" != 1 ]; then
+  runuser -u "$AGENT_USER" -- env HOME="$H" "$H/bin/set-tg-commands" || \
+    echo "      WARN: не вдалося опублікувати меню команд Telegram (повтор: ~/bin/set-tg-commands)"
+fi
 
 echo "[6/7] необов’язкові інструменти"
 
 if product_has_feature google-workspace && ! command -v gog >/dev/null 2>&1; then
+  if [ "$CLAUDE_UPDATE_MAINTENANCE" = 1 ]; then
+    echo "FATAL: gog зник під час оновлення; не завантажую його автоматично" >&2
+    exit 1
+  fi
   bash "$KIT/scripts/install-gog.sh"
 fi
 
@@ -945,7 +1273,7 @@ if product_has_feature google-workspace && command -v gog >/dev/null 2>&1 && \
    [ -s "$GOOGLE_OAUTH_CLIENT" ] && [ ! -s "$H/.local/share/gogcli/credentials.json" ]; then
   runuser -u "$AGENT_USER" -- env HOME="$H" \
     "$H/bin/gog" auth credentials set "$GOOGLE_OAUTH_CLIENT" >/dev/null || \
-    echo "      WARN: не вдалося записати спільний OAuth-клієнт Google (повтор: ~/bin/gog auth credentials set /opt/claude-tg-starter/assets/product/google-oauth-client.json)"
+    echo "      WARN: не вдалося записати спільний OAuth-клієнт Google (повтор: ~/bin/gog auth credentials set $KIT/assets/product/google-oauth-client.json)"
 fi
 
 EXTERNAL_SKILLS="$KIT/assets/external-skills"
@@ -994,17 +1322,21 @@ fi
 
 if product_has_feature media-downloads; then
   if [ ! -x "$H/.local/bin/yt-dlp" ]; then
-    runuser -u "$AGENT_USER" -- env HOME="$H" \
-      PIPX_HOME="$H/.local/share/pipx" PIPX_BIN_DIR="$H/.local/bin" \
-      pipx install yt-dlp >/dev/null
+    if [ "$CLAUDE_UPDATE_MAINTENANCE" != 1 ]; then
+      runuser -u "$AGENT_USER" -- env HOME="$H" \
+        PIPX_HOME="$H/.local/share/pipx" PIPX_BIN_DIR="$H/.local/bin" \
+        pipx install yt-dlp >/dev/null
+    fi
   fi
   [ -x "$H/.local/bin/yt-dlp" ] || {
     echo "FATAL: yt-dlp не встановлено" >&2
     exit 1
   }
   if [ ! -x "$H/.local/bin/deno" ]; then
-    runuser -u "$AGENT_USER" -- env HOME="$H" \
-      npm install -g --prefix "$H/.local" deno >/dev/null
+    if [ "$CLAUDE_UPDATE_MAINTENANCE" != 1 ]; then
+      runuser -u "$AGENT_USER" -- env HOME="$H" \
+        npm install -g --prefix "$H/.local" deno >/dev/null
+    fi
   fi
   [ -x "$H/.local/bin/deno" ] || {
     echo "FATAL: Deno не встановлено" >&2
@@ -1013,8 +1345,10 @@ if product_has_feature media-downloads; then
 fi
 
 if product_has_feature vercel; then
-  runuser -u "$AGENT_USER" -- env HOME="$H" \
-    npm install -g --prefix "$H/.npm-global" vercel@latest >/dev/null
+  if [ "$CLAUDE_UPDATE_MAINTENANCE" != 1 ]; then
+    runuser -u "$AGENT_USER" -- env HOME="$H" \
+      npm install -g --prefix "$H/.npm-global" vercel@latest >/dev/null
+  fi
   [ -x "$H/.npm-global/bin/vercel" ] || {
     echo "FATAL: Vercel CLI не встановлено" >&2
     exit 1
@@ -1125,5 +1459,9 @@ python3 "$KIT/assets/bin/update-safety-check" accept \
   --policy "$KIT/assets/product/managed-runtime.json" \
   --baseline "$H/.claude/product/managed-runtime-baseline.json" \
   --owner "$AGENT_USER"
+render_template "$KIT/assets/templates/CLAUDE.md.template" "$MANAGED_CLAUDE" \
+  --accept-baseline "$PERSONA_BASELINE_CLAUDE"
+render_template "$ROLE_PROFILE" "$MANAGED_PRODUCT" \
+  --accept-baseline "$PERSONA_BASELINE_PRODUCT"
 
 echo "✅ Ядро встановлено: керовані ресурси оновлено, дані власника збережено, перевірки пройдено."

@@ -28,10 +28,357 @@ UPSTREAM_SERVER_SHA256 = (
 )
 UPSTREAM_PACKAGE_START = "bun install --no-summary 1>&2 && bun server.ts"
 GOLDEN_SERVER_SHA256 = (
-    "14be9b96df91fe248c3386713ac463be68e0bbad87632760536d2ddb6a6b73b2"
+    "5d7dcc06ef83cc4d51a77abc8ec746c84acb620ba312f26a308b05e959ca5833"
 )
 PREVIOUS_GOLDEN_SERVER_SHA256S = frozenset(
     {
+        # The golden before only another request's legacy worker moving to the registering request.
+        "bafbe2536530e6caedb183d8c14be0e6951d3d4f688298a06a0e3a34dfe4fde9",
+        # The golden before a legacy worker moving to the request that registered it under guard and shadow.
+        "31b679bef5f545fff4224e64e805fb1f2a9fa38e6ac3e0e08ea0dd55a158aa1c",
+        # The golden before a reused worker moving to the request that registered it under guard and shadow.
+        "02d6fcd1af3e83640b679baec3b1a83103f5f565bf08a229017aebac243b12d0",
+        # 141a3ad60c44 Shadow changes nothing live: an upgraded session keeps its background
+        "67f032c354248dd2727c6b83befb352bf2a64ff7fa7674e9cc496ca1f1f21f71",
+        # The golden before Shadow changes nothing live: upgraded sessions keep background work under guard and shadow; no busy-queue notice (owner 29.09).
+        "22c636c6d17eac45d4bd6bc178e090f9ad86eed5a0f4466d7fd141bb624fbecb",
+        # The golden before K release round 2: a promotion keeps an owner's group off.
+        "cec7d3c3e7906deac131b481481c72c7e4df23e687ca7adf8dfdf0304b7749de",
+        # 075ebe304510 A reply cut off by a restart is never sent twice, and the owner hears
+        "ee681312ab255429b67179202ff21eb135b4ead0f4db90e1e863835cad56dbec",
+        # 88a8ad5973c4 A forgotten reply forwards only a real answer, the owner hears of ever
+        "7163f14ab8a5085d749d33304b146f345dc4f3b5813190efbb7dd64a64f8348d",
+        # 06527e640f7c A file continuation is not a new acknowledgement; tests follow the one
+        "85063d3d44c2fdf45bb90e8e08b3b6b50a2743700b287eb8a15ea50090fc2095",
+        # 9ff65d99ac57 Only an acknowledgement counts as one: a delivered final no longer hol
+        "dc962216afac4bbc5893249ee265d1895426b6eb32f01573cfcdaa636df4c422",
+        # 40f1fd80d60a Merge the worker obligation branch's completion order and bounded work
+        "13c2e481c82f4eb2633fa632cd57cbc4927f378b0e83871ba60f56b0c148c397",
+        # f0b870083f7c A repeated acknowledgement that names a task registers it without send
+        "203dfdc970a9d88d33e0a818300761c6f3bef389eb2c30caaaac85dff8bfa5f2",
+        # b712028d6179 Keep the repeated-progress refusal in one function the reply path call
+        "bebbee52e2488b0c74d75e9af43551a628f4cea00799124201425bb2479479f5",
+        # daf3a83658dd Merge the worker obligation branch with K into the forgotten-reply bra
+        "6daa4afc957a6e6f5e213ad7097c2b023bf0b9bfcabc1159d134dc4bc8597b25",
+        # 259a73496878 A request acknowledged minutes ago is not acknowledged again; the reco
+        "0298b7cea20ea67d85c4ca87f5225dabacc14ba54cd45d8ae40d57f34c9a2e36",
+        # d69eff086517 Merge the worker obligation changes into the forgotten-reply branch
+        "db265ae301f4dc9f708f47c7f7053add8376eee31228c7b8e6889c20d02f67b0",
+        # 3706d906e97c A long forgotten answer arrives whole in parts, and a rate-limited for
+        "bce4823b2e1d2fe32f2cbf23bcbac82cb9eee874d96ee63d24259f1c16b70994",
+        # 481c3c52f8c6 An answer the model forgets to send reaches the person once, and a per
+        "00df080e4de415ffa5d8938013c102611d84a2ca5969354d5137a9a70b6b38ef",
+        # e7c14ab5b152 The hang check reads an unchanged transcript only once
+        "5b0f466ee58d7328719ba4e03a82292a7f7d0b49e761f56a1e912f4ec83bf131",
+        # 9c81b7f265ae Long work in a subagent no longer gets a delay warning or an interrupt
+        "3a85753b78b4df4e06cd007605bcb8183478664e913826eaf035b679a21a3f70",
+        # The golden before K with the forgotten-reply line (B4 r2) merged.
+        "1cc0362361cd6f165f7d5ed1301022ac45341230217709da78dbd0e4030b6167",
+        # The golden before group and channel connection.
+        "1502cd89e460867b7a3fed6e90cfbaa14fadf707d4a5ccc2e207fb6eb5f9627e",
+        # The golden before company typing and media kinds.
+        "b73e4c22d09df5f81ef1e9b622fc35c18ee7f104b9a576d699364ee3aab8dac7",
+        # The golden before company forwards gather in one job.
+        "8b48a73a7b0aa786d5659dd6e52952901044d7d9ccf81b1f02849202b684fecd",
+        # The golden before the U line merged into K.
+        "4710caf3c30b5675b72565515bb3faebfbb9c7ba28de0ee7323d8b70db87e24c",
+        # 5b7caa3ffeae A refused report about a possibly lost silent-worker notice never re-o
+        "1ba9bc35bfd6957e9066f36e8ab11cabc5fc41a478390582ebe39925f5e1766a",
+        # 75b4a4206c04 The owner's report that a silent-worker notice may not have arrived is
+        "ea2572236480e1e5f4716627d6fc799572f997a8bf6b663b4f5018af88f857df",
+        # 3ea454cb5fdd A reply delivered but not recorded no longer holds every chat until a
+        "1bc38ab4d0db173542eaafb39c797681cf990e84eea2cc5cb61ec8ec7b323ef3",
+        # 77e3248d1492 The owner always hears when a silent background task stops holding a r
+        "008d6f8a14de5af949c73728ed05705760c4b95816bb8c734192b7e4d71d4850",
+        # aa1fb9a3d949 A stopped background task no longer leaves its request unanswered, and
+        "774215d553a7c321f55e251dbff0d78c8ecc54cc1345669f5fc8cb25a0b31afd",
+        # 02f386b179f9 Under guard and shadow, log a silent worker once and change nothing el
+        "044237460fe46414d5e16fd81e2161cefe79bc84461bf3ba52b0d50cc3d96ba5",
+        # 1bcf067a6421 Register a progress notice's task when its file continuation completes
+        "e3c23a9c3976f33f2db2aca8215f73c21ffe077d1e682690ec2420781e067aee",
+        # ff980cb52572 Under the receiver, stop a silent worker, or one that three refused fi
+        "447473a8cd420b0c5ea4ef0ab81c7d3eea3ea5a6de5233c414f1320c144744a0",
+        # e1ec61ac3dad Merge K 34e6a75e: the Rufus replay fix and the company-session photo i
+        "cb748cef1ef33d8ce39f812ce67117736749350acc65474044a0e641631e1066",
+        # 4bce8beeea40 Register a worker again when progress names it after its round ended u
+        "9434fa12a86a086d086979cf112dcfea98c45aa90088a5206ece1820af41909f",
+        # 9d11defbd58a Stop offering a request again after it hung three times, and tell the
+        "9054a0293a6a83945f295763652ff2b99eca2f91f73960f97f1c75862f709df9",
+        # dc473ef6d064 Tell the owner once when a background worker goes silent
+        "f806e06a54d7c574341aa55dc19df54679eef2e8cd6ae6339fbfa24a4b272aa5",
+        # 9398af2cc8c2 Let a deferred request claim a worker launched in another turn by an e
+        "f0862ef508a3aa2fb3205681d62cd2489dc5420bdce0f87002fb9dc30b0e2c47",
+        # 1e9829300913 Let a callback turn register every worker it launches, not only the fi
+        "b5921d53bf7758a31b198694225e8bff0df1c71179a7aeff179679a32a47081d",
+        # 1e48e755cec9 Offer a failed progress notice one resend only when repeating it is sa
+        "81f5f9cba955803f8219753edb7acc5462301b941dff401b23697149bf2c80c5",
+        # 5d4dd39668a1 Refuse no_reply while background work of the request is still running
+        "e3441c52f80e66fce88af828a4bfaa484b178ba05ac7382346c2f650cb616ff3",
+        # b2a17ab6a1af Register a background task only once Telegram accepts its whole progre
+        "2d27a00d59ae91e10e9f7818d13807a62537d072ae32656b2ca32ddf77aa73b3",
+        # acb12e63163c Log a background task registered with no recorded launch, which its re
+        "76691407272f84b703b1c5d414f56892854cc089390994629e1ccd2cdec287fc",
+        # 026350a86157 Log a conflicting historical task owner once instead of at every start
+        "10b13aad527d892e70afddd5b1886454d1570e5d4c67e22ed8d549ed04ee4a42",
+        # 6d2e78adba88 Take the write lock before the receiver's startup reads its delivery c
+        "80cfb6748d9f717ad27200b3dce080f4a1eab37c46754787488fec0cb1c97b28",
+        # b49694bd1d31 Settle a delivered answer's kept ACK from every resolution, and from a
+        "198a26d642a19b1f365da20266a697352a15cf1083920ff61ea97cc5aaabd4df",
+        # bb26fb0fbdfc Keep a delivered answer's ACK only while calls of its request are unre
+        "ff6c63a4782306c5a9a46ea221a8e89418f49b2c00f69019b53980aeb0eaa44f",
+        # d16582a9ef83 Tell a dead shell send from a live one by its process start time, so a
+        "bdf371c38ad4912d959a8d672354f57029a4dd34689e04c884f181220f6874d5",
+        # a4cfcd080862 Tell the owner about an answer whose delivery could not be confirmed a
+        "bec95fbc1b698a2868a336ebcd066bdec5b1699225dde2621a7cf5b7454c68c6",
+        # 84144455dbcd Keep a delivered answer until every other call of its turn has finishe
+        "710bde0d9552c1d73f57dbb8935ff4de7ce0d5f4be0ff64d0d7ba08279561196",
+        # de738df364d9 Settle a shell send that is killed on its way to Telegram, so no chat
+        "7832f7786aa17469c1bc7e08956cbd0fedc694de000922c79c30ada615dbde2a",
+        # 1f8ebf6093d0 Keep classifying a request's queue head in shadow mode when a worker g
+        "4ecf1fc44efda1ad60faef01615c6addaf7d248fcf48dbbf4cd7dd00b57ec445",
+        # 9043839df8e4 Keep a request in the queue when its superseded answer's receipt arriv
+        "403232958336076e592ca4a657e1f7373d42a9f9c4a917c40b31a7b408cc2d3d",
+        # c719c6272c4e Hold a final answer until its request's workers are accounted for, und
+        "9382dae550ba372b5a94948516f720b7ee772b5dea352a4207749390194be47e",
+        # 5bf8b875bbe2 Let a progress notice claim its own worker, and keep waiting launches
+        "117149192e9dbbdce4a84531a2bfefdd3f73fcaddfc4ab4a56fecde924d41c15",
+        # d91ff2e14844 Keep the Telegram channel starting when two copies open the ledger at
+        "8784877d45eaa6f2dcc525b17457195ee7ce25dad6eb4dae7fc7a420e674f71a",
+        # abaead93ad6d Keep a durable record of each background worker and never clear its ow
+        "e201af8bbff83903050f9524ed2a8c2cadb8fc38a166d41f6592dd54af6fdca8",
+        # The golden before the company parity line merged into K.
+        "be3982870a6ecdfeeb32abbfe587d85410872d5302e216d122fff58f369a16d9",
+        # 3923594728e5 «done» works only for an action whose result is unknown; for anything
+        "d44782b998a466456d810392fb7d2c9ef28e9029776288a1a9cc6c08fa940f4a",
+        # ba82e3d4e312 The owner says whether an action with an unknown result happened, and
+        "820c74b27bb6e64858c5f7888bf8a35eac3544c6c033ba55cafa62395dbcd181",
+        # b927aeddcd89 Only the owner lifts a company hold on changed rights or an unknown ac
+        "417fc707e119661777a62b7513aa219281c1d70e278c7dd7cb0771d695ed7e9e",
+        # 9d418729a1cc A company chat on pause hears one line instead of two contradicting on
+        "2cb9223bf75e56dddce59050d44e4297a9757414408dda8034c0979e1a43b048",
+        # 1e5af46fa7e6 A request only it keeps failing waits alone, reruns never repeat finis
+        "f6caa1881be05c153c77036cd4caf699e6a77fd6e35a744d7861b3e1fce362e5",
+        # f79a0fc7a5ed Merge the kit baseline into the addressed-chat notices
+        "6fc8e2583203519a2e2c929ae046845626d662277fb29e8d6a175c3e3a569cdd",
+        # 6cca531b9b6a A message waiting its short merge window is no longer overtaken by an
+        "08c0c29393773795a6ecbd5f76b309b8b22669527a1d1392ff66940feaef845c",
+        # 868838f5e5a4 A later photo of a group album only joins the request that mentioned t
+        "e9cf9b9647db3a4b82b4c38a2f73082b75b3a424c3d1eeb809c29dacc2eb4ffd",
+        # 6352a30235bc Every photo of a group album reaches the company request that mentione
+        "899e57b9379a78648af1e84da5c373b8a5464b594d3027496e993f31e4d6da95",
+        # 130b61241a98 Keep up with the receipts line: a waiting message keeps its turn over
+        "8f82cf36a13ef4470109bff2b2b881a1a92b7c70f8af09ba8e86c16e2bf8e052",
+        # c45393e14061 The edit and unsupported-message notices speak Ukrainian, like the res
+        "e347d64586e9613ce74518c77b283c8ee9bf884988b754fe1a6008ae6debf1ba",
+        # 8a3b2461cdef The backup check reads a forwarded or edited message's words once
+        "764e8825cdc7b89bb20f294951e77e6a88b5864a9a5a85adea893638a57dbe64",
+        # fcf1095cb6cc A forwarded command or backup request is a quote for the bot, and an e
+        "fd2dfe417f444169d21da70274eded0de4d5e86befa40179bdeb9dea6a2dbf9d",
+        # 2b4c7dd72d10 A login code the owner forwards reaches the login rescue and never the
+        "56edb604f365ccaa1582e33ac192363feefc5df494c206fa21a36c638afcea9c",
+        # 75c23cc949cc Replying to one's own fresh photo or video brings it once
+        "b2bc78516a9a6a60fa53738c665c1ebb721fa5ea97c55d4cb58f4518b2b68d67",
+        # 4207d6b3ad19 A forwarded voice keeps its author in the owner's chat, a company job,
+        "c02baa1757023093f05e2b34a01c32b6f75ac7c073309699a521914b55334818",
+        # 66546ba93143 A forwarded message and the sender's own words stay separate turns
+        "d9559337fd36c0d57afe653c196642de7e4b5299daa51d3bfb0c0ae45432652e",
+        # ab03b12f9134 An edit of group chatter the bot was not asked about draws no notice
+        "30e6064df28f10f0000a3f448f92e512ec799f003421cbdaa7cdce4dc3f5283e",
+        # 005f409a6e3b A company album becomes one request instead of one per photo
+        "1e84a7f216ff533f5880d255ea08a56f5e4b942059fa71ce1830a04a5b616d6b",
+        # 6b7c12b85f7f A game, an invoice, paid media or a giveaway gets «Такий тип повідомле
+        "c515ae5fcd4b2b2f895ee757a4a2bfdd0ed2bdb9785e90288b3f8be1258649b4",
+        # 5fa28e4fb2a9 An unreadable voice asks its author for text instead of «try later», a
+        "36811412d34a9519c5aa96470eafa30bbe6228ca2f898c5a2a5ddc31484ab462",
+        # 08c734b63194 A group message edited to mention the bot becomes a request, and other
+        "ac728bca9e1e6d648ccd71e51b54d37d830d5084b4db89fe861c1db268cb2ff5",
+        # e7f87c0ea486 An edit update that changes no words stays quiet
+        "62aaa2537459dac31e07eb78787a571296a0e254fefd6311d9ecb349aaff5f1f",
+        # ac6bf4df4c21 A GitHub token stays hidden in link addresses and in the message a com
+        "106a6f2c03da7e0f77255f1ac5b5d2f1aed83f7a61acac7c06046428988aed82",
+        # 91bcdb7f7ebd An edited message gets one honest line a day instead of silence
+        "9ed06a596ebc51d2633108c95d341a97fa152d38c1b59691a84105272867258c",
+        # b976469a29e6 A company chat says which files it cannot open, and a file over 20 MB
+        "62d32cd681e3733071ed78c05a8d2a036fff9aa75e3b9e7bf474f6c34bfaf4ef",
+        # d3027f1774eb A reply to a photo or file brings that file to the bot, and a company
+        "537825a0726ee023c33430891f530ac31e538df8b798db22e73a0f8279164acb",
+        # 1f7dbb264e71 Videos and round videos posted around a group mention reach it
+        "e00b3ba5c716e9bb4e72dd3b8c3c8066820890ce987f00f526b2f4c9c5699c6a",
+        # 3f696847a329 Links hidden under words reach the bot with their address
+        "a75e0cb789c95eb5b01f39f5039ab4b226ea7f630a7c78ba36f70f6db1070803",
+        # baedacad2427 A forwarded message tells the bot whose words it carries, and a forwar
+        "01222130df3ec08a68cd5719fac149d8aeaba908a2ce565aa854f6469de10b32",
+        # fc4b089108d1 Polls, dice, checklists and forwarded stories reach the bot as words
+        "279866eeeafa59298577e007efd1898d53885b302b5e433fad121f5c1a1db983",
+        # The golden before K: merge message kinds (868838f5).
+        "953a6301ec5e4d0c876cdf45497a7925a2bb05b3a420eccdd569f93a1bdafc6b",
+        # 6cb05ca6f067 The unbound-answer fence checks every offered message, not only the fi
+        "2f60eba67faeebc1e62c9107088ac3711cfe5ace6a2b2aea67c1abc36a257fac",
+        # f3f26de97e32 An answer without its request id never goes out unbound, and a message
+        "a75fb0d3adf53eaf5cc8c9add8f1e65d117f9a07ce9f92e00475efb2666f70db",
+        # 45aaa6c7f38a A message offered to the bot keeps its turn until it is taken, and the
+        "ba982f10711e20f0c07d44d1afb1feb78fe43f615b654998589499c9499eb7ff",
+        # 70a5142810b2 A message waiting its short merge window holds the queue until it is t
+        "d86bdad5589d98895a1561ec6c1609008dfb6053f3893b7a51d2a45ca7d8a956",
+        # The golden before K: merge burst head (6cb05ca6).
+        "f01e30be6d229e65b04181277ac4f132901b54d9d944f1a1a5b35738b9254583",
+        # ba6c6fe86077 Merge commit 'd3a71af2' into fix/busy-notice-locale-table-20260927
+        "23bffc285e104db46abeabbd082c5ee199cea38a46188741117e0d6908279bae",
+        # 54b94bd57522 Waiting and paused-task notices take their Russian wording from the sh
+        "dda1280c885369bd9af52c554d703671c230e66061d07bd35e733e85322224c6",
+        # The golden before login-pause notices reading the shared table.
+        "726fefa0289ecaa1251221e1a1ab35e7c379169ad61cb5f69c41d8ed8bc7cef0",
+        # 99f649bfe2a2 Only a reply from the bot itself counts as a working Claude login, not
+        "2314665a8fb4284b9b69d99480ac10fc7272633f0c171c4daf38b78e96c80ac1",
+        # a9f042f0e28d A refused Claude login gets one more try, and every waiting chat hears
+        "ddbd89fd9d3088f026866ae194bf2a5939f1a4b40bba980f9a242754d4e319ed",
+        # 6c2a29a5f0c2 Requests sent while the Claude login was expired wait and are answered
+        "e14cbabecc15a4876b788c955a53b86dba88fddf64b9be2d5d1156f29befa021",
+        # The golden before the kit baseline d3a71af2 merged into the addressed-chat notices.
+        "c0596bd4a5fca7de2baf2569686672adb99e0cb8f9bc9fad0901656b76f8c3aa",
+        # The golden before the owner's close command for a held request.
+        "a788dab39d4fab7d30aadc396fcda018b1d6fa70100f42e5693abdf1bc0d6409",
+        # The golden before the owner's limit line in the main bot.
+        "9b93fa1413a8016bc2ff45566c76389fdceaffa3c595bcd15b164e8039f69212",
+        # The golden before the busy-queue notice reading the addressed flag.
+        "13d2d1d349a0b892ed150e4e1103b7b5ccd6593ad3f8c60146f93c1baa1c0994",
+        # 6f0f0facf175 Backup setup takes only its own answers, and a GitHub token in a rich
+        "60eb7fd4124b612a9b39d37349227ab562bf3e79d6a636cddab83430830d7a1e",
+        # 059c4ee67aa9 Files and photos reach the bot with the request they belong to
+        "9d900aa161adac77af29ff5342ce1664f5cb9238fa8c2766b6d92ad1f9336fa9",
+        # 974a2d4ce8dd A message waiting behind long work hears so once, and group chatter ne
+        "ddc937d68c8c65b58c24cf02120acc2d9d6e812c3b9e5fe5be0f01b69b1df774",
+        # 3839a7651beb The bot stays silent on a photo sent after a mention when it has nothi
+        "8b6fb137a4e05c256d295352f10a228540ebeb88cdd9faf4223ef0caf46d76e4",
+        # f59b9c8cf2df A chat hears the waiting notice at most once in half an hour
+        "db241218de3282d880ba7d7355c9841f020e8c62ea16dd140f906907b4080176",
+        # ff17a89abb58 Backup setup no longer mistakes file names, «стоп» or «yes/no» for its
+        "879c8480b47d61860a9b3a5d3be3fe51a156ead75df7bf139f443ff4efabe541",
+        # 856d26589d60 A photo sent right after a group mention reaches it, and shared sender
+        "bb542034986444e52083b84558b134c554f8aae1a9e8f748394e10719593134d",
+        # b3641442f9fe A GitHub token sent as a rich message is deleted before it reaches the
+        "a1098ae9cf58cde9b26c0ec23fb382eed812f88ac95d8af29ba7f2c2c1a9ddf4",
+        # 74066b60373a Tell a message to wait only when it really waits, and never group chat
+        "15dd84e23fec8414a725e30d48dcd355d152eab8c9f8a1323fba30b29aca1f88",
+        # d0eec5fb4710 Files and photos reach the bot with the request they belong to
+        "3c15022461ca6aa07cea33dea2ec73339d63ca3712ae47917664d3b2d89646d0",
+        # 83d85810da33 A message waiting behind long work now hears once that it was received
+        "aa3b06588b8d3f74f5cf8c1ce0c6e89c5703d116404dc1afd219672b7a393a94",
+        # The golden before K was merged into the addressed-chat notices.
+        "ebd9a55e0ff4602724f5305f4a88a85693a99047084557243e22a9cf900d4801",
+        # 6658f7df01b1 Give one usage-limit notice that names its zone and reaches the right
+        "048531e644c443588148540aa3ddb3a01ffcbb98d4e058d833705069d3b3e152",
+        # d7f2fbe954f9 Merge keeping service notices to the people they concern
+        "573949610309cfd1e73cd0ae5d02948fdeb3289fb8e0008a83fe5f07eaf84210",
+        # f038733e896f Tell every chat waiting on a usage limit once, with the reset time
+        "a931ee7c6ee0b3ee5603e04e5555ec9967cc7500e9abf8eb6bb96f7d222cc5d3",
+        # The golden before E's usage-limit notices were merged with the addressed flag.
+        "1a59b71b9d0916b19f45df861c86e2cf7fe924ced397a27768b367e863ecf07d",
+        # The golden before chatter got no receipt reaction or typing and a request lost without text was reported.
+        "8f6e491ee036f4edbd55fcf8c067362c20dded1f31b7fed05853656373bd1ffc",
+        # The golden before group chatter that addressed nobody was kept out of limit and corporate notices.
+        "0ca0cd12301582490cd2d8db439da14b70fadfa4a5343d0e08dc065cde0a2de3",
+        # The golden before group talk that addressed nobody was marked as observation and kept out of service notices.
+        "74057d0f67a6e940c67beb023093b37849f8c2ffcfea24cbd998f6f33ebc71ea",
+        # 3aaebd5e8328 Keep later replies from hiding missed sends in delivery shadow verdict
+        "1d493994d4c139f3dd452f2c914d95b54e0940276a3547079b170da3a0a5c258",
+        # 3f2dfd3bf3f5 Cap the retry wait after repeated failures at ten minutes
+        "e5beba6189b00a26462ed3e5551e148f7e6c683ef2d67b66f7d8371a7231dbd1",
+        # f20683da2429 Wait longer before retrying a request whose answers keep failing
+        "69369da230e2a610e8f6320b58cac068a47ab70a8cc861dc41307bcfe56d1cd2",
+        # 587d8041b3fd Keep guard misattribution and chat-less turns out of delivery shadow v
+        "e2b8105fb6b4b3cec5ca62a15de2334d019e1272b337e68c1a1f278971e60305",
+        # The golden before shadow records separate guard wrong-origin credits and headless turns.
+        "ead4fc79d882e422856fa39c8692384074a5e4778c6ce04e2fd37b4dbd88960f",
+        # The golden before blocked and uncredited delivery claims are rejected.
+        "214c79df0bbe1c37faa0480a317562c536c60f7991a4359152a2e308ec31a688",
+        # 522b5c2fa365 Expose durable intake failures in owner health
+        "9527799e894c770958a393f3849ba11453e15570ebaa3ba7fc23d91007dad468",
+        # 90471270cb39 Retry owner uncertainty notice after Telegram rate limit
+        "e88ab2202a680a6b9f763a57c18988c8b51cd840120fa4396035588a01e9b92c",
+        # 2edff717a42d Alert owner once when outbound delivery is uncertain
+        "065e3966280e7d440e118482aa4348a9aa258781ffac365149b929d9f5d5193d",
+        # 23f2930f7c43 fix(telegram): release polling after corporate runtime load failure
+        "42b81d0ad782c46d79cc75140a31ecc4d9b09cfd72da06c676115f058773e716",
+        # The golden before short Telegram group join greeting.
+        "598581bb12098fe8d1c3403841a0cf09f17e891674a13d7bc75a0419d794b195",
+        # Jeff's reviewed 25 Sep direct-poller hotfix: exact 8ed378e9 preimage
+        # plus the three intake/shutdown hunks, before his full kit upgrade.
+        "4c908816bec4a94df59af81801d1b8f9945b3d3a4700c6ee37f4420fe927c501",
+        # 577977dd5729 Retry failed Telegram intake without advancing poll offset.
+        "9547565876c0c30d801ab77f7def9b5041ad4f8eb3514190db78d2366822b314",
+        # The golden before Telegram intake and shutdown confirmation fixes.
+        "f5f3f6c1e9c228b27b7f7eb44c6818b756f5cb29dbf16672070f766a5fd47019",
+        # The golden before background progress notice retry.
+        "65a7012f41c46f22e17b27c4d801e89029e47126f8524c4de8637ee7cc86783c",
+        # 824f7a6b8445 fix(receipts): allow safe file continuation after partial reply
+        "e96da7b7f6b4b0d833b11f6eeb6c1714829257f7812a68758f04c69602cf7beb",
+        # 86bede08772c Fail closed for unknown resumed native sessions
+        "a2f753d5a3bd52822e26e170e73a7179afecd772b2c46c0e8031b1a8d9fc083e",
+        # e5d07f3e5ad8 fix(receipts): fence uncertain sends in guard and shadow modes
+        "a94f2a2789b77a0a3dafd0f372395c50c38a7d2c885610de6f32cc9a0b48f36b",
+        # 43cc7b4f1341 fix(receipts): fence acknowledged reply before durable receipt
+        "63331b8596126f795d499debcf7d149933c7d9b58ba44b7609ce1e9c2f198fe7",
+        # 42faac655e27 fix(receipts): preserve native session proof across prune and restart
+        "bbe553f8f2da8d8a47f143664cc6a8804f972bd4abc7881070a8b96a886e6d15",
+        # The golden before unknown native resume remains quarantined.
+        "4d0730f9b12fb802746dbe395cf6aa37561c7880d8a0f41ddabc7331a3c71505",
+        # The golden before native session origin survives preboot resume.
+        "080d08fa85fae1b768ae19e41ed1df07433f214c236ba995a2ea9962c1cdd87b",
+        # 40ed8bc5f92c Keep legacy native session risk through request rebinding
+        "e4634901538e4c7aa42d3a55e51fd6de848093b1ca0892bd6abf0adbd4cff901",
+        # The golden before native session safety and terminal receipts.
+        "0dd139cb11d463a05259d32010b8953313042dc05656d9e5e8a89ce274b6659f",
+        # The golden before callback terminal receipts.
+        "ed47f92be89de11c62ce54a24871da309276977a1a5a112a2a643feaa4a5c769",
+        # 0b21cc5de32f Honor agent notice locale for paused background work
+        "7ea1bde413ff06e716f63186eb4eef3b5d1452087039d652e005d4f187a2d44a",
+        # 47b515676fc9 Merge commit '86bb5f25d3e71cc2eff2d988f9dd54e1ef40bca4' into integrati
+        "fafbc597fa36e5e428af11a70c43922dbc310ae70388373c7484fff373eb7b3c",
+        # 86bb5f25d3e7 Reject legacy native task reuse across service restarts
+        "a58cb2f41bccd94b5b8dd0d44169ca54bb314601312ebbeced59f0e01de7a1a5",
+        # 5d2345b33112 Bind native callbacks and result retries to original requests
+        "726afd7c41bf28fcb091ecfd52a167e12ae3939a475504efa55eca033782c0d2",
+        # 486dbb2df6a3 Guard implicit sends against unbound native callbacks
+        "2117a750ed7324d727755724dd8146e1b938f0b4d3f2e5d2b3badc560b8c800c",
+        # 18829b079094 Bind native callbacks to immutable Telegram request origins
+        "3a88d42957f587cdac49c50ea746d7e3d1a8b8bf78094d91c7ae09e256cad6ac",
+        # 73c1e3b98a5f fix(telegram): bind receipts to the exact request origin
+        "7edcff57870dfa492ffde1b66f3345e07fd5d46c5ba8e76c73985a919a0df3a5",
+        # The golden before background pause notice locale and Telegram retry.
+        "1f6f88488b1eee2d2316f190432e8c000c9b22af09bb96f0257e37702e1dd479",
+        # 78786c751859 Merge commit '5c47fa8efba46e4009bc66b3ff2ee22e52246756' into release/s
+        "17e33a929e19bbc5e6b534a867cf0aca055ec970afce3d3a62cd4282277166d1",
+        # 5c47fa8efba4 Retry definite Telegram limit notice rejections safely
+        "a75510e7155ed0b5bf8dcc6d1ca4cc0738c957d43baa57190bcdd4f18dcd006a",
+        # 94577207f080 Notify original requests on renewed provider pauses
+        "e901f4c5ee79630fb0f78d9fbabccf8d5096c0083b54c712c9a191bc32f280cf",
+        # The golden before durable forum delivery routing.
+        "57a653a60f3a17cccb4c8796a544cd1b7fa11136e03ca02e96465418fd03c63e",
+        # b9f88d53a90c fix: route deferred Telegram callbacks from durable delivery evidence
+        "6ebebf64fb4724abead4c64a6098fe6896465f1da97eafbacb896634095b3fd7",
+        # Golden before exact forum routing and per-part receipts.
+        "bccc725f6fd281b1507ba7f6f9b9bbc5e8cf7338420939656660a26d9499bc7f",
+        # Para topic-only reviewed preimage.
+        "b1224bead6e1c21169327ce881edc074c32b7c0e240f8ba0b643391ced04ca99",
+        # The intermediate reviewed combinations before Stop transcript and burst handling.
+        "1aaa7bbdfc40fb1b33ba6884c740d528b26607666745b8a82f5b4da534234539",
+        "c1f8825f05217dbdc5e850b4a1deaddf0419a74f54699496522883f83bf327b8",
+        "3b58cbb85e58a5e55e7c39207cd800a61c8a13f829b80f6a549321c06aa9b195",
+        "8a806b860ac810d187a8bfd97f32251f711725dce1d018906c5b5e9287c00ba2",
+        "08faf7477cc3a426848868d876e440abc0e682d625ceb5f15525256ca11a16cc",
+        # The golden before accurate targeted unstick delivery warning after corporate queue recovery.
+        "a33139f80b71949cfca78549d91d535bed114232425f150a3c1c6eaaf5de6611",
+        # The golden before scoped superadmin recovery and terminal access confirmation.
+        "1ad768f4586361e0769aa776017fa2ba95fdde985c0402714993adb7302293d6",
+        # The golden before recoverable team and settings confirmation callbacks.
+        "20ad47bdb340054a3891c114d05f111637a8ec3cb5cc4d831fab95da12939fbb",
+        # The golden before superadmin business controls and private OAuth routing.
+        "14be9b96df91fe248c3386713ac463be68e0bbad87632760536d2ddb6a6b73b2",
+        # 956fad0ee3ab Let superadmins manage business and group settings
+        "3d9afc64791e8b37a11d7f78163fddb6ae5fa2efae8b7f871d8ff0ffa61c5ef0",
+        # 4f7aedbc6c04 Let superadmins manage team roles in private chat
+        "92ffc392b15d0b295a4c3c166560828bb8e82acaaa380b5c0e278a29a6f2af8a",
         # The golden before fail-closed superadmin routing.
         "f2c7f6068704518bc9ba2e70f2295a20ff694f133c7062621f85fe9d23b9031f",
         # The golden before superadmin business setup and resource confirmations.
@@ -740,6 +1087,19 @@ def _atomic_replace_server(
     temporary_fd = -1
     try:
         directory_fd = _open_directory_chain_fd(home, install.root, uid)
+        source_metadata = os.stat(
+            "server.ts", dir_fd=directory_fd, follow_symlinks=False
+        )
+        if (
+            not stat.S_ISREG(source_metadata.st_mode)
+            or not _owned_mode_is_safe(source_metadata, uid)
+            or source_metadata.st_nlink != 1
+        ):
+            raise _fail("server.ts Telegram plugin має небезпечного власника або права")
+        # Jeff's private cache uses 0600. An update must not make it public.
+        replacement_mode = (
+            0o600 if stat.S_IMODE(source_metadata.st_mode) == 0o600 else 0o644
+        )
         before = _read_regular_at(
             directory_fd,
             "server.ts",
@@ -757,10 +1117,10 @@ def _atomic_replace_server(
         temporary_fd = os.open(
             temporary_name,
             os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-            0o644,
+            replacement_mode,
             dir_fd=directory_fd,
         )
-        os.fchmod(temporary_fd, 0o644)
+        os.fchmod(temporary_fd, replacement_mode)
         view = memoryview(golden_bytes)
         while view:
             written = os.write(temporary_fd, view)
@@ -776,6 +1136,21 @@ def _atomic_replace_server(
             limit=MAX_SERVER_BYTES,
         )
         if hashlib.sha256(latest).hexdigest() not in expected_source_shas:
+            raise _fail("server.ts Telegram plugin змінився перед записом")
+        latest_metadata = os.stat(
+            "server.ts", dir_fd=directory_fd, follow_symlinks=False
+        )
+        if (
+            latest_metadata.st_dev,
+            latest_metadata.st_ino,
+            latest_metadata.st_mode,
+            latest_metadata.st_uid,
+        ) != (
+            source_metadata.st_dev,
+            source_metadata.st_ino,
+            source_metadata.st_mode,
+            source_metadata.st_uid,
+        ):
             raise _fail("server.ts Telegram plugin змінився перед записом")
         os.replace(
             temporary_name,

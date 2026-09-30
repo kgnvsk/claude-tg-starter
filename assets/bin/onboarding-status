@@ -7,6 +7,7 @@ from contextlib import closing
 import json
 import os
 from pathlib import Path
+import pwd
 import re
 import shutil
 import shlex
@@ -173,9 +174,36 @@ def stock_template(name: str) -> str | None:
 
     Порівняння зі змістом — єдиний чесний спосіб сказати «власник сюди не писав».
     Розмір цього не показує: ядро на три рядки буває цілком осмисленим.
+    Каталог комплекту в кожного агента свій: основний має /opt/claude-tg-starter,
+    решта — /opt/claude-tg-starter@<користувач>. Каталог основного служить іншому
+    агенту лише до його першого власного оновлення й лише для того самого продукту.
     """
+    def product(path: Path) -> str | None:
+        candidates = (path / "PRODUCT.json", path / "assets/product/runtime.json") if path.is_dir() else (path,)
+        for candidate in candidates:
+            try:
+                value = json.loads(candidate.read_text(encoding="utf-8")).get("productId")
+            except FileNotFoundError:
+                continue
+            except (OSError, UnicodeError, ValueError, AttributeError):
+                return None
+            return value if isinstance(value, str) and value else None
+        return None
+
+    default = Path("/opt/claude-tg-starter")
+    user = pwd.getpwuid(os.getuid()).pw_name
+    own = Path(f"{default}@{user}")
+    kits = []
+    if user == "claude":
+        kits.append(default)
+    elif own.is_dir() and not own.is_symlink():
+        kits.append(own)
+    elif (not any(os.path.lexists(f"{own}{suffix}") for suffix in ("", ".new", ".prev"))
+          and product(default) is not None
+          and product(default) == product(HOME / ".claude/product/runtime.json")):
+        kits.append(default)
     for kit in (
-        Path("/opt/claude-tg-starter"),
+        *kits,
         Path("/opt/claude-premium"),
         Path("/opt/cash-deploy"),
         HOME / "claude-premium",

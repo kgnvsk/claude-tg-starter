@@ -24,5 +24,6 @@
   ],
   "optionalChecks": [
     "memory_backup"
-  ]
+  ],
+  "hostLayout": "per-agent-1"
 }
