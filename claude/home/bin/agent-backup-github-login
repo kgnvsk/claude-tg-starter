@@ -102,11 +102,12 @@ def login(backup, owner, nonce):
     # Older Ubuntu CLI versions lack `gh auth token`. Both old gh (plaintext
     # by default) and modern gh (--insecure-storage above) write this isolated
     # private credential file; do not touch the user's global gh account.
+    # GitHub CLI 2.40+ also keeps a copy under users.<login>: one token written twice is still one token.
     hosts = backend.protected_read(directory / 'hosts.yml').decode()
-    found = re.findall(r'^\s+oauth_token:\s*[\"\']?([A-Za-z0-9_]{20,255})[\"\']?\s*$', hosts, re.M)
+    found = set(re.findall(r'^\s+oauth_token:\s*[\"\']?([A-Za-z0-9_]{20,255})[\"\']?\s*$', hosts, re.M))
     if len(found) != 1:
         raise backend.BackupError('github-token-unavailable')
-    token = found[0]
+    token = found.pop()
     store = backend.helper('agent-backup-github-store')
     try:
         store.check_repository(repository, token)
