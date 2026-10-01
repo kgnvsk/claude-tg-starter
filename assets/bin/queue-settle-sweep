@@ -312,6 +312,19 @@ def settle_completed_durable_head() -> None:
                 item[1] for item in connection.execute("PRAGMA table_info(delivery_task_owners)")}
             unclaimed = ("(own.delivery_id IS NULL AND own.state='legacy')" if obligations
                          else "own.delivery_id IS NULL")
+            # A return without a request is unknown only when the launch ledger cannot place it.
+            # A worker that belongs to no request (it carries its occurrence) and one no request
+            # registered (its launch is 'unowned') are known, and keep no carrier here.
+            # Each half is asked only of a ledger that has its column: a box between two kits may
+            # have one without the other, and a column that is missing must not stop the proof.
+            unknown_return = "unknown.delivery_id IS NULL"
+            if "occurrence" in callback_columns:
+                unknown_return += " AND unknown.occurrence IS NULL"
+            if obligations:
+                unknown_return += (" AND NOT EXISTS (SELECT 1 FROM delivery_task_owners launched "
+                                   "WHERE launched.session_id=unknown.session_id AND launched.stamp=unknown.stamp "
+                                   "AND launched.task_id=unknown.task_id AND launched.delivery_id IS NULL "
+                                   "AND launched.state='unowned')")
             row = connection.execute(
                 "SELECT delivery_id, state, coalesce(started_at, created_at) "
                 "FROM pending_inbound_deliveries ORDER BY created_at, rowid LIMIT 1"
@@ -352,8 +365,10 @@ def settle_completed_durable_head() -> None:
                 f"AND (own.delivery_id=r.delivery_id OR {unclaimed})) "
                 "AND NOT EXISTS (SELECT 1 FROM delivery_task_returns ret "
                 "WHERE ret.session_id=r.session_id AND ret.stamp=r.stamp "
-                "AND (ret.delivery_id=r.delivery_id OR "
-                "(ret.delivery_id IS NULL AND ret.observed_at>=r.created_at))))",
+                "AND ret.delivery_id=r.delivery_id) "
+                "AND NOT EXISTS (SELECT 1 FROM delivery_task_returns unknown "
+                "WHERE unknown.session_id=r.session_id AND unknown.stamp=r.stamp "
+                f"AND {unknown_return} AND unknown.observed_at>=r.created_at))",
                 (delivery_id, delivery_id, now - 30_000),
             ).rowcount
             if retired == 1:
@@ -378,7 +393,6 @@ def settle_completed_durable_head() -> None:
             if obligations:
                 other_work = "own.delivery_id=r.delivery_id AND own.state NOT IN ('returned','stopped')"
                 later_return = "other.observed_at>terminal.created_at"
-                unknown_return = "unknown.delivery_id IS NULL AND unknown.occurrence IS NULL"
                 launches = connection.execute(
                     "SELECT 1 FROM sqlite_master WHERE type='table' AND name='delivery_task_launches'").fetchone()
                 unowned = [row[0] for row in connection.execute(
@@ -394,7 +408,6 @@ def settle_completed_durable_head() -> None:
             else:
                 other_work = "own.delivery_id=r.delivery_id AND own.task_id<>r.task_id"
                 later_return = "other.return_id<>ret.return_id"
-                unknown_return = "unknown.delivery_id IS NULL"
                 unowned = []
             retired = connection.execute(
                 "DELETE FROM pending_inbound_deliveries WHERE delivery_id=? AND state='started' "

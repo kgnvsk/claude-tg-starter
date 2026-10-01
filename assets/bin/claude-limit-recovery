@@ -470,7 +470,17 @@ def _ancestry_disposition(event: dict) -> tuple[str, ChannelRef | None]:
         content = message.get("content")
         if isinstance(content, str):
             ref = _carrier_ref(content, event.get("origin"))
-            return ("carrier", ref) if ref is not None else ("reject", None)
+            if ref is not None:
+                return "carrier", ref
+            # A note the CLI wrote into the turn itself (an image's size, advice
+            # about the usage limit, a Stop hook's feedback) is no one's prompt:
+            # it carries no origin and no channel envelope. Refusing it hid the
+            # limit behind it (Сорька, 01.10, CLI 2.1.286). Told by kind, like
+            # the stop guard does, not by its text.
+            if (event.get("isMeta") is True and event.get("origin") is None
+                    and re.match(r"\s*<channel\b", content) is None):
+                return "continue", None
+            return "reject", None
         if isinstance(content, list) and content and all(
             isinstance(block, dict) and block.get("type") == "tool_result"
             for block in content

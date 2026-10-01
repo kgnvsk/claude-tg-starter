@@ -28,10 +28,14 @@ UPSTREAM_SERVER_SHA256 = (
 )
 UPSTREAM_PACKAGE_START = "bun install --no-summary 1>&2 && bun server.ts"
 GOLDEN_SERVER_SHA256 = (
-    "5d7dcc06ef83cc4d51a77abc8ec746c84acb620ba312f26a308b05e959ca5833"
+    "dd57dbd4d5b045ac6c2643f3747ecbbbb11b5b5d1e28c128d34c760d5a611144"
 )
 PREVIOUS_GOLDEN_SERVER_SHA256S = frozenset(
     {
+        # The golden before a limit notice saved what it says together with its reservation.
+        "553aa57d18b0a7617b7e955eca592736d18bf9b19a57391210025767c03f7cdf",
+        # The golden before a limit notice without the reset is followed by the reset, and the queue waits out the reset margin.
+        "5d7dcc06ef83cc4d51a77abc8ec746c84acb620ba312f26a308b05e959ca5833",
         # The golden before only another request's legacy worker moving to the registering request.
         "bafbe2536530e6caedb183d8c14be0e6951d3d4f688298a06a0e3a34dfe4fde9",
         # The golden before a legacy worker moving to the request that registered it under guard and shadow.

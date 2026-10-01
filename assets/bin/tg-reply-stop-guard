@@ -2297,19 +2297,31 @@ def completed_visible_callbacks(
                 by_hash.setdefault(prompt_hash, set()).add(delivery_id)
             if any(len(owners) > 1 for owners in by_hash.values()):
                 return False
-            for callback, (_, _, delivery_id, observed_at, occurrence) in zip(current, returns):
+            for callback, (task_id, _, delivery_id, observed_at, occurrence) in zip(current, returns):
                 if not delivery_id and occurrence is not None:
                     continue  # A request-less worker returned: nothing is owed once it is read.
                 if not callback['external'] and not delivery_id:
                     continue  # This turn's own native launch was read above.
                 if not delivery_id:
+                    # No request registered this worker, so there is none to answer. Guard and
+                    # shadow may not block for it (NOVSKY, 27.09): its launch turn recorded
+                    # would_block_unowned_worker. A callback the ledger never saw stays unproven.
+                    if obligations and conn.execute(
+                            "SELECT 1 FROM delivery_task_owners WHERE session_id=? AND stamp=? AND task_id=? "
+                            "AND delivery_id IS NULL AND state='unowned'", (session, stamp, task_id)).fetchone():
+                        continue
                     return False
                 result = conn.execute(
                     'SELECT turn_id,chat_id,thread_id,state,task_id,response_turn_id,'
-                    'updated_at,acknowledged_at,request_payload FROM delivery_results '
+                    'updated_at,acknowledged_at,request_payload,finished_at FROM delivery_results '
                     'WHERE delivery_id=? AND session_id=? AND stamp=?',
                     (delivery_id, session, stamp),
                 ).fetchone()
+                # The request had ended before this worker returned: no reply can prove anything
+                # under it any more, and a refusal only repeats (Сорька, 01.10: 41 times).
+                if (result is not None and result[3] in ('complete', 'no_reply', 'cancelled', 'failed')
+                        and result[9] and result[9] <= observed_at):
+                    continue
                 if result is None or result[7] is None or result[8] is None:
                     return False
                 receipt = conn.execute(
@@ -3058,6 +3070,12 @@ def main() -> None:
         if not verdict.getvalue().strip() and not complete_terminal_stop_deliveries(hook):
             block_cleanup()
     output = verdict.getvalue()
+    if output.strip():
+        # A refusal keeps the native turn open, not the queue: an input with its own exact
+        # terminal proof leaves it whatever the refusal still asks for. Its pending
+        # neighbours stay, and nothing here accepts the Stop.
+        with redirect_stdout(io.StringIO()):
+            complete_terminal_stop_deliveries(hook)
     sys.stdout.write(output)
     if output.strip() or hook.get("hook_event_name") != "Stop":
         return

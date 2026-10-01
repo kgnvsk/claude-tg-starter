@@ -3613,7 +3613,9 @@ function providerResetAt(now = Date.now()): number {
     const incident = JSON.parse(readFileSync(path, 'utf8'))?.incident
     if (!incident || incident.resolved || incident.expired) return 0
     const reset = incident.reset_epoch_ms
-    return Number.isSafeInteger(reset) && reset > now && reset < now + 8 * 86_400_000
+    // The reset is named to the minute: the queue waits two minutes past it, and
+    // through them, or a request offered in its first seconds hits the same limit.
+    return Number.isSafeInteger(reset) && reset + 120_000 > now && reset < now + 8 * 86_400_000
       ? reset + 120_000 : 0
   } catch { return 0 }
 }
@@ -4105,6 +4107,8 @@ async function notifyPausedBackgroundResults(): Promise<void> {
   const reset = providerResetAt(now)
   const deadline = Math.max(Number(pause?.value) || 0, reset)
   if (deadline <= now) return
+  // Past the minute the provider named only the margin is left: nothing to announce.
+  if (reset && deadline === reset && reset - 120_000 <= now) return
   if (!reset && now < (pause?.updated_at ?? 0) + LIMIT_NOTICE_RESET_WAIT_MS
     && existsSync(join(process.env.AGENT_ROOT ?? homedir(), 'logs', 'claude-limit-recovery.json'))) return
   const waiting = MSG_DB.query(`SELECT r.delivery_id, r.chat_id, r.thread_id, r.recovery_notice_at,
@@ -4130,16 +4134,22 @@ async function notifyPausedBackgroundResults(): Promise<void> {
       .get(`limit_notice:${key}`) as { value: string; updated_at: number } | null
     const told = Number(marker?.value) || 0
     const last = Math.max(Math.abs(marker?.updated_at ?? 0), ...rows.map(row => Math.abs(row.recovery_notice_at ?? 0)))
-    if (last && !modelAnsweredSince(last) && !(told && deadline > told)) continue
-    // A negative timestamp reserves the attempt durably. An unknown network
-    // outcome must not produce repeated alerts on every tick/restart.
+    // A notice that could not name the reset is followed once by the reset.
+    if (last && !modelAnsweredSince(last) && !(told && deadline > told) && !(marker && !told && reset)) continue
+    // A negative timestamp reserves the attempt durably, together with what this
+    // notice says to the conversation: a crash or an unknown network outcome
+    // must not repeat it on a later tick or at the next start.
     const reservation = -Date.now()
-    if (!MSG_DB.query(`UPDATE delivery_results SET recovery_notice_at = ? WHERE delivery_id = ? AND recovery_notice_at IS ?`)
-      .run(reservation, carrier.delivery_id, carrier.recovery_notice_at).changes) continue
     // The deadline told counts only when it named the provider's reset.
-    const remember = () => MSG_DB.query(`INSERT INTO delivery_runtime (key, value, updated_at) VALUES (?, ?, ?)
-      ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`)
-      .run(`limit_notice:${key}`, String(reset ? deadline : 0), Date.now())
+    const said = String(reset ? deadline : 0)
+    if (!MSG_DB.transaction(() => {
+      if (!MSG_DB.query(`UPDATE delivery_results SET recovery_notice_at = ? WHERE delivery_id = ? AND recovery_notice_at IS ?`)
+        .run(reservation, carrier.delivery_id, carrier.recovery_notice_at).changes) return false
+      MSG_DB.query(`INSERT INTO delivery_runtime (key, value, updated_at) VALUES (?, ?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`)
+        .run(`limit_notice:${key}`, said, -reservation)
+      return true
+    })()) continue
     try {
       // providerResetAt adds the two-minute margin; people see the provider's reset.
       await bot.api.sendMessage(carrier.chat_id, limitNoticeText(reset && reset - 120_000),
@@ -4148,23 +4158,30 @@ async function notifyPausedBackgroundResults(): Promise<void> {
         recovery_notice_retry_at=NULL, recovery_notice_failures=0
         WHERE delivery_id=? AND recovery_notice_at=?`)
         .run(Date.now(), carrier.delivery_id, reservation)
-      remember()
     } catch (error) {
       if (error instanceof GrammyError && error.error_code === 429) {
         // Telegram explicitly rejected the request, so it cannot create a
-        // duplicate. Retry after a durable bounded backoff. A network error
-        // leaves the negative reservation in place because delivery is unknown.
-        const prior = MSG_DB.query(`SELECT recovery_notice_failures FROM delivery_results
-          WHERE delivery_id=? AND recovery_notice_at=?`)
-          .get(carrier.delivery_id, reservation) as { recovery_notice_failures: number } | null
-        const backoff = Math.min(60_000, 5_000 * 2 ** Math.min(prior?.recovery_notice_failures ?? 0, 4))
-        MSG_DB.query(`UPDATE delivery_results SET recovery_notice_at=NULL,
-          recovery_notice_retry_at=?, recovery_notice_failures=recovery_notice_failures+1
-          WHERE delivery_id=? AND recovery_notice_at=?`)
-          .run(Date.now() + backoff, carrier.delivery_id, reservation)
+        // duplicate. The line is owed again after a durable bounded backoff,
+        // and the conversation's marker goes back to what it was, both only
+        // while this reservation still stands. A network error leaves the
+        // reservation and the marker in place because delivery is unknown.
+        MSG_DB.transaction(() => {
+          const prior = MSG_DB.query(`SELECT recovery_notice_failures FROM delivery_results
+            WHERE delivery_id=? AND recovery_notice_at=?`)
+            .get(carrier.delivery_id, reservation) as { recovery_notice_failures: number } | null
+          const backoff = Math.min(60_000, 5_000 * 2 ** Math.min(prior?.recovery_notice_failures ?? 0, 4))
+          if (!MSG_DB.query(`UPDATE delivery_results SET recovery_notice_at=NULL,
+            recovery_notice_retry_at=?, recovery_notice_failures=recovery_notice_failures+1
+            WHERE delivery_id=? AND recovery_notice_at=?`)
+            .run(Date.now() + backoff, carrier.delivery_id, reservation).changes) return
+          if (marker) MSG_DB.query(`UPDATE delivery_runtime SET value=?, updated_at=?
+            WHERE key=? AND value=? AND updated_at=?`)
+            .run(marker.value, marker.updated_at, `limit_notice:${key}`, said, -reservation)
+          else MSG_DB.query(`DELETE FROM delivery_runtime WHERE key=? AND value=? AND updated_at=?`)
+            .run(`limit_notice:${key}`, said, -reservation)
+        })()
         process.stderr.write('telegram channel: background pause notice rejected; retry scheduled\n')
       } else {
-        remember()
         process.stderr.write('telegram channel: background pause notice unconfirmed; saved work retained\n')
       }
     }

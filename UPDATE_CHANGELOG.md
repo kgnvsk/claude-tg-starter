@@ -1,8 +1,8 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-10-01.82c9478a66b6`
+- Реліз: `2026-10-01.03f6e71697c7`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `82c9478a66b636e788c63cba3a6b3725becddfdd`
+- Ревізія вихідного комплекту: `03f6e71697c7ec7e11e6c2c78fb80c155976172a`
 - Дата релізу: `2026-10-01`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
@@ -19,12 +19,19 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    The receiver harness runs a copy beside node_modules and never downloads its packages
-    Test that the receiver harness starts with the package registry unreachable (red)
-    Pin the persona sources of the four other kits published on 23.09
-    Test that every kit published on 23.09 has its persona pins for every product (red)
-    The rules sync no longer adds a blank line to the owner's file on every update
-    Test that a repeated rules sync leaves the owner's file as it is (red)
+    The sweep asks each ledger column only of a ledger that has it
+    Tests: a late rejection overwrites neither a newer reservation nor a newer marker
+    Tests: every terminal state lets its late worker go; the edges around the two exemptions still refuse
+    A refused Stop still lets an answered request leave the queue
+    Test that a refused Stop still lets an answered request leave the queue (red)
+    The sweep retires an answered request whatever workers of others returned meanwhile
+    Test that the sweep retires an answered request whatever workers of others returned meanwhile (red)
+    A limit notice saves what it says with its reservation, before the network
+    Test that a follow-up cut off in flight is not sent again, and that one Telegram rejected is still owed (red)
+    A returned worker nobody can answer for no longer holds Stop or the queue under guard and shadow
+    Test that a returned worker nobody can answer for does not hold the next request (red)
+    A limit is read past the CLI's own notes; its time is told once it is known; the queue waits out the reset margin
+    Test that a limit is read past the CLI's own notes, its time is told once it is known, and the queue waits out the reset margin (red)
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не
