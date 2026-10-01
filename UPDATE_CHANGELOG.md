@@ -1,8 +1,8 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-10-01.fd2d207295c7`
+- Реліз: `2026-10-01.82c9478a66b6`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `fd2d207295c70c6af0c2340c6f31db0ee410bec5`
+- Ревізія вихідного комплекту: `82c9478a66b636e788c63cba3a6b3725becddfdd`
 - Дата релізу: `2026-10-01`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
@@ -19,8 +19,12 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    Take the GitHub CLI token written twice as one token
-    Test the modern GitHub CLI credential file with its per-user copy of the token (red)
+    The receiver harness runs a copy beside node_modules and never downloads its packages
+    Test that the receiver harness starts with the package registry unreachable (red)
+    Pin the persona sources of the four other kits published on 23.09
+    Test that every kit published on 23.09 has its persona pins for every product (red)
+    The rules sync no longer adds a blank line to the owner's file on every update
+    Test that a repeated rules sync leaves the owner's file as it is (red)
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не

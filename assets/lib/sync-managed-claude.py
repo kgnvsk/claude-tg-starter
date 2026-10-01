@@ -27,7 +27,7 @@ def main() -> int:
     path.write_text(
         "\n".join(managed_imports)
         + "\n\n"
-        + "\n".join(lines).rstrip()
+        + "\n".join(lines).lstrip("\n").rstrip()
         + "\n",
         encoding="utf-8",
     )
