@@ -32,6 +32,10 @@ from zoneinfo import ZoneInfo
 VERSION = 1
 PRIVACY_POLICY = "no-secrets-v1"
 INTERVAL = 24 * 3600
+# The snapshot helper gives every database pass 30 s unless the context says otherwise, and the sanitizer's rebuild
+# takes as long as the database is big (Manzik, 02.10.2026: 115 MB needed 77 s, so every backup stopped on
+# sqlite-capture-failed). A backup may take the helper's maximum.
+SQLITE_TIMEOUT_SECONDS = 600
 AGE_VERSION = "v1.3.2"
 AGE_DIGESTS = {
     "linux-amd64": "cbe24006683f8eb669266162894b9a522a1af52f2665fbc63a4bb032ed26ac10",
@@ -250,6 +254,7 @@ class Backup:
         configured = self.load(self.directory / "context.json")
         context = dict(configured)
         context.update(sourceHome=str(self.home), platform=platform.system(), architecture=platform.machine())
+        context.setdefault("sqliteTimeoutSeconds", SQLITE_TIMEOUT_SECONDS)
         system_required = configured.get("systemContextRequired", platform.system() == "Linux" and Path("/run/systemd/system").is_dir())
         if system_required:
             config = self.load(self.config_path)

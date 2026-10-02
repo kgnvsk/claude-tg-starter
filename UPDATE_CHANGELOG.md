@@ -1,8 +1,8 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-10-02.6d47f4ebd938`
+- Реліз: `2026-10-02.49ca2217008b`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `6d47f4ebd938c6a63815c198c9c3d69c6ebcab51`
+- Ревізія вихідного комплекту: `49ca2217008b6865cbd960895f728e36860f5617`
 - Дата релізу: `2026-10-02`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
@@ -19,14 +19,12 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    Approve kit-module in the runtime validator, so an install that ships it passes step 2
-    Give a person their rights before their chat, never pause from the owner's request, scope the guide to its engine
-    Leave brag-slim listed with its description; follow the receiver's new record in the Instagram test
-    Ship the MIT skill brag-slim with Premium as a second pinned outside source
-    Read a config as the kit's reader does, protect the built bridge, prove the receiver before signalling it; guide access
-    Test that no native payload carries a skill naming a module helper it lacks
-    Make a module setup safe to repeat: keep the owner's files, schedule and config
-    Tell every agent about each feature its product declares, and let it set the module up itself
+    Point to the CLI's saved context only when it is cut; keep a language warning by age
+    Judge a reply's language only against the request it certainly answers, once
+    Budget every part of the injected context, and keep the chat block closed
+    Stop a reply written wholly in another script than the person's message
+    Give a backup the snapshot helper's maximum for database passes
+    Keep the injected chat context within what the CLI passes on whole
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не

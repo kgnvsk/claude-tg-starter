@@ -15,12 +15,25 @@ B) RAW MARKUP IN PLAIN TEXT: format='text' пропускает любую ст�
    [текст](url): в plain они видны сырыми. Код в `...` и URL не проверяются,
    `a*b` в формулах не bold. Причина называет исправление в один шаг.
 
+C) МОВА ВІДПОВІДІ (Манзік, 02.10.2026): після години англомовної роботи бот відповів
+   англійською на «Перевір бекап», хоча правило мови в нього було. Якщо повідомлення людини
+   написане кирилицею, а у відповіді немає жодної кириличної літери (або навпаки — латиницею),
+   reply блокується з причиною в один крок. Числа, код, посилання й назви файлів не оцінюються;
+   запит, у якому більше чужомовного тексту, ніж самого запиту, теж.
+   Лише коли запит, на який відповідають, відомий напевно: його називає delivery_id, або у
+   відкритому ході цієї сесії в цьому чаті й темі він один. Пізніше повідомлення з черги чи з
+   іншої теми мову не визначає. На один запит — одне попередження: друга спроба проходить
+   (запис про попередження живе 30 днів).
+   Не вдалося прочитати архів або записати, що попередження вже було, — пропускаємо.
+
 Одноразовий bypass (не довше 5 хв):
 touch ~/.claude/state/tg-format-enforcer.bypass
 """
+import fcntl
 import json
 import os
 import re
+import sqlite3
 import sys
 import time
 
@@ -32,6 +45,13 @@ BOLD_MARKUP = re.compile(r"(?<![\w*])\*[^\s*][^*\n]{2,}[^\s*]\*(?![\w*])"
                          r"|(?<![\w*])\*\*[^\s*][^*\n]{2,}[^\s*]\*\*(?![\w*])")
 LINK_MARKUP = re.compile(r"\[[^\]\n]+\]\([^)\n]+\)")
 LITERAL_SPANS = re.compile(r"```.*?```|`[^`\n]*`|https?://[^\s)]+", re.S)
+TELEGRAM_STATE = os.environ.get("TELEGRAM_STATE_DIR") or os.path.join(
+    os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(AGENT_ROOT, ".claude"), "channels", "telegram")
+# Code, links, mentions, paths and file names say nothing about the language of a text.
+NOT_PROSE = re.compile(r"```.*?```|`[^`\n]*`|https?://\S+|@\w+|\S+[/\\_.]\S+", re.S)
+REPLY_PROSE_LETTERS = 40
+LANGUAGE_WARNED = os.path.join(AGENT_ROOT, ".claude/state/tg-format-enforcer.language")
+LANGUAGE_WARNING_DAYS = 30  # a request still open after this long may get its warning once more
 
 
 def log(msg: str) -> None:
@@ -83,6 +103,89 @@ def has_double_escape(text: str) -> tuple[bool, str]:
     if len(hits) >= 3:
         return True, f"{len(hits)} ручних escape-послідовностей (\\. \\- \\( ...)"
     return False, ""
+
+
+def letters(text: str) -> tuple[int, int]:
+    """Cyrillic and Latin letters in the prose of a text."""
+    prose = NOT_PROSE.sub(" ", text)
+    return len(re.findall(r"[\u0400-\u04FF]", prose)), len(re.findall(r"[A-Za-z]", prose))
+
+
+def answered_request(data: dict, tool_input: dict) -> tuple[str, str]:
+    """(delivery id, the person's text) of the request this reply answers, when that is certain; else ('', '').
+
+    Certain means: the reply names it, or it is the only request the session's open turn holds in this chat and
+    topic, with no result of an earlier turn waiting there. A newer message that is only queued, or one of another
+    topic, is not what is being answered (the receiver credits a reply the same way)."""
+    chat = str(tool_input.get("chat_id") or "")
+    thread = tool_input.get("thread_id")
+    thread = None if thread in (None, "") else str(thread)
+    named = tool_input.get("delivery_id")
+    try:
+        archive = sqlite3.connect(f"file:{os.path.join(TELEGRAM_STATE, 'messages.db')}?mode=ro", uri=True, timeout=1.0)
+        try:
+            if isinstance(named, str) and named:
+                delivery = named if named.startswith(chat + ":") else ""
+            else:
+                open_turn = ("FROM delivery_turns t WHERE t.closed_at IS NULL AND t.session_id=?")
+                held = archive.execute(
+                    f"SELECT m.delivery_id FROM delivery_turn_messages m WHERE m.chat_id=? AND m.thread_id IS ? "
+                    f"AND m.turn_id IN (SELECT t.turn_id {open_turn})",
+                    (chat, thread, str(data.get("session_id") or ""))).fetchall()
+                earlier = archive.execute(
+                    f"SELECT 1 FROM delivery_results r WHERE r.chat_id=? AND r.thread_id IS ? "
+                    f"AND r.response_turn_id IN (SELECT t.turn_id {open_turn}) LIMIT 1",
+                    (chat, thread, str(data.get("session_id") or ""))).fetchone()
+                delivery = held[0][0] if len(held) == 1 and not earlier else ""
+            message = delivery.rsplit(":", 1)[-1]
+            if not delivery or not message.isdigit():
+                return "", ""
+            row = archive.execute("SELECT text FROM messages WHERE chat_id=? AND direction='in' AND message_id=? "
+                                  "ORDER BY ts DESC LIMIT 1", (chat, int(message))).fetchone()
+        finally:
+            archive.close()
+    except (sqlite3.Error, OSError):
+        return "", ""
+    return (delivery, row[0]) if row and isinstance(row[0], str) else ("", "")
+
+
+def other_script(asked: str, text: str) -> str:
+    """The script the person wrote in, when the reply has not a letter of it; else an empty string."""
+    asked_cyrillic, asked_latin = letters(asked)
+    cyrillic, latin = letters(text)
+    if asked_cyrillic >= 4 and asked_cyrillic > asked_latin and not cyrillic and latin >= REPLY_PROSE_LETTERS:
+        return "кирилицею"
+    if asked_latin >= 20 and not asked_cyrillic and not latin and cyrillic >= REPLY_PROSE_LETTERS:
+        return "латиницею"
+    return ""
+
+
+def first_warning(delivery: str) -> bool:
+    """True when this request has had no language warning within the retention time and the warning is now on
+    record. A record that cannot be read or written gives False: a reply is never stopped twice for one request."""
+    now = int(time.time())
+    try:
+        os.makedirs(os.path.dirname(LANGUAGE_WARNED), exist_ok=True)
+        with open(LANGUAGE_WARNED, "a+") as record:
+            fcntl.flock(record, fcntl.LOCK_EX)  # two reply hooks at once must not both find «no warning yet»
+            record.seek(0)
+            lines = record.read().splitlines()
+            kept = {}
+            for line in lines:
+                request, _, at = line.partition("\t")
+                if at.isdigit() and now - int(at) < LANGUAGE_WARNING_DAYS * 86400:
+                    kept[request] = at
+            if delivery in kept:
+                return False
+            if len(kept) != len(lines):  # drop what has aged out; only then is the record written anew
+                record.seek(0)
+                record.truncate()
+                record.write("".join(f"{request}\t{at}\n" for request, at in kept.items()))
+            record.write(f"{delivery}\t{now}\n")
+    except OSError:
+        log("language check skipped: the warning record cannot be kept")
+        return False
+    return True
 
 
 def main() -> None:
@@ -151,6 +254,20 @@ def main() -> None:
             f"1. Plain-текст: прибери `*` і `**` навколо слів, а [текст](url) заміни на «текст: url».\n"
             f"2. Або надішли з format='markdownv2' (значення за замовчуванням) — "
             f"тоді розмітка відрендериться."
+        )
+        print(json.dumps({"decision": "block", "reason": msg}))
+        sys.exit(0)
+
+    # ПРОВЕРКА C: ответ целиком не на языке сообщения, на которое отвечают; одно предупреждение на запрос.
+    delivery, asked = answered_request(data, tool_input)
+    script = other_script(asked, text) if delivery else ""
+    if script and first_warning(delivery):
+        log(f"BLOCK language: person wrote {script} len={len(text)} request={delivery}")
+        msg = (
+            f"❌ МОВА: людина написала {script}, а у відповіді немає жодного слова цією мовою.\n"
+            f"\n"
+            f"Відповідай мовою її останнього повідомлення і повтори один раз. Якщо текст іншою мовою — "
+            f"саме те, що вона просила (лист, переклад, цитата), додай зверху один рядок її мовою."
         )
         print(json.dumps({"decision": "block", "reason": msg}))
         sys.exit(0)
