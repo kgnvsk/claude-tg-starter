@@ -57,6 +57,7 @@ MANAGED_BIN_NAMES = frozenset(
         "heic-to-jpg",
         "html-to-pdf",
         "hubspot-crm",
+        "inbox-secretary",
         "install-plugins",
         "kit-module",
         "learning-review",

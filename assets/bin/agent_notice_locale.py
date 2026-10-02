@@ -101,6 +101,22 @@ RUSSIAN_NOTICES = {
     ),
     "schedule.chat": " в чат {chat}",
     "reminder.undelivered": "⚠️ Не удалось доставить напоминание «{name}». Telegram отклонил: {reason}",
+    "secretary.channel_down": "⚠️ Секретарь в {channel} сейчас не слушает: {problem}",
+    "secretary.limit": "⚠️ Секретарь не может писать ответы: исчерпан лимит Claude.",
+    "secretary.login": "⚠️ Секретарь не может писать ответы: Claude не принимает вход.",
+    "secretary.forward": "📩 {channel} · {name}: «{text}»\nОтвет не подготовлен.",
+    "secretary.escalate": "📩 {channel} · {name}: «{text}»\nНужен ты: {reason}",
+    "secretary.escalate_note": "Нужен ты: {reason}",
+    "secretary.proposal": (
+        "📩 {channel} · {name}: «{text}»\n\nПредлагаю ответить:\n«{draft}»{note}\n\n"
+        "Отправить? Скажи «да» или напиши свой вариант. [{id}]"
+    ),
+    "secretary.cap": (
+        "⚠️ {channel} · {name}: слишком много сообщений за час — дальше отвечай сам или дождись, "
+        "пока лимит освободится.\nПоследнее: «{text}»"
+    ),
+    "secretary.send_failed": "⚠️ {channel} · {name}: ответ не ушёл ({error}).\nСообщение: «{text}»",
+    "secretary.new_lead": "🆕 {channel} · {name}: «{text}»\nОтвечаю сам: «{reply}»",
 }
 
 

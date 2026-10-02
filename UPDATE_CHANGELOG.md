@@ -1,9 +1,9 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-10-02.6d90af302382`
+- Реліз: `2026-10-03.d5de77b64edd`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `6d90af3023821eac20325c379f5ccb1c16531420`
-- Дата релізу: `2026-10-02`
+- Ревізія вихідного комплекту: `d5de77b64eddb45ba58fcb6c9f6adcae91ceefd0`
+- Дата релізу: `2026-10-03`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
 
@@ -19,11 +19,25 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    Keep the bot's account record in step with a /relogin
-    Do not call an accepted login code rejected
-    Let go only of the CLI's own background task, never of a worker's callback
-    Let /relogin switch accounts when Claude does not name the current one
-    Keep answering after the CLI moves a slow tool call to the background
+    tests: the busy-database claim test holds the lock until the hook has answered
+    inbox-secretary: a read that failed before any send is tried again; after five the owner is told
+    personal Telegram clients: no retries inside Telethon
+    tests: media-dl's retry counts its downloads; the H.264 check has its own cases
+    media-dl: a video that is not H.264 is re-encoded so Mac, iPhone and Telegram can play it
+    inbox-secretary: the reply speaks as the owner himself; Telethon's used-up retries are an unknown outcome
+    secretary and owner-send: the owner's word is read after the last network wait; only real denials are «not sent»
+    inbox-secretary: describe the closed call without the literal nested-run form
+    tests: the send-boundary cases run beside a bridge that would take any attempt
+    secretary and owner-send: one admission check at the send boundary; honest unknown outcomes
+    inbox-secretary: fetch what Telegram's push did not bring; log why a chat is left out
+    skills: keep both descriptions under the 200-character limit
+    skills: whom the secretary answers, and how the owner widens or narrows it
+    inbox-secretary: by default only dialogs that begin after the switch; the owner may widen it or name chats
+    inbox-secretary: ask mode has the same per-chat hour limit as dialog
+    inbox-secretary: one listener however started; the started listener carries no session environment
+    inbox-secretary: the owner's personal channels listen, propose replies, or hold a dialog
+    personal-inbox: chats the owner closed for the agent; a running bridge takes the new binary
+    personal-inbox: one message from the owner's Telegram or WhatsApp on his request
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не
