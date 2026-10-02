@@ -56,6 +56,13 @@ AGENT_ROOT = Path(os.environ.get("AGENT_ROOT", str(HOME)))
 CLAUDE_CONFIG_DIR = Path(
     os.environ.get("CLAUDE_CONFIG_DIR", str(HOME / ".claude"))
 )
+# The launcher leaves CLAUDE_CONFIG_DIR unset for the default folder: set, even to ~/.claude, it
+# moves the CLI's account record from ~/.claude.json to <folder>/.claude.json. The CLI is asked
+# here exactly as the bot runs it, or a login lands in a record the bot never reads (Арти,
+# 02.10.2026: /relogin switched the login and the bot went on naming the previous account).
+CLI_CONFIG_ENV = (
+    {"CLAUDE_CONFIG_DIR": str(CLAUDE_CONFIG_DIR)} if os.environ.get("CLAUDE_CONFIG_DIR") else {}
+)
 STATE_DIR = Path(
     os.environ.get("TELEGRAM_STATE_DIR")
     or str(AGENT_ROOT / ".claude/channels/telegram")
@@ -128,18 +135,18 @@ def looks_like_code(text: str) -> bool:
     return bool(re.fullmatch(r"[A-Za-z0-9_#\-\.]{15,}", text))
 
 
+def login_environment() -> dict:
+    """The environment of every CLI call of this flow: the bot's own config location."""
+    return {**os.environ, "HOME": str(HOME), **CLI_CONFIG_ENV, "ATARAX_SUPPRESS_TELEGRAM": "1"}
+
+
 def _auth_status() -> dict | None:
     """`claude auth status` as JSON; None when blocked, malformed or timed out."""
     try:
         probe = subprocess.run(
             [str(CLAUDE_BIN), "auth", "status"],
             capture_output=True, text=True, timeout=25,
-            env={
-                **os.environ,
-                "HOME": str(HOME),
-                "CLAUDE_CONFIG_DIR": str(CLAUDE_CONFIG_DIR),
-                "ATARAX_SUPPRESS_TELEGRAM": "1",
-            },
+            env=login_environment(),
         )
         out = (probe.stdout or "") + (probe.stderr or "")
         # Хук no-nested-claude-guard блокує виклик і повертає свій текст замість
@@ -552,7 +559,10 @@ def acquire_lock() -> int | None:
 
 
 def wait_code_from_owner(chat: str, since_ms: int, state: str = "",
-                         switching_from: str = "", manual_target: bool = False) -> str | None:
+                         switching_from: str = "", manual_target: bool = False,
+                         switching: bool | None = None) -> str | None:
+    if switching is None:
+        switching = bool(switching_from)
     deadline = time.time() + CODE_TIMEOUT_S
     while time.time() < deadline:
         if manual_target and not manual_relogin_chat(chat):
@@ -562,8 +572,9 @@ def wait_code_from_owner(chat: str, since_ms: int, state: str = "",
         # false "still logged out / link expired" alert ten minutes later.
         # During an account switch the old login is alive by definition: only
         # a different account means someone else completed a login meanwhile.
-        if switching_from:
-            if auth_email() not in ("", switching_from):
+        # With no address known for the old login, nothing can prove another one: wait for the code.
+        if switching:
+            if switching_from and auth_email() not in ("", switching_from):
                 return None
         elif logged_in():
             return None
@@ -591,17 +602,17 @@ def wait_code_from_owner(chat: str, since_ms: int, state: str = "",
 
 
 def login_outcome(switching_from: str, switched_to: str, warn: str,
-                  show_identity: bool = True) -> tuple[str, str]:
+                  show_identity: bool = True, switching: bool | None = None) -> tuple[str, str]:
     """The owner's message and the log line for a login that landed. Only a distinct account
     is a switch: the same one, or one we could not identify, keeps its limit (Codex, task 48 P2).
     Only the owner's chat sees account identities, as everywhere else in this flow."""
     queued = "Службу перезапущено, збережені запити залишаються в черзі." + warn
-    if not switching_from:
+    if not (bool(switching_from) if switching is None else switching):
         return "✅ Вхід у Claude відновлено. " + queued, "rescue OK, transport verified"
     if distinct_account(switching_from, switched_to):
         return (f"✅ Обліковий запис Claude змінено: тепер {switched_to if show_identity else 'новий вхід'}. " + queued,
                 "account switched, transport verified")
-    if switched_to == switching_from:
+    if switching_from and switched_to == switching_from:
         return (f"✅ Вхід виконано, але це той самий обліковий запис Claude ({switched_to if show_identity else 'приховано'}): якщо його "
                 "ліміт вичерпано, відповіді підуть після скидання. " + queued,
                 "same account logged in again, transport verified")
@@ -665,14 +676,16 @@ def main(force: bool = False, chat_override: str | None = None) -> int:
     # weekly limit, a shared login). Nothing below may read `loggedIn` as
     # "done": the old account answers `loggedIn: true` until the new one lands.
     switching_from = auth_email() if force else ""
-    log("account switch requested — starting login flow" if switching_from
+    # Арти, 02.10.2026: a live login can answer `loggedIn: true` with no account address. The
+    # owner's /relogin is an account switch then too. Taken for a dead login, the first liveness
+    # check ended it as «restored by another flow»: the link died three seconds after it was
+    # sent, the service restarted, and the pasted code was never read.
+    switching = bool(switching_from) or (force and logged_in() is True)
+    log("account switch requested — starting login flow" if switching
         else "auth dead — starting rescue flow")
     pid, fd = pty.fork()
     if pid == 0:
-        os.environ["HOME"] = str(HOME)
-        os.environ["CLAUDE_CONFIG_DIR"] = str(CLAUDE_CONFIG_DIR)
-        os.environ["ATARAX_SUPPRESS_TELEGRAM"] = "1"
-        os.execv(str(CLAUDE_BIN), [str(CLAUDE_BIN), "auth", "login", "--claudeai"])
+        os.execve(str(CLAUDE_BIN), [str(CLAUDE_BIN), "auth", "login", "--claudeai"], login_environment())
 
     output = b""
     url = ""
@@ -707,9 +720,10 @@ def main(force: bool = False, chat_override: str | None = None) -> int:
         log("manual relogin recipient revoked before link delivery")
         return 1
     publish_auth_input(chat, state, since_ms)
-    if switching_from:
+    if switching:
+        current = f" ({switching_from if show_account_identity else 'приховано'})" if switching_from else ""
         send(token, chat,
-             f"🔐 Перемикаю обліковий запис Claude за твоєю командою. Поточний вхід ({switching_from if show_account_identity else 'приховано'}) "
+             f"🔐 Перемикаю обліковий запис Claude за твоєю командою. Поточний вхід{current} "
              "працює, доки не завершиш новий:\n"
              "1) Відкрий посилання нижче та увійди до ПОТРІБНОГО облікового запису Claude.\n"
              "2) Скопіюй код зі сторінки.\n"
@@ -728,7 +742,8 @@ def main(force: bool = False, chat_override: str | None = None) -> int:
              "/relogin, і я відразу надішлю свіже (скільки завгодно разів).")
     log("oauth url sent to authorized chat; waiting for code")
 
-    code = wait_code_from_owner(chat, since_ms, state, switching_from, chat_override is not None)
+    code = wait_code_from_owner(chat, since_ms, state, switching_from, chat_override is not None,
+                                switching=switching)
     if code is None:
         try:
             os.kill(pid, signal.SIGKILL)
@@ -740,7 +755,7 @@ def main(force: bool = False, chat_override: str | None = None) -> int:
             success_message=(
                 f"✅ Обліковий запис Claude вже змінено іншим способом: тепер {(auth_email() or 'новий вхід') if show_account_identity else 'новий вхід'}. "
                 "Службу перезапущено, збережені запити залишаються в черзі."
-                if switching_from else
+                if switching else
                 "✅ Вхід у Claude вже відновлено іншим способом. "
                 "Службу перезапущено, збережені запити залишаються в черзі."
             ),
@@ -771,6 +786,19 @@ def main(force: bool = False, chat_override: str | None = None) -> int:
                     break
             except OSError:
                 break
+    if not landed:
+        # The terminal closes when the login process ends, and that read leaves the loop before
+        # the exit status is collected (Арти, 02.10.2026: an accepted code was called rejected and
+        # the service was not restarted). Collect it here; a process still running proves nothing.
+        for _ in range(50):
+            try:
+                done, status = os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                break
+            if done == pid:
+                landed = os.waitstatus_to_exitcode(status) == 0
+                break
+            time.sleep(0.2)
 
     if not logged_in():
         # old CLIs ignore the stdin paste — their login waits on a loopback port
@@ -790,9 +818,9 @@ def main(force: bool = False, chat_override: str | None = None) -> int:
                     break
                 time.sleep(5)
 
-    switched_to = auth_email() if switching_from else ""
-    if switching_from:
-        succeeded = landed or switched_to not in ("", switching_from)
+    switched_to = auth_email() if switching else ""
+    if switching:
+        succeeded = landed or (bool(switching_from) and switched_to not in ("", switching_from))
     else:
         succeeded = bool(logged_in())
     if succeeded:
@@ -800,7 +828,8 @@ def main(force: bool = False, chat_override: str | None = None) -> int:
         warn = (f"\n⚠️ У {ENV_FILE if show_account_identity else 'налаштуваннях'} залишився {zombies} — старий токен перекриває "
                 "нову авторизацію (бот отримає 401). Видали цей рядок і перезапусти мене."
                 if zombies else "")
-        success_message, success_log = login_outcome(switching_from, switched_to, warn, show_account_identity)
+        success_message, success_log = login_outcome(switching_from, switched_to, warn, show_account_identity,
+                                                     switching=switching)
         return finish_recovery(
             token,
             chat,
@@ -811,10 +840,10 @@ def main(force: bool = False, chat_override: str | None = None) -> int:
             account_switched=distinct_account(switching_from, switched_to),
         )
 
-    if switching_from:
+    if switching:
         send(token, chat,
              "❌ Код не підійшов (або надісланий із зайвим текстом). "
-             f"Залишаюся на {switching_from if show_account_identity else 'попередньому вході'}. "
+             f"Залишаюся на {switching_from if switching_from and show_account_identity else 'попередньому вході'}. "
              "Напиши /relogin — надішлю свіже посилання, спробуємо ще раз.")
         log("code rejected — account unchanged")
         return 1

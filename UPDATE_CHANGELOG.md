@@ -1,8 +1,8 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-10-02.49ca2217008b`
+- Реліз: `2026-10-02.6d90af302382`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `49ca2217008b6865cbd960895f728e36860f5617`
+- Ревізія вихідного комплекту: `6d90af3023821eac20325c379f5ccb1c16531420`
 - Дата релізу: `2026-10-02`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
@@ -19,12 +19,11 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    Point to the CLI's saved context only when it is cut; keep a language warning by age
-    Judge a reply's language only against the request it certainly answers, once
-    Budget every part of the injected context, and keep the chat block closed
-    Stop a reply written wholly in another script than the person's message
-    Give a backup the snapshot helper's maximum for database passes
-    Keep the injected chat context within what the CLI passes on whole
+    Keep the bot's account record in step with a /relogin
+    Do not call an accepted login code rejected
+    Let go only of the CLI's own background task, never of a worker's callback
+    Let /relogin switch accounts when Claude does not name the current one
+    Keep answering after the CLI moves a slow tool call to the background
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не

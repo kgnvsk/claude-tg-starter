@@ -1908,7 +1908,29 @@ def native_request_events(events: list[dict], turn_events: list[dict], delivery_
     return scope
 
 
-def native_background_work(events: list[dict], turn_events: list[dict], delivery_id: str | None) -> dict:
+def clis_own_tool_call_task(hook: dict, task_id: str) -> bool:
+    """True for a tool call the CLI moved to the background itself, which no request registered.
+
+    Арти, 02.10.2026: the CLI moved a Telegram reply that was uploading two 49 MB videos to the
+    background and reported its failure in a task notice with no tool-use ID. Read as a worker's
+    callback nobody owned, it refused Stop twice after the answer had gone out. The CLI names
+    that kind of task «k» and eight characters; a worker's callback of any other shape, and
+    anything the ledger cannot answer for sure, stays a callback as before.
+    """
+    session = hook.get('session_id')
+    if not session or not re.fullmatch(r'k[0-9a-z]{8}', task_id):
+        return False
+    try:
+        with closing(sqlite3.connect(f"file:{telegram_state_dir() / 'messages.db'}?mode=ro",
+                                     uri=True, timeout=0.2)) as conn:
+            return conn.execute('SELECT 1 FROM delivery_task_owners WHERE session_id=? AND task_id=? LIMIT 1',
+                                (session, task_id)).fetchone() is None
+    except sqlite3.Error:
+        return False
+
+
+def native_background_work(events: list[dict], turn_events: list[dict], delivery_id: str | None,
+                           no_worker=None) -> dict:
     """Only native launch receipts and read callbacks describe background work.
 
     A successful Monitor/async tool_result confirms a launch, not its result.
@@ -2006,6 +2028,9 @@ def native_background_work(events: list[dict], turn_events: list[dict], delivery
             task = re.search(r'<task-id>([A-Za-z0-9_-]{1,128})</task-id>', text)
             bound = tasks.get(task.group(1)) if task else None
             tool = re.search(r'<tool-use-id>([^<]+)</tool-use-id>', text)
+            if task and not tool and not bound and no_worker is not None and no_worker(task.group(1)):
+                # A tool call the CLI moved to the background itself: not a worker of any request.
+                continue
             if re.search(r'<status>killed</status>', text):
                 # An agent Claude stopped: the notice confirms the stop of that exact
                 # launch and carries no result. It closes the task like TaskStop and
@@ -2712,7 +2737,8 @@ def evaluate_stop(hook: dict) -> None:
     chat_id, thread_id, general_topic = scope
     delivery_id = telegram_delivery_id(prompt, origin)
 
-    native_work = native_background_work(events, turn_events, delivery_id)
+    native_work = native_background_work(events, turn_events, delivery_id,
+                                         lambda task_id: clis_own_tool_call_task(hook, task_id))
     request_less = request_less_tasks(hook, native_work['pending'])
     if request_less:
         native_work['pending'] = [task for task in native_work['pending'] if task not in request_less]

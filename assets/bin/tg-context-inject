@@ -300,6 +300,12 @@ def claim_telegram_delivery(prompt: str, data: dict) -> bool:
             conn.close()
 
 
+# The ID the CLI gives a tool call it moved to the background (its kind «mcp_task»): «k» and eight
+# characters, as the CLI's own table of task kinds has it (b command, a agent, m monitor, k this one).
+# No request launches such a task, and it cannot be registered before its notice names it.
+CLI_TOOL_CALL_TASK = re.compile(r"k[0-9a-z]{8}")
+
+
 def task_notification_id(prompt: str) -> str | None:
     # Only a native notification envelope is eligible. In particular, never
     # search within a channel body, quoted text, or another plugin's envelope.
@@ -333,6 +339,16 @@ def return_callback(conn: sqlite3.Connection, session_id: str, stamp: str, turn_
         "SELECT delivery_id, state, launch_ref, occurrence, launched_turn FROM delivery_task_owners "
         "WHERE session_id=? AND stamp=? AND task_id=?", (session_id, stamp, task_id),
     ).fetchone()
+    if launch is None and owner is None and CLI_TOOL_CALL_TASK.fullmatch(task_id) and not conn.execute(
+            "SELECT 1 FROM delivery_task_owners WHERE session_id=? AND task_id=? LIMIT 1", (session_id, task_id)).fetchone():
+        # Арти, 02.10.2026: a reply with two 49 MB videos outlasted the 120 s an MCP call may stay
+        # silent. The CLI had moved the call to the background as a task of its own and reported
+        # its failure in this same envelope. Written down as a worker's return nobody could place,
+        # it made the receiver demand a delivery_id of the next reply, the guard refuse Stop, and
+        # the sweep keep an answered request at the head of the queue. A worker's callback that
+        # names no tool call and has no owner (a registration that failed, a callback restored
+        # after a restart) is still recorded: only the CLI's own kind is let go.
+        return []
     exact = owner is not None and owner[1] in ("owned", "unowned") and (
         owner[2] == launch if owner[2] is not None else owner[1] == "owned")
     if re.search(r"<status>killed</status>", prompt):
