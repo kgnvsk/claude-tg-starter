@@ -1089,6 +1089,21 @@ semantic["remindAfterDays"] = 0
 path.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 PY
 
+# The agent's crontab, or nothing when it has none yet. Any other failure of the read stops the caller:
+# a write after it would leave the owner's own schedule replaced by the kit's lines alone.
+agent_crontab() {
+  local listing problem status=0
+  problem="$(mktemp)"
+  listing="$(LC_ALL=C crontab -u "$AGENT_USER" -l 2>"$problem")" || status=$?
+  if [ "$status" -ne 0 ] && ! grep -qi 'no crontab for' "$problem"; then
+    echo "FATAL: розклад користувача $AGENT_USER не прочитано, тому не змінюю його: $(tr '\n' ' ' < "$problem")" >&2
+    rm -f "$problem"
+    return 1
+  fi
+  rm -f "$problem"
+  [ "$status" -ne 0 ] || printf '%s\n' "$listing"
+}
+
 install_managed_crontab() {
   # Ubuntu cron ignores CRON_TZ: the header below only documents intent, the
   # schedule follows the system clock, so daily jobs on a UTC box fire hours
@@ -1104,7 +1119,7 @@ install_managed_crontab() {
     fi
   fi
   local existing_crontab unmanaged_crontab
-  existing_crontab="$(crontab -u "$AGENT_USER" -l 2>/dev/null || true)"
+  existing_crontab="$(agent_crontab)" || return 1
   # Boxes installed before the managed markers existed still carry those same
   # entries outside the block, so rewriting the block leaves a second copy behind
   # and every job runs twice — Cash was firing reminders, the watchdog, vault-sync,
@@ -1166,7 +1181,7 @@ managed_crontab_block() {
 # owner-customized crontab in the middle of an update transaction.
 add_missing_managed_jobs() {
   local existing missing
-  existing="$(crontab -u "$AGENT_USER" -l 2>/dev/null || true)"
+  existing="$(agent_crontab)" || return 1
   if ! printf '%s\n' "$existing" | grep -Fxq '# BEGIN claude-tg-starter'; then
     echo "      керований блок знято на час обслуговування — crontab не змінюю"
     return 0
@@ -1228,7 +1243,7 @@ drop_retired_managed_jobs() {
 # run leaves retired lines untouched, even when the managed block is present.
 remove_retired_managed_jobs() {
   local existing pruned
-  existing="$(crontab -u "$AGENT_USER" -l 2>/dev/null || true)"
+  existing="$(agent_crontab)" || return 1
   printf '%s\n' "$existing" | grep -Fxq '# BEGIN claude-tg-starter' || return 0
   pruned="$(printf '%s\n' "$existing" | drop_retired_managed_jobs)"
   [ "$pruned" != "$existing" ] || return 0

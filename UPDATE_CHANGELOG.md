@@ -1,9 +1,9 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-10-01.03f6e71697c7`
+- Реліз: `2026-10-02.6d47f4ebd938`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `03f6e71697c7ec7e11e6c2c78fb80c155976172a`
-- Дата релізу: `2026-10-01`
+- Ревізія вихідного комплекту: `6d47f4ebd938c6a63815c198c9c3d69c6ebcab51`
+- Дата релізу: `2026-10-02`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
 
@@ -19,19 +19,14 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    The sweep asks each ledger column only of a ledger that has it
-    Tests: a late rejection overwrites neither a newer reservation nor a newer marker
-    Tests: every terminal state lets its late worker go; the edges around the two exemptions still refuse
-    A refused Stop still lets an answered request leave the queue
-    Test that a refused Stop still lets an answered request leave the queue (red)
-    The sweep retires an answered request whatever workers of others returned meanwhile
-    Test that the sweep retires an answered request whatever workers of others returned meanwhile (red)
-    A limit notice saves what it says with its reservation, before the network
-    Test that a follow-up cut off in flight is not sent again, and that one Telegram rejected is still owed (red)
-    A returned worker nobody can answer for no longer holds Stop or the queue under guard and shadow
-    Test that a returned worker nobody can answer for does not hold the next request (red)
-    A limit is read past the CLI's own notes; its time is told once it is known; the queue waits out the reset margin
-    Test that a limit is read past the CLI's own notes, its time is told once it is known, and the queue waits out the reset margin (red)
+    Approve kit-module in the runtime validator, so an install that ships it passes step 2
+    Give a person their rights before their chat, never pause from the owner's request, scope the guide to its engine
+    Leave brag-slim listed with its description; follow the receiver's new record in the Instagram test
+    Ship the MIT skill brag-slim with Premium as a second pinned outside source
+    Read a config as the kit's reader does, protect the built bridge, prove the receiver before signalling it; guide access
+    Test that no native payload carries a skill naming a module helper it lacks
+    Make a module setup safe to repeat: keep the owner's files, schedule and config
+    Tell every agent about each feature its product declares, and let it set the module up itself
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не

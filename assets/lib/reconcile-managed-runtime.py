@@ -58,6 +58,7 @@ MANAGED_BIN_NAMES = frozenset(
         "html-to-pdf",
         "hubspot-crm",
         "install-plugins",
+        "kit-module",
         "learning-review",
         "media-dl",
         "meet-bot",

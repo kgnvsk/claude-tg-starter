@@ -15,6 +15,7 @@
     "asana-tasks",
     "auto-publisher",
     "backup-recovery",
+    "brag-slim",
     "brand-fonts",
     "business-systems-integration",
     "channel-publishing",
@@ -47,6 +48,7 @@
     "hyperframes-registry",
     "image",
     "influencer-marketing",
+    "instagram-dm",
     "launch",
     "marketing-council",
     "marketing-ideas",
@@ -58,6 +60,7 @@
     "motion-graphics",
     "music-to-video",
     "offers",
+    "personal-inbox",
     "pm-assistant",
     "pr-to-video",
     "pricing",
@@ -76,10 +79,13 @@
     "spreadsheets",
     "sql-readonly",
     "talking-head-recut",
+    "team-access",
     "tender-watch",
+    "vault-web",
     "vercel-deploy",
     "video",
     "video-craft",
-    "web-report"
+    "web-report",
+    "youtube-comments"
   ]
 }

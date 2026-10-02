@@ -1,0 +1,112 @@
+#!/bin/bash
+# kit-module — підключити необов'язковий модуль цього продукту самому агентові, без root.
+#
+#   kit-module list                  які модулі є в комплекті й файли яких уже поставлено тут
+#   kit-module setup <назва> [арг]   запустити власне налаштування модуля (можна повторювати)
+#   kit-module path <назва>          каталог модуля в комплекті — там його SETUP.md / README.md
+#
+# Комплект належить root і лише читається. Налаштування пише тільки в дім цього користувача:
+# помічники в ~/bin, стан, власний crontab. Що потрібно від власника — у скілі модуля.
+set -euo pipefail
+
+KIT=/opt/claude-tg-starter
+# Кожен агент має власний каталог комплекту: основний /opt/claude-tg-starter,
+# решта /opt/claude-tg-starter@<користувач>. Каталог основного служить іншому
+# агенту лише до його першого власного оновлення й лише для того самого продукту.
+user="$(id -un)"
+if [ -n "${KIT_MODULE_KIT:-}" ]; then
+  KIT="$KIT_MODULE_KIT"
+elif [ "$user" != claude ]; then
+  own="$KIT@$user"
+  if [ -d "$own" ] && [ ! -L "$own" ]; then
+    KIT="$own"
+  else
+    for candidate in "$own" "$own.new" "$own.prev"; do
+      if [ -e "$candidate" ] || [ -L "$candidate" ]; then
+        echo "Комплект цього агента зараз замінюється; спробуй за кілька хвилин." >&2
+        exit 1
+      fi
+    done
+    if ! python3 - "$KIT" "$HOME/.claude/product/runtime.json" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+
+def product(path):
+    path = Path(path)
+    candidates = (path / "PRODUCT.json", path / "assets/product/runtime.json") if path.is_dir() else (path,)
+    for candidate in candidates:
+        try:
+            value = json.loads(candidate.read_text(encoding="utf-8")).get("productId")
+        except FileNotFoundError:
+            continue
+        except (OSError, UnicodeError, ValueError, AttributeError):
+            return None
+        return value if isinstance(value, str) and value else None
+    return None
+
+
+kit, home = product(sys.argv[1]), product(sys.argv[2])
+raise SystemExit(0 if kit is not None and kit == home else 1)
+PY
+    then
+      echo "Комплекту цього агента на сервері немає; модулі недоступні." >&2
+      exit 1
+    fi
+  fi
+fi
+
+STATE="$HOME/.claude/product/modules"
+name_ok() { [[ "$1" =~ ^[a-z][a-z0-9-]{0,40}$ ]]; }
+module_dir() {
+  name_ok "$1" || { echo "Назва модуля — малі латинські літери, цифри й дефіс." >&2; return 2; }
+  [ -f "$KIT/modules/$1/setup.sh" ] || {
+    echo "У цьому продукті немає модуля «$1». Наявні: $(available | tr '\n' ' ')" >&2
+    return 3
+  }
+  printf '%s\n' "$KIT/modules/$1"
+}
+available() {
+  local dir
+  for dir in "$KIT"/modules/*/; do
+    [ -f "$dir/setup.sh" ] && basename "$dir"
+  done 2>/dev/null || true
+}
+release() {
+  python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8")).get("releaseId", ""))' "$KIT/RELEASE.json" 2>/dev/null || true
+}
+
+case "${1:-}" in
+  list)
+    current="$(release)"
+    for name in $(available); do
+      if [ -f "$STATE/$name" ]; then
+        # Запис каже лише, що файли модуля поставлено і з якого випуску; чи підключено акаунт — каже перевірка в скілі.
+        recorded="$(cat "$STATE/$name")"
+        newer=""
+        [ -z "$current" ] || [ "${recorded%% · *}" = "$current" ] || newer="; комплект уже $current — онови тим самим setup, коли буде зручно"
+        echo "$name — поставлено ($recorded)$newer"
+      else
+        echo "$name — у комплекті, ще не поставлено"
+      fi
+    done
+    ;;
+  path)
+    module_dir "${2:-}"
+    ;;
+  setup)
+    [ "$(id -u)" -ne 0 ] || { echo "Запусти під користувачем агента, не root." >&2; exit 1; }
+    dir="$(module_dir "${2:-}")"
+    name="$2"
+    shift 2
+    bash "$dir/setup.sh" "$@"
+    install -d -m 700 "$STATE"
+    current="$(release)"
+    printf '%s\n' "${current:-невідомий випуск} · $(date -u +%Y-%m-%dT%H:%MZ)" > "$STATE/$name"
+    ;;
+  *)
+    sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'
+    exit 2
+    ;;
+esac
