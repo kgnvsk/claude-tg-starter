@@ -94,8 +94,8 @@ OWNER_EMAIL="${OWNER_EMAIL:-}"
 VAULT_LOCALE="${VAULT_LOCALE:-en-US}"
 OWNER_NOTICE_LOCALE="${OWNER_NOTICE_LOCALE:-uk}"
 case "$OWNER_NOTICE_LOCALE" in
-  uk|ru) ;;
-  *) echo "FATAL: OWNER_NOTICE_LOCALE має бути uk або ru" >&2; exit 1 ;;
+  uk|ru|pl|en) ;;
+  *) echo "FATAL: OWNER_NOTICE_LOCALE має бути uk, ru, pl або en" >&2; exit 1 ;;
 esac
 if [ -z "${VOICE_SETUP_STATUS:-}" ]; then
   if [ -n "$OPENAI_API_KEY" ]; then

@@ -39,6 +39,7 @@ from contextlib import closing, contextmanager
 import fcntl
 import os
 import pty
+import pwd
 import re
 import select
 import signal
@@ -47,9 +48,16 @@ import stat
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
+
+_NOTICE_SPEC = importlib.util.spec_from_file_location(
+    "agent_notice_locale", Path(__file__).with_name("agent_notice_locale.py")
+)
+_NOTICE_MODULE = importlib.util.module_from_spec(_NOTICE_SPEC)
+_NOTICE_SPEC.loader.exec_module(_NOTICE_MODULE)
 
 HOME = Path(os.environ.get("HOME", "/home/claude"))
 AGENT_ROOT = Path(os.environ.get("AGENT_ROOT", str(HOME)))
@@ -108,6 +116,11 @@ def log(message: str) -> None:
     LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
     with LOG_FILE.open("a", encoding="utf-8") as handle:
         handle.write(f"{time.strftime('%F %T')} {message}\n")
+
+
+def say(key: str, ukrainian: str, **values: str) -> str:
+    """The owner's text in the agent's notice language (OWNER_NOTICE_LOCALE), Ukrainian by default."""
+    return _NOTICE_MODULE.notice_text(key, ukrainian, home=AGENT_ROOT).format(**values)
 
 
 def mark_auth_established() -> None:
@@ -202,7 +215,70 @@ def env_token_zombies() -> str:
         return ""
 
 
+def _proc_starttime(pid: int) -> str | None:
+    """The kernel's start time of a process (/proc/<pid>/stat field 22): a reused PID has another one."""
+    try:
+        text = (PROC_ROOT / str(pid) / "stat").read_text(encoding="utf-8", errors="replace")
+        return text[text.rfind(")") + 2:].split()[19]
+    except (OSError, IndexError):
+        return None
+
+
+def _receiver_state_dir(environ: dict[bytes, bytes]) -> str | None:
+    """The state folder a receiver started with this environment uses, or None when it is not an absolute path.
+
+    The receiver's own rule (telegram-server-fixed.ts): TELEGRAM_STATE_DIR when set, even to an empty or
+    foreign value, else <CLAUDE_CONFIG_DIR or ~/.claude>/channels/telegram, ~ being HOME or the user's
+    home from the password file.
+    """
+    state = environ.get(b"TELEGRAM_STATE_DIR")
+    if state is None:
+        config = environ.get(b"CLAUDE_CONFIG_DIR")
+        if config is None:
+            home = environ.get(b"HOME")
+            config = os.path.join(os.fsdecode(home) if home is not None else pwd.getpwuid(os.getuid()).pw_dir,
+                                  ".claude")
+        state = os.path.join(os.fsdecode(config), "channels", "telegram")
+    state = os.fsdecode(state)
+    return state if os.path.isabs(state) else None
+
+
+def poller_token() -> str:
+    """TELEGRAM_BOT_TOKEN of this agent's own live poller, or "" unless every check holds.
+
+    The process is the canonical poller (bot.pid, this uid, bun server.ts), the
+    state folder its environment gives the receiver is ours, and after its
+    environment was read it is still the same process: bot.pid names it and its
+    start time is unchanged (Codex AGENTS 03.10, #175). A shared plugins folder
+    or working directory proves nothing about which bot a process serves.
+    Nothing about the token is ever logged.
+    """
+    pid = _canonical_poller_pid()
+    started = _proc_starttime(pid) if pid else None
+    if not started:
+        return ""
+    try:
+        environ = dict(item.split(b"=", 1) for item in (PROC_ROOT / str(pid) / "environ").read_bytes().split(b"\0")
+                       if b"=" in item)
+    except OSError:
+        return ""
+    state = _receiver_state_dir(environ)
+    ours = state is not None and os.path.realpath(state) == os.path.realpath(STATE_DIR)
+    token = environ.get(b"TELEGRAM_BOT_TOKEN", b"").decode("utf-8", "replace").strip()
+    if not ours or not token or _canonical_poller_pid() != pid or _proc_starttime(pid) != started:
+        return ""
+    return token
+
+
 def bot_token() -> str:
+    """The token this agent's live poller runs with; the channel file only when that cannot be proven.
+
+    CMO Bro, 03.10.2026: the channel file held a stale token (401) while the
+    poller ran with a valid one from its own environment, so every link was lost.
+    """
+    token = poller_token()
+    if token:
+        return token
     for line in ENV_FILE.read_text(encoding="utf-8").splitlines():
         if line.startswith("TELEGRAM_BOT_TOKEN="):
             return line.split("=", 1)[1].strip()
@@ -248,29 +324,50 @@ def manual_relogin_chat(chat: str) -> bool:
         return False
 
 
-def send(token: str, chat: str, text: str) -> None:
+def send(token: str, chat: str, text: str) -> str:
+    """"delivered" when Telegram said ok; "refused" when it said no (HTTP 4xx or ok=false: nothing was
+    sent); "unconfirmed" when no answer came back — the message may have arrived (Codex AGENTS 03.10,
+    #175 P1-1). The reason is logged; the token never is."""
     body = urllib.parse.urlencode({"chat_id": chat, "text": text}).encode()
     req = urllib.request.Request(
         f"https://api.telegram.org/bot{token}/sendMessage", data=body
     )
     try:
         with urllib.request.urlopen(req, timeout=15) as response:
-            delivered = json.loads(response.read()).get("ok") is True
-        if delivered:
-            try:
-                subprocess.run(
-                    [str(AGENT_ROOT / "bin/tg-fallback-outbound"), chat],
-                    check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                    timeout=5,
-                )
-            except (OSError, subprocess.TimeoutExpired):
-                log("auth reply delivered but outbound receipt failed")
+            answer = json.loads(response.read())
+    except urllib.error.HTTPError as error:
+        try:
+            reason = str(json.loads(error.read()).get("description", ""))
+        except Exception:
+            reason = ""
+        log(f"send failed: HTTP {error.code} {reason[:120]}".rstrip())
+        return "refused" if 400 <= error.code < 500 else "unconfirmed"
     except Exception as error:
-        log(f"send failed: {type(error).__name__}")
+        log(f"send unconfirmed: {type(error).__name__}")
+        return "unconfirmed"
+    if not isinstance(answer, dict):
+        log("send unconfirmed: an answer that is not Telegram's")
+        return "unconfirmed"
+    if answer.get("ok") is not True:
+        log(f"send failed: Telegram refused: {str(answer.get('description', ''))[:120]}")
+        return "refused"
+    try:
+        subprocess.run(
+            [str(AGENT_ROOT / "bin/tg-fallback-outbound"), chat],
+            check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        log("auth reply delivered but outbound receipt failed")
+    return "delivered"
 
 
 def canonical_poller_alive() -> bool:
-    """Prove bot.pid names this user's live Bun server.ts process.
+    return _canonical_poller_pid() is not None
+
+
+def _canonical_poller_pid() -> int | None:
+    """Prove bot.pid names this user's live Bun server.ts process; its PID, or None.
 
     A bare PID existence check is unsafe because stale PIDs can be reused. The
     Telegram server owns bot.pid and removes it on clean shutdown, while /proc
@@ -279,13 +376,13 @@ def canonical_poller_alive() -> bool:
     try:
         metadata = BOT_PID_FILE.lstat()
         if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid():
-            return False
+            return None
         raw = BOT_PID_FILE.read_text(encoding="ascii").strip()
         if not raw.isdigit():
-            return False
+            return None
         pid = int(raw)
         if pid <= 1:
-            return False
+            return None
         os.kill(pid, 0)
 
         process = PROC_ROOT / str(pid)
@@ -294,19 +391,19 @@ def canonical_poller_alive() -> bool:
             line for line in status.splitlines() if line.startswith("Uid:")
         )
         if int(uid_line.split()[1]) != os.getuid():
-            return False
+            return None
 
         executable = Path(os.readlink(process / "exe")).name
         if executable not in {"bun", "bun.exe"}:
-            return False
+            return None
         arguments = [
             value.decode("utf-8", errors="replace")
             for value in (process / "cmdline").read_bytes().split(b"\0")
             if value
         ]
-        return any(Path(argument).name == "server.ts" for argument in arguments)
+        return pid if any(Path(argument).name == "server.ts" for argument in arguments) else None
     except (OSError, UnicodeDecodeError, ValueError, StopIteration):
-        return False
+        return None
 
 
 def wait_for_canonical_poller() -> bool:
@@ -501,7 +598,7 @@ def finish_recovery(
             released = release_limit_hold() if account_switched and recovered else 0
     except (OSError, sqlite3.Error, RuntimeError, subprocess.SubprocessError):
         log("auth restored but auth-control queue settlement failed; retained")
-        send(token, chat, "⚠️ Вхід відновлено, але черга ще потребує перевірки. Запити збережено.")
+        send(token, chat, say("auth.queue_unchecked", "⚠️ Вхід відновлено, але черга ще потребує перевірки. Запити збережено."))
         return 1
     if settled:
         log(f"settled {settled} auth-control deliveries; business requests preserved")
@@ -518,9 +615,10 @@ def finish_recovery(
     send(
         token,
         chat,
-        "⚠️ Авторизацію Claude відновлено, але Telegram-канал не запустився "
-        "після двох безпечних перезапусків. Відновлення не позначено завершеним — "
-        "потрібна перевірка каналу.",
+        say("auth.transport_failed",
+            "⚠️ Авторизацію Claude відновлено, але Telegram-канал не запустився "
+            "після двох безпечних перезапусків. Відновлення не позначено завершеним — "
+            "потрібна перевірка каналу."),
     )
     log("auth restored but Telegram poller failed after two restarts")
     return 1
@@ -556,6 +654,22 @@ def acquire_lock() -> int | None:
         os.close(descriptor)
         return None
     return descriptor
+
+
+def owner_wrote_since(since_ms: int) -> bool:
+    """The owner sent the bot a message after this moment (read-only; unread is no)."""
+    try:
+        chat = owner_chat()
+        conn = sqlite3.connect(f"file:{MESSAGES_DB}?mode=ro", uri=True, timeout=2)
+        try:
+            return conn.execute(
+                "SELECT 1 FROM messages WHERE chat_id=? AND direction='in' AND ts>? LIMIT 1",
+                (chat, since_ms),
+            ).fetchone() is not None
+        finally:
+            conn.close()
+    except Exception:
+        return False
 
 
 def wait_code_from_owner(chat: str, since_ms: int, state: str = "",
@@ -606,18 +720,20 @@ def login_outcome(switching_from: str, switched_to: str, warn: str,
     """The owner's message and the log line for a login that landed. Only a distinct account
     is a switch: the same one, or one we could not identify, keeps its limit (Codex, task 48 P2).
     Only the owner's chat sees account identities, as everywhere else in this flow."""
-    queued = "Службу перезапущено, збережені запити залишаються в черзі." + warn
+    queued = say("auth.queued", "Службу перезапущено, збережені запити залишаються в черзі.") + warn
     if not (bool(switching_from) if switching is None else switching):
-        return "✅ Вхід у Claude відновлено. " + queued, "rescue OK, transport verified"
+        return say("auth.restored", "✅ Вхід у Claude відновлено. ") + queued, "rescue OK, transport verified"
     if distinct_account(switching_from, switched_to):
-        return (f"✅ Обліковий запис Claude змінено: тепер {switched_to if show_identity else 'новий вхід'}. " + queued,
+        who = switched_to if show_identity else say("auth.new_login", "новий вхід")
+        return (say("auth.switched", "✅ Обліковий запис Claude змінено: тепер {who}. ", who=who) + queued,
                 "account switched, transport verified")
     if switching_from and switched_to == switching_from:
-        return (f"✅ Вхід виконано, але це той самий обліковий запис Claude ({switched_to if show_identity else 'приховано'}): якщо його "
-                "ліміт вичерпано, відповіді підуть після скидання. " + queued,
+        who = switched_to if show_identity else say("auth.hidden", "приховано")
+        return (say("auth.same_account", "✅ Вхід виконано, але це той самий обліковий запис Claude ({who}): якщо його "
+                    "ліміт вичерпано, відповіді підуть після скидання. ", who=who) + queued,
                 "same account logged in again, transport verified")
-    return ("✅ Вхід у Claude виконано, але не вдалося перевірити, який це обліковий запис, тому пауза "
-            "через ліміт, якщо вона була, лишається до скидання. " + queued,
+    return (say("auth.unverified", "✅ Вхід у Claude виконано, але не вдалося перевірити, який це обліковий запис, тому пауза "
+                "через ліміт, якщо вона була, лишається до скидання. ") + queued,
             "login landed, account unverified, transport verified")
 
 
@@ -651,15 +767,29 @@ def main(force: bool = False, chat_override: str | None = None) -> int:
         log("debounced")
         return 0
     # Manual retries bypass the cap but keep it consumed. If the owner ignores
-    # that link too, the next health tick still must not send another one.
+    # that link too, the next health tick still must not send another one —
+    # until the owner writes again: a link sent at night dies in ten minutes,
+    # and the owner's next message is when a fresh one is useful (03.10.2026).
+    # A cap taken before the last established login belongs to an outage that
+    # login ended (AALL, Лилу: capped since 28.09, no link on 03.10).
     if not force:
         try:
             _n = int(ATTEMPTS_FILE.read_text(encoding="ascii").strip() or "0")
+            capped_at = ATTEMPTS_FILE.stat().st_mtime
         except Exception:
-            _n = 0
+            _n, capped_at = 0, 0.0
         if _n >= AUTO_ATTEMPTS_CAP:
-            log(f"auto-rescue capped after {_n} attempts; waiting for /relogin")
-            return 0
+            try:
+                stale = AUTH_ESTABLISHED.stat().st_mtime > capped_at
+            except OSError:
+                stale = False
+            if stale:
+                log("auto-rescue cap of an earlier outage cleared: a login was established after it")
+            elif owner_wrote_since(int(capped_at * 1000)):
+                log("owner wrote after the last link; sending a fresh one")
+            else:
+                log(f"auto-rescue capped after {_n} attempts; waiting for /relogin or the owner's next message")
+                return 0
     ATTEMPTS_FILE.parent.mkdir(parents=True, exist_ok=True)
     ATTEMPTS_FILE.write_text(str(AUTO_ATTEMPTS_CAP), encoding="ascii")
     ATTEMPTS_FILE.chmod(0o600)
@@ -721,26 +851,39 @@ def main(force: bool = False, chat_override: str | None = None) -> int:
         return 1
     publish_auth_input(chat, state, since_ms)
     if switching:
-        current = f" ({switching_from if show_account_identity else 'приховано'})" if switching_from else ""
-        send(token, chat,
-             f"🔐 Перемикаю обліковий запис Claude за твоєю командою. Поточний вхід{current} "
+        current = (f" ({switching_from if show_account_identity else say('auth.hidden', 'приховано')})"
+                   if switching_from else "")
+        outcome = send(token, chat, say("auth.switch_link",
+             "🔐 Перемикаю обліковий запис Claude за твоєю командою. Поточний вхід{current} "
              "працює, доки не завершиш новий:\n"
              "1) Відкрий посилання нижче та увійди до ПОТРІБНОГО облікового запису Claude.\n"
              "2) Скопіюй код зі сторінки.\n"
              "3) Надішли мені сюди код ОДНИМ повідомленням (лише код, без слів).\n\n"
-             f"{url}\n\n"
+             "{url}\n\n"
              "⏳ Чекаю код 10 хвилин. Передумав — нічого не надсилай, усе залишиться як є. "
-             "Свіже посилання — командою /relogin.")
+             "Свіже посилання — командою /relogin.", current=current, url=url))
     else:
-        send(token, chat,
+        outcome = send(token, chat, say("auth.link",
              "🔐 Термін дії моєї авторизації Claude завершився. Віднови її за хвилину, без SSH:\n"
              "1) Відкрий посилання нижче та увійди до свого облікового запису Claude.\n"
              "2) Скопіюй код зі сторінки.\n"
              "3) Надішли мені сюди код ОДНИМ повідомленням (лише код, без слів).\n\n"
-             f"{url}\n\n"
+             "{url}\n\n"
              "⏳ Чекаю код 10 хвилин. Якщо не встигнеш або посилання втратить чинність — просто напиши мені "
-             "/relogin, і я відразу надішлю свіже (скільки завгодно разів).")
-    log("oauth url sent to authorized chat; waiting for code")
+             "/relogin, і я відразу надішлю свіже (скільки завгодно разів).", url=url))
+    if outcome == "refused":
+        os.kill(pid, signal.SIGKILL)
+        if not force:
+            try:
+                ATTEMPTS_FILE.unlink()
+            except OSError:
+                pass
+        log("oauth url NOT delivered (Telegram refused); the next attempt follows the debounce")
+        return 1
+    # An unconfirmed send may have reached the owner: the same flow keeps waiting for its code
+    # and the link is not sent again (Codex AGENTS 03.10, #175 P1-1).
+    log("oauth url sent to authorized chat; waiting for code" if outcome == "delivered"
+        else "oauth url send unconfirmed (it may have arrived); waiting for code")
 
     code = wait_code_from_owner(chat, since_ms, state, switching_from, chat_override is not None,
                                 switching=switching)
@@ -753,17 +896,24 @@ def main(force: bool = False, chat_override: str | None = None) -> int:
             token,
             chat,
             success_message=(
-                f"✅ Обліковий запис Claude вже змінено іншим способом: тепер {(auth_email() or 'новий вхід') if show_account_identity else 'новий вхід'}. "
-                "Службу перезапущено, збережені запити залишаються в черзі."
+                say("auth.switched_elsewhere", "✅ Обліковий запис Claude вже змінено іншим способом: тепер {who}. ",
+                    who=(auth_email() or say("auth.new_login", "новий вхід")) if show_account_identity
+                    else say("auth.new_login", "новий вхід"))
+                + say("auth.queued", "Службу перезапущено, збережені запити залишаються в черзі.")
                 if switching else
-                "✅ Вхід у Claude вже відновлено іншим способом. "
-                "Службу перезапущено, збережені запити залишаються в черзі."
+                say("auth.restored_elsewhere", "✅ Вхід у Claude вже відновлено іншим способом. ")
+                + say("auth.queued", "Службу перезапущено, збережені запити залишаються в черзі.")
             ),
             success_log="rescue completed by another login flow; transport verified",
             account_switched=distinct_account(switching_from, auth_email()),
         )
     if not code:
         os.kill(pid, signal.SIGKILL)
+        if not force:
+            try:
+                os.utime(ATTEMPTS_FILE)
+            except OSError:
+                pass
         log("code wait timeout")
         return 1
 
@@ -825,8 +975,10 @@ def main(force: bool = False, chat_override: str | None = None) -> int:
         succeeded = bool(logged_in())
     if succeeded:
         zombies = env_token_zombies()
-        warn = (f"\n⚠️ У {ENV_FILE if show_account_identity else 'налаштуваннях'} залишився {zombies} — старий токен перекриває "
-                "нову авторизацію (бот отримає 401). Видали цей рядок і перезапусти мене."
+        warn = (say("auth.zombie_warn", "\n⚠️ У {where} залишився {zombies} — старий токен перекриває "
+                    "нову авторизацію (бот отримає 401). Видали цей рядок і перезапусти мене.",
+                    where=str(ENV_FILE) if show_account_identity else say("auth.settings", "налаштуваннях"),
+                    zombies=zombies)
                 if zombies else "")
         success_message, success_log = login_outcome(switching_from, switched_to, warn, show_account_identity,
                                                      switching=switching)
@@ -841,15 +993,17 @@ def main(force: bool = False, chat_override: str | None = None) -> int:
         )
 
     if switching:
-        send(token, chat,
+        send(token, chat, say("auth.code_rejected_switch",
              "❌ Код не підійшов (або надісланий із зайвим текстом). "
-             f"Залишаюся на {switching_from if switching_from and show_account_identity else 'попередньому вході'}. "
-             "Напиши /relogin — надішлю свіже посилання, спробуємо ще раз.")
+             "Залишаюся на {who}. "
+             "Напиши /relogin — надішлю свіже посилання, спробуємо ще раз.",
+             who=switching_from if switching_from and show_account_identity
+             else say("auth.previous_login", "попередньому вході")))
         log("code rejected — account unchanged")
         return 1
-    send(token, chat,
+    send(token, chat, say("auth.code_rejected",
          "❌ Код не підійшов (або надісланий із зайвим текстом). "
-         "Напиши /relogin — надішлю свіже посилання, спробуємо ще раз.")
+         "Напиши /relogin — надішлю свіже посилання, спробуємо ще раз."))
     log("code rejected — still logged out")
     return 1
 

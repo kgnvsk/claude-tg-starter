@@ -38,6 +38,9 @@ ACCESS_FILE = STATE_DIR / "access.json"
 MESSAGES_DB = STATE_DIR / "messages.db"
 STATE_FILE = AGENT_ROOT / "logs/unstick-watch.state"
 RESTART_HOLD = AGENT_ROOT / "logs/restart-hold.until"
+# The hold this command wrote itself, by value: a second /unstick inside its fifteen minutes is the
+# owner asking again, not an update (Арти, 03.10.2026: «Зараз триває оновлення» while nothing was updating).
+RESTART_HOLD_BY_UNSTICK = AGENT_ROOT / "logs/restart-hold.unstick"
 LIFECYCLE_LOCK = AGENT_ROOT / "logs/transport-lifecycle.lock"
 LOG = AGENT_ROOT / "logs/healthcheck.log"
 SERVICE = os.environ.get("CLAUDE_TELEGRAM_SERVICE", "claude-telegram.service")
@@ -242,6 +245,13 @@ def restart_hold_active() -> bool:
     # or a planted symlink is not evidence of an update, and refusing on it
     # would strand him with no way back. Junk is replaced by the write below.
     if raw.isdigit() and len(raw) <= 10 and int(time.time()) < int(raw):
+        try:
+            ours = RESTART_HOLD_BY_UNSTICK.read_text(encoding="ascii").strip() == raw
+        except OSError:
+            ours = False
+        if ours:
+            note(f"/unstick: the hold until {raw} is an earlier /unstick's; the owner asked again")
+            return False
         note(f"/unstick: restart hold active until {raw} — refusing to restart")
         return True
     return False
@@ -337,7 +347,9 @@ def main() -> int:
 
         loops = recent_restarts()
         if needs_hold:
-            atomic_write_restart_hold(int(time.time()) + HOLD_SECONDS)
+            until = int(time.time()) + HOLD_SECONDS
+            atomic_write_private(RESTART_HOLD_BY_UNSTICK, str(until).encode("ascii"))
+            atomic_write_restart_hold(until)
             note(f"/unstick from authorized chat: holding automatic restarts {HOLD_SECONDS // 60}m, "
                  f"restarts in last 10m={loops}")
         else:

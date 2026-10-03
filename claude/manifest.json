@@ -7,7 +7,7 @@
     "local-foundation-v1"
   ],
   "source": "codex/starter/product.json",
-  "sourceRevision": "24a99e9132d0423fba455e26d1eadd6c3ee005e4",
+  "sourceRevision": "5915a8958b0a46c8708fb8b67b370cf24583c376",
   "sourceDirty": false,
   "features": [
     "browser"
@@ -76,7 +76,7 @@
     "assets/bin/agent-nightly-github-backup": "830e627cd7289fa644b4a7a2de58085c2f54bff6fbb21e32e02c81f5a4577c51",
     "assets/bin/agent-provider-run": "b0d5700a1a356231b9d5f264db1c08794ad5cc5e30b32b9f83eaed4d030660e2",
     "assets/bin/agent_connections.py": "83bc42d8140c5f4a0f623b8ae4e1eae2318a3134726f5c50fda202cce0b78296",
-    "assets/bin/agent_notice_locale.py": "fc6fce14c0c33992061623fb43bebfd9e0bc04678c2d4e60c6e0f17c2232c030",
+    "assets/bin/agent_notice_locale.py": "2030a15a84ad5aa99c89b8813e366031a345adc3de84cfc73f79446c251f729f",
     "assets/bin/browser-pdf.mjs": "8c5ef5cfe0f4110401353bb4e07196ea3c9b30e61b0a81ae70b27341337a3552",
     "assets/bin/gh": "eb68b88e4a852b27ac6554b6913f4165fefcf0588133dcc7746b239552623d3e",
     "assets/bin/learning-review": "7c61f7214dac384f1b284d33d9e4e31cf1d946f8a5dd7ba0853058136e920507",
@@ -176,7 +176,7 @@
     "home/bin/agent-nightly-github-backup": "830e627cd7289fa644b4a7a2de58085c2f54bff6fbb21e32e02c81f5a4577c51",
     "home/bin/agent-provider-run": "b0d5700a1a356231b9d5f264db1c08794ad5cc5e30b32b9f83eaed4d030660e2",
     "home/bin/agent_connections.py": "83bc42d8140c5f4a0f623b8ae4e1eae2318a3134726f5c50fda202cce0b78296",
-    "home/bin/agent_notice_locale.py": "fc6fce14c0c33992061623fb43bebfd9e0bc04678c2d4e60c6e0f17c2232c030",
+    "home/bin/agent_notice_locale.py": "2030a15a84ad5aa99c89b8813e366031a345adc3de84cfc73f79446c251f729f",
     "home/bin/browser-pdf.mjs": "8c5ef5cfe0f4110401353bb4e07196ea3c9b30e61b0a81ae70b27341337a3552",
     "home/bin/gh": "eb68b88e4a852b27ac6554b6913f4165fefcf0588133dcc7746b239552623d3e",
     "home/bin/learning-review": "7c61f7214dac384f1b284d33d9e4e31cf1d946f8a5dd7ba0853058136e920507",

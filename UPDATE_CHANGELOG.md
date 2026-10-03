@@ -1,8 +1,8 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-10-03.24a99e9132d0`
+- Реліз: `2026-10-03.5915a8958b0a`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `24a99e9132d0423fba455e26d1eadd6c3ee005e4`
+- Ревізія вихідного комплекту: `5915a8958b0a46c8708fb8b67b370cf24583c376`
 - Дата релізу: `2026-10-03`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
@@ -19,7 +19,11 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    Pin the persona sources of the 16.09, 22.09 and the seventh 23.09 kit
+    Take the poller token only when the state folder its environment gives the receiver is this agent's
+    Keep an unconfirmed link's flow waiting; take the poller token only from this agent's proven poller
+    A second /fix inside the first one's hold restarts instead of claiming an update
+    Read the rescue's owner texts through say() in the Ukrainian surfaces check
+    Get a working login link to the owner after a lost Claude login, in their language
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не

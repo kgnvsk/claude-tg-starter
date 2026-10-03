@@ -767,6 +767,9 @@ AUTH_STATUS=$(timeout 20 env HOME="$H" ATARAX_SUPPRESS_TELEGRAM=1 \
     $H/.local/bin/claude auth status 2>/dev/null || true)
 if printf '%s' "$AUTH_STATUS" | grep -Fq '"loggedIn": true'; then
     CLAUDE_AUTHENTICATED=true
+    # A live login ends the outage its automatic link belonged to, however it came back
+    # (link, /relogin, Novsky): the next outage gets a link of its own (AALL, Лилу 03.10).
+    rm -f "$H/.claude/auth-rescue-auto-attempts"
 else
     CLAUDE_AUTHENTICATED=false
     # No preamble: claude-auth-rescue below sends the login link itself, and the
