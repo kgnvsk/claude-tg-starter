@@ -20,6 +20,7 @@ note() { printf '==> %s\n' "$*"; }
 
 MODE=""
 SSH_ADMIN_USER="${SSH_ADMIN_USER:-root}"
+harden_arguments=("$@")
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --baseline) MODE=baseline ;;
@@ -53,15 +54,29 @@ SSH_PORT="${SSH_PORT:-$(detect_ssh_port)}"
 
 # Whoever runs the hardening is exempt from the two controls managed here.
 OPERATOR_IP="${OPERATOR_IP:-$(detect_operator_ip)}"
-[[ "$OPERATOR_IP" =~ ^[0-9a-fA-F:.]+$ ]] || OPERATOR_IP=""
 if [ "$MODE" = baseline ] && [ -z "$OPERATOR_IP" ] \
   && [ "${ALLOW_UNWHITELISTED_SSH:-0}" != 1 ]; then
   die "refusing baseline without an operator IP; run through SSH, set OPERATOR_IP, or explicitly set ALLOW_UNWHITELISTED_SSH=1"
 fi
 
 BACKUP_ROOT=/var/backups/claude-tg-starter/security
-BACKUP_DIR="$BACKUP_ROOT/$(date -u +%Y%m%dT%H%M%SZ)-$MODE"
-install -d -m 700 "$BACKUP_DIR"
+KIT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+OPERATOR_REGISTRY=/etc/claude-tg-starter/operator-ips.json
+OPERATOR_JAIL=/etc/fail2ban/jail.d/claude-tg-starter.conf
+OPERATOR_IPS=""
+if [ "$MODE" = baseline ]; then
+  if [ "${CLAUDE_TG_HARDEN_LOCKED:-0}" != 1 ]; then
+    # Only flock keeps the descriptor: package-started daemons must not retain
+    # this host lock after the installer has finished.
+    exec flock -w 60 --close /run/claude-tg-starter.lock \
+      env CLAUDE_TG_HARDEN_LOCKED=1 /bin/bash -p "${BASH_SOURCE[0]}" "${harden_arguments[@]}"
+  fi
+  # Validate all old state and the new address before backup/package/network writes.
+  OPERATOR_IPS="$(python3 -I "$KIT/assets/lib/operator-ips.py" \
+    --registry "$OPERATOR_REGISTRY" --jail "$OPERATOR_JAIL" --current "$OPERATOR_IP")"
+  install -d -m 700 "$BACKUP_ROOT"
+  BACKUP_DIR="$(mktemp -d "$BACKUP_ROOT/$(date -u +%Y%m%dT%H%M%SZ)-baseline.XXXXXX")"
+fi
 
 backup_file() {
   local source="$1" relative="${1#/}" destination="$BACKUP_DIR/${1#/}"
@@ -78,6 +93,7 @@ record_backups() {
   for path in \
     /etc/ssh/sshd_config.d/00-claude-tg-starter-hardening.conf \
     /etc/fail2ban/jail.d/claude-tg-starter.conf \
+    /etc/claude-tg-starter/operator-ips.json \
     /etc/apt/apt.conf.d/52claude-tg-starter-security \
     /etc/sysctl.d/99-claude-tg-starter-security.conf \
     /etc/ufw/ufw.conf /etc/ufw/user.rules /etc/ufw/user6.rules; do
@@ -87,39 +103,13 @@ record_backups() {
   ln -sfn "$BACKUP_DIR" "$BACKUP_ROOT/latest"
 }
 
-baseline() {
-  record_backups
-  export DEBIAN_FRONTEND=noninteractive
-  note "installing firewall, brute-force protection, and security updates"
-  apt-get update
-  apt-get install -y ufw fail2ban unattended-upgrades
-
-  local cloud_id=""
-  if command -v cloud-id >/dev/null 2>&1; then
-    cloud_id="$(cloud-id 2>/dev/null || true)"
-  fi
-  if [[ "$cloud_id" == *oracle* ]] && [ "${ALLOW_UFW_ON_ORACLE:-0}" != 1 ]; then
-    printf 'WARN: Oracle Cloud detected; skipping UFW because Ubuntu 24.04 images may rely on provider networking.\n' >&2
-    printf '      Set ALLOW_UFW_ON_ORACLE=1 only after checking the provider firewall and iSCSI setup.\n' >&2
-  else
-    note "enabling deny-by-default firewall; preserving SSH on port $SSH_PORT"
-    ufw default deny incoming
-    ufw default allow outgoing
-    if [ -n "$OPERATOR_IP" ]; then
-      note "exempting operator IP $OPERATOR_IP from the SSH rate limit"
-      ufw allow from "$OPERATOR_IP" to any port "$SSH_PORT" proto tcp \
-        comment 'operator IP — never rate-limited'
-    else
-      printf 'WARN: could not detect operator IP (no SSH_CONNECTION); SSH rate limit will apply to everyone, including you.\n' >&2
-    fi
-    ufw limit "$SSH_PORT/tcp" comment 'SSH rate limit'
-    ufw logging low
-    ufw --force enable
-  fi
-
-  local ignore_ips="127.0.0.1/8 ::1"
-  [ -n "$OPERATOR_IP" ] && ignore_ips="$ignore_ips $OPERATOR_IP"
-  cat > /etc/fail2ban/jail.d/claude-tg-starter.conf <<EOF
+write_operator_jail() {
+  local ignore_ips="127.0.0.1/8 ::1" operator
+  for operator in $OPERATOR_IPS; do ignore_ips="$ignore_ips $operator"; done
+  install -d -m 755 "$(dirname "$OPERATOR_JAIL")"
+  local temporary
+  temporary="$(mktemp "$(dirname "$OPERATOR_JAIL")/.claude-jail.XXXXXX")"
+  cat > "$temporary" <<EOF
 [sshd]
 enabled = true
 port = $SSH_PORT
@@ -129,8 +119,79 @@ maxretry = 5
 findtime = 10m
 bantime = 1h
 EOF
-  systemctl enable --now fail2ban
+  chmod 644 "$temporary"
+  mv -f "$temporary" "$OPERATOR_JAIL"
+}
+
+reload_operator_exemptions() {
+  local operator
   fail2ban-client reload >/dev/null
+  for operator in $OPERATOR_IPS; do
+    # Existing bans survive an ignoreip edit. Unban only individual known
+    # operators, never entire networks, unrelated jails or all Internet clients.
+    [[ "$operator" == */* ]] || fail2ban-client set sshd unbanip "$operator" >/dev/null
+  done
+}
+
+allow_operator_ssh() {
+  local operator
+  for operator in $OPERATOR_IPS; do
+    ufw prepend allow from "$operator" to any port "$SSH_PORT" proto tcp \
+      comment 'operator IP — never rate-limited'
+  done
+}
+
+baseline() {
+  record_backups
+  note "rollback backup: $BACKUP_DIR"
+  OPERATOR_IPS="$(python3 -I "$KIT/assets/lib/operator-ips.py" --write \
+    --registry "$OPERATOR_REGISTRY" --jail "$OPERATOR_JAIL" --current "$OPERATOR_IP")"
+  write_operator_jail
+  # Protect a currently banned applying operator before apt can spend minutes.
+  if command -v fail2ban-client >/dev/null 2>&1 && systemctl is-active --quiet fail2ban; then
+    reload_operator_exemptions
+  fi
+
+  local cloud_id=""
+  if command -v cloud-id >/dev/null 2>&1; then
+    cloud_id="$(cloud-id 2>/dev/null || true)"
+  fi
+  if command -v ufw >/dev/null 2>&1 \
+    && { [[ "$cloud_id" != *oracle* ]] || [ "${ALLOW_UFW_ON_ORACLE:-0}" = 1 ]; }; then
+    allow_operator_ssh
+  fi
+  note "installing firewall, brute-force protection, and security updates"
+  "$KIT/assets/lib/install-env" /root DEBIAN_FRONTEND=noninteractive apt-get update
+  "$KIT/assets/lib/install-env" /root DEBIAN_FRONTEND=noninteractive apt-get install -y ufw fail2ban unattended-upgrades
+
+  if [[ "$cloud_id" == *oracle* ]] && [ "${ALLOW_UFW_ON_ORACLE:-0}" != 1 ]; then
+    printf 'WARN: Oracle Cloud detected; skipping UFW because Ubuntu 24.04 images may rely on provider networking.\n' >&2
+    printf '      Set ALLOW_UFW_ON_ORACLE=1 only after checking the provider firewall and iSCSI setup.\n' >&2
+  else
+    note "enabling deny-by-default firewall; preserving SSH on port $SSH_PORT"
+    ufw default deny incoming
+    ufw default allow outgoing
+    if [ -n "$OPERATOR_IPS" ]; then
+      note "preserving known operator exemptions from the SSH rate limit"
+      allow_operator_ssh
+    else
+      printf 'WARN: could not detect operator IP (no SSH_CONNECTION); SSH rate limit will apply to everyone, including you.\n' >&2
+    fi
+    ufw limit "$SSH_PORT/tcp" comment 'SSH rate limit'
+    if [ -n "$OPERATOR_IPS" ]; then
+      # UFW skips a duplicate prepend, so legacy late ALLOWs cannot be moved
+      # that way. Keep every ALLOW in place and move only the managed LIMIT
+      # behind them. During this brief gap unknown clients see default DENY;
+      # known operators retain their ALLOW, including on an interrupted run.
+      ufw --force delete limit "$SSH_PORT/tcp" comment 'SSH rate limit'
+      ufw limit "$SSH_PORT/tcp" comment 'SSH rate limit'
+    fi
+    ufw logging low
+    ufw --force enable
+  fi
+
+  systemctl enable --now fail2ban
+  reload_operator_exemptions
 
   cat > /etc/apt/apt.conf.d/52claude-tg-starter-security <<'EOF'
 APT::Periodic::Update-Package-Lists "1";
@@ -170,14 +231,14 @@ EOF
   else
     printf 'NOTE: operator IP was NOT auto-whitelisted. If SSH starts refusing you, see recovery below.\n'
   fi
-  printf 'Locked out anyway? bans self-clear (UFW ~30s, fail2ban <=1h), or via the provider console:\n'
-  printf '  fail2ban-client unban --all ; ufw disable\n'
+  printf 'Keep this SSH session open and verify a fresh authenticated connection before closing it.\n'
+  printf 'For recovery, use scripts/rollback-server-hardening.sh with the backup above from the open session.\n'
   printf "Вхід за паролем лишається доступним: власник має заходити з телефона й чужого комп'ютера.\n"
 }
 
 case "$MODE" in
   baseline) baseline ;;
-  audit) "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/security-audit.sh" ;;
+  audit) "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/security-audit.sh"; exit $? ;;
 esac
 
 printf 'Backup: %s\n' "$BACKUP_DIR"

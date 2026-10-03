@@ -406,7 +406,16 @@ REVIEWED_DEPENDENCY_BASE = "7b2ee757625859758e82dded46f97aede51fd682"
 REVIEWED_DEPENDENCY_DELTA = {
     "installer/dependencies.py": (
         "1baf48535fd53745ce61ba59f7d520d159b5d5fb4f09484c580bcb56b07d75e3",
-        "4c7bad77e178bb4a8d042e0c27165658fac0eff234911a61ab5cadb1a3385e28"),
+        "a3012c77990bf6d4156f73ed840f07ef120a5d561e11fe7b0f5db0d7300b478d"),
+}
+# Security review 03.10: only execute() and its environment allowlist changed;
+# package versions, installation commands and probes are byte-for-byte unchanged.
+# This exact forward transition needs no dependency reinstall. Unknown recipes,
+# downgrades and corporate/CLI recipe changes still require their own review.
+REVIEWED_DEPENDENCY_ENVIRONMENT_DELTA = {
+    "installer/dependencies.py": (
+        "4c7bad77e178bb4a8d042e0c27165658fac0eff234911a61ab5cadb1a3385e28",
+        "a3012c77990bf6d4156f73ed840f07ef120a5d561e11fe7b0f5db0d7300b478d"),
 }
 DEPENDENCY_RECIPE_FILES = (
     "installer/dependencies.py", "installer/corporate.py", "installer/install-node.py",
@@ -423,8 +432,10 @@ def dependency_version_contract(installed: dict, target: dict, previous_revision
         if not all(isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value)
                    for value in (old, new)):
             raise ValueError("maintenance dependency recipe missing")
-        if old != new and not (previous_revision == REVIEWED_DEPENDENCY_BASE
-                               and REVIEWED_DEPENDENCY_DELTA.get(path) == (old, new)):
+        if old != new and not (
+                REVIEWED_DEPENDENCY_ENVIRONMENT_DELTA.get(path) == (old, new) or
+                previous_revision == REVIEWED_DEPENDENCY_BASE
+                and REVIEWED_DEPENDENCY_DELTA.get(path) == (old, new)):
             raise ValueError("maintenance dependency recipe changed; review this agent separately")
 
     def package_inputs(files):

@@ -371,7 +371,7 @@ verify_preserved_vercel_cli() {
     echo "FATAL: встановлений Vercel CLI відсутній або не виконується; оновлення комплекту зупинено" >&2
     return 1
   }
-  version="$(runuser -u "$AGENT_USER" -- env HOME="$H" \
+  version="$(runuser -u "$AGENT_USER" -- "$KIT/assets/lib/install-env" "$H" \
     VERCEL_TELEMETRY_DISABLED=1 NO_UPDATE_NOTIFIER=1 \
     /usr/bin/timeout --foreground 30s "$cli" --version 2>/dev/null)" || {
       echo "FATAL: встановлений Vercel CLI не відповідає; оновлення комплекту зупинено" >&2
@@ -401,7 +401,7 @@ maintenance_require_python() {
     echo "FATAL: для оновлення відсутнє середовище $name; віднови його окремо і повтори" >&2
     return 1
   }
-  runuser -u "$AGENT_USER" -- "$python" -I -B -c "$import_check" >/dev/null 2>&1 || {
+  runuser -u "$AGENT_USER" -- "$KIT/assets/lib/install-env" "$H" "$python" -I -B -c "$import_check" >/dev/null 2>&1 || {
     echo "FATAL: середовище $name не працює; оновлення комплекту зупинено" >&2
     return 1
   }
@@ -410,7 +410,7 @@ verify_maintenance_dependencies() {
   [ "$CLAUDE_UPDATE_MAINTENANCE" = 1 ] || return 0
   maintenance_require_command gh || return 1
   maintenance_require_command sqlite3 || return 1
-  /usr/bin/python3 -B -c 'import numpy, markdown' >/dev/null 2>&1 || {
+  "$KIT/assets/lib/install-env" /root /usr/bin/python3 -B -c 'import numpy, markdown' >/dev/null 2>&1 || {
     echo "FATAL: системні Python-залежності пам’яті відсутні; оновлення комплекту зупинено" >&2
     return 1
   }
@@ -496,14 +496,14 @@ validate_starter_foundation
 # root here) and only fail when it is still unavailable afterwards.
 if ! command -v gh >/dev/null 2>&1; then
   if [ "$CLAUDE_UPDATE_MAINTENANCE" != 1 ]; then
-    DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 update -qq
-    DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 install -y -q gh
+    "$KIT/assets/lib/install-env" /root DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 update -qq
+    "$KIT/assets/lib/install-env" /root DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 install -y -q gh
   fi
 fi
 
 if ! command -v sqlite3 >/dev/null 2>&1; then
   if [ "$CLAUDE_UPDATE_MAINTENANCE" != 1 ]; then
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -q sqlite3 >/dev/null 2>&1 || true
+    "$KIT/assets/lib/install-env" /root DEBIAN_FRONTEND=noninteractive apt-get install -y -q sqlite3 >/dev/null 2>&1 || true
   fi
   command -v sqlite3 >/dev/null 2>&1 || {
     echo "FATAL: sqlite3 відсутній, і його не вдалося встановити; виконай apt-get install -y sqlite3" >&2
@@ -516,7 +516,7 @@ fi
 if product_has_feature telegram-corporate-sessions && [ "$MODULE_TELEGRAM_CORPORATE" = 1 ]; then
   if ! command -v bwrap >/dev/null 2>&1 || ! command -v socat >/dev/null 2>&1; then
     if [ "$CLAUDE_UPDATE_MAINTENANCE" != 1 ]; then
-      DEBIAN_FRONTEND=noninteractive apt-get install -y -q bubblewrap socat >/dev/null 2>&1 || true
+      "$KIT/assets/lib/install-env" /root DEBIAN_FRONTEND=noninteractive apt-get install -y -q bubblewrap socat >/dev/null 2>&1 || true
     fi
   fi
   for dependency in bwrap socat; do
@@ -540,24 +540,24 @@ fi
 # Semantic memory runs from the system Python. install-base provisions numpy on
 # guided clean installs; this convergence path also covers direct product
 # installs and upgrades from releases that predate vector search.
-if ! /usr/bin/python3 -c 'import numpy' >/dev/null 2>&1; then
+if ! "$KIT/assets/lib/install-env" /root /usr/bin/python3 -c 'import numpy' >/dev/null 2>&1; then
   if [ "$CLAUDE_UPDATE_MAINTENANCE" != 1 ]; then
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -q python3-numpy >/dev/null 2>&1 || true
+    "$KIT/assets/lib/install-env" /root DEBIAN_FRONTEND=noninteractive apt-get install -y -q python3-numpy >/dev/null 2>&1 || true
   fi
 fi
-/usr/bin/python3 -c 'import numpy' >/dev/null 2>&1 || {
+"$KIT/assets/lib/install-env" /root /usr/bin/python3 -c 'import numpy' >/dev/null 2>&1 || {
   echo "FATAL: python3-numpy відсутній, і його не вдалося встановити" >&2
   exit 1
 }
 
 # Веб-звіт рендерить нотатки вольта в HTML. Системний Python на 24.04 зовнішньо
 # керований, тому пакет ставимо тут, а не pip-ом під час першого запуску.
-if ! /usr/bin/python3 -c 'import markdown' >/dev/null 2>&1; then
+if ! "$KIT/assets/lib/install-env" /root /usr/bin/python3 -c 'import markdown' >/dev/null 2>&1; then
   if [ "$CLAUDE_UPDATE_MAINTENANCE" != 1 ]; then
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -q python3-markdown >/dev/null 2>&1 || true
+    "$KIT/assets/lib/install-env" /root DEBIAN_FRONTEND=noninteractive apt-get install -y -q python3-markdown >/dev/null 2>&1 || true
   fi
 fi
-/usr/bin/python3 -c 'import markdown' >/dev/null 2>&1 || {
+"$KIT/assets/lib/install-env" /root /usr/bin/python3 -c 'import markdown' >/dev/null 2>&1 || {
   echo "FATAL: python3-markdown відсутній, і його не вдалося встановити" >&2
   exit 1
 }
@@ -644,9 +644,7 @@ if [ "$STARTER_FOUNDATION_REQUIRED" = 1 ]; then
   install -m 600 /dev/null "$H/.claude/product/starter-foundation-pending"
 fi
 
-# Package installs run their packages' own scripts: none of the bot's secrets goes into their environment.
-NO_SECRETS=(-u NOVSKY_LICENSE_KEY -u TELEGRAM_BOT_TOKEN -u OPENAI_API_KEY -u OPENAI_API_KEY_FALLBACK
-  -u RECALL_API_KEY -u SITE_PASSWORD -u GOG_KEYRING_PASSWORD)
+# Every package install/import uses install-env: public settings only, including future secret names.
 
 # Agent runtimes, installed into the account's OWN prefix. bun must resolve from
 # $H/.local/bin: Claude spawns MCP servers with a trimmed PATH that excludes
@@ -654,12 +652,12 @@ NO_SECRETS=(-u NOVSKY_LICENSE_KEY -u TELEGRAM_BOT_TOKEN -u OPENAI_API_KEY -u OPE
 # poller with no useful error. Both installs are idempotent.
 if [ ! -x "$H/.local/bin/bun" ]; then
   echo "  встановлюю середовище виконання bun"
-  runuser -u "$AGENT_USER" -- env "${NO_SECRETS[@]}" HOME="$H" \
+  runuser -u "$AGENT_USER" -- "$KIT/assets/lib/install-env" "$H" \
     npm install -g --prefix "$H/.local" bun >/dev/null
 fi
 if [ ! -x "$H/.local/bin/claude" ]; then
   echo "  встановлюю Claude Code CLI"
-  runuser -u "$AGENT_USER" -- env "${NO_SECRETS[@]}" HOME="$H" \
+  runuser -u "$AGENT_USER" -- "$KIT/assets/lib/install-env" "$H" \
     npm install -g --prefix "$H/.local" @anthropic-ai/claude-code >/dev/null
 fi
 # The --prefix flag above applies to that one command and is never written to
@@ -668,7 +666,7 @@ fi
 # attempt failed and installs froze on whatever version shipped that day — one
 # customer sat 11 releases behind for 19 days and only saw it as a UI warning.
 if [ "$CLAUDE_UPDATE_MAINTENANCE" != 1 ]; then
-  runuser -u "$AGENT_USER" -- env HOME="$H" npm config set prefix "$H/.local" >/dev/null
+  runuser -u "$AGENT_USER" -- "$KIT/assets/lib/install-env" "$H" npm config set prefix "$H/.local" >/dev/null
 fi
 
 for runtime in bun claude; do
@@ -773,56 +771,56 @@ bash "$KIT/assets/lib/activate-role-subagents.sh" "$KIT" "$H" "$AGENT_USER" "${A
 if product_has_feature telegram-corporate-sessions; then
   if [ ! -x "$H/.venvs/heif/bin/python" ]; then
     if [ "$CLAUDE_UPDATE_MAINTENANCE" != 1 ]; then
-      runuser -u "$AGENT_USER" -- python3 -m venv "$H/.venvs/heif" || {
+      runuser -u "$AGENT_USER" -- "$KIT/assets/lib/install-env" "$H" python3 -m venv "$H/.venvs/heif" || {
         echo "FATAL: для HEIF-конвертера потрібен python3-venv" >&2
         exit 1
       }
     fi
   fi
   if [ "$CLAUDE_UPDATE_MAINTENANCE" != 1 ]; then
-    runuser -u "$AGENT_USER" -- "$H/.venvs/heif/bin/python" -m pip \
+    runuser -u "$AGENT_USER" -- "$KIT/assets/lib/install-env" "$H" "$H/.venvs/heif/bin/python" -m pip \
       install -q --requirement "$KIT/assets/requirements/heif.txt"
   fi
-  runuser -u "$AGENT_USER" -- "$H/.venvs/heif/bin/python" -I \
+  runuser -u "$AGENT_USER" -- "$KIT/assets/lib/install-env" "$H" "$H/.venvs/heif/bin/python" -I \
     -c 'from PIL import Image; from pillow_heif import register_heif_opener; register_heif_opener(thumbnails=False)'
 fi
 
 if product_has_feature sql-readonly; then
   if [ ! -x "$H/.venvs/bigquery/bin/python" ]; then
     if [ "$CLAUDE_UPDATE_MAINTENANCE" != 1 ]; then
-      runuser -u "$AGENT_USER" -- python3 -m venv "$H/.venvs/bigquery" || {
+      runuser -u "$AGENT_USER" -- "$KIT/assets/lib/install-env" "$H" python3 -m venv "$H/.venvs/bigquery" || {
         echo "FATAL: для sql-readonly потрібен python3-venv" >&2
         exit 1
       }
     fi
   fi
   if [ "$CLAUDE_UPDATE_MAINTENANCE" != 1 ]; then
-    runuser -u "$AGENT_USER" -- "$H/.venvs/bigquery/bin/python" -m pip \
+    runuser -u "$AGENT_USER" -- "$KIT/assets/lib/install-env" "$H" "$H/.venvs/bigquery/bin/python" -m pip \
       install -q --requirement "$KIT/assets/requirements/bigquery.txt"
   fi
-  runuser -u "$AGENT_USER" -- "$H/.venvs/bigquery/bin/python" \
+  runuser -u "$AGENT_USER" -- "$KIT/assets/lib/install-env" "$H" "$H/.venvs/bigquery/bin/python" \
     -c 'from google.cloud import bigquery'
 fi
 
 if product_has_feature finance-data; then
   if [ ! -x "$H/.venvs/finance/bin/python" ]; then
     if [ "$CLAUDE_UPDATE_MAINTENANCE" != 1 ]; then
-      runuser -u "$AGENT_USER" -- python3 -m venv --system-site-packages "$H/.venvs/finance" || {
+      runuser -u "$AGENT_USER" -- "$KIT/assets/lib/install-env" "$H" python3 -m venv --system-site-packages "$H/.venvs/finance" || {
         echo "FATAL: для finance-data потрібен python3-venv" >&2
         exit 1
       }
     fi
   fi
   if [ "$CLAUDE_UPDATE_MAINTENANCE" != 1 ]; then
-    runuser -u "$AGENT_USER" -- "$H/.venvs/finance/bin/pip" install -q --upgrade yfinance
+    runuser -u "$AGENT_USER" -- "$KIT/assets/lib/install-env" "$H" "$H/.venvs/finance/bin/pip" install -q --upgrade yfinance
   fi
-  runuser -u "$AGENT_USER" -- "$H/.venvs/finance/bin/python" -c 'import yfinance'
+  runuser -u "$AGENT_USER" -- "$KIT/assets/lib/install-env" "$H" "$H/.venvs/finance/bin/python" -c 'import yfinance'
 fi
 
 if product_has_feature spreadsheets; then
   if [ ! -x "$H/.venvs/spreadsheets/bin/python" ]; then
     if [ "$CLAUDE_UPDATE_MAINTENANCE" != 1 ]; then
-      runuser -u "$AGENT_USER" -- python3 -m venv --system-site-packages \
+      runuser -u "$AGENT_USER" -- "$KIT/assets/lib/install-env" "$H" python3 -m venv --system-site-packages \
         "$H/.venvs/spreadsheets" || {
           echo "FATAL: для spreadsheets потрібен python3-venv" >&2
           exit 1
@@ -830,10 +828,10 @@ if product_has_feature spreadsheets; then
     fi
   fi
   if [ "$CLAUDE_UPDATE_MAINTENANCE" != 1 ]; then
-    runuser -u "$AGENT_USER" -- "$H/.venvs/spreadsheets/bin/pip" \
+    runuser -u "$AGENT_USER" -- "$KIT/assets/lib/install-env" "$H" "$H/.venvs/spreadsheets/bin/pip" \
       install -q --upgrade openpyxl xlsxwriter
   fi
-  runuser -u "$AGENT_USER" -- "$H/.venvs/spreadsheets/bin/python" \
+  runuser -u "$AGENT_USER" -- "$KIT/assets/lib/install-env" "$H" "$H/.venvs/spreadsheets/bin/python" \
     -c 'import openpyxl, xlsxwriter'
 fi
 
@@ -1337,9 +1335,9 @@ if product_has_feature media-downloads || \
     echo "FATAL: Node.js/npx відсутній; установи Node 22+ перед налаштуванням ядра" >&2
     exit 1
   fi
-  node_major="$(node -p 'Number(process.versions.node.split(".")[0])')"
+  node_major="$("$KIT/assets/lib/install-env" /root node -p 'Number(process.versions.node.split(".")[0])')"
   if [ "$node_major" -lt 22 ]; then
-    echo "FATAL: потрібен Node.js 22+; знайдено $(node --version)" >&2
+    echo "FATAL: потрібен Node.js 22+; знайдено $("$KIT/assets/lib/install-env" /root node --version)" >&2
     exit 1
   fi
 fi
@@ -1347,7 +1345,7 @@ fi
 if product_has_feature media-downloads; then
   if [ ! -x "$H/.local/bin/yt-dlp" ]; then
     if [ "$CLAUDE_UPDATE_MAINTENANCE" != 1 ]; then
-      runuser -u "$AGENT_USER" -- env "${NO_SECRETS[@]}" HOME="$H" \
+      runuser -u "$AGENT_USER" -- "$KIT/assets/lib/install-env" "$H" \
         PIPX_HOME="$H/.local/share/pipx" PIPX_BIN_DIR="$H/.local/bin" \
         pipx install yt-dlp >/dev/null
     fi
@@ -1358,7 +1356,7 @@ if product_has_feature media-downloads; then
   }
   if [ ! -x "$H/.local/bin/deno" ]; then
     if [ "$CLAUDE_UPDATE_MAINTENANCE" != 1 ]; then
-      runuser -u "$AGENT_USER" -- env "${NO_SECRETS[@]}" HOME="$H" \
+      runuser -u "$AGENT_USER" -- "$KIT/assets/lib/install-env" "$H" \
         npm install -g --prefix "$H/.local" deno >/dev/null
     fi
   fi
@@ -1370,7 +1368,7 @@ fi
 
 if product_has_feature vercel; then
   if [ "$CLAUDE_UPDATE_MAINTENANCE" != 1 ]; then
-    runuser -u "$AGENT_USER" -- env "${NO_SECRETS[@]}" HOME="$H" \
+    runuser -u "$AGENT_USER" -- "$KIT/assets/lib/install-env" "$H" \
       npm install -g --prefix "$H/.npm-global" vercel@latest >/dev/null
   fi
   [ -x "$H/.npm-global/bin/vercel" ] || {

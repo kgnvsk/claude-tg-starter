@@ -1,8 +1,8 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-10-03.bf3ac4233ee6`
+- Реліз: `2026-10-03.0934bd65c639`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `bf3ac4233ee6593de7a68e97cac8c8a712dbe901`
+- Ревізія вихідного комплекту: `0934bd65c6390a98e4519810f8b951733e5457fc`
 - Дата релізу: `2026-10-03`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
@@ -19,46 +19,10 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    tests: the Vercel install harness carries the installer's secrets list
-    Installer: the license key reaches the license check only; package installs get none of the bot's secrets
-    tests: the reminder worker runs get a 60 s hang guard instead of 10 s
-    tests: a Codex task that keeps reporting outlives its timeout with room for a slow beat
-    publish-products: the release tag takes the commit's date, as the archives' release id does
-    Every kit bot keeps the receipts in shadow: new installs and updates of the old default
-    Wait for the message to close in the receipt-retry test instead of reading it between two transactions
-    Bring the last test of the old start-up quarantine to the accepted rule
-    Pin the receiver whose start gives up the fence of a cut-off progress
-    A progress a restart cut off gives its fence up at the start; its request is recovered, not handed to the owner
-    Let the shadow report ask ten agreements only of the chat kinds a bot serves
-    Keep the paused request of the «not woken» test out of the recovery timer
-    Let a worker's one more end reach its request while only a progress is on its way
-    Run the evening replay's own tests only, not the base stand's again
-    Test the remaining cases of the wait: unknown progress, unreadable proof, damaged request text
-    Drop the blank line at the end of the evening replay test
-    Pin the receiver that waits for a returned worker's one more end
-    Bring the two «returned worker» tests to the wait for its one more end
-    Let a request wait for one more end of a worker whose recorded run already returned for it
-    Count a reopened request's work in its response turn only from the moment it entered that turn
-    Bind an end with no launch id only to a freshly created Agent with no other history
-    Test that an id-less end never discharges a first resume across a restart or an unreadable history (red)
-    Return a task by an end with no launch id when it is the task's only launch in this run
-    Test an id-less end of the only launch in this run returning it (red)
-    Pin the receiver that reads the unfamiliar-end proof only where it can free a task
-    Read the unfamiliar-end proof only under the receiver, and only for a request that holds the task
-    Test an unreadable unfamiliar-end proof never holding an ordinary progress, and the receiver freeing nothing it cannot prove (red)
-    Pin the receiver whose previous-owner rule accepts an unfamiliar end's own final receipt
-    Let the terminal receipt of an unfamiliar end's own final free its task for the next request
-    Test a task whose unfamiliar end's final went out after its turn closed registering for the next request (red)
-    Pin the receiver that answers an unfamiliarly ended run's request in its current turn
-    Answer the request in the current turn when its unfamiliar end's final is admitted
-    Test a resume while the unfamiliar end's final is on the network superseding it in either order (red)
-    Pin the receiver whose recorded-launch proof never holds a send outside the receiver
-    Keep the recorded-launch proof an observation outside the receiver, and fail-closed under it
-    Test an unreadable launch record never holding a live progress outside the receiver (red)
-    Resume a run that ended unfamiliarly for its request while that request is still owed an answer
-    Test a resume while a refused unfamiliar-end final is still owed holding that request (red)
-    Pin the receiver that registers a resumed worker by its recorded launch
-    Register a worker resumed after a service restart by the launch this run recorded
+    tests: the killed tick's lock is awaited, not checked at once
+    tests: the Codex integration timeout test gives the helper 3 s to start, not 1
+    fix: preserve maintenance compatibility after install isolation
+    fix: isolate install secrets and preserve operator SSH access
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не

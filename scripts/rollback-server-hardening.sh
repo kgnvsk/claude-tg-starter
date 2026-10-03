@@ -3,6 +3,10 @@
 set -euo pipefail
 
 [ "$(id -u)" -eq 0 ] || { echo "FATAL: run as root" >&2; exit 1; }
+if [ "${CLAUDE_TG_HARDEN_ROLLBACK_LOCKED:-0}" != 1 ]; then
+  exec flock -w 60 --close /run/claude-tg-starter.lock \
+    env CLAUDE_TG_HARDEN_ROLLBACK_LOCKED=1 /bin/bash -p "${BASH_SOURCE[0]}" "$@"
+fi
 BACKUP_ROOT=/var/backups/claude-tg-starter/security
 BACKUP_DIR="${1:-$(readlink -f "$BACKUP_ROOT/latest" 2>/dev/null || true)}"
 [ -d "$BACKUP_DIR" ] || { echo "FATAL: backup directory not found" >&2; exit 1; }
@@ -21,6 +25,7 @@ restore_file() {
 for target in \
   /etc/ssh/sshd_config.d/00-claude-tg-starter-hardening.conf \
   /etc/fail2ban/jail.d/claude-tg-starter.conf \
+  /etc/claude-tg-starter/operator-ips.json \
   /etc/apt/apt.conf.d/52claude-tg-starter-security \
   /etc/sysctl.d/99-claude-tg-starter-security.conf \
   /etc/ufw/ufw.conf /etc/ufw/user.rules /etc/ufw/user6.rules; do

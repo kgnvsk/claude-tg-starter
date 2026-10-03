@@ -11,7 +11,7 @@ SHARE=/srv/claude-browser-share
 CLAUDE_HOME=/home/claude
 CLAUDE_BIN="$CLAUDE_HOME/.local/bin/claude"
 
-node -e 'process.exit(Number(process.versions.node.split(".")[0]) >= 22 ? 0 : 1)' \
+"$KIT/assets/lib/install-env" /root node -e 'process.exit(Number(process.versions.node.split(".")[0]) >= 22 ? 0 : 1)' \
   || { echo "FATAL: Node.js 22+ is required" >&2; exit 1; }
 id claude >/dev/null 2>&1 || { echo "FATAL: install the claude user first" >&2; exit 1; }
 id claude-browser >/dev/null 2>&1 || useradd --system --home-dir "$STATE" --shell /usr/sbin/nologin claude-browser
@@ -24,15 +24,15 @@ install -d -o claude -g claude-browser -m 2770 "$SHARE"
 install -d -o claude -g claude -m 755 "$CLAUDE_HOME/bin"
 
 echo "==> installing pinned @playwright/mcp@$PLAYWRIGHT_MCP_VERSION"
-PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm install --prefix "$RUNTIME" --omit=dev --no-audit --no-fund \
+"$KIT/assets/lib/install-env" /root PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm install --prefix "$RUNTIME" --omit=dev --no-audit --no-fund \
   "@playwright/mcp@$PLAYWRIGHT_MCP_VERSION"
 PW_CLI="$RUNTIME/node_modules/playwright/cli.js"
 [ -f "$PW_CLI" ] || { echo "FATAL: Playwright CLI not found at $PW_CLI" >&2; exit 1; }
 
 echo "==> installing exact browser dependencies"
-node "$PW_CLI" install-deps chromium
+"$KIT/assets/lib/install-env" /root node "$PW_CLI" install-deps chromium
 echo "==> installing exact Chromium revision as claude-browser"
-runuser -u claude-browser -- env HOME="$STATE" PLAYWRIGHT_BROWSERS_PATH="$STATE/ms-playwright" \
+runuser -u claude-browser -- "$KIT/assets/lib/install-env" "$STATE" PLAYWRIGHT_BROWSERS_PATH="$STATE/ms-playwright" \
   node "$PW_CLI" install chromium
 chmod -R a+rX "$STATE/ms-playwright"
 
@@ -55,11 +55,11 @@ done
 systemctl is-active --quiet claude-browser.service || { journalctl -u claude-browser.service -n 80 --no-pager; exit 1; }
 
 echo "==> running real DOM + screenshot smoke as isolated browser user"
-runuser -u claude-browser -- env HOME="$STATE" PLAYWRIGHT_BROWSERS_PATH="$STATE/ms-playwright" \
+runuser -u claude-browser -- "$KIT/assets/lib/install-env" "$STATE" PLAYWRIGHT_BROWSERS_PATH="$STATE/ms-playwright" \
   node "$RUNTIME/browser-smoke.mjs"
 
 echo "==> exercising Playwright through the MCP protocol"
-runuser -u claude-browser -- env HOME="$STATE" \
+runuser -u claude-browser -- "$KIT/assets/lib/install-env" "$STATE" \
   node "$RUNTIME/browser-mcp-smoke.mjs"
 setpriv --reuid=claude --regid=claude --init-groups -- \
   python3 -c 'import sys; open(sys.argv[1], "rb").read(1)' "$SHARE/mcp-tool-smoke.png" || {

@@ -1,0 +1,28 @@
+#!/bin/bash -p
+# Third-party installs and probes receive public settings only. -p also ignores
+# inherited BASH_ENV/functions before this trusted boundary clears the environment.
+set -euo pipefail
+
+[ "$#" -ge 2 ] || { echo 'FATAL: install-env needs a home and a command' >&2; exit 2; }
+install_home="$1"
+shift
+[[ "$install_home" = /* && ! "$install_home" =~ [[:cntrl:]] ]] || {
+  echo 'FATAL: invalid install home' >&2; exit 2;
+}
+install_settings=(LANG=C.UTF-8 LC_ALL=C.UTF-8)
+while [[ "${1:-}" =~ ^[a-zA-Z_][a-zA-Z0-9_]*= ]]; do
+  case "${1%%=*}" in
+    PIPX_HOME|PIPX_BIN_DIR|PLAYWRIGHT_BROWSERS_PATH|PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD|\
+    DEBIAN_FRONTEND|VERCEL_TELEMETRY_DISABLED|NO_UPDATE_NOTIFIER)
+      install_settings+=("$1") ;;
+    *) echo 'FATAL: non-public install setting refused' >&2; exit 2 ;;
+  esac
+  shift
+done
+[ "$#" -gt 0 ] && [[ "$1" != -* ]] || {
+  echo 'FATAL: install-env needs a command' >&2; exit 2;
+}
+install_user="$(/usr/bin/id -un)"
+exec /usr/bin/env -i HOME="$install_home" USER="$install_user" LOGNAME="$install_user" \
+  PATH="$install_home/.local/bin:$install_home/.npm-global/bin:$install_home/.bun/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+  "${install_settings[@]}" "$@"
