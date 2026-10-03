@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import signal
 import sqlite3
 import stat
 import subprocess
@@ -2640,6 +2641,294 @@ def requeue_started_head(db: Path, delivery_id: str) -> bool:
             connection.close()
 
 
+LEDGER_EPOCH = "callback_ledger_epoch:"
+CORPORATE_RUNNING = ("leased", "prompt_submitted", "result_persisted", "outbound_sending")
+
+
+def ledger_busy(db: Path) -> bool:
+    """Work the receiver's ledger still has running; an unread ledger counts as busy.
+
+    An open turn is work. A closed turn does not end the background work it
+    deferred to (Codex AGENTS 03.10, #173 P1-1): a launch not yet resolved or
+    an obligation not yet returned or stopped of the run the newest callback
+    epoch names holds too, as does a company job in flight. Rows of earlier
+    runs are history: their workers ended with their run.
+    """
+    connection = None
+    try:
+        connection = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=1)
+        if connection.execute("SELECT 1 FROM delivery_turns WHERE closed_at IS NULL LIMIT 1").fetchone():
+            return True
+        run = connection.execute(
+            "SELECT substr(key, ?) FROM delivery_runtime WHERE substr(key, 1, ?) = ? "
+            "ORDER BY CAST(value AS INTEGER) DESC LIMIT 1",
+            (len(LEDGER_EPOCH) + 1, len(LEDGER_EPOCH), LEDGER_EPOCH),
+        ).fetchone()
+        if run is None or connection.execute(
+            "SELECT 1 FROM delivery_task_launches WHERE stamp=? AND state='launching' "
+            "UNION ALL SELECT 1 FROM delivery_task_owners WHERE stamp=? AND state IN ('unowned','owned') LIMIT 1",
+            (run[0], run[0]),
+        ).fetchone():
+            return True
+        tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        return "conversation_jobs" in tables and connection.execute(
+            f"SELECT 1 FROM conversation_jobs WHERE state IN ({','.join('?' * len(CORPORATE_RUNNING))}) LIMIT 1",
+            CORPORATE_RUNNING,
+        ).fetchone() is not None
+    except sqlite3.Error:
+        return True
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def ledger_decision(decision: Decision, db: Path) -> Decision:
+    """On the ledger the watcher keeps only the offer the CLI holds in its own queue.
+
+    The receiver wakes saved work after reset without replacing its native
+    session, and process health is the healthcheck's job. What the receiver
+    cannot see is the CLI's queue: after a limit the CLI may take each offer
+    into it and start nothing (Арти 03.10.2026, 04:51-05:04 UTC, until the
+    owner's /unstick). A held Telegram enqueue while the ledger has no work
+    running is that case; tick() proves it again with the CLI frozen.
+    """
+    if (
+        decision.eligible
+        and decision.trigger is not None
+        and decision.trigger.startswith("enqueue:")
+        and not ledger_busy(db)
+    ):
+        return decision
+    return Decision(False, None, "durable_scheduler_owns_recovery")
+
+
+class ProcUnreadable(Exception):
+    """A process of ours exists but /proc would not say what it is: no proof either way."""
+
+
+def _proc_stat(proc: Path, pid: int) -> tuple[int, str, str] | None:
+    """(parent pid, state letter, start time) of a process; None only when it is gone.
+
+    Codex AGENTS 03.10 (#173 re-review P1-2): an entry that exists but cannot be
+    read is not «gone»; it raises, and the freeze is undone.
+    """
+    try:
+        text = (proc / str(pid) / "stat").read_text(encoding="utf-8", errors="replace")
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+    except OSError as error:
+        raise ProcUnreadable(pid) from error
+    fields = text[text.rfind(")") + 2:].split()
+    if len(fields) < 20:
+        raise ProcUnreadable(pid)
+    return int(fields[1]), fields[0], fields[19]
+
+
+def cli_tree(service: str, proc: Path = Path("/proc")) -> list[int]:
+    """The service's Claude CLI and every process under it: its hooks, receiver and workers."""
+    parents: dict[int, int] = {}
+    roots = []
+    try:
+        entries = list(proc.iterdir())
+    except OSError:
+        return []
+    mine = os.getuid()
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        try:
+            owner = entry.stat().st_uid
+            groups = (entry / "cgroup").read_text(encoding="utf-8", errors="replace")
+            argv = (entry / "cmdline").read_bytes().split(b"\0")
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        except OSError as error:
+            if owner_of(entry) == mine:
+                raise ProcUnreadable(pid) from error
+            continue
+        try:
+            info = _proc_stat(proc, pid)
+        except ProcUnreadable:
+            if owner == mine:
+                raise
+            continue
+        if info is None:
+            continue
+        parents[pid] = info[0]
+        in_service = any(service in line.rsplit(":", 1)[-1].split("/") for line in groups.splitlines())
+        if in_service and os.path.basename(argv[0].decode("utf-8", "replace")) in ("claude", "claude.exe") \
+                and b"--channels" in argv:
+            roots.append(pid)
+    tree = set(roots)
+    grown = True
+    while grown:
+        grown = False
+        for pid, parent in parents.items():
+            if parent in tree and pid not in tree:
+                tree.add(pid)
+                grown = True
+    return sorted(tree)
+
+
+def owner_of(entry: Path) -> int | None:
+    try:
+        return entry.stat().st_uid
+    except OSError:
+        return None
+
+
+# A freeze never outlives this, whatever happens to the watcher (Codex AGENTS 03.10, #173 re-review P1-1).
+FREEZE_GUARD_S = 30
+
+
+def _write_record(record: Path, pids: dict[int, str]) -> None:
+    """Which processes are (about to be) stopped, with their start times, before any SIGSTOP."""
+    record.parent.mkdir(parents=True, exist_ok=True)
+    handle, temporary = tempfile.mkstemp(dir=record.parent, prefix=".frozen.")
+    with os.fdopen(handle, "w", encoding="utf-8") as stream:
+        json.dump({"pids": {str(pid): start for pid, start in pids.items()}}, stream)
+    os.replace(temporary, record)
+
+
+def _start_thaw_guard(record: Path) -> None:
+    """A guard in its own session continues the recorded processes after FREEZE_GUARD_S: the cron
+    budget's SIGTERM, a SIGKILL or a crash of this process cannot leave them stopped."""
+    subprocess.Popen(
+        [sys.executable, str(Path(__file__).resolve()), "--thaw-guard", str(record), str(FREEZE_GUARD_S)],
+        start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL, close_fds=True,
+    )
+
+
+def _stopped_or_gone(proc: Path, pid: int, start: str) -> bool:
+    info = _proc_stat(proc, pid)
+    return info is None or info[2] != start or info[1] in ("T", "t", "Z", "X")
+
+
+def freeze_cli(service: str, record: Path, proc: Path = Path("/proc")) -> list[int] | None:
+    """Stop the service's CLI tree (SIGSTOP), so nothing in it opens a turn or works on.
+
+    The proof that the CLI only holds input is read again under this freeze
+    (Codex AGENTS 03.10, #173 P1-2); a hook or worker caught before its commit
+    commits nothing, and the restart that follows ends it (systemd sends SIGCONT
+    with SIGTERM). Every pid goes into `record` with its start time before it is
+    stopped, and a guard continues them after FREEZE_GUARD_S unless they are
+    gone (re-review P1-1). Admission needs a scan taken with every known member
+    already stopped that finds no new one (re-review P1-2). A process that cannot
+    be stopped or read, a tree still growing after five rounds, or a member not
+    stopped within 2 s undoes the freeze. Returns the stopped pids, or None.
+    """
+    stopped: dict[int, str] = {}
+    me = {os.getpid(), os.getppid()}
+    guarded = False
+    try:
+        for _ in range(5):
+            fresh: dict[int, str] = {}
+            for pid in cli_tree(service, proc):
+                if pid in stopped or pid in me:
+                    continue
+                info = _proc_stat(proc, pid)
+                if info is not None:
+                    fresh[pid] = info[2]
+            if not fresh:
+                if stopped:
+                    return list(stopped)
+                return None
+            _write_record(record, {**stopped, **fresh})
+            if not guarded:
+                _start_thaw_guard(record)
+                guarded = True
+            for pid in fresh:
+                try:
+                    os.kill(pid, signal.SIGSTOP)
+                except ProcessLookupError:
+                    continue
+                stopped[pid] = fresh[pid]
+            deadline = _monotonic() + 2
+            while not all(_stopped_or_gone(proc, pid, start) for pid, start in stopped.items()):
+                if _monotonic() >= deadline:
+                    raise TimeoutError("a process of the CLI tree did not stop")
+                _sleep(0.05)
+    except (OSError, ProcUnreadable, TimeoutError):
+        pass
+    if stopped or guarded:
+        thaw(record, proc)
+    return None
+
+
+def thaw(record: Path, proc: Path = Path("/proc")) -> list[int]:
+    """Continue every recorded process that is still the one stopped (same start time).
+
+    A pid is forgotten only once it is continued, gone or replaced by another
+    process; one that cannot be read or continued stays in the record for the
+    guard and the next tick to retry (Codex AGENTS 03.10, #173 re-review of
+    f76c4bba P1-1). Returns the pids still unresolved.
+    """
+    try:
+        pids = json.loads(record.read_text(encoding="utf-8")).get("pids", {})
+    except FileNotFoundError:
+        return []
+    except (OSError, ValueError):
+        return [-1]  # a record that cannot be read stays for the next attempt
+    left: dict[int, str] = {}
+    for key, start in pids.items():
+        try:
+            pid = int(key)
+        except ValueError:
+            continue  # nothing can be signalled for it
+        try:
+            info = _proc_stat(proc, pid)
+        except (ProcUnreadable, ValueError):
+            left[pid] = start
+            continue
+        if info is None or info[2] != start:
+            continue
+        try:
+            os.kill(pid, signal.SIGCONT)
+        except ProcessLookupError:
+            continue
+        except OSError:
+            left[pid] = start
+    if left:
+        _write_record(record, left)
+    else:
+        try:
+            record.unlink()
+        except FileNotFoundError:
+            pass
+    return list(left)
+
+
+def _freeze_lock(record: Path) -> int:
+    """The lock every tick holds from its first step to its end, a freeze and its restart included.
+    The guard thaws only while holding it, so it never continues a tree the watcher is about to
+    restart (re-review P1-2); a watcher that dies releases it with its process."""
+    descriptor = os.open(record.with_name(record.stem + ".lock"), os.O_CREAT | os.O_RDWR, 0o600)
+    fcntl.flock(descriptor, fcntl.LOCK_EX)
+    return descriptor
+
+
+def _thaw_and_exit(record: Path):
+    def handler(signum, _frame):
+        thaw(record)
+        raise SystemExit(128 + signum)
+    return handler
+
+
+def thaw_guard(record: Path, seconds: float) -> int:
+    _sleep(seconds)
+    descriptor = _freeze_lock(record)
+    try:
+        for _ in range(12):
+            if not thaw(record):
+                break
+            _sleep(5)
+    finally:
+        os.close(descriptor)
+    return 0
+
+
 def receiver_owns_limit_notices(db: Path) -> bool:
     """The receiver that holds the queue tells each waiting chat about a limit."""
     connection = None
@@ -2780,12 +3069,12 @@ def _open_lifecycle_lock(path: Path) -> int | None:
         raise StateError("lifecycle lock unavailable") from error
 
 
-def _reserve_attempt(state: dict, decision: Decision, now_ms: int) -> None:
+def _reserve_attempt(state: dict, decision: Decision, now_ms: int, *, notify: bool = True) -> None:
     incident = state["incident"]
     if incident is None or not decision.eligible or decision.trigger is None:
         raise StateError("cannot reserve suppressed attempt")
     attempt_id = f"{now_ms}-{len(incident['attempts']) + 1}"
-    notice_chat_ids = _pending_chat_ids(incident)
+    notice_chat_ids = _pending_chat_ids(incident) if notify else []
     incident["attempts"].append(
         {
             "attempt_id": attempt_id,
@@ -3114,6 +3403,7 @@ def tick(mode: str) -> int:
     if mode not in {"initialize", "observe", "active"}:
         return 2
     descriptor: int | None = None
+    freeze_lock: int | None = None
     try:
         agent_root = _agent_root()
         logs = agent_root / "logs"
@@ -3132,6 +3422,16 @@ def tick(mode: str) -> int:
                 raise StateError("initialized state contains an incident")
             return 0
 
+        # Processes this watcher stopped before are continued first, whatever the tick decides
+        # next: that compensation needs no new restart (Codex AGENTS 03.10, re-review of
+        # 3dc97a97). While any of them stays unresolved nothing new is frozen, reserved or
+        # restarted.
+        record = logs / "claude-limit-recovery.frozen.json"
+        freeze_lock = _freeze_lock(record)
+        if thaw(record):
+            _record_suppression(agent_root, "previous_freeze_unresolved")
+            return 0
+
         state = load_state(state_path)
         now_ms = _now_ms()
         state = _refresh_transcripts(agent_root, state, now_ms)
@@ -3148,14 +3448,9 @@ def tick(mode: str) -> int:
             _record_suppression(agent_root, "observe_mode")
             return 0
 
-        if durable_scheduler_owns_recovery(messages_db):
-            # The receiver wakes saved work after reset without replacing its
-            # native session. Process health remains the healthcheck's job.
-            atomic_write_state(state_path, state)
-            _record_suppression(agent_root, "durable_scheduler_owns_recovery")
-            return 0
-
-        refused = refused_request(state, now_ms)
+        # On the ledger the receiver owns the head; see ledger_decision.
+        ledger = durable_scheduler_owns_recovery(messages_db)
+        refused = None if ledger else refused_request(state, now_ms)
         if refused is not None and _restart_hold_status(agent_root) is None:
             # Reserved before the queue changes: a crash may skip the replay,
             # never repeat it over the request's new turn.
@@ -3166,6 +3461,8 @@ def tick(mode: str) -> int:
                 return 0
 
         decision = decide_attempt(state, now_ms)
+        if ledger:
+            decision = ledger_decision(decision, messages_db)
         if not decision.eligible:
             if decision.suppression == "incident_expired" and incident is not None:
                 incident["expired"] = True
@@ -3193,6 +3490,8 @@ def tick(mode: str) -> int:
             _record_suppression(agent_root, "incident_resolved")
             return 0
         decision = decide_attempt(state, now_ms)
+        if ledger:
+            decision = ledger_decision(decision, messages_db)
         if not decision.eligible:
             if decision.suppression == "incident_expired" and incident is not None:
                 incident["expired"] = True
@@ -3200,16 +3499,39 @@ def tick(mode: str) -> int:
             _record_suppression(agent_root, decision.suppression or "suppressed")
             return 0
 
-        _reserve_attempt(state, decision, now_ms)
-        atomic_write_state(state_path, state)
-        restarted = restart_and_notify(state, service, runner)
-        atomic_write_state(state_path, state)
+        frozen = False
+        # The cron budget ends this process with SIGTERM: under a freeze that continues the CLI first.
+        previous = {sig: signal.signal(sig, _thaw_and_exit(record)) for sig in (signal.SIGTERM, signal.SIGHUP)} \
+            if ledger else {}
+        try:
+            if ledger:
+                stopped = freeze_cli(service, record)
+                if stopped is None:
+                    atomic_write_state(state_path, state)
+                    _record_suppression(agent_root, "cli_not_frozen")
+                    return 0
+                frozen = True
+                if ledger_busy(messages_db):
+                    atomic_write_state(state_path, state)
+                    _record_suppression(agent_root, "durable_scheduler_owns_recovery")
+                    return 0
+            _reserve_attempt(state, decision, now_ms, notify=not receiver_owns_limit_notices(messages_db))
+            atomic_write_state(state_path, state)
+            restarted = restart_and_notify(state, service, runner)
+            atomic_write_state(state_path, state)
+        finally:
+            if frozen:
+                thaw(record)  # after a restart these processes are gone; otherwise they go on as before
+            for sig, handler in previous.items():
+                signal.signal(sig, handler)
         if not restarted:
             _record_suppression(agent_root, "restart_or_readiness_failed")
         return 0
     except (StateError, OSError, OverflowError, ValueError):
         return 1
     finally:
+        if freeze_lock is not None:
+            os.close(freeze_lock)
         if descriptor is not None:
             try:
                 fcntl.flock(descriptor, fcntl.LOCK_UN)
@@ -3288,6 +3610,11 @@ def main() -> int:
         )
         print(status)
         return 0
+    if len(arguments) == 3 and arguments[0] == "--thaw-guard":
+        try:
+            return thaw_guard(Path(arguments[1]), float(arguments[2]))
+        except ValueError:
+            return 2
     if arguments == ["--limit-until"]:
         try:
             until = limit_until(_agent_root() / ".claude" / "projects")

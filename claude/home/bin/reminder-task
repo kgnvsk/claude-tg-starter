@@ -417,6 +417,8 @@ def delivery_status(rem_dir, task, actor=None, chat=None):
         if state not in DELIVERY_STATES:
             state = "invalid"
         cursor = small_text(journal / "cursor")
+        if cursor and cursor.startswith("split:"):  # parts of a result made under <<<SPLIT>>>
+            cursor = cursor[len("split:"):]
         cursor = cursor if cursor and UINT_RE.fullmatch(cursor) else "unknown"
         if state == "cancelled":
             next_step = "retry_cancel"

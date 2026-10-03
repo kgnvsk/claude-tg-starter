@@ -315,6 +315,9 @@ def migrate(
     if isinstance(env, dict):
         env.setdefault("MCP_TOOL_TIMEOUT", "180000")            # 3 min hard cap / call
         env.setdefault("CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT", "120000")  # 2 min no-progress
+        # Owner, 03.10.2026: the CLI updates only when we roll a version out (first Кеш and Кнопа, then
+        # the rest by hand); 2.1.288 arrived overnight by itself. An operator's own value is kept.
+        env.setdefault("DISABLE_AUTOUPDATER", "1")
 
     rendered = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
     fd, temporary = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)

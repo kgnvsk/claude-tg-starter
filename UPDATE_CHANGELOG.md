@@ -1,8 +1,8 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-10-03.0eb968c7e098`
+- Реліз: `2026-10-03.ac5451dc50a1`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `0eb968c7e098d3d76834997410a7b4031bed1f00`
+- Ревізія вихідного комплекту: `ac5451dc50a1fd5e10d8109c6deef8655f3a9ef1`
 - Дата релізу: `2026-10-03`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
@@ -19,9 +19,15 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    Company limit line names whose plan it is; the company reminder waits for durable state
-    Send a fresh login link in the owner's daytime while the outage goes on
-    Name the Claude limit and its reset in the person's language, and remind a chat that writes again
+    A left freeze is continued at the start of every tick
+    An unresolved freeze is kept, and the guard thaws only under its lock
+    The marker split belongs to results made under it
+    The Claude CLI does not update itself on an agent
+    A scheduled task's result can arrive as several separate messages
+    A freeze of the CLI is bounded whatever happens to the watcher, and catches a late child
+    Restart a held CLI only when nothing runs, proven again with the CLI frozen
+    Restart a ledger bot whose CLI holds the receiver's offer after a limit
+    A Pro plan compacts the conversation around 450K instead of 747K
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не

@@ -515,7 +515,7 @@ run_agent_task() {
 ${prompt}"
   else
     [ -z "${thread_id:-}" ] || destination="чат ${chat}, тему ${thread_id}"
-    prompt="Це автоматичне завдання планувальника. Напиши лише текст результату мовою завдання: планувальник сам доставить його в ${destination}. Файли надсилай через tg-send-file${thread_id:+ з --thread-id ${thread_id}}.
+    prompt="Це автоматичне завдання планувальника. Напиши лише текст результату мовою завдання: планувальник сам доставить його в ${destination}. Якщо завдання просить кілька окремих повідомлень, розділи їх рядком <<<SPLIT>>> — кожна частина піде окремим повідомленням. Файли надсилай через tg-send-file${thread_id:+ з --thread-id ${thread_id}}.
 
 ${prompt}"
   fi
@@ -558,20 +558,30 @@ ${prompt}"
 # answered "message is too long", and Lera's morning and evening lists were
 # lost, 2026-09-01..03); it travels as several messages, split at line ends.
 split_chunks() {
+  # With 1: the result was made under the <<<SPLIT>>> instruction, and a line of its own reading
+  # <<<SPLIT>>> ends one message and starts the next; a task asked for «separate messages» had no
+  # way to send them and said so in the chat (Арти, 03.10.2026). Any other text, a reminder's or a
+  # result saved before, keeps the split its cursor was counted in (Codex AGENTS 03.10, #179 P1).
   python3 -c '
-import sys
+import re, sys
 text = sys.stdin.read().rstrip()
 limit = 3500
+pieces = [text]
+if sys.argv[1] == "1":
+    pieces = re.split(r"(?m)^[ \t]*<<<SPLIT>>>[ \t]*$", text)
+    if len(pieces) > 1:
+        pieces = [piece.strip("\n").rstrip() for piece in pieces if piece.strip()] or [""]
 parts = []
-while len(text) > limit:
-    cut = text.rfind("\n", 0, limit)
-    if cut < limit // 2:
-        cut = limit
-    parts.append(text[:cut].rstrip())
-    text = text[cut:].lstrip("\n")
-parts.append(text)
+for text in pieces:
+    while len(text) > limit:
+        cut = text.rfind("\n", 0, limit)
+        if cut < limit // 2:
+            cut = limit
+        parts.append(text[:cut].rstrip())
+        text = text[cut:].lstrip("\n")
+    parts.append(text)
 sys.stdout.write("\0".join(parts))
-'
+' "${1:-0}"
 }
 
 delivered() {
@@ -954,7 +964,7 @@ reconcile_prepared_topic() {
 }
 
 deliver_saved_run() {
-  local journal="$1" state source result cursor chunk index resp response_class saved_parse
+  local journal="$1" state source result cursor prefix chunk index resp response_class saved_parse
   state=$(cat "$journal/state" 2>/dev/null) || return 1
   source="$journal/source.rem"
   result="$journal/result.txt"
@@ -1018,6 +1028,10 @@ deliver_saved_run() {
     return 1
   fi
   cursor=$(cat "$journal/cursor" 2>/dev/null) || return 1
+  # A result made under the <<<SPLIT>>> instruction counts its parts as split:N. A runner from
+  # before it would count them its own way; it finds no number there and stops instead.
+  prefix=""
+  case $cursor in split:*) prefix=split:; cursor=${cursor#split:} ;; esac
   is_uint "$cursor" || {
     atomic_text "$journal/state" uncertain
     log_message "UNCERTAIN scheduled run $(basename "$journal"): invalid chunk cursor"
@@ -1040,7 +1054,7 @@ deliver_saved_run() {
     atomic_text "$journal/state" sending || return 1
     if resp=$(send_text "$chat" "$chunk" "$saved_parse" "$thread_id"); then
       index=$((index + 1))
-      atomic_text "$journal/cursor" "$index" || return 1
+      atomic_text "$journal/cursor" "$prefix$index" || return 1
       atomic_text "$journal/state" ready || return 1
       continue
     fi
@@ -1053,7 +1067,7 @@ deliver_saved_run() {
     fi
     log_message "FAILED saved scheduled result $(basename "$journal") chunk=$index status=$response_class: $(printf '%s' "$resp" | tr '\n' ' ' | cut -c1-180)"
     return 0
-  done < <(split_chunks < "$result")
+  done < <(split_chunks "${prefix:+1}" < "$result")
   rm -rf -- "$journal"
 }
 
@@ -1112,8 +1126,8 @@ run_occurrence() {
     { printf '%s\n\n' "$late" && cat "$result_temp"; } > "$result_temp.late" &&
       mv -f "$result_temp.late" "$result_temp"
   fi
-  if [ ! -s "$result_temp" ] || ! mv "$result_temp" "$journal/result.txt" ||
-     ! atomic_text "$journal/state" ready; then
+  if [ ! -s "$result_temp" ] || ! atomic_text "$journal/cursor" split:0 ||
+     ! mv "$result_temp" "$journal/result.txt" || ! atomic_text "$journal/state" ready; then
     rm -f "$result_temp"
     log_message "UNCERTAIN scheduled run $(basename "$journal"): result could not be committed"
     return

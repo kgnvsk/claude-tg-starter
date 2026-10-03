@@ -53,7 +53,13 @@ export PATH="$HOME/.local/bin:$BUN_INSTALL/bin:$HOME/bin:/usr/local/bin:/usr/bin
 # Native Claude clamps this window to the model's supported context. With a 1M
 # model and the output reserve, 850K at 90% compacts around 747K. Keep ordinary
 # conversation history; native background workers own lengthy intermediate work.
-# Explicit operator overrides remain authoritative.
+# A Pro plan counts every step's whole history against its 5-hour limit, so it
+# compacts around 450K (owner, 03.10.2026: Арти read 283M-447M tokens a day at
+# ~747K and ran out within hours). Explicit operator overrides remain authoritative.
+if [ -z "${CLAUDE_CODE_AUTO_COMPACT_WINDOW:-}" ] \
+  && grep -q '"subscriptionType" *: *"pro"' "$CLAUDE_CONFIG_ROOT/.credentials.json" 2>/dev/null; then
+  CLAUDE_CODE_AUTO_COMPACT_WINDOW=500000
+fi
 export CLAUDE_CODE_AUTO_COMPACT_WINDOW="${CLAUDE_CODE_AUTO_COMPACT_WINDOW:-850000}"
 export CLAUDE_AUTOCOMPACT_PCT_OVERRIDE="${CLAUDE_AUTOCOMPACT_PCT_OVERRIDE:-90}"
 
