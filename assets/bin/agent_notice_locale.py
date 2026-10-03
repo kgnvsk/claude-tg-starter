@@ -456,45 +456,59 @@ MONTHS = {
 }
 
 
-def agent_time_zone(home: Path) -> str:
-    """TIMEZONE from the agent's live profile, or UTC."""
+def named_time_zone(home: Path) -> str | None:
+    """TIMEZONE from the agent's live profile when it names a real zone, else None."""
     try:
         lines = (home / ".agent-profile.env").read_text(encoding="utf-8").splitlines()
     except (OSError, UnicodeError):
-        return "UTC"
+        return None
     found = [line.partition("=")[2].strip().strip("'\"") for line in lines if line.startswith("TIMEZONE=")]
     if len(found) != 1:
-        return "UTC"
+        return None
     try:
         from zoneinfo import ZoneInfo
         ZoneInfo(found[0])
     except (ValueError, KeyError, OSError):
-        return "UTC"
+        return None
     return found[0]
 
 
-ACCEPTED = {  # (no reset known, «after» with a time, Kyiv)
-    "uk": ("Прийняв, відповім трохи згодом", "Прийняв, відповім після", "за київським часом"),
-    "ru": ("Принял, отвечу чуть позже", "Принял, отвечу после", "по киевскому времени"),
-    "pl": ("Przyjąłem, odpowiem trochę później", "Przyjąłem, odpowiem po", "czasu kijowskiego"),
-    "en": ("Got it, I'll reply a bit later", "Got it, I'll reply after", "Kyiv time"),
+def agent_time_zone(home: Path) -> str:
+    """TIMEZONE from the agent's live profile, or UTC."""
+    return named_time_zone(home) or "UTC"
+
+
+# Owner, 03.10.2026 (Арти): the person hears that it is the plan's limit and when it resets.
+LIMIT_REACHED = {  # (no reset known, with the reset time)
+    "uk": ("Уперся в ліміт Claude за тарифом — відповім, щойно він скинеться",
+           "Уперся в ліміт Claude за тарифом — відповім після"),
+    "ru": ("Упёрся в лимит Claude по тарифу — отвечу, как только он сбросится",
+           "Упёрся в лимит Claude по тарифу — отвечу после"),
+    "pl": ("Wyczerpał się limit Claude w planie — odpowiem, gdy tylko się odnowi",
+           "Wyczerpał się limit Claude w planie — odpowiem po"),
+    "en": ("I've hit my Claude plan limit — I'll reply as soon as it resets",
+           "I've hit my Claude plan limit — I'll reply after"),
 }
 
 
 def accepted_line(home: Path, reset_epoch_ms: int | None, now_ms: int) -> str:
-    """The owner's line (27.09), the same as the receiver's and the corporate runtime's."""
+    """The limit line, the same as the receiver's and the corporate runtime's.
+
+    The reset in the agent's zone, its date only when that is not today there,
+    and the zone named only when the profile sets none.
+    """
     locale = owner_notice_locale(home)
-    later, after, kyiv = ACCEPTED[locale]
+    later, after = LIMIT_REACHED[locale]
     if not reset_epoch_ms:
         return later
     from datetime import datetime
     from zoneinfo import ZoneInfo
-    zone = agent_time_zone(home)
+    named = named_time_zone(home)
+    zone = named or "UTC"
     at = datetime.fromtimestamp(reset_epoch_ms / 1000, ZoneInfo(zone))
     today = datetime.fromtimestamp(now_ms / 1000, ZoneInfo(zone)).date()
     day = "" if at.date() == today else f" {at.day} {MONTHS[locale][at.month - 1]}"
-    where = kyiv if zone in ("Europe/Kyiv", "Europe/Kiev") else f"({zone})"
-    return f"{after} {at:%H:%M}{day} {where}"
+    return f"{after} {at:%H:%M}{day}" + ("" if named else f" ({zone})")
 
 
 def notice_text(key: str, ukrainian: str, *, home: Path) -> str:

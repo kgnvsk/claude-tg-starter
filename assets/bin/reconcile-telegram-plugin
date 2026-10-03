@@ -28,10 +28,12 @@ UPSTREAM_SERVER_SHA256 = (
 )
 UPSTREAM_PACKAGE_START = "bun install --no-summary 1>&2 && bun server.ts"
 GOLDEN_SERVER_SHA256 = (
-    "4265fea73d010cae7b788b8f7e71f68fbf3e200f68cbf0d57f51c836aad45bf0"
+    "c5c7c7c35fca23038224178d0d52110c5acfde0bb0308e4f1295e27788939aec"
 )
 PREVIOUS_GOLDEN_SERVER_SHA256S = frozenset(
     {
+        # The golden released as 2026-10-03.bf3ac4233ee6 (receipts release 3), before the limit line named the limit.
+        "4265fea73d010cae7b788b8f7e71f68fbf3e200f68cbf0d57f51c836aad45bf0",
         # The golden before the merge that joins the receipts branch with the receiver main released on 01.10 (limit notices, answered heads).
         "650f218654ab43f69763c705a5bb3c35ddbda5defc756afa519eb2743211be21",
         # The golden main released as 2026-10-01.03f6e71697c7, before its merge with the receipts branch.

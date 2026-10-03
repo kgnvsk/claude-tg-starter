@@ -123,6 +123,21 @@ def say(key: str, ukrainian: str, **values: str) -> str:
     return _NOTICE_MODULE.notice_text(key, ukrainian, home=AGENT_ROOT).format(**values)
 
 
+# A link that died unused and an owner who has not written since: the outage goes on, so a fresh link
+# goes in the owner's daytime (09:00-21:00 in the agent's TIMEZONE), at most every 6 hours. Верні, Пара,
+# Team bot 03.10: the night link expired and the bots stayed silent until someone noticed.
+DAYTIME_RELINK_AFTER_S = 6 * 3600
+
+
+def owner_daytime(at: float) -> bool:
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    try:
+        return 9 <= datetime.fromtimestamp(at, ZoneInfo(_NOTICE_MODULE.agent_time_zone(AGENT_ROOT))).hour < 21
+    except Exception:
+        return False
+
+
 def mark_auth_established() -> None:
     AUTH_ESTABLISHED.parent.mkdir(parents=True, exist_ok=True)
     AUTH_ESTABLISHED.touch(mode=0o600, exist_ok=True)
@@ -787,6 +802,8 @@ def main(force: bool = False, chat_override: str | None = None) -> int:
                 log("auto-rescue cap of an earlier outage cleared: a login was established after it")
             elif owner_wrote_since(int(capped_at * 1000)):
                 log("owner wrote after the last link; sending a fresh one")
+            elif time.time() - capped_at >= DAYTIME_RELINK_AFTER_S and owner_daytime(time.time()):
+                log("the outage goes on and it is the owner's daytime; sending a fresh link")
             else:
                 log(f"auto-rescue capped after {_n} attempts; waiting for /relogin or the owner's next message")
                 return 0

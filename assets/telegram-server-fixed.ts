@@ -4223,10 +4223,22 @@ function ownerNotice(key: string, ukrainian: string): Promise<string> {
 // again after the reset). Group talk marked as addressed to nobody is not a
 // request, and a request paused for a login problem does not wait on the limit.
 const LIMIT_NOTICE_RESET_WAIT_MS = envNumber('TG_LIMIT_NOTICE_RESET_WAIT_MS', 90_000)
+// A conversation that writes again while the limit holds hears the line once more, but only for a
+// message sent at least this long after its last notice (owner, 03.10: Arthur's «Ты тут?» got nothing).
+const LIMIT_REMINDER_MS = envNumber('TG_LIMIT_REMINDER_MS', 30 * 60_000)
+
+// Owner, 03.10.2026 (Арти): the person hears that it is the plan's limit and when it resets, in the
+// agent's language (agent_notice_locale.LIMIT_REACHED and the corporate runtime say the same).
+const LIMIT_REACHED: Record<string, readonly [later: string, after: string, tag: string]> = {
+  uk: ['Уперся в ліміт Claude за тарифом — відповім, щойно він скинеться', 'Уперся в ліміт Claude за тарифом — відповім після', 'uk-UA'],
+  ru: ['Упёрся в лимит Claude по тарифу — отвечу, как только он сбросится', 'Упёрся в лимит Claude по тарифу — отвечу после', 'ru-RU'],
+  pl: ['Wyczerpał się limit Claude w planie — odpowiem, gdy tylko się odnowi', 'Wyczerpał się limit Claude w planie — odpowiem po', 'pl-PL'],
+  en: ["I've hit my Claude plan limit — I'll reply as soon as it resets", "I've hit my Claude plan limit — I'll reply after", 'en-GB'],
+}
 
 function limitNoticeText(resetAt: number): string {
-  let russian = false
-  let zone = 'UTC'
+  let locale = 'uk'
+  let zone: string | null = null
   try {
     // The per-agent profile, not VAULT_LOCALE or the process environment,
     // selects owner-facing notices in the rest of the kit.
@@ -4238,22 +4250,21 @@ function limitNoticeText(resetAt: number): string {
         const found = lines.filter(line => line.startsWith(`${name}=`))
         return found.length === 1 ? found[0]!.trim() : ''
       }
-      russian = /^OWNER_NOTICE_LOCALE=(?:ru|'ru'|"ru")$/.test(setting('OWNER_NOTICE_LOCALE'))
-      zone = /^TIMEZONE=(['"]?)([A-Za-z0-9_+\/-]+)\1$/.exec(setting('TIMEZONE'))?.[2] ?? zone
+      locale = /^OWNER_NOTICE_LOCALE=(['"]?)(uk|ru|pl|en)\1$/.exec(setting('OWNER_NOTICE_LOCALE'))?.[2] ?? locale
+      zone = /^TIMEZONE=(['"]?)([A-Za-z0-9_+\/-]+)\1$/.exec(setting('TIMEZONE'))?.[2] ?? null
     }
   } catch { /* Existing agents keep Ukrainian notices without a valid profile. */ }
-  // The owner's line (27.09), the same as the corporate runtime's: the reset in the
-  // agent's zone, its date only when that is not today there.
-  if (!resetAt) return russian ? 'Принял, отвечу чуть позже' : 'Прийняв, відповім трохи згодом'
+  const [later, after, tag] = LIMIT_REACHED[locale]!
+  if (!resetAt) return later
+  // The reset in the agent's zone, its date only when that is not today there, the zone
+  // named only when the profile sets none.
   const format = (at: number, options: Intl.DateTimeFormatOptions) =>
-    new Intl.DateTimeFormat(russian ? 'ru-RU' : 'uk-UA', { timeZone: zone, ...options }).format(at)
-  try { format(resetAt, {}) } catch { zone = 'UTC' }
+    new Intl.DateTimeFormat(tag, { timeZone: zone ?? 'UTC', ...options }).format(at)
+  try { format(resetAt, {}) } catch { zone = null }
   const day = format(resetAt, { day: 'numeric', month: 'long' })
   const at = format(resetAt, { hour: '2-digit', minute: '2-digit', hourCycle: 'h23' })
     + (day === format(Date.now(), { day: 'numeric', month: 'long' }) ? '' : ` ${day}`)
-  const where = zone === 'Europe/Kyiv' || zone === 'Europe/Kiev'
-    ? (russian ? 'по киевскому времени' : 'за київським часом') : `(${zone})`
-  return `${russian ? 'Принял, отвечу после' : 'Прийняв, відповім після'} ${at} ${where}`
+  return `${after} ${at}${zone ? '' : ' (UTC)'}`
 }
 
 function modelAnsweredSince(at: number): boolean {
@@ -4324,7 +4335,7 @@ async function notifyPausedBackgroundResults(): Promise<void> {
   if (!reset && now < (pause?.updated_at ?? 0) + LIMIT_NOTICE_RESET_WAIT_MS
     && existsSync(join(process.env.AGENT_ROOT ?? homedir(), 'logs', 'claude-limit-recovery.json'))) return
   const waiting = MSG_DB.query(`SELECT r.delivery_id, r.chat_id, r.thread_id, r.recovery_notice_at,
-      r.recovery_notice_retry_at FROM delivery_results r
+      r.recovery_notice_retry_at, r.created_at FROM delivery_results r
     WHERE ((r.state IN ('paused','resume_pending') AND r.recovery_reason IS NOT 'provider_auth')
       OR (r.state = 'queued' AND EXISTS (SELECT 1 FROM pending_inbound_deliveries p
           WHERE p.delivery_id = r.delivery_id AND p.state IN ('queued','offered'))))
@@ -4332,7 +4343,8 @@ async function notifyPausedBackgroundResults(): Promise<void> {
       AND coalesce(CASE WHEN json_valid(r.request_payload)
         THEN json_extract(r.request_payload, '$.params.meta.addressed') END, '') <> 'false'
     ORDER BY r.created_at, r.delivery_id`).all() as Array<{ delivery_id: string; chat_id: string;
-      thread_id: string | null; recovery_notice_at: number | null; recovery_notice_retry_at: number | null }>
+      thread_id: string | null; recovery_notice_at: number | null; recovery_notice_retry_at: number | null
+      created_at: number }>
   const conversations = new Map<string, typeof waiting>()
   for (const row of waiting) {
     const key = `${row.chat_id}:${row.thread_id ?? ''}`
@@ -4347,7 +4359,9 @@ async function notifyPausedBackgroundResults(): Promise<void> {
     const told = Number(marker?.value) || 0
     const last = Math.max(Math.abs(marker?.updated_at ?? 0), ...rows.map(row => Math.abs(row.recovery_notice_at ?? 0)))
     // A notice that could not name the reset is followed once by the reset.
-    if (last && !modelAnsweredSince(last) && !(told && deadline > told) && !(marker && !told && reset)) continue
+    const wroteAgain = rows.some(row => row.created_at >= last + LIMIT_REMINDER_MS)
+    if (last && !modelAnsweredSince(last) && !(told && deadline > told) && !(marker && !told && reset)
+      && !wroteAgain) continue
     // A negative timestamp reserves the attempt durably, together with what this
     // notice says to the conversation: a crash or an unknown network outcome
     // must not repeat it on a later tick or at the next start.
