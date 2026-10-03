@@ -1,8 +1,8 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-10-03.0934bd65c639`
+- Реліз: `2026-10-03.24a99e9132d0`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `0934bd65c6390a98e4519810f8b951733e5457fc`
+- Ревізія вихідного комплекту: `24a99e9132d0423fba455e26d1eadd6c3ee005e4`
 - Дата релізу: `2026-10-03`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
@@ -19,10 +19,7 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    tests: the killed tick's lock is awaited, not checked at once
-    tests: the Codex integration timeout test gives the helper 3 s to start, not 1
-    fix: preserve maintenance compatibility after install isolation
-    fix: isolate install secrets and preserve operator SSH access
+    Pin the persona sources of the 16.09, 22.09 and the seventh 23.09 kit
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не
