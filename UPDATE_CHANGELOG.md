@@ -1,8 +1,8 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-10-03.d5de77b64edd`
+- Реліз: `2026-10-03.bf3ac4233ee6`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `d5de77b64eddb45ba58fcb6c9f6adcae91ceefd0`
+- Ревізія вихідного комплекту: `bf3ac4233ee6593de7a68e97cac8c8a712dbe901`
 - Дата релізу: `2026-10-03`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
@@ -19,25 +19,46 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    tests: the busy-database claim test holds the lock until the hook has answered
-    inbox-secretary: a read that failed before any send is tried again; after five the owner is told
-    personal Telegram clients: no retries inside Telethon
-    tests: media-dl's retry counts its downloads; the H.264 check has its own cases
-    media-dl: a video that is not H.264 is re-encoded so Mac, iPhone and Telegram can play it
-    inbox-secretary: the reply speaks as the owner himself; Telethon's used-up retries are an unknown outcome
-    secretary and owner-send: the owner's word is read after the last network wait; only real denials are «not sent»
-    inbox-secretary: describe the closed call without the literal nested-run form
-    tests: the send-boundary cases run beside a bridge that would take any attempt
-    secretary and owner-send: one admission check at the send boundary; honest unknown outcomes
-    inbox-secretary: fetch what Telegram's push did not bring; log why a chat is left out
-    skills: keep both descriptions under the 200-character limit
-    skills: whom the secretary answers, and how the owner widens or narrows it
-    inbox-secretary: by default only dialogs that begin after the switch; the owner may widen it or name chats
-    inbox-secretary: ask mode has the same per-chat hour limit as dialog
-    inbox-secretary: one listener however started; the started listener carries no session environment
-    inbox-secretary: the owner's personal channels listen, propose replies, or hold a dialog
-    personal-inbox: chats the owner closed for the agent; a running bridge takes the new binary
-    personal-inbox: one message from the owner's Telegram or WhatsApp on his request
+    tests: the Vercel install harness carries the installer's secrets list
+    Installer: the license key reaches the license check only; package installs get none of the bot's secrets
+    tests: the reminder worker runs get a 60 s hang guard instead of 10 s
+    tests: a Codex task that keeps reporting outlives its timeout with room for a slow beat
+    publish-products: the release tag takes the commit's date, as the archives' release id does
+    Every kit bot keeps the receipts in shadow: new installs and updates of the old default
+    Wait for the message to close in the receipt-retry test instead of reading it between two transactions
+    Bring the last test of the old start-up quarantine to the accepted rule
+    Pin the receiver whose start gives up the fence of a cut-off progress
+    A progress a restart cut off gives its fence up at the start; its request is recovered, not handed to the owner
+    Let the shadow report ask ten agreements only of the chat kinds a bot serves
+    Keep the paused request of the «not woken» test out of the recovery timer
+    Let a worker's one more end reach its request while only a progress is on its way
+    Run the evening replay's own tests only, not the base stand's again
+    Test the remaining cases of the wait: unknown progress, unreadable proof, damaged request text
+    Drop the blank line at the end of the evening replay test
+    Pin the receiver that waits for a returned worker's one more end
+    Bring the two «returned worker» tests to the wait for its one more end
+    Let a request wait for one more end of a worker whose recorded run already returned for it
+    Count a reopened request's work in its response turn only from the moment it entered that turn
+    Bind an end with no launch id only to a freshly created Agent with no other history
+    Test that an id-less end never discharges a first resume across a restart or an unreadable history (red)
+    Return a task by an end with no launch id when it is the task's only launch in this run
+    Test an id-less end of the only launch in this run returning it (red)
+    Pin the receiver that reads the unfamiliar-end proof only where it can free a task
+    Read the unfamiliar-end proof only under the receiver, and only for a request that holds the task
+    Test an unreadable unfamiliar-end proof never holding an ordinary progress, and the receiver freeing nothing it cannot prove (red)
+    Pin the receiver whose previous-owner rule accepts an unfamiliar end's own final receipt
+    Let the terminal receipt of an unfamiliar end's own final free its task for the next request
+    Test a task whose unfamiliar end's final went out after its turn closed registering for the next request (red)
+    Pin the receiver that answers an unfamiliarly ended run's request in its current turn
+    Answer the request in the current turn when its unfamiliar end's final is admitted
+    Test a resume while the unfamiliar end's final is on the network superseding it in either order (red)
+    Pin the receiver whose recorded-launch proof never holds a send outside the receiver
+    Keep the recorded-launch proof an observation outside the receiver, and fail-closed under it
+    Test an unreadable launch record never holding a live progress outside the receiver (red)
+    Resume a run that ended unfamiliarly for its request while that request is still owed an answer
+    Test a resume while a refused unfamiliar-end final is still owed holding that request (red)
+    Pin the receiver that registers a resumed worker by its recorded launch
+    Register a worker resumed after a service restart by the launch this run recorded
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не

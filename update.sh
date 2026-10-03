@@ -793,6 +793,8 @@ if [ -z "${AGENT_NAME:-}" ]; then
 fi
 
 env CLAUDE_UPDATE_MAINTENANCE="$CLAUDE_UPDATE_MAINTENANCE" bash "$KIT/assets/install-core.sh"
+# Nothing after the install needs the license key; the tools started below do not inherit it.
+unset NOVSKY_LICENSE_KEY
 
 # MODULE_TELEGRAM_CORPORATE=0 (never-activated installation on a host without
 # user namespaces for the agent) installs no module; install-core has already

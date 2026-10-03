@@ -19,8 +19,8 @@ import { z } from 'zod'
 import { Bot, GrammyError, InlineKeyboard, InputFile, type Context } from 'grammy'
 import type { ReactionTypeEmoji } from 'grammy/types'
 import { randomBytes, createHash } from 'crypto'
-import { accessSync, constants, existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, lstatSync, renameSync, realpathSync, chmodSync, openSync, fsyncSync, closeSync, readSync } from 'fs'
-import { homedir } from 'os'
+import { accessSync, constants, existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, lstatSync, renameSync, realpathSync, chmodSync, openSync, fsyncSync, closeSync, readSync, readlinkSync } from 'fs'
+import { homedir, tmpdir } from 'os'
 import { execFile, execFileSync } from 'child_process'
 import { join, extname, sep, relative, resolve, basename } from 'path'
 import { pathToFileURL } from 'node:url'
@@ -403,6 +403,10 @@ for (const [name, definition] of [
   // B4: when the one recovery turn for a forgotten reply also ended without an
   // answer, and when B4 decided what the request is owed.
   ['forgot_reply_at', 'INTEGER'], ['forgot_reply_decided_at', 'INTEGER'],
+  // L-2′: the generation at which the request was deferred to one more end of a worker whose recorded
+  // run had already returned for it. It names that wait only while it equals result_generation: every
+  // way out of the wait moves the generation on or leaves `deferred`.
+  ['continuation_generation', 'INTEGER'],
 ]) {
   if (!resultColumns.has(name!)) {
     try { MSG_DB.run(`ALTER TABLE delivery_results ADD COLUMN ${name} ${definition}`) }
@@ -499,6 +503,20 @@ for (const [table, name, definition] of [
   try { MSG_DB.run(`ALTER TABLE ${table} ADD COLUMN ${name} ${definition}`) }
   catch (error) { if (!String(error).includes('duplicate column name')) throw error }
 }
+// A worker's run whose own end status no hook knows (a newer CLI), as tg-context-inject saw it: the exact
+// occurrence and launch it ended. Under the receiver the model's own final, when that run is its request's
+// one open item, ends the worker as `ended_unread` and is sent (task 50, Codex 01:42): released_* name it,
+// and notice_at holds the owner's one notice of it like silent_notified_at does, here because a resume
+// starts the worker's row over.
+MSG_DB.run(`CREATE TABLE IF NOT EXISTS delivery_task_unread_ends (
+  session_id TEXT NOT NULL, stamp TEXT NOT NULL, task_id TEXT NOT NULL, occurrence INTEGER NOT NULL,
+  launch_ref TEXT NOT NULL, status TEXT NOT NULL, prompt_hash TEXT NOT NULL, turn_id INTEGER NOT NULL,
+  observed_at INTEGER NOT NULL, released_delivery_id TEXT, released_generation INTEGER, released_at INTEGER,
+  notice_at INTEGER, PRIMARY KEY (session_id, stamp, task_id, occurrence)
+)`)
+// Where each owner's notice of a worker is reserved, sent or owed again (notifySilentWorkers).
+const WORKER_NOTICES = [['delivery_task_owners', 'silent_notified_at'], ['delivery_task_launches', 'silent_notified_at'],
+  ['delivery_task_unread_ends', 'notice_at']] as const
 // A terminal receipt exists only after the entire final reply was accepted by
 // Telegram and the same result generation was atomically marked complete.
 // Unlike a transport receipt, it identifies the exact native callback (when
@@ -2403,16 +2421,42 @@ type ScopedRequest = {
 // superseded final may complete its request, only while this list is empty.
 // A worker the owner was told about (silent_notified_at, NOVSKY 27.09) no
 // longer counts: it stops blocking, and its late callback still binds.
+// B0-c (Knopa, 01.10.2026): a request enters its response turn when its worker's
+// return is bound there. What that turn launched before then, for the request it
+// was opened for, is not this request's work; a launch at or after that moment
+// is, and so is every launch of a response turn with no bound return. The moment
+// of an unowned obligation is its recorded launch's, never the owner row's: that
+// row survives resumes. A launch record that cannot be found counts.
+const SCOPE_WORK = `WITH entered(at) AS (SELECT min(observed_at) FROM delivery_task_returns
+      WHERE session_id=?1 AND stamp=?2 AND delivery_id=?3 AND turn_id=?5)
+  SELECT 'launch ' || launch_ref AS work FROM delivery_task_launches, entered
+    WHERE session_id=?1 AND stamp=?2 AND state='launching' AND silent_notified_at IS NULL
+      AND (launched_turn=?4 OR (launched_turn=?5 AND created_at >= coalesce(entered.at, 0)))
+  UNION ALL SELECT 'task ' || o.task_id FROM delivery_task_owners o, entered
+    WHERE o.session_id=?1 AND o.stamp=?2 AND o.silent_notified_at IS NULL
+      AND ((o.state IN ('owned','legacy') AND o.delivery_id=?3)
+        OR (o.state='unowned' AND (o.launched_turn=?4 OR (o.launched_turn=?5 AND coalesce(
+          (SELECT l.created_at FROM delivery_task_launches l WHERE l.launch_ref=o.launch_ref
+            AND l.session_id=o.session_id AND l.stamp=o.stamp), 9223372036854775807) >= coalesce(entered.at, 0)))))`
+// The list before B0-c: everything both turns launched.
+const SCOPE_WORK_TURNS = `SELECT 'launch ' || launch_ref AS work FROM delivery_task_launches
+    WHERE session_id=?1 AND stamp=?2 AND state='launching' AND launched_turn IN (?4, ?5)
+      AND silent_notified_at IS NULL
+  UNION ALL SELECT 'task ' || task_id FROM delivery_task_owners
+    WHERE session_id=?1 AND stamp=?2 AND ((state IN ('owned','legacy') AND delivery_id=?3)
+      OR (state='unowned' AND launched_turn IN (?4, ?5))) AND silent_notified_at IS NULL`
 function scopeWork(request: ScopedRequest): string[] {
-  return (MSG_DB.query(`SELECT 'launch ' || launch_ref AS work FROM delivery_task_launches
-      WHERE session_id=? AND stamp=? AND state='launching' AND launched_turn IN (?, ?)
-        AND silent_notified_at IS NULL
-    UNION ALL SELECT 'task ' || task_id FROM delivery_task_owners
-      WHERE session_id=? AND stamp=? AND ((state IN ('owned','legacy') AND delivery_id=?)
-        OR (state='unowned' AND launched_turn IN (?, ?))) AND silent_notified_at IS NULL`)
-    .all(request.session_id, request.stamp, request.turn_id, request.response_turn_id,
-      request.session_id, request.stamp, request.delivery_id, request.turn_id, request.response_turn_id) as
-      Array<{ work: string }>).map(row => row.work)
+  const list = (sql: string) => (MSG_DB.query(sql).all(request.session_id, request.stamp, request.delivery_id,
+    request.turn_id, request.response_turn_id) as Array<{ work: string }>).map(row => row.work)
+  if (WORKER_GATES) return list(SCOPE_WORK)
+  // Guard and shadow only observe this list, and the moment a request entered its turn is a newer reading
+  // than the list they always had: when it cannot be read they observe by that list, and nothing they
+  // send is held for it (Codex 01.10 23:20, P0-2).
+  try { return list(SCOPE_WORK) } catch (error) {
+    process.stderr.write(`telegram channel: when ${request.delivery_id} entered its turn cannot be read; `
+      + `its open work is observed as before: ${error}\n`)
+    return list(SCOPE_WORK_TURNS)
+  }
 }
 
 // A network send cannot be rolled back with SQLite. Fence the exact retained
@@ -2443,6 +2487,61 @@ function countFinalRefusal(refusal: OpenWorkRefusal): void {
     }).immediate()
   } catch (error) {
     process.stderr.write(`telegram channel: refused final not counted: ${error}\n`)
+  }
+}
+
+// Task 50, Codex 01:42; owner, 01.10: a worker's run that ended in an own status no hook knows (a newer CLI)
+// must not leave its author worse off than the guard, which sends this final at once. When that exact run is
+// its request's one open item, the model's own final ends it as `ended_unread` (no return is proven), reserves
+// the owner's one notice, answers the request in this turn as a callback would reopen it into its turn, so a
+// launch made now supersedes this final while it may still be on the network (R4-1; Codex 02:59 P1-2), and
+// is armed in the same transaction. Anything else open refuses as before.
+function endUnreadWorker(request: ScopedRequest, open: string[], generation: number, now: number): boolean {
+  if (open.length !== 1 || !open[0]!.startsWith('task ')) return false
+  const task = open[0]!.slice('task '.length)
+  const owner = MSG_DB.query(`SELECT o.state, o.delivery_id, o.occurrence, o.launched_turn FROM delivery_task_owners o
+      JOIN delivery_task_unread_ends u ON u.session_id=o.session_id AND u.stamp=o.stamp AND u.task_id=o.task_id
+        AND u.occurrence=o.occurrence AND u.launch_ref=o.launch_ref AND u.released_at IS NULL
+    WHERE o.session_id=? AND o.stamp=? AND o.task_id=? AND o.silent_notified_at IS NULL`)
+    .get(request.session_id, request.stamp, task) as
+    { state: string; delivery_id: string | null; occurrence: number; launched_turn: number | null } | null
+  if (!owner) return false
+  if (owner.state === 'unowned') {
+    // An unregistered worker belongs to the one open request of the turn that launched it (B0-a).
+    const sole = MSG_DB.query(`SELECT delivery_id FROM delivery_results WHERE session_id=? AND stamp=?
+        AND state IN ('pending','deferred') AND (turn_id=? OR response_turn_id=?)`)
+      .all(request.session_id, request.stamp, owner.launched_turn, owner.launched_turn) as Array<{ delivery_id: string }>
+    if (sole.length !== 1 || sole[0]!.delivery_id !== request.delivery_id) return false
+  } else if (owner.state !== 'owned' || owner.delivery_id !== request.delivery_id) {
+    return false
+  }
+  MSG_DB.query(`UPDATE delivery_task_owners SET state='ended_unread', delivery_id=?
+    WHERE session_id=? AND stamp=? AND task_id=? AND occurrence=?`)
+    .run(request.delivery_id, request.session_id, request.stamp, task, owner.occurrence)
+  MSG_DB.query(`UPDATE delivery_task_unread_ends SET released_delivery_id=?, released_generation=?, released_at=?,
+      notice_at=0
+    WHERE session_id=? AND stamp=? AND task_id=? AND occurrence=?`)
+    .run(request.delivery_id, generation, now, request.session_id, request.stamp, task, owner.occurrence)
+  MSG_DB.query(`UPDATE delivery_results SET response_turn_id=coalesce((SELECT turn_id FROM delivery_turns
+      WHERE session_id=? AND closed_at IS NULL ORDER BY turn_id DESC LIMIT 1), response_turn_id)
+    WHERE delivery_id=? AND turn_id=?`).run(request.session_id, request.delivery_id, request.turn_id)
+  process.stderr.write(`telegram channel: task ${task} of ${request.delivery_id} ended in a status no hook knows; `
+    + 'the final is admitted as the guard would send it\n')
+  return true
+}
+
+// The request was answered by the very final endUnreadWorker admitted for this task, as that final's own terminal
+// receipt proves (task 50, Codex 03:27). A proof that cannot be read proves nothing (Codex 03:40).
+function unreadEndAnswered(delivery: string, task: string): boolean {
+  try {
+    return MSG_DB.query(`SELECT 1 FROM delivery_results r JOIN delivery_task_unread_ends u
+        ON u.released_delivery_id=r.delivery_id AND u.stamp=r.stamp AND u.task_id=r.task_id
+      JOIN delivery_terminal_receipts t ON t.delivery_id=u.released_delivery_id AND t.result_generation=u.released_generation
+      WHERE r.delivery_id=? AND r.task_id=? AND r.stamp IS ? AND r.state='complete' LIMIT 1`)
+      .get(delivery, task, DELIVERY_STAMP) != null
+  } catch (error) {
+    process.stderr.write(`telegram channel: unfamiliar-end proof of ${delivery} unreadable; it keeps ${task}: ${error}\n`)
+    return false
   }
 }
 
@@ -2486,7 +2585,7 @@ function armOutboundTransaction(delivery: ResultDelivery, partialReceiptId?: num
         (ScopedRequest & { state: string }) | null
       if (current?.state === 'complete') continue // another reply in the same completed turn
       const open = delivery.phase === 'final' && current ? scopeWork(current) : []
-      if (open.length && WORKER_GATES) {
+      if (open.length && WORKER_GATES && !endUnreadWorker(current!, open, delivery.generations[index]!, now)) {
         throw new OpenWorkRefusal(`Background work of this request is still open (${open.join(', ')}); nothing was sent. `
           + 'Send a progress reply with its task_id now and the final answer after its callback, or stop that task first',
           current!, open)
@@ -2631,6 +2730,15 @@ function processStart(pid: number): string | null {
 // the tick settles it as the startup check does (U3 review P2-2, 27.09), instead of holding
 // its request and every chat behind it until a restart.
 const DETACHED_ATTEMPT_MS = envNumber('TG_DETACHED_ATTEMPT_MS', 15 * 60_000)
+// The shell sender that armed an attempt is gone: no such process, or its PID now names another one.
+function senderGone(pid: number, started: string | null): boolean {
+  try { process.kill(pid, 0) } catch (error) {
+    if ((error as { code?: string }).code === 'ESRCH') return true // EPERM: it exists, only not ours to signal
+  }
+  const now = started === null ? null : processStart(pid)
+  return now !== null && now !== started
+}
+
 function settleOrphanedShellAttempts(): void {
   const armed = MSG_DB.query(`SELECT delivery_id, turn_id, chat_id, thread_id, outbound_attempt_at AS at,
       outbound_attempt_pid AS pid, outbound_attempt_pid_start AS started, outbound_attempt_generation AS generation,
@@ -2641,16 +2749,7 @@ function settleOrphanedShellAttempts(): void {
       delivery_id: string; turn_id: number; chat_id: string; thread_id: string | null; at: number
       pid: number | null; started: string | null; generation: number | null; final: number }>
   for (const row of armed) {
-    if (row.pid !== null) {
-      let gone = false
-      try { process.kill(row.pid, 0) } catch (error) {
-        gone = (error as { code?: string }).code === 'ESRCH' // EPERM: it exists, only not ours to signal
-      }
-      if (!gone) {
-        const started = row.started === null ? null : processStart(row.pid)
-        if (started === null || started === row.started) continue
-      }
-    }
+    if (row.pid !== null && !senderGone(row.pid, row.started)) continue
     if (row.final) {
       quarantineUncertainFinal({ chat_id: row.chat_id, thread_id: row.thread_id, phase: 'final', task_id: null,
         targets: [{ turn_id: row.turn_id, delivery_id: row.delivery_id }], generations: [row.generation] })
@@ -2933,9 +3032,13 @@ function registerBackgroundResult(delivery: ResultDelivery): void {
     // SendMessage reuses the agent ID. Release its previous owner only after
     // both the native callback and the final disposition, not a terminal ACK
     // alone: an unread old callback must not claim a new request.
-    const previous = MSG_DB.query(`SELECT delivery_id FROM delivery_results WHERE task_id = ? AND stamp IS ?
+    let previous = MSG_DB.query(`SELECT delivery_id FROM delivery_results WHERE task_id = ? AND stamp IS ?
       AND NOT (state IN ('complete', 'no_reply', 'cancelled', 'failed') AND response_turn_id IS NOT NULL)`)
       .all(delivery.task_id, DELIVERY_STAMP) as Array<{ delivery_id: string }>
+    // Under the receiver a request answered by the very final endUnreadWorker admitted waits for no callback
+    // either, also when that final went out after its turn closed (Codex 03:27). Guard and shadow never free a
+    // task that way and keep the rule above as it was (Codex 03:40).
+    if (WORKER_GATES) previous = previous.filter(row => !unreadEndAnswered(row.delivery_id, delivery.task_id!))
     if (previous.some(row => !delivery.targets.some(target => target.delivery_id === row.delivery_id))) {
       throw new Error('Another request still owns this task_id; use its original delivery_id until its native callback is read, or start a separate task')
     }
@@ -2989,9 +3092,21 @@ function registerBackgroundResult(delivery: ResultDelivery): void {
         recordShadow('would_refuse_registration', { chat_id: delivery.chat_id, thread_id: delivery.thread_id,
           delivery_id: target.delivery_id, turn_id: target.turn_id, detail: `legacy session: ${delivery.task_id}` })
       }
-      const earlierOwner = MSG_DB.query(`SELECT 1 FROM delivery_task_owners
+      // An owner of this task ID in another session or service run refuses it, unless this run recorded the
+      // launch its obligation stands on: its callback then binds by that exact launch, never by the ID (Knopa,
+      // 01.10: a SendMessage resume of an agent launched before a restart). A launch record that cannot be read
+      // proves nothing, so the earlier owner stands; under guard and shadow that is only observed and never
+      // holds the send (Codex 02:49 P0-1).
+      let earlierOwner = MSG_DB.query(`SELECT 1 FROM delivery_task_owners
         WHERE task_id=? AND delivery_id IS NOT ? AND NOT (session_id=? AND stamp=?) LIMIT 1`)
-        .get(delivery.task_id, target.delivery_id, session.session_id, DELIVERY_STAMP)
+        .get(delivery.task_id, target.delivery_id, session.session_id, DELIVERY_STAMP) != null
+      if (earlierOwner) {
+        try {
+          earlierOwner = !currentLaunchRecorded(session.session_id, delivery.task_id)
+        } catch (error) {
+          process.stderr.write(`telegram channel: launch record of ${delivery.task_id} unreadable; its earlier owner stands: ${error}\n`)
+        }
+      }
       if (earlierOwner) {
         if (WORKER_GATES) throw new Error('This native task_id belonged to another request, including a previous service session; start a fresh background task')
         recordShadow('would_refuse_registration', { chat_id: delivery.chat_id, thread_id: delivery.thread_id,
@@ -3033,6 +3148,23 @@ function registerBackgroundResult(delivery: ResultDelivery): void {
         // to), goes to the request that registered it, and its callback answers that one, as before
         // K. An unread callback of an open or answered request refused this above (`previous`).
         // A request's own legacy obligation still waits for exact proof of its launch.
+        if ((owner.state === 'returned' || owner.state === 'stopped') && owner.delivery_id === target.delivery_id) {
+          // An observer only: its failed lookup must not refuse the live progress (Codex, 30.09 20:15 P0).
+          // Where the receiver would wait for the worker's one more end (L-2′) the record says so, as its
+          // own class: it is neither a refusal nor a newly exact return (Codex, 01.10 23:20).
+          let refused = false
+          let continuation = false
+          try {
+            refused = recordedLaunch(session.session_id, delivery.task_id)
+            continuation = refused && owner.state === 'returned'
+              && continuationProved(session.session_id, delivery.task_id, target.delivery_id)
+          } catch (error) {
+            process.stderr.write(`telegram channel: launch record of ${delivery.task_id} unreadable; not observed: ${error}\n`)
+          }
+          if (refused) recordShadow(continuation ? 'would_defer_continuation' : 'would_refuse_registration', {
+            chat_id: delivery.chat_id, thread_id: delivery.thread_id, delivery_id: target.delivery_id, turn_id: target.turn_id,
+            detail: continuation ? delivery.task_id : `${owner.state} without a launch: ${delivery.task_id}` })
+        }
         ownAgain(session.session_id, delivery.task_id, owner.state, target.delivery_id)
       }
       const changed = MSG_DB.query(`UPDATE delivery_results SET state = 'deferred', task_id = ?,
@@ -3050,6 +3182,35 @@ function registerBackgroundResult(delivery: ResultDelivery): void {
 // no recorded new launch (a resume the launch hook did not see): the request
 // owns its next round, as a task with no recorded launch. Under guard and shadow
 // this is also how another request's worker, owned or legacy, moves to the one registering it.
+// This run's open obligation of the task stands on a launch the launch hook recorded in this run.
+function currentLaunchRecorded(session: string, task: string): boolean {
+  return MSG_DB.query(`SELECT 1 FROM delivery_task_owners o JOIN delivery_task_launches l
+      ON l.launch_ref=o.launch_ref AND l.session_id=o.session_id AND l.stamp=o.stamp AND l.task_id=o.task_id
+    WHERE o.session_id=? AND o.stamp=? AND o.task_id=? AND o.state IN ('owned','unowned') LIMIT 1`)
+    .get(session, DELIVERY_STAMP, task) != null
+}
+
+function recordedLaunch(session: string, task: string): boolean {
+  return MSG_DB.query(`SELECT 1 FROM delivery_task_launches WHERE session_id=? AND stamp=? AND task_id=? LIMIT 1`)
+    .get(session, DELIVERY_STAMP, task) != null
+}
+
+// L-2′ (Knopa, 01.10.2026; Codex 22:26 and 23:20). The task's latest recorded launch in this run returned,
+// exactly, for this request: its owner row is `returned` with that launch and that occurrence, and the
+// return of that occurrence is bound to the request. Only then may a progress that names the task again
+// defer the request to the worker's one more end (it woke on its own background work and will end with
+// no launch id). The owner row stays the proof of the round that ended and is never changed for this.
+function continuationProved(session: string, task: string, delivery: string): boolean {
+  return MSG_DB.query(`SELECT 1 FROM delivery_task_owners o JOIN delivery_task_returns ret
+      ON ret.session_id=o.session_id AND ret.stamp=o.stamp AND ret.task_id=o.task_id
+        AND ret.delivery_id=o.delivery_id AND ret.occurrence=o.occurrence
+    WHERE o.session_id=? AND o.stamp=? AND o.task_id=? AND o.delivery_id=? AND o.state='returned'
+      AND o.launch_ref IS NOT NULL AND o.launch_ref=(SELECT l.launch_ref FROM delivery_task_launches l
+        WHERE l.session_id=o.session_id AND l.stamp=o.stamp AND l.task_id=o.task_id
+        ORDER BY l.created_at DESC, l.rowid DESC LIMIT 1) LIMIT 1`)
+    .get(session, DELIVERY_STAMP, task, delivery) != null
+}
+
 function ownAgain(session: string, task: string, state: string, delivery: string): void {
   MSG_DB.query(`UPDATE delivery_task_owners SET state='owned', delivery_id=?, occurrence=occurrence+1,
       launch_ref=NULL, launched_turn=NULL, silent_notified_at=NULL, final_refusals=0
@@ -3105,12 +3266,14 @@ function registrationOwner(task: string, target: Receipt['targets'][number],
 function registerAcknowledged(delivery: ResultDelivery, index: number, now: number): boolean {
   const target = delivery.targets[index]!
   const session = MSG_DB.query(`SELECT session_id, turn_id, response_turn_id, result_generation,
-    final_admitted_generation, state FROM delivery_results WHERE delivery_id=? AND turn_id=? AND chat_id=? AND thread_id IS ?
+    final_admitted_generation, state, recovery_reason FROM delivery_results WHERE delivery_id=? AND turn_id=? AND chat_id=? AND thread_id IS ?
       AND stamp IS ? AND state IN ('pending','deferred') AND result_generation=?`)
     .get(target.delivery_id, target.turn_id, delivery.chat_id, delivery.thread_id, DELIVERY_STAMP,
       delivery.generations[index]) as { session_id: string; turn_id: number; response_turn_id: number | null;
-      result_generation: number; final_admitted_generation: number | null; state: string } | null
+      result_generation: number; final_admitted_generation: number | null; state: string;
+      recovery_reason: string | null } | null
   if (!session) return false // registered already, or moved on by a callback or a recovery
+  let continuation = false
   try {
     if (session.final_admitted_generation === session.result_generation) {
       throw new Error('a final of this request was admitted meanwhile')
@@ -3125,8 +3288,25 @@ function registerAcknowledged(delivery: ResultDelivery, index: number, now: numb
       MSG_DB.query(`UPDATE delivery_task_owners SET state='owned', delivery_id=?
         WHERE session_id=? AND stamp=? AND task_id=? AND state='unowned'`)
         .run(target.delivery_id, session.session_id, DELIVERY_STAMP, delivery.task_id)
-    } else if (owner.state === 'returned' || owner.state === 'stopped') {
-      ownAgain(session.session_id, delivery.task_id!, owner.state, target.delivery_id)
+    } else if (owner.state === 'returned' || owner.state === 'stopped' || owner.state === 'ended_unread') {
+      // Codex, 30.09 (task 50 P1): where the launch hook records this task's launches, a progress is
+      // no launch. Owning a finished worker again let any later notice of the task, even an earlier
+      // run's, close a round that never ran; a recorded resume starts the next round itself. With
+      // no launch of the task ever recorded (no launch hook), a resume can only be taken on trust.
+      if (recordedLaunch(session.session_id, delivery.task_id!)) {
+        // L-2′: the one exception is the worker whose latest recorded run returned exactly for this very
+        // request. The request then waits for the worker's one more end, and the owner row is left alone.
+        // A request whose wait was already given up once (recoverQuietContinuations) does not wait again.
+        continuation = owner.state === 'returned' && session.recovery_reason !== 'continuation_quiet'
+          && continuationProved(session.session_id, delivery.task_id!, target.delivery_id)
+        if (!continuation) {
+          throw new Error(`task ${delivery.task_id} already ${owner.state === 'returned' ? 'returned'
+            : owner.state === 'stopped' ? 'was stopped' : 'ended'} `
+            + 'and no new launch of it was recorded')
+        }
+      } else {
+        ownAgain(session.session_id, delivery.task_id!, owner.state, target.delivery_id)
+      }
     }
   } catch (error) {
     process.stderr.write(`telegram channel: progress of ${target.delivery_id} registers nothing: ${error}\n`)
@@ -3136,9 +3316,12 @@ function registerAcknowledged(delivery: ResultDelivery, index: number, now: numb
       response_turn_id=CASE WHEN EXISTS (SELECT 1 FROM delivery_turns t WHERE t.turn_id=delivery_results.response_turn_id
         AND t.closed_at IS NULL) THEN response_turn_id ELSE NULL END,
       result_generation=result_generation+1, acknowledged_at=coalesce(acknowledged_at,?), updated_at=?,
-      outbound_attempt_at=NULL, outbound_attempt_generation=NULL
+      outbound_attempt_at=NULL, outbound_attempt_generation=NULL,
+      continuation_generation=CASE WHEN ? THEN result_generation+1 ELSE continuation_generation END
     WHERE delivery_id=? AND turn_id=? AND result_generation=?`)
-    .run(delivery.task_id, now, now, target.delivery_id, target.turn_id, session.result_generation)
+    .run(delivery.task_id, now, now, continuation ? 1 : 0, target.delivery_id, target.turn_id, session.result_generation)
+  if (continuation) process.stderr.write(`telegram channel: ${target.delivery_id} waits for one more end of task `
+    + `${delivery.task_id}, whose recorded run already returned for it\n`)
   settleHead(target, delivery.chat_id, delivery.thread_id, now)
   delivery.generations[index] = session.result_generation + 1
   return true
@@ -3748,11 +3931,40 @@ function retainLegacyRequests(): void {
   }
 }
 
+// A progress notice answers nothing, so one a restart cut off is no answer whose delivery is uncertain (Codex,
+// 02.10.2026 02:15). At a start no in-process send of an earlier receiver is alive and a detached shell sender has
+// exited: such a notice, and one whose shell sender is gone, gives its fence up by its exact attempt. Its request
+// stays owed and goes to the ordinary recovery of saved requests; nothing is registered without a recorded ACK and
+// nothing is sent again. A living shell sender keeps its fence and settles it itself. What is a progress is told
+// as settleOrphanedShellAttempts() tells it: a final, a final a launch superseded and an attempt of unknown
+// generation are not, and stay for the quarantine below.
+function releaseOrphanedProgress(): void {
+  const armed = MSG_DB.query(`SELECT delivery_id, turn_id, outbound_attempt_at AS at, outbound_attempt_pid AS pid,
+      outbound_attempt_pid_start AS started FROM delivery_results WHERE outbound_attempt_at IS NOT NULL
+      AND NOT (final_admitted_generation IS outbound_attempt_generation OR superseded_by IS NOT NULL)
+      AND state IN ('pending','deferred','paused','resume_pending')`).all() as Array<{
+      delivery_id: string; turn_id: number; at: number; pid: number | null; started: string | null }>
+  for (const row of armed) {
+    if (row.pid !== null && !senderGone(row.pid, row.started)) continue
+    if (MSG_DB.query(`UPDATE delivery_results SET outbound_attempt_at=NULL, outbound_attempt_generation=NULL
+      WHERE delivery_id=? AND turn_id=? AND outbound_attempt_at=? AND outbound_attempt_pid IS ?`)
+      .run(row.delivery_id, row.turn_id, row.at, row.pid).changes) {
+      process.stderr.write(`telegram channel: the progress notice of ${row.delivery_id} was cut off by a restart; `
+        + 'its fence is cleared and its answer stays owed\n')
+    }
+  }
+}
+
 function fenceUncertainOutbounds(): void {
+  try { releaseOrphanedProgress() } catch (error) {
+    process.stderr.write(`telegram channel: armed progress notices could not be read; they stay fenced: ${error}\n`)
+  }
   const fenced = MSG_DB.transaction(() => {
     const now = Date.now()
+    // What is still armed and no progress: a living shell sender's progress keeps its fence without a quarantine.
     const count = MSG_DB.query(`UPDATE delivery_results SET state='blocked', recovery_reason='outbound_uncertain',
       finished_at=NULL, updated_at=? WHERE outbound_attempt_at IS NOT NULL
+        AND (final_admitted_generation IS outbound_attempt_generation OR superseded_by IS NOT NULL)
         AND state IN ('queued','pending','deferred','paused','resume_pending')`).run(now).changes
     MSG_DB.query(`UPDATE delivery_turn_messages SET closed_by='outbound_uncertain', closed_at=?
       WHERE closed_at IS NULL AND EXISTS (SELECT 1 FROM delivery_results r
@@ -4319,16 +4531,116 @@ async function silentWorkerNoticeText(requests: string[]): Promise<string> {
     .replace('{requests}', requests.join(', '))
 }
 
+// The truthful reason of a worker whose own end status no hook knew (task 50, Codex 01:42 and 01:55): its
+// request's final let it go, or the silent rule did after its usual window. Never «no result or updates».
+async function unreadEndNoticeText(requests: string[]): Promise<string> {
+  return (await ownerNotice('queue.unread_end', 'Службове повідомлення про фонову задачу запиту {requests} не розпізнано '
+    + '(можливо, оновився Claude CLI). Відповідь агента на цей запит більше не чекає на задачу.'))
+    .replace('{requests}', requests.join(', '))
+}
+
+async function unreadTimeoutNoticeText(requests: string[]): Promise<string> {
+  return (await ownerNotice('queue.unread_timeout', 'Службове повідомлення про фонову задачу запиту {requests} '
+    + 'не розпізнано. Очікування цієї задачі знято за встановленим таймаутом.'))
+    .replace('{requests}', requests.join(', '))
+}
+
+// unread: 1 when the worker's current launch's own end status was seen but not known, else 0. It only chooses
+// the notice's wording.
 type HeldWork = { kind: 'task' | 'launch'; key: string; session_id: string; stamp: string; delivery_id: string;
-  turn_id: number; chat_id: string; thread_id: string | null }
+  turn_id: number; chat_id: string; thread_id: string | null; released: number | null; unread: number }
+
+// A worker's own sign of life: the CLI writes an agent's transcript and every task's output file while it works.
+// Knopa's workers of 34 min and 2 h (30.09) sent no progress for over 30 min yet wrote all along (the longest
+// gap was 21 min); a long task must never fare worse under receipts than under the guard (owner, 01.10).
+function workerActivity(session_id: string, task_id: string): number {
+  const paths: string[] = []
+  const session = MSG_DB.query(`SELECT transcript_path FROM delivery_sessions WHERE session_id=?`)
+    .get(session_id) as { transcript_path: string | null } | null
+  if (session?.transcript_path?.endsWith('.jsonl')) {
+    paths.push(join(session.transcript_path.slice(0, -'.jsonl'.length), 'subagents', `agent-${task_id}.jsonl`))
+  }
+  const tasks = join(tmpdir(), `claude-${process.getuid?.() ?? ''}`)
+  try {
+    for (const project of readdirSync(tasks)) paths.push(join(tasks, project, session_id, 'tasks', `${task_id}.output`))
+  } catch {}
+  let last = 0
+  for (const path of paths) {
+    try { last = Math.max(last, statSync(path).mtimeMs) } catch { continue }
+    // A background command that prints nothing still holds its output file open for writing while it runs.
+    if (path.endsWith('.output') && heldForWriting(path)) return Date.now()
+  }
+  return last
+}
+
+const PROC_DIR = process.env.TG_PROC_DIR || '/proc'
+
+// Only a descriptor whose access mode can write counts: a tail -f or a monitor reading the output of a task that
+// died proves nothing (Codex 23:56), and a descriptor whose fdinfo cannot be read proves nothing either.
+function heldForWriting(path: string): boolean {
+  let target: string
+  try { target = realpathSync(path) } catch { return false }
+  let pids: string[]
+  try { pids = readdirSync(PROC_DIR).filter(name => /^[0-9]+$/.test(name)) } catch { return false }
+  for (const pid of pids) {
+    let fds: string[]
+    try { fds = readdirSync(join(PROC_DIR, pid, 'fd')) } catch { continue }
+    for (const fd of fds) {
+      try {
+        if (readlinkSync(join(PROC_DIR, pid, 'fd', fd)) !== target) continue
+        const flags = /^flags:\s*([0-7]+)\s*$/m.exec(readFileSync(join(PROC_DIR, pid, 'fdinfo', fd), 'utf8'))
+        const mode = flags ? parseInt(flags[1]!, 8) & 3 : 0
+        if (mode === 1 || mode === 2) return true  // O_WRONLY or O_RDWR; 3 is reserved and can neither read nor write
+      } catch {}
+    }
+  }
+  return false
+}
+
+// L-2′: a request that waits for one more end of its returned worker is bounded too (Codex 01.10 23:20,
+// P1-2): no end with no launch id may ever come, and nothing else would answer the author. After the same
+// quiet window as an owned worker's — counted from the worker's last return or wake and the request's last
+// receipt, with the worker's own files quiet as well — and with nothing else of its scope open and no send
+// of it in flight, the answer it owes goes once to the ordinary recovery of a saved request: its original
+// input with the recovery context, in the same session. The task is not started again and nobody is told
+// «no result». While the worker's files show it alive the request waits on, quietly. A recovery turn that
+// ends without an answer is held for B4 like any other; the request never enters this wait a second time.
+function recoverQuietContinuations(): void {
+  const now = Date.now()
+  const waits = MSG_DB.query(`SELECT r.* FROM delivery_results r JOIN delivery_task_owners o
+      ON o.session_id=r.session_id AND o.stamp=r.stamp AND o.task_id=r.task_id AND o.delivery_id=r.delivery_id
+    WHERE r.stamp=? AND r.state='deferred' AND r.continuation_generation=r.result_generation AND o.state='returned'
+      AND r.outbound_attempt_at IS NULL AND r.superseded_by IS NULL AND r.superseded_ack IS NULL
+      AND r.final_admitted_generation IS NOT r.result_generation AND r.forgot_reply_at IS NULL
+      AND max(coalesce((SELECT max(ret.observed_at) FROM delivery_task_returns ret WHERE ret.session_id=r.session_id
+            AND ret.stamp=r.stamp AND ret.task_id=r.task_id AND ret.delivery_id=r.delivery_id), 0),
+          coalesce((SELECT max(c.created_at) FROM delivery_receipts c WHERE c.delivery_id=r.delivery_id
+            AND c.source IN ('reply','shell')), 0)) <= ?`)
+    .all(DELIVERY_STAMP, now - OWNED_WORKER_SILENT_MS) as Array<DurableResult & ScopedRequest>
+  for (const wait of waits) {
+    if (workerActivity(wait.session_id, wait.task_id!) > now - OWNED_WORKER_SILENT_MS) continue
+    if (scopeWork(wait).length) continue // another worker still holds it; that worker has its own bound
+    MSG_DB.transaction(() => {
+      // A wake may have reopened it since the read: only the very wait that was read is given up.
+      if (!MSG_DB.query(`SELECT 1 FROM delivery_results WHERE delivery_id=? AND turn_id=? AND state='deferred'
+          AND continuation_generation=result_generation AND result_generation=? AND outbound_attempt_at IS NULL`)
+        .get(wait.delivery_id, wait.turn_id, wait.result_generation)) return
+      pauseRequest(wait, 'continuation_quiet')
+      process.stderr.write(`telegram channel: task ${wait.task_id} of ${wait.delivery_id} returned and has been quiet for `
+        + `${Math.round(OWNED_WORKER_SILENT_MS / 1000)}s; its answer is recovered from the saved request\n`)
+    }).immediate()
+  }
+}
 
 async function notifySilentWorkers(): Promise<void> {
   const now = Date.now()
   const quiet = `max(coalesce(%LAUNCHED%, 0), coalesce((SELECT max(c.created_at) FROM delivery_receipts c
       WHERE c.delivery_id=r.delivery_id AND c.source IN ('reply','shell')), 0)) <= ?`
-  const held = [
+  const candidates = [
     ...MSG_DB.query(`SELECT 'task' AS kind, o.task_id AS key, o.session_id, o.stamp, r.delivery_id, r.turn_id,
-        r.chat_id, r.thread_id
+        r.chat_id, r.thread_id, o.silent_notified_at AS released, EXISTS (SELECT 1 FROM delivery_task_unread_ends u
+          WHERE u.session_id=o.session_id AND u.stamp=o.stamp AND u.task_id=o.task_id
+            AND u.occurrence=o.occurrence AND u.launch_ref=o.launch_ref) AS unread
       FROM delivery_task_owners o JOIN delivery_results r ON r.session_id=o.session_id AND r.stamp=o.stamp
         AND ((o.state IN ('owned','legacy') AND r.delivery_id=o.delivery_id)
           OR (o.state='unowned' AND o.launched_turn IN (r.turn_id, r.response_turn_id)))
@@ -4338,7 +4650,7 @@ async function notifySilentWorkers(): Promise<void> {
           AND ${quiet.replace('%LAUNCHED%', 'l.created_at')}))`)
       .all(DELIVERY_STAMP, now - OWNED_WORKER_SILENT_MS) as HeldWork[],
     ...MSG_DB.query(`SELECT 'launch' AS kind, l.launch_ref AS key, l.session_id, l.stamp, r.delivery_id, r.turn_id,
-        r.chat_id, r.thread_id
+        r.chat_id, r.thread_id, l.silent_notified_at AS released, 0 AS unread
       FROM delivery_task_launches l JOIN delivery_results r ON r.session_id=l.session_id AND r.stamp=l.stamp
         AND l.launched_turn IN (r.turn_id, r.response_turn_id)
       WHERE l.stamp=? AND l.state='launching' AND (l.silent_notified_at=0
@@ -4346,7 +4658,29 @@ async function notifySilentWorkers(): Promise<void> {
           AND ${quiet.replace('%LAUNCHED%', 'l.created_at')}))`)
       .all(DELIVERY_STAMP, now - OWNED_WORKER_SILENT_MS) as HeldWork[],
   ]
-  if (!held.length) return
+  const living = candidates.filter(row => row.released !== 0 && row.kind === 'task'
+    && workerActivity(row.session_id, row.key) > now - OWNED_WORKER_SILENT_MS)
+  const held = candidates.filter(row => !living.includes(row))
+  // A request its own final answered after its worker's unfamiliar end (endUnreadWorker), of any service stamp.
+  const answered = WORKER_GATES ? MSG_DB.query(`SELECT rowid AS id, released_delivery_id AS delivery_id
+    FROM delivery_task_unread_ends WHERE notice_at=0`).all() as Array<{ id: number; delivery_id: string }> : []
+  if (WORKER_GATES && living.length) {
+    // A living worker's request whose turn ended with no progress waits for it as if that progress had been
+    // sent: the FIFO moves on, the worker still holds its request, and nobody is told anything (owner, 01.10).
+    MSG_DB.transaction(() => {
+      for (const row of living) {
+        const request = MSG_DB.query(`SELECT r.turn_id, r.chat_id, r.thread_id FROM delivery_results r
+            JOIN delivery_turns t ON t.turn_id=coalesce(r.response_turn_id, r.turn_id)
+          WHERE r.delivery_id=? AND r.state='pending' AND t.closed_at IS NOT NULL`)
+          .get(row.delivery_id) as { turn_id: number; chat_id: string; thread_id: string | null } | null
+        if (!request) continue
+        MSG_DB.query(`UPDATE delivery_results SET state='deferred', updated_at=? WHERE delivery_id=? AND state='pending'`)
+          .run(now, row.delivery_id)
+        settleHead({ delivery_id: row.delivery_id, turn_id: request.turn_id }, request.chat_id, request.thread_id, now)
+      }
+    }).immediate()
+  }
+  if (!held.length && !answered.length) return
   if (!WORKER_GATES) {
     for (const row of held) {
       const key = `${row.kind} ${row.key} ${row.delivery_id}`
@@ -4365,11 +4699,15 @@ async function notifySilentWorkers(): Promise<void> {
   // reservation releases the worker, in the same transaction as the request it held.
   const reservation = -now
   const requests = new Set<string>()
+  // Each request under its workers' reasons, in the one notice: silent, its unfamiliar end not known, or
+  // answered by its own final after that end (never deferred here).
+  const reasons = [new Set<string>(), new Set<string>(), new Set<string>()]
   const released = new Set<string>()
   MSG_DB.transaction(() => {
     for (const row of held) {
       if (released.has(`${row.kind} ${row.key}`)) {
         requests.add(row.delivery_id) // another request of the same worker's turn
+        reasons[row.unread]!.add(row.delivery_id)
         continue
       }
       const reserved = row.kind === 'task'
@@ -4381,7 +4719,12 @@ async function notifySilentWorkers(): Promise<void> {
       if (reserved) {
         released.add(`${row.kind} ${row.key}`)
         requests.add(row.delivery_id)
+        reasons[row.unread]!.add(row.delivery_id)
       }
+    }
+    for (const row of answered) {
+      if (MSG_DB.query(`UPDATE delivery_task_unread_ends SET notice_at=? WHERE rowid=? AND notice_at=0`)
+        .run(reservation, row.id).changes) reasons[2]!.add(row.delivery_id)
     }
     for (const delivery_id of requests) {
       const request = MSG_DB.query(`SELECT r.delivery_id, r.session_id, r.stamp, r.turn_id, r.response_turn_id,
@@ -4395,18 +4738,22 @@ async function notifySilentWorkers(): Promise<void> {
       settleHead({ delivery_id, turn_id: request.turn_id }, request.chat_id, request.thread_id, now)
     }
   }).immediate()
-  if (!requests.size) return
+  if (!reasons.some(set => set.size)) return
   try {
-    await bot.api.sendMessage(OWNER_CHAT_ID, await silentWorkerNoticeText([...requests]), undefined, AbortSignal.timeout(5000))
-    for (const table of ['delivery_task_owners', 'delivery_task_launches']) {
-      MSG_DB.query(`UPDATE ${table} SET silent_notified_at=? WHERE silent_notified_at=?`).run(Date.now(), reservation)
+    const [silent, unrecognized, answered] = reasons
+    const text = [silent!.size ? await silentWorkerNoticeText([...silent!]) : '',
+      unrecognized!.size ? await unreadTimeoutNoticeText([...unrecognized!]) : '',
+      answered!.size ? await unreadEndNoticeText([...answered!]) : ''].filter(Boolean).join('\n\n')
+    await bot.api.sendMessage(OWNER_CHAT_ID, text, undefined, AbortSignal.timeout(5000))
+    for (const [table, column] of WORKER_NOTICES) {
+      MSG_DB.query(`UPDATE ${table} SET ${column}=? WHERE ${column}=?`).run(Date.now(), reservation)
     }
   } catch (error) {
     if (error instanceof GrammyError && error.error_code === 429) {
       // Telegram refused it, so nothing was delivered: the workers stay released,
       // and the notice is due again a minute later.
-      for (const table of ['delivery_task_owners', 'delivery_task_launches']) {
-        MSG_DB.query(`UPDATE ${table} SET silent_notified_at=0 WHERE silent_notified_at=?`).run(reservation)
+      for (const [table, column] of WORKER_NOTICES) {
+        MSG_DB.query(`UPDATE ${table} SET ${column}=0 WHERE ${column}=?`).run(reservation)
       }
       silentWorkerRetryAt = Date.now() + 60_000
     }
@@ -4415,8 +4762,8 @@ async function notifySilentWorkers(): Promise<void> {
 }
 
 async function unconfirmedSilentNoticeText(requests: string[]): Promise<string> {
-  return (await ownerNotice('queue.silent_unconfirmed', 'Не знаю, чи дійшло повідомлення про фонову задачу запиту {requests}, '
-    + 'що мовчала: процес перервався або Telegram не підтвердив надсилання. Вона вже не затримує інші повідомлення.'))
+  return (await ownerNotice('queue.silent_unconfirmed', 'Не знаю, чи дійшло повідомлення про фонову задачу запиту {requests}: '
+    + 'процес перервався або Telegram не підтвердив надсилання. Вона вже не затримує інші повідомлення.'))
     .replace('{requests}', requests.join(', '))
 }
 
@@ -4431,7 +4778,6 @@ let unconfirmedSilentRetryAt = 0
 async function reportUnconfirmedSilentNotices(): Promise<void> {
   if (!/^[1-9][0-9]*$/.test(OWNER_CHAT_ID) || Date.now() < unconfirmedSilentRetryAt) return
   const before = -(Date.now() - UNCONFIRMED_SILENT_NOTICE_MS)
-  const tables = ['delivery_task_owners', 'delivery_task_launches']
   let requests: string[] = []
   // This attempt's rows, and only these, change state below: a report another attempt left
   // uncertain (3) is never made owed again by this one's 429 (Codex re-review, 28.09).
@@ -4444,21 +4790,22 @@ async function reportUnconfirmedSilentNotices(): Promise<void> {
       UNION SELECT DISTINCT r.delivery_id FROM delivery_task_launches l
         JOIN delivery_results r ON r.session_id=l.session_id AND r.stamp=l.stamp
           AND l.launched_turn IN (r.turn_id, r.response_turn_id)
-        WHERE (l.silent_notified_at < 0 AND l.silent_notified_at > ?1) OR l.silent_notified_at = 2`).all(before) as Array<{ delivery_id: string }>)
+        WHERE (l.silent_notified_at < 0 AND l.silent_notified_at > ?1) OR l.silent_notified_at = 2
+      UNION SELECT DISTINCT released_delivery_id FROM delivery_task_unread_ends
+        WHERE (notice_at < 0 AND notice_at > ?1) OR notice_at = 2`).all(before) as Array<{ delivery_id: string }>)
       .map(row => row.delivery_id)
     // Reserved first: a report left at 2 by a restart or a 429 is owed as well.
-    for (const table of tables) {
-      MSG_DB.query(`UPDATE ${table} SET silent_notified_at=2
-        WHERE silent_notified_at < 0 AND silent_notified_at > ?`).run(before)
-      attempt.set(table, (MSG_DB.query(`SELECT rowid AS id FROM ${table} WHERE silent_notified_at=2`).all() as Array<{ id: number }>)
+    for (const [table, column] of WORKER_NOTICES) {
+      MSG_DB.query(`UPDATE ${table} SET ${column}=2 WHERE ${column} < 0 AND ${column} > ?`).run(before)
+      attempt.set(table, (MSG_DB.query(`SELECT rowid AS id FROM ${table} WHERE ${column}=2`).all() as Array<{ id: number }>)
         .map(row => row.id))
     }
   }).immediate()
   const move = (from: number, to: number): number => {
     let changed = 0
-    for (const table of tables) {
+    for (const [table, column] of WORKER_NOTICES) {
       for (const id of attempt.get(table) ?? []) {
-        changed += MSG_DB.query(`UPDATE ${table} SET silent_notified_at=? WHERE rowid=? AND silent_notified_at=?`)
+        changed += MSG_DB.query(`UPDATE ${table} SET ${column}=? WHERE rowid=? AND ${column}=?`)
           .run(to, id, from).changes
       }
     }
@@ -5192,7 +5539,8 @@ async function settleResults(): Promise<void> {
       // B4: the request's one recovery turn for a forgotten reply ended without
       // an answer too. No further recovery: the last resort takes it after the grace.
       if (WORKER_GATES && result.state === 'pending' && result.close_kind === 'stop'
-        && result.recovery_reason === 'stop' && result.recovery_count > 0 && holdForgottenReply(result)) continue
+        && (result.recovery_reason === 'stop' || result.recovery_reason === 'continuation_quiet')
+        && result.recovery_count > 0 && holdForgottenReply(result)) continue
       // The re-offer cap is the receiver's liveness policy; under guard and shadow a hang is
       // recovered as before K, with no failure and no notice (Codex, task 46 P0-2).
       if (WORKER_GATES && result.close_kind === 'escape' && hangsOf(result) > HUNG_REOFFERS) {
@@ -5203,6 +5551,7 @@ async function settleResults(): Promise<void> {
       pauseRequest(result, limit ? 'provider_limit' : result.close_kind ?? 'process_interrupted', limit,
         result.closed_at ?? undefined, result.close_detail)
     }
+    if (WORKER_GATES) recoverQuietContinuations()
     await notifySilentWorkers()
     await reportUnconfirmedSilentNotices()
     await notifyPausedBackgroundResults()

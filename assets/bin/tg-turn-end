@@ -166,10 +166,15 @@ def has_outcome(
 # Background work still open in a request's scope, of its own stamp: the same
 # list as tg-send's SCOPE_WORK and the receiver's scopeWork().
 SCOPE_WORK = (
-    "SELECT 1 FROM delivery_task_launches WHERE session_id=:session AND stamp=:stamp AND state='launching' "
-    "AND launched_turn IN (:turn, :response){released} UNION ALL SELECT 1 FROM delivery_task_owners "
-    "WHERE session_id=:session AND stamp=:stamp AND ((state IN ('owned','legacy') AND delivery_id=:delivery) "
-    "OR (state='unowned' AND launched_turn IN (:turn, :response))){released} LIMIT 1"
+    "WITH entered(at) AS (SELECT min(observed_at) FROM delivery_task_returns WHERE session_id=:session "
+    "AND stamp=:stamp AND delivery_id=:delivery AND turn_id=:response) "
+    "SELECT 1 FROM delivery_task_launches, entered WHERE session_id=:session AND stamp=:stamp AND state='launching' "
+    "AND (launched_turn=:turn OR (launched_turn=:response AND created_at >= coalesce(entered.at, 0))){released} "
+    "UNION ALL SELECT 1 FROM delivery_task_owners o, entered "
+    "WHERE o.session_id=:session AND o.stamp=:stamp AND ((o.state IN ('owned','legacy') AND o.delivery_id=:delivery) "
+    "OR (o.state='unowned' AND (o.launched_turn=:turn OR (o.launched_turn=:response AND coalesce("
+    "(SELECT l.created_at FROM delivery_task_launches l WHERE l.launch_ref=o.launch_ref "
+    "AND l.session_id=o.session_id AND l.stamp=o.stamp), 9223372036854775807) >= coalesce(entered.at, 0))))){released} LIMIT 1"
 )
 
 

@@ -147,7 +147,22 @@ def rejected_background_notice(context):
 # launch of its claim turn or response turn. The receiver's scopeWork() is the
 # same list. A final is admitted, and a superseded final may complete its
 # request, only while it is empty.
+# B0-c: of the response turn, only what was launched at or after the request's own return there (the
+# receiver's comment has the rule).
 SCOPE_WORK = (
+    "WITH entered(at) AS (SELECT min(observed_at) FROM delivery_task_returns WHERE session_id=:session "
+    "AND stamp=:stamp AND delivery_id=:delivery AND turn_id=:response) "
+    "SELECT 'launch ' || launch_ref FROM delivery_task_launches, entered WHERE session_id=:session "
+    "AND stamp=:stamp AND state='launching' AND (launched_turn=:turn OR (launched_turn=:response "
+    "AND created_at >= coalesce(entered.at, 0))){released} "
+    "UNION ALL SELECT 'task ' || o.task_id FROM delivery_task_owners o, entered WHERE o.session_id=:session "
+    "AND o.stamp=:stamp AND ((o.state IN ('owned','legacy') AND o.delivery_id=:delivery) "
+    "OR (o.state='unowned' AND (o.launched_turn=:turn OR (o.launched_turn=:response AND coalesce("
+    "(SELECT l.created_at FROM delivery_task_launches l WHERE l.launch_ref=o.launch_ref "
+    "AND l.session_id=o.session_id AND l.stamp=o.stamp), 9223372036854775807) >= coalesce(entered.at, 0))))){released}"
+)
+# The list before B0-c: everything both turns launched.
+SCOPE_WORK_TURNS = (
     "SELECT 'launch ' || launch_ref FROM delivery_task_launches WHERE session_id=:session "
     "AND stamp=:stamp AND state='launching' AND launched_turn IN (:turn, :response){released} "
     "UNION ALL SELECT 'task ' || task_id FROM delivery_task_owners WHERE session_id=:session "
@@ -160,9 +175,22 @@ def scope_work(connection, delivery, session, stamp, turn, response):
     # A worker the owner was told about no longer counts: it stops blocking (NOVSKY 27.09).
     released = "silent_notified_at" in {
         row[1] for row in connection.execute("PRAGMA table_info(delivery_task_launches)")}
-    return [row[0] for row in connection.execute(
-        SCOPE_WORK.format(released=" AND silent_notified_at IS NULL" if released else ""), {
-            "delivery": delivery, "session": session, "stamp": stamp, "turn": turn, "response": response})]
+
+    def listed(scope):
+        return [row[0] for row in connection.execute(
+            scope.format(released=" AND silent_notified_at IS NULL" if released else ""), {
+                "delivery": delivery, "session": session, "stamp": stamp, "turn": turn, "response": response})]
+
+    if os.environ.get("TG_DELIVERY_AUTHORITY") == "receiver":
+        return listed(SCOPE_WORK)
+    # Shadow only observes this list, and the moment a request entered its turn is a newer reading than the
+    # list it always had: when it cannot be read it observes by that list (Codex 01.10 23:20, P0-2), as the
+    # receiver's scopeWork() does.
+    try:
+        return listed(SCOPE_WORK)
+    except sqlite3.Error as error:
+        log(f"when {delivery} entered its turn cannot be read; its open work is observed as before: {error}")
+        return listed(SCOPE_WORK_TURNS)
 
 
 class OpenWork(ValueError):
@@ -238,6 +266,84 @@ def process_start(pid):
     return started or None
 
 
+def current_launch_recorded(connection, session, stamp, task_id):
+    """The receiver's currentLaunchRecorded(): this run's open obligation of the task stands on a launch the
+    launch hook recorded in this run, so its callback binds by that exact launch, never by the task ID, and an
+    owner of the ID in an earlier run refuses nothing (Knopa, 01.10). A record that cannot be read proves
+    nothing, and the earlier owner stands (Codex 02:49 P0-1)."""
+    try:
+        if "launch_ref" not in {row[1] for row in connection.execute("PRAGMA table_info(delivery_task_owners)")} or \
+                not connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='delivery_task_launches'").fetchone():
+            return False
+        return connection.execute(
+            "SELECT 1 FROM delivery_task_owners o JOIN delivery_task_launches l ON l.launch_ref=o.launch_ref "
+            "AND l.session_id=o.session_id AND l.stamp=o.stamp AND l.task_id=o.task_id "
+            "WHERE o.session_id=? AND o.stamp=? AND o.task_id=? AND o.state IN ('owned','unowned') LIMIT 1",
+            (session, stamp, task_id)).fetchone() is not None
+    except sqlite3.Error as error:
+        log(f"launch record of {task_id} unreadable; its earlier owner stands: {error}")
+        return False
+
+
+def unread_end_answered(connection, delivery, task_id, stamp):
+    """The receiver's unreadEndAnswered(): the request was answered by the very final end_unread_worker admitted
+    for this task, as that final's own terminal receipt proves (task 50, Codex 03:27). A proof that cannot be
+    read proves nothing (Codex 03:40)."""
+    try:
+        return connection.execute(
+            "SELECT 1 FROM delivery_results r JOIN delivery_task_unread_ends u ON u.released_delivery_id=r.delivery_id "
+            "AND u.stamp=r.stamp AND u.task_id=r.task_id JOIN delivery_terminal_receipts t "
+            "ON t.delivery_id=u.released_delivery_id AND t.result_generation=u.released_generation "
+            "WHERE r.delivery_id=? AND r.task_id=? AND r.stamp=? AND r.state='complete' LIMIT 1",
+            (delivery, task_id, stamp)).fetchone() is not None
+    except sqlite3.Error as error:
+        log(f"unfamiliar-end proof of {delivery} unreadable; it keeps {task_id}: {error}")
+        return False
+
+
+def end_unread_worker(connection, delivery, session, stamp, work, generation, now):
+    """The receiver's endUnreadWorker() (task 50, Codex 01:42): a worker's run that ended in an own status no hook
+    knows, its request's one open item, is ended by this final as `ended_unread`, not as a return, the owner's
+    one notice is reserved and the request is answered in this turn, so a launch made now supersedes this
+    final (R4-1; Codex 02:59 P1-2), in the capture transaction. Anything else open refuses as before."""
+    if len(work) != 1 or not work[0].startswith("task ") or not connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='delivery_task_unread_ends'").fetchone():
+        return False
+    task = work[0][len("task "):]
+    owner = connection.execute(
+        "SELECT o.state, o.delivery_id, o.occurrence, o.launched_turn FROM delivery_task_owners o "
+        "JOIN delivery_task_unread_ends u ON u.session_id=o.session_id AND u.stamp=o.stamp AND u.task_id=o.task_id "
+        "AND u.occurrence=o.occurrence AND u.launch_ref=o.launch_ref AND u.released_at IS NULL "
+        "WHERE o.session_id=? AND o.stamp=? AND o.task_id=? AND o.silent_notified_at IS NULL",
+        (session, stamp, task)).fetchone()
+    if owner is None:
+        return False
+    if owner[0] == "unowned":
+        # An unregistered worker belongs to the one open request of the turn that launched it (B0-a).
+        sole = connection.execute(
+            "SELECT delivery_id FROM delivery_results WHERE session_id=? AND stamp=? "
+            "AND state IN ('pending','deferred') AND (turn_id=? OR response_turn_id=?)",
+            (session, stamp, owner[3], owner[3])).fetchall()
+        if [row[0] for row in sole] != [delivery]:
+            return False
+    elif owner[0] != "owned" or owner[1] != delivery:
+        return False
+    connection.execute(
+        "UPDATE delivery_task_owners SET state='ended_unread', delivery_id=? "
+        "WHERE session_id=? AND stamp=? AND task_id=? AND occurrence=?", (delivery, session, stamp, task, owner[2]))
+    connection.execute(
+        "UPDATE delivery_task_unread_ends SET released_delivery_id=?, released_generation=?, released_at=?, "
+        "notice_at=0 WHERE session_id=? AND stamp=? AND task_id=? AND occurrence=?",
+        (delivery, generation, now, session, stamp, task, owner[2]))
+    connection.execute(
+        "UPDATE delivery_results SET response_turn_id=coalesce((SELECT turn_id FROM delivery_turns "
+        "WHERE session_id=? AND closed_at IS NULL ORDER BY turn_id DESC LIMIT 1), response_turn_id) "
+        "WHERE delivery_id=? AND session_id=? AND stamp=?", (session, delivery, session, stamp))
+    log(f"task {task} of {delivery} ended in a status no hook knows; the final is admitted as the guard would send it")
+    return True
+
+
 def admit(connection, delivery, row, phase, task_id=None):
     """Under the receiver, the fence its reply arms, inside the capture
     transaction: a final is refused before the network while work of its scope
@@ -247,7 +353,7 @@ def admit(connection, delivery, row, phase, task_id=None):
     session, stamp, turn, response, _, generation = row
     now = int(time.time() * 1000)
     work = scope_work(connection, delivery, session, stamp, turn, response) if phase == "final" else []
-    if work:
+    if work and not end_unread_worker(connection, delivery, session, stamp, work, generation, now):
         raise OpenWork(f"background work of this request is still open ({', '.join(work)}); nothing "
                        "was sent. Send TG_DELIVERY_PHASE=progress with its TG_DELIVERY_TASK_ID now and "
                        "the final after its callback, or stop that task first", work, session, stamp)
@@ -687,6 +793,11 @@ def capture_delivery(chat_id, thread_id=None):
                     "AND NOT (state IN ('complete','no_reply','cancelled','failed') "
                     "AND response_turn_id IS NOT NULL)", (task_id, stamp),
                 ).fetchall()
+                # Under the receiver a request answered by the very final end_unread_worker admitted waits for no
+                # callback either (Codex 03:27); guard and shadow keep the rule above as it was (Codex 03:40).
+                if receiver:
+                    previous = [row for row in previous
+                                if not unread_end_answered(connection, row[0], task_id, stamp)]
                 if any(row[0] not in {target[1] for target in targets} for row in previous):
                     raise ValueError("Another request still owns TG_DELIVERY_TASK_ID; use its original "
                                      "TG_DELIVERY_ID until its native callback is read, or start a separate task")
@@ -741,7 +852,7 @@ def capture_delivery(chat_id, thread_id=None):
                     earlier_owner = connection.execute(
                         "SELECT 1 FROM delivery_task_owners WHERE task_id=? AND delivery_id IS NOT ? "
                         "AND NOT (session_id=? AND stamp=?) LIMIT 1", (task_id, delivery, session[0], stamp),
-                    ).fetchone()
+                    ).fetchone() and not current_launch_recorded(connection, session[0], stamp, task_id)
                     if earlier_owner:
                         raise ValueError("this native task ID belonged to another request, including "
                                          "a previous service session; start a fresh background task")
@@ -811,6 +922,19 @@ def capture_delivery(chat_id, thread_id=None):
                             (delivery, session[0], stamp, task_id),
                         )
                     elif owner[1] in ("returned", "stopped"):
+                        # Guard and shadow keep their path; shadow records what the receiver would refuse, or,
+                        # where it would wait for the worker's one more end (L-2′), that, as its own class.
+                        continuation = False
+                        try:
+                            refused = owner[0] == delivery and recorded_launch(connection, session[0], stamp, task_id)
+                            continuation = (refused and owner[1] == "returned"
+                                            and continuation_proved(connection, session[0], stamp, task_id, delivery))
+                        except sqlite3.Error:
+                            refused = False  # an observer: its failed lookup changes nothing live
+                        if refused:
+                            record_verdict(connection, "would_defer_continuation" if continuation else "would_refuse_registration",
+                                           delivery, turn, scope[0], scope[1],
+                                           task_id if continuation else f"{owner[1]} without a launch: {task_id}")
                         own_again(connection, session[0], stamp, task_id, owner[1], delivery)
                     changed = connection.execute(
                         "UPDATE delivery_results SET state='deferred', task_id=?, response_turn_id=NULL, "
@@ -897,6 +1021,33 @@ def settle_head(connection, delivery, turn, chat_id, thread_id, now):
     )
 
 
+def recorded_launch(connection, session, stamp, task_id):
+    """A launch of this task the launch hook recorded in this session: where there is one, a progress is
+    no launch and a finished worker is not owned again (Codex, 30.09, task 50 P1); the receiver's
+    recordedLaunch(). Only a ledger from before the launch table proves there is none; any other
+    failed lookup raises, since an unreadable registry proves nothing (Codex, 30.09 19:14)."""
+    if not connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='delivery_task_launches'").fetchone():
+        return False
+    return connection.execute(
+        "SELECT 1 FROM delivery_task_launches WHERE session_id=? AND stamp=? AND task_id=? LIMIT 1",
+        (session, stamp, task_id)).fetchone() is not None
+
+
+def continuation_proved(connection, session, stamp, task_id, delivery):
+    """The task's latest recorded launch in this run returned, exactly, for this request: the receiver's
+    continuationProved() (L-2′). Only then may a progress naming the task again defer the request to the
+    worker's one more end; the owner row stays the proof of the round that ended."""
+    return connection.execute(
+        "SELECT 1 FROM delivery_task_owners o JOIN delivery_task_returns ret ON ret.session_id=o.session_id "
+        "AND ret.stamp=o.stamp AND ret.task_id=o.task_id AND ret.delivery_id=o.delivery_id AND ret.occurrence=o.occurrence "
+        "WHERE o.session_id=? AND o.stamp=? AND o.task_id=? AND o.delivery_id=? AND o.state='returned' "
+        "AND o.launch_ref IS NOT NULL AND o.launch_ref=(SELECT l.launch_ref FROM delivery_task_launches l "
+        "WHERE l.session_id=o.session_id AND l.stamp=o.stamp AND l.task_id=o.task_id "
+        "ORDER BY l.created_at DESC, l.rowid DESC LIMIT 1) LIMIT 1",
+        (session, stamp, task_id, delivery)).fetchone() is not None
+
+
 def own_again(connection, session, stamp, task_id, state, delivery):
     """A task of this request that returned or was stopped, registered again with no
     recorded new launch (a resume the launch hook did not see): the request owns its
@@ -920,19 +1071,37 @@ def register_acknowledged(connection, context, target, chat_id, thread_id, now):
     to the log. False when nothing was registered."""
     stamp, task_id = context["stamp"], context["task_id"]
     delivery, turn = target["delivery_id"], target["turn_id"]
+    # A receiver from before L-2′ has no such wait: its ledger lacks the column that names it.
+    waits = "continuation_generation" in {row[1] for row in connection.execute("PRAGMA table_info(delivery_results)")}
     row = connection.execute(
-        "SELECT session_id, turn_id, response_turn_id, result_generation, final_admitted_generation, state "
-        "FROM delivery_results WHERE delivery_id=? AND turn_id=? AND stamp=? "
+        "SELECT session_id, turn_id, response_turn_id, result_generation, final_admitted_generation, state, "
+        "recovery_reason FROM delivery_results WHERE delivery_id=? AND turn_id=? AND stamp=? "
         "AND state IN ('pending','deferred') AND result_generation IS ?",
         (delivery, turn, stamp, target.get("result_generation")),
     ).fetchone()
     if row is None:
         return False
-    session, claim_turn, response_turn, generation, admitted, status = row
+    session, claim_turn, response_turn, generation, admitted, status, recovered = row
     owner = connection.execute(
         "SELECT delivery_id, state, launched_turn FROM delivery_task_owners WHERE session_id=? AND stamp=? "
         "AND task_id=?", (session, stamp, task_id),
     ).fetchone()
+    finished_launch = None
+    if owner and owner[1] in ("returned", "stopped", "ended_unread") and owner[0] == delivery:
+        try:
+            finished_launch = recorded_launch(connection, session, stamp, task_id)
+        except sqlite3.Error as error:
+            log(f"launch record of {task_id} unreadable: {error}")
+            finished_launch = "unreadable"
+    # L-2′: the one worker a progress may name again after its recorded run ended is the one that returned
+    # exactly for this very request; the request then waits for its one more end and the owner row is left
+    # alone. A request whose wait was already given up once does not wait again.
+    continuation = False
+    if finished_launch is True and waits and owner[1] == "returned" and recovered != "continuation_quiet":
+        try:
+            continuation = continuation_proved(connection, session, stamp, task_id, delivery)
+        except sqlite3.Error as error:
+            log(f"return of {task_id} unreadable, so its one more end cannot be awaited: {error}")
     if admitted is not None and admitted == generation:
         reason = "a final of this request was admitted meanwhile"
     elif (owner and owner[1] == "unowned" and status != "deferred"
@@ -940,6 +1109,11 @@ def register_acknowledged(connection, context, target, chat_id, thread_id, now):
         reason = "its launch is not this request's"
     elif owner and owner[1] != "unowned" and owner[0] != delivery:
         reason = "the task belongs to another request"
+    elif finished_launch == "unreadable":
+        reason = "the task's launch record cannot be read, so a new round of it cannot be proved"
+    elif finished_launch and not continuation:
+        ended = {"returned": "returned", "stopped": "was stopped"}.get(owner[1], "ended")
+        reason = f"the task already {ended} and no new launch of it was recorded"
     elif connection.execute(
             "SELECT 1 FROM delivery_unbound_task_returns u "
             "JOIN delivery_results r ON r.session_id=u.session_id AND r.stamp=u.stamp "
@@ -963,16 +1137,20 @@ def register_acknowledged(connection, context, target, chat_id, thread_id, now):
             "UPDATE delivery_task_owners SET state='owned', delivery_id=? "
             "WHERE session_id=? AND stamp=? AND task_id=? AND state='unowned'", (delivery, session, stamp, task_id),
         )
-    elif owner[1] in ("returned", "stopped"):
+    elif owner[1] in ("returned", "stopped", "ended_unread") and not continuation:
         own_again(connection, session, stamp, task_id, owner[1], delivery)
     connection.execute(
         "UPDATE delivery_results SET state='deferred', task_id=?, response_turn_id=CASE WHEN EXISTS ("
         "SELECT 1 FROM delivery_turns t WHERE t.turn_id=delivery_results.response_turn_id AND t.closed_at IS NULL) "
         "THEN response_turn_id ELSE NULL END, result_generation=result_generation+1, "
         "acknowledged_at=coalesce(acknowledged_at,?), updated_at=?, outbound_attempt_at=NULL, "
-        "outbound_attempt_generation=NULL WHERE delivery_id=? AND turn_id=? AND result_generation=?",
+        "outbound_attempt_generation=NULL"
+        + (", continuation_generation=result_generation+1" if continuation else "")
+        + " WHERE delivery_id=? AND turn_id=? AND result_generation=?",
         (task_id, now, now, delivery, turn, generation),
     )
+    if continuation:
+        log(f"{delivery} waits for one more end of task {task_id}, whose recorded run already returned for it")
     settle_head(connection, delivery, turn, chat_id, thread_id, now)
     return True
 

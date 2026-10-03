@@ -306,34 +306,169 @@ def claim_telegram_delivery(prompt: str, data: dict) -> bool:
 CLI_TOOL_CALL_TASK = re.compile(r"k[0-9a-z]{8}")
 
 
-def task_notification_id(prompt: str) -> str | None:
-    # Only a native notification envelope is eligible. In particular, never
-    # search within a channel body, quoted text, or another plugin's envelope.
-    match = re.fullmatch(
-        r"<task-notification>\s*<task-id>([A-Za-z0-9_-]{1,128})</task-id>.*</task-notification>",
-        prompt, re.DOTALL,
-    )
-    if not match or prompt.count("<task-id>") != 1 or prompt.count("</task-notification>") != 1:
+# A native notice's own status that ends its worker's run. CLI 2.1.285 writes completed, failed and
+# killed, names blocked in its own docs, and stopped for a worker another agent stopped or one orphaned
+# at a resume. Any other status, or none (a worker resumed or stalled, a Monitor event), ends nothing.
+RETURN_STATUSES = ("completed", "failed", "blocked")
+STOP_STATUSES = ("killed", "stopped")
+# Statuses of a worker that still runs or waits: never an end, whatever a newer CLI adds (Codex 01:42).
+OPEN_STATUSES = ("pending", "running", "input_required")
+
+
+def notice_fields(prompt: str) -> dict[str, str] | None:
+    """The own child elements of the prompt's one native notice, or None when it is not exactly one.
+
+    Only a prompt that is one <task-notification> element, whitespace aside, is eligible: never a
+    channel body, quoted text or another plugin's envelope. Its children are elements in any order,
+    and the tags of each occur once in the whole prompt, so a payload (result, summary, output) can
+    neither close its element early nor pass for the notice's own task-id, tool-use-id or status
+    (Codex 12:22, task 50 P1-2).
+    """
+    body = re.fullmatch(r"\s*<task-notification>(.*)</task-notification>\s*", prompt, re.DOTALL)
+    if not body or prompt.count("<task-notification>") != 1 or prompt.count("</task-notification>") != 1:
         return None
-    return match.group(1)
+    fields: dict[str, str] = {}
+    rest = body.group(1)
+    while rest.strip():
+        opened = re.match(r"\s*<([a-z][a-z0-9_-]{0,63})>", rest)
+        name = opened.group(1) if opened else None
+        if name is None or name in fields or prompt.count(f"<{name}>") != 1 or prompt.count(f"</{name}>") != 1:
+            return None
+        close = rest.find(f"</{name}>", opened.end())
+        if close < 0:
+            return None
+        fields[name] = rest[opened.end():close].strip()
+        rest = rest[close + len(name) + 3:]
+    return fields
+
+
+def task_notification(prompt: str) -> tuple[str, str | None, str] | None:
+    """(task-id, tool-use-id or None, status) of a worker's end, from its native notice's own metadata.
+    Anything else ends nothing."""
+    fields = notice_fields(prompt)
+    if fields is None:
+        return None
+    task, launch, status = fields.get("task-id", ""), fields.get("tool-use-id"), fields.get("status")
+    if (not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", task) or status not in RETURN_STATUSES + STOP_STATUSES
+            or (launch is not None and not re.fullmatch(r"[^<>\s]{1,256}", launch))):
+        return None
+    return task, launch, status
+
+
+def unfamiliar_end(prompt: str) -> tuple[str, str, str] | None:
+    """(task-id, tool-use-id, status) of a readable native notice whose own status ends its worker in a word this
+    hook does not know, as a newer CLI may write it. Only this, bound to the current launch of an open worker, may
+    later let the model's own final through as the guard would (task 50, Codex 01:42): never a notice without its
+    own launch id, with no status or the status of a worker that still runs, or one not readable as one envelope."""
+    fields = notice_fields(prompt)
+    if fields is None:
+        return None
+    task, launch, status = fields.get("task-id", ""), fields.get("tool-use-id", ""), fields.get("status", "")
+    if (not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", task) or not re.fullmatch(r"[^<>\s]{1,256}", launch)
+            or not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", status)
+            or status in RETURN_STATUSES + STOP_STATUSES + OPEN_STATUSES):
+        return None
+    return task, launch, status
+
+
+def record_unfamiliar_end(conn: sqlite3.Connection, session_id: str, stamp: str, turn_id: int,
+                          end: tuple[str, str, str], prompt: str, now: int) -> None:
+    """Typed evidence that the current launch of an open worker ended unfamiliarly: the exact occurrence and
+    launch, never matched later from the diagnostic text or by time. It decides nothing by itself."""
+    task, launch, status = end
+    owner = conn.execute(
+        "SELECT occurrence FROM delivery_task_owners WHERE session_id=? AND stamp=? AND task_id=? "
+        "AND state IN ('owned','unowned') AND launch_ref=?", (session_id, stamp, task, launch),
+    ).fetchone()
+    if owner is not None:
+        conn.execute(
+            "INSERT OR IGNORE INTO delivery_task_unread_ends (session_id,stamp,task_id,occurrence,launch_ref,status,"
+            "prompt_hash,turn_id,observed_at) VALUES (?,?,?,?,?,?,?,?,?)",
+            (session_id, stamp, task, owner[0], launch, status,
+             hashlib.sha256(prompt.encode("utf-8")).hexdigest(), turn_id, now))
+
+
+def unread_end(prompt: str) -> str | None:
+    """What a native notice says of a worker's end that task_notification() cannot read, for the record:
+    its task-id, status and element names, never its payload. The status is the notice's own; a notice
+    with none, or pending, ends nothing and is not recorded (Codex 12:22 P1-4, 21:51 P2). A notice that
+    cannot be read as one envelope is recorded by any status in it: it may be the end the reader refused."""
+    stripped = prompt.strip()
+    if not stripped.startswith("<task-notification>"):
+        return None
+    fields = notice_fields(prompt)
+    if fields is not None:
+        status, task = fields.get("status"), fields.get("task-id") or "-"
+    else:
+        statuses = [value for value in re.findall(r"<status>\s*([^<]{0,32}?)\s*</status>", stripped) if value != "pending"]
+        status = statuses[0] if statuses else None
+        found = re.search(r"<task-id>\s*([A-Za-z0-9_-]{1,128})\s*</task-id>", stripped)
+        task = found.group(1) if found else "-"
+    if status is None or status == "pending":
+        return None
+    names = ",".join(re.findall(r"^<([a-z][a-z0-9_-]{0,63})>", stripped, re.M))
+    return f"notice {task[:128]}: status {status[:32]!r}; elements {names}"
+
+
+# Background work still open in a request's scope, as the receiver's scopeWork() lists it: B0-c leaves out
+# what its response turn launched before the request's own return entered that turn.
+SCOPE_WORK = (
+    "WITH entered(at) AS (SELECT min(observed_at) FROM delivery_task_returns WHERE session_id=:session "
+    "AND stamp=:stamp AND delivery_id=:delivery AND turn_id=:response) "
+    "SELECT 1 FROM delivery_task_launches, entered WHERE session_id=:session AND stamp=:stamp "
+    "AND state='launching' AND silent_notified_at IS NULL AND (launched_turn=:turn OR (launched_turn=:response "
+    "AND created_at >= coalesce(entered.at, 0))) "
+    "UNION ALL SELECT 1 FROM delivery_task_owners o, entered WHERE o.session_id=:session AND o.stamp=:stamp "
+    "AND o.silent_notified_at IS NULL AND ((o.state IN ('owned','legacy') AND o.delivery_id=:delivery) "
+    "OR (o.state='unowned' AND (o.launched_turn=:turn OR (o.launched_turn=:response AND coalesce("
+    "(SELECT l.created_at FROM delivery_task_launches l WHERE l.launch_ref=o.launch_ref "
+    "AND l.session_id=o.session_id AND l.stamp=o.stamp), 9223372036854775807) >= coalesce(entered.at, 0))))) LIMIT 1"
+)
+# The list before B0-c: everything both turns launched.
+SCOPE_WORK_TURNS = (
+    "SELECT 1 FROM delivery_task_launches WHERE session_id=:session AND stamp=:stamp AND state='launching' "
+    "AND launched_turn IN (:turn, :response) AND silent_notified_at IS NULL "
+    "UNION ALL SELECT 1 FROM delivery_task_owners WHERE session_id=:session AND stamp=:stamp "
+    "AND ((state IN ('owned','legacy') AND delivery_id=:delivery) OR (state='unowned' AND launched_turn IN (:turn, :response))) "
+    "AND silent_notified_at IS NULL LIMIT 1"
+)
+
+
+def work_open(conn: sqlite3.Connection, session_id: str, stamp: str, delivery: str, turn: int,
+              response: int | None) -> bool:
+    """Whether a stop leaves its request waiting for other work. Here the list decides the turn in every
+    mode, so guard and shadow keep the list they always had and only log where the receiver would differ
+    (Codex 01.10 23:20, P0-1)."""
+    scope = {"session": session_id, "stamp": stamp, "delivery": delivery, "turn": turn, "response": response}
+    if AUTHORITY == "receiver":
+        return conn.execute(SCOPE_WORK, scope).fetchone() is not None
+    held = conn.execute(SCOPE_WORK_TURNS, scope).fetchone() is not None
+    if held:
+        try:
+            if conn.execute(SCOPE_WORK, scope).fetchone() is None:
+                ledger_log(f"stop: {delivery} still waits for a launch its turn made before it entered; "
+                           "the receiver would reopen it")
+        except sqlite3.Error as error:
+            ledger_log(f"stop: when {delivery} entered its turn cannot be read; not observed: {error}")
+    return held
 
 
 def return_callback(conn: sqlite3.Connection, session_id: str, stamp: str, turn_id: int,
-                    task_id: str, prompt: str, now: int) -> list[dict]:
+                    notice: tuple[str, str | None, str], prompt: str, now: int) -> list[dict]:
     """Resolve a native notification by the obligation of its exact launch.
 
     The owner row of (session, stamp, task_id) is open and the notice's
-    <tool-use-id> is its launch_ref; a task registered with no recorded launch
+    <tool-use-id> is its launch_ref, or the notice has none and that launch is
+    the task's only one in this run; a task registered with no recorded launch
     returns by its bound task ID. Only then the obligation is returned, the
     return is written with its request and occurrence, and that request is
     reopened; a paused one keeps its pause and is only named. A request-less
     obligation returns without reopening anything. Anything else (a legacy
     obligation, an earlier occurrence, another stamp, a replay) is unbound and
-    visible. `killed` confirms a stop: the obligation is stopped, and it is
-    neither a return nor a reopening.
+    visible. `killed` or `stopped` confirms a stop: the obligation is stopped,
+    and it is neither a return nor a reopening.
     """
-    launch = re.search(r"<tool-use-id>([^<]{1,256})</tool-use-id>", prompt)
-    launch = launch.group(1) if launch else None
+    task_id, launch, status = notice
     prompt_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
     owner = conn.execute(
         "SELECT delivery_id, state, launch_ref, occurrence, launched_turn FROM delivery_task_owners "
@@ -349,9 +484,25 @@ def return_callback(conn: sqlite3.Connection, session_id: str, stamp: str, turn_
         # names no tool call and has no owner (a registration that failed, a callback restored
         # after a restart) is still recorded: only the CLI's own kind is let go.
         return []
-    exact = owner is not None and owner[1] in ("owned", "unowned") and (
-        owner[2] == launch if owner[2] is not None else owner[1] == "owned")
-    if re.search(r"<status>killed</status>", prompt):
+    # An end with no launch id at all (the CLI omits it for about one Agent end in seven, Knopa 29.09-01.10) is the
+    # end of a freshly created Agent with no other history; after any resume it stays ambiguous (task 50, L-1).
+    only_launch = (launch is None and owner is not None and owner[2] is not None and owner[3] == 1
+                   and fresh_agent(conn, session_id, stamp, task_id, owner[2]))
+    exact = owner is not None and owner[1] in ("owned", "unowned", "ended_unread") and (
+        (owner[2] == launch or only_launch) if owner[2] is not None else owner[1] == "owned")
+    if exact and owner[1] == "ended_unread" and fallback_answered(conn, session_id, stamp, task_id, owner[3]):
+        # Codex 01:42 P1-2 (task 50): the model's own final already answers this run's request, in flight, kept
+        # fenced or completed by its own terminal receipt. The run's late end is history only: the worker stays
+        # ended_unread, so the owner's reserved notice still goes out once, and nothing is reopened.
+        if status not in STOP_STATUSES and not conn.execute(
+                "SELECT 1 FROM delivery_task_returns WHERE session_id=? AND stamp=? AND task_id=? AND prompt_hash=?",
+                (session_id, stamp, task_id, prompt_hash)).fetchone():
+            conn.execute(
+                "INSERT INTO delivery_task_returns (session_id,stamp,turn_id,task_id,prompt_hash,delivery_id,"
+                "observed_at,occurrence) VALUES (?,?,?,?,?,NULL,?,?)",
+                (session_id, stamp, turn_id, task_id, prompt_hash, now, owner[3]))
+        return []
+    if status in STOP_STATUSES:
         if not exact:
             return []
         conn.execute("UPDATE delivery_task_owners SET state='stopped' WHERE session_id=? AND stamp=? "
@@ -359,21 +510,32 @@ def return_callback(conn: sqlite3.Connection, session_id: str, stamp: str, turn_
         # Codex U4 review P1-5: a stop is no return, but a request no other worker holds is
         # owed its final now, in this turn, as every mode bound this notice before U4.
         # Otherwise the worker still running answers it.
-        delivery = owner[0] if owner[1] == "owned" else launch_turn_request(conn, session_id, stamp, owner[4])
+        delivery = (owner[0] if owner[1] in ("owned", "ended_unread")
+                    else launch_turn_request(conn, session_id, stamp, owner[4]))
         request = conn.execute(
             "SELECT chat_id, thread_id, state, turn_id, response_turn_id FROM delivery_results "
             "WHERE delivery_id=? AND session_id=? AND stamp=?", (delivery, session_id, stamp),
         ).fetchone() if delivery else None
-        if request is None or request[2] not in ("pending", "deferred") or conn.execute(
-                "SELECT 1 FROM delivery_task_launches WHERE session_id=? AND stamp=? AND state='launching' "
-                "AND launched_turn IN (?, ?) AND silent_notified_at IS NULL "
-                "UNION ALL SELECT 1 FROM delivery_task_owners WHERE session_id=? AND stamp=? "
-                "AND ((state IN ('owned','legacy') AND delivery_id=?) OR (state='unowned' AND launched_turn IN (?, ?))) "
-                "AND silent_notified_at IS NULL LIMIT 1",
-                (session_id, stamp, request[3], request[4], session_id, stamp, delivery, request[3], request[4]),
-        ).fetchone():
+        if request is None or request[2] not in ("pending", "deferred") or work_open(
+                conn, session_id, stamp, delivery, request[3], request[4]):
             return []
         return reopen_request(conn, delivery, request, turn_id, now)
+    if AUTHORITY == "receiver" and launch is None and owner is not None and owner[1] == "returned" and owner[0]:
+        wake = continuation_wake(conn, session_id, stamp, task_id, owner[0], prompt_hash)
+        if wake is not None:
+            request, free = wake
+            # A wake is a native event routed to an answer already owed, never proof of a new run: no occurrence,
+            # and the worker's row, its occurrence and its launch stay as its recorded end left them.
+            conn.execute(
+                "INSERT INTO delivery_task_returns (session_id,stamp,turn_id,task_id,prompt_hash,delivery_id,"
+                "observed_at,occurrence) VALUES (?,?,?,?,?,?,?,NULL)",
+                (session_id, stamp, turn_id, task_id, prompt_hash, owner[0], now))
+            if not free:
+                # Codex 01.10 23:20, P1-1: a final of this request is admitted, on its way or kept as an ACK. The
+                # wake is history only; reopening would leave a second final owed after the one already sent.
+                ledger_log(f"end of {task_id} with no launch id: {owner[0]} already has its final under way; not reopened")
+                return []
+            return reopen_request(conn, owner[0], request, turn_id, now)
     # A replayed notification never returns an obligation a second time.
     exact = exact and not conn.execute(
         "SELECT 1 FROM delivery_task_returns WHERE session_id=? AND stamp=? AND task_id=? AND prompt_hash=? LIMIT 1",
@@ -425,6 +587,82 @@ def return_callback(conn: sqlite3.Connection, session_id: str, stamp: str, turn_
     return [{"delivery_id": delivery, "chat_id": request[0], "thread_id": request[1]}]
 
 
+# The receiver's continuationProved(): the task's latest recorded launch in this run returned, exactly, for this
+# request (L-2′).
+CONTINUATION_PROVED = (
+    "SELECT 1 FROM delivery_task_owners o JOIN delivery_task_returns ret ON ret.session_id=o.session_id "
+    "AND ret.stamp=o.stamp AND ret.task_id=o.task_id AND ret.delivery_id=o.delivery_id AND ret.occurrence=o.occurrence "
+    "WHERE o.session_id=? AND o.stamp=? AND o.task_id=? AND o.delivery_id=? AND o.state='returned' "
+    "AND o.launch_ref IS NOT NULL AND o.launch_ref=(SELECT l.launch_ref FROM delivery_task_launches l "
+    "WHERE l.session_id=o.session_id AND l.stamp=o.stamp AND l.task_id=o.task_id "
+    "ORDER BY l.created_at DESC, l.rowid DESC LIMIT 1) LIMIT 1"
+)
+
+
+def continuation_wake(conn: sqlite3.Connection, session_id: str, stamp: str, task_id: str, delivery: str,
+                      prompt_hash: str) -> tuple[tuple, bool] | None:
+    """L-2′ (Knopa, 01.10.2026): a worker whose recorded run returned for a request woke on its own background
+    work and ended again, with no launch id, while that one request waits for exactly that (the receiver deferred
+    it at this very generation after the same proof). Returns the request's (chat_id, thread_id) and whether it is
+    free to be reopened, or None when this end is no such wake: a replay, a request that does not wait, a proof
+    that no longer holds. Anything unreadable is no wake, and the end stays unbound as before.
+
+    Free means no final of the request is admitted, on its way or kept as an ACK. A progress on its way answers
+    nothing, so it does not hold the wake back (Codex 02.10 01:25): the request is reopened under that send's
+    fence, which its own settlement clears by the attempt's generation, and its ACK finds the generation moved
+    on and defers nothing. An armed attempt is a final as settleOrphanedShellAttempts() tells one."""
+    try:
+        if "continuation_generation" not in {row[1] for row in conn.execute("PRAGMA table_info(delivery_results)")}:
+            return None
+        if conn.execute(
+                "SELECT 1 FROM delivery_task_returns WHERE session_id=? AND stamp=? AND task_id=? AND prompt_hash=? LIMIT 1",
+                (session_id, stamp, task_id, prompt_hash)).fetchone():
+            return None
+        waiting = conn.execute(
+            "SELECT chat_id, thread_id, (outbound_attempt_at IS NULL OR final_admitted_generation IS NOT "
+            "outbound_attempt_generation) AND superseded_by IS NULL AND superseded_ack IS NULL "
+            "AND final_admitted_generation IS NOT result_generation FROM delivery_results WHERE delivery_id=? "
+            "AND session_id=? AND stamp=? AND state='deferred' AND task_id=? AND continuation_generation=result_generation",
+            (delivery, session_id, stamp, task_id)).fetchall()
+        if len(waiting) != 1 or not conn.execute(CONTINUATION_PROVED, (session_id, stamp, task_id, delivery)).fetchone():
+            return None
+        return (waiting[0][0], waiting[0][1]), bool(waiting[0][2])
+    except sqlite3.Error as error:
+        ledger_log(f"continuation of {task_id} unreadable; its end with no launch id stays unbound: {error}")
+        return None
+
+
+def fresh_agent(conn: sqlite3.Connection, session_id: str, stamp: str, task_id: str, launch_ref: str) -> bool:
+    """The task's current launch created it with the Agent tool, and the database knows nothing else of it: no other
+    launch, no owner in another session or service run, no earlier end. A SendMessage resume, the first one after a
+    restart included, never qualifies (Codex 04:20, L-1). A history that cannot be read proves nothing."""
+    try:
+        created = conn.execute(
+            "SELECT 1 FROM delivery_task_launches WHERE launch_ref=? AND session_id=? AND stamp=? AND task_id=? "
+            "AND tool_name='Agent'", (launch_ref, session_id, stamp, task_id)).fetchone() is not None
+        return (created
+                and conn.execute("SELECT count(*) FROM delivery_task_launches WHERE task_id=?",
+                                 (task_id,)).fetchone()[0] == 1
+                and conn.execute("SELECT 1 FROM delivery_task_owners WHERE task_id=? "
+                                 "AND NOT (session_id=? AND stamp=?)", (task_id, session_id, stamp)).fetchone() is None
+                and conn.execute("SELECT 1 FROM delivery_task_returns WHERE task_id=?", (task_id,)).fetchone() is None)
+    except sqlite3.Error as error:
+        ledger_log(f"launch history of {task_id} unreadable; its end without a launch id stays unbound: {error}")
+        return False
+
+
+def fallback_answered(conn: sqlite3.Connection, session_id: str, stamp: str, task_id: str, occurrence: int) -> bool:
+    """The final that ended this run unfamiliarly is in flight, kept fenced as uncertain, or completed by its own
+    terminal receipt (Codex 01:42 P1-2). A definite refusal clears its fence, and the answer is owed as usual."""
+    return conn.execute(
+        "SELECT 1 FROM delivery_task_unread_ends u JOIN delivery_results r ON r.delivery_id=u.released_delivery_id "
+        "WHERE u.session_id=? AND u.stamp=? AND u.task_id=? AND u.occurrence=? AND u.released_at IS NOT NULL "
+        "AND ((r.outbound_attempt_at IS NOT NULL AND r.outbound_attempt_generation=u.released_generation) "
+        "OR EXISTS (SELECT 1 FROM delivery_terminal_receipts t WHERE t.delivery_id=r.delivery_id "
+        "AND t.result_generation=u.released_generation)) LIMIT 1",
+        (session_id, stamp, task_id, occurrence)).fetchone() is not None
+
+
 def launch_turn_request(conn: sqlite3.Connection, session_id: str, stamp: str, launched_turn: int | None) -> str | None:
     """No progress registered the worker: under the receiver it belongs to the one open
     request of the turn it was launched in, like a deferral (B0-a)."""
@@ -463,11 +701,29 @@ def open_service_turn(data: dict, prompt: str) -> list[dict]:
         if ledger_present(conn):
             now = int(time.time() * 1000)
             turn_id = open_turn(conn, session, now)
-            task_id = task_notification_id(prompt)
+            notice = task_notification(prompt)
+            task_id = notice[0] if notice else None
             stamp = os.environ.get("TG_DELIVERY_STAMP")
-            if task_id and stamp and results_present(conn) and {"state", "launch_ref"} <= {
+            unread = None if notice else unread_end(prompt)
+            if unread and conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE name='delivery_shadow' AND type='table'").fetchone():
+                # An observation, in every mode: it never decides this turn (Codex 12:22, task 50 P1-4).
+                ledger_log(f"unrecognized task end: {unread}")
+                try:
+                    conn.execute("INSERT OR IGNORE INTO delivery_shadow (created_at,class,turn_id,detail) "
+                                 "VALUES (?,'unrecognized_task_end',?,?)", (now, turn_id, unread))
+                except sqlite3.Error as error:
+                    ledger_log(f"unrecognized_task_end not recorded: {error}")
+            unfamiliar = unfamiliar_end(prompt) if unread else None
+            if unfamiliar and stamp and conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE name='delivery_task_unread_ends' AND type='table'").fetchone():
+                try:
+                    record_unfamiliar_end(conn, session["session_id"], stamp, turn_id, unfamiliar, prompt, now)
+                except sqlite3.Error as error:
+                    ledger_log(f"unfamiliar end of {unfamiliar[0]} not recorded: {error}")
+            if notice and stamp and results_present(conn) and {"state", "launch_ref"} <= {
                     row[1] for row in conn.execute("PRAGMA table_info(delivery_task_owners)")}:
-                results = return_callback(conn, session["session_id"], stamp, turn_id, task_id, prompt, now)
+                results = return_callback(conn, session["session_id"], stamp, turn_id, notice, prompt, now)
             elif task_id and stamp and results_present(conn):
                 # A receiver from before worker obligations: the one deferred
                 # request that holds this task_id, as that receiver bound it.
@@ -767,7 +1023,12 @@ def recovery_context(prompt: str, data: dict) -> str:
         "tool never reaches the person. Answer now with reply phase=final and this exact delivery_id; "
         "for a group message that needs no answer, call no_reply instead. "
         + ("This is the one retry. " if AUTHORITY == "receiver" else "")
-    ) if row["recovery_reason"] == "stop" else ""
+    ) if row["recovery_reason"] == "stop" else (
+        # L-2′: the request waited for one more result of a background task whose run had ended, and none came.
+        "This request was waiting for one more result from a background task that had already ended, and none came. "
+        "Do not start that task again and do not wait for it: read what it has produced so far and answer now with "
+        "reply phase=final and this exact delivery_id, saying plainly what is still missing. This is the one retry. "
+    ) if row["recovery_reason"] == "continuation_quiet" else ""
     return (
         '<recovery-context source="durable-request-ledger">\n'
         + forgotten + acknowledged_note(next((receipt["created_at"] for receipt in receipts

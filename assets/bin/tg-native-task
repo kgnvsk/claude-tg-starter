@@ -214,11 +214,21 @@ def resolve_intent(session: str, stamp: str, call: str, tool: str, arguments: di
             ).fetchone() is not None
             # A resume starts the next occurrence of the same task ID. An open
             # obligation keeps its request and state: a task ID is never handed
-            # to another request. A returned or stopped one starts over, unowned,
-            # and nothing its earlier round was released for carries over.
+            # to another request. A returned or stopped one, or one whose run ended
+            # in an unfamiliar status (task 50), starts over, unowned, and nothing
+            # its earlier round was released for carries over. A run that ended
+            # unfamiliarly while its request is still owed an answer (its final
+            # definitely refused, or still fenced) is resumed for that request:
+            # the new run holds it (Codex 02:37 P1-1).
             # A legacy obligation has no launch to compare with and is never replaced.
+            prior = conn.execute(
+                "SELECT o.state, r.state FROM delivery_task_owners o LEFT JOIN delivery_results r "
+                "ON r.delivery_id=o.delivery_id AND r.session_id=o.session_id AND r.stamp=o.stamp "
+                "WHERE o.session_id=? AND o.stamp=? AND o.task_id=?", (session, stamp, task)).fetchone()
+            held = prior is not None and prior[0] == "ended_unread" and prior[1] not in (None, *ANSWERED)
+            over = "delivery_task_owners.state IN ('returned','stopped'" + ("" if held else ",'ended_unread'") + ")"
             restart = "".join(
-                f"{column}=CASE WHEN delivery_task_owners.state IN ('returned','stopped') THEN {fresh} "
+                f"{column}=CASE WHEN delivery_task_owners.state IN ('returned','stopped','ended_unread') THEN {fresh} "
                 f"ELSE delivery_task_owners.{column} END, "
                 for column, fresh in (("silent_notified_at", "NULL"), ("final_refusals", "0"))
                 if column in {row[1] for row in conn.execute("PRAGMA table_info(delivery_task_owners)")})
@@ -228,11 +238,10 @@ def resolve_intent(session: str, stamp: str, call: str, tool: str, arguments: di
                 "VALUES (?,?,?,NULL,1,'unowned',?,?) ON CONFLICT(session_id,stamp,task_id) DO UPDATE SET "
                 + restart +
                 "occurrence=delivery_task_owners.occurrence+1, launch_ref=excluded.launch_ref, "
-                "delivery_id=CASE WHEN delivery_task_owners.state IN ('returned','stopped') THEN NULL "
-                "ELSE delivery_task_owners.delivery_id END, "
-                "launched_turn=CASE WHEN delivery_task_owners.state IN ('returned','stopped') "
-                "THEN excluded.launched_turn ELSE delivery_task_owners.launched_turn END, "
-                "state=CASE WHEN delivery_task_owners.state IN ('returned','stopped') THEN 'unowned' "
+                f"delivery_id=CASE WHEN {over} THEN NULL ELSE delivery_task_owners.delivery_id END, "
+                f"launched_turn=CASE WHEN {over} THEN excluded.launched_turn "
+                "ELSE delivery_task_owners.launched_turn END, "
+                f"state=CASE WHEN {over} THEN 'unowned' WHEN delivery_task_owners.state='ended_unread' THEN 'owned' "
                 "ELSE delivery_task_owners.state END "
                 "WHERE delivery_task_owners.state<>'legacy'",
                 (session, stamp, task, call, turn if owed else None),
@@ -280,10 +289,11 @@ def ledger_missing() -> bool:
         conn.close()
 
 
-def record_unrecorded(session: object, call: object, tool: str, error: Exception) -> None:
-    """Guard and shadow let a launch the ledger could not record run. Where the
-    ledger still takes a write, delivery_shadow keeps the fact for the shadow
-    report, once per turn."""
+def record_observation(session: object, kind: str, detail: str) -> None:
+    """Where the ledger still takes a write, delivery_shadow keeps a fact for
+    the shadow report, once per turn: a launch guard or shadow let run although
+    the ledger could not record it (launch_unrecorded), or a worker's end in
+    words this hook does not know (unrecognized_task_end)."""
     try:
         conn = connect()
         try:
@@ -293,12 +303,12 @@ def record_unrecorded(session: object, call: object, tool: str, error: Exception
             ).fetchone()
             conn.execute(
                 "INSERT OR IGNORE INTO delivery_shadow (created_at,class,turn_id,detail) VALUES (?,?,?,?)",
-                (int(time.time() * 1000), "launch_unrecorded", turn[0] if turn else None, f"{tool} {call}: {error}"),
+                (int(time.time() * 1000), kind, turn[0] if turn else None, detail),
             )
         finally:
             conn.close()
     except sqlite3.Error as failure:
-        log(f"{tool} {call}: launch_unrecorded not recorded either: {failure!r}")
+        log(f"{detail}: {kind} not recorded either: {failure!r}")
 
 
 def result_text(value: object) -> str:
@@ -339,9 +349,14 @@ def resolve_batch(session: str, calls: list) -> None:
 
 def record_stop(session: str, stamp: str, arguments: dict, response: dict) -> None:
     task = arguments.get("task_id")
-    if not (isinstance(task, str) and TASK_ID.fullmatch(task) and response.get("task_id") == task
-            and re.match(r"Successfully stopped task: " + re.escape(task) + r"(?![A-Za-z0-9_-])",
-                         str(response.get("message", "")))):
+    named = isinstance(task, str) and TASK_ID.fullmatch(task) and response.get("task_id") == task
+    message = str(response.get("message", ""))
+    if not (named and re.match(r"Successfully stopped task: " + re.escape(task) + r"(?![A-Za-z0-9_-])", message)):
+        if named:
+            # The CLI answered for this task in words this hook does not know (Codex 12:22, task 50
+            # P1-4): no proof of a stop, and the record says so at once.
+            record_observation(session, "unrecognized_task_end", f"TaskStop {task}: {message[:40]!r}")
+            log(f"TaskStop {task}: unrecognized answer {message[:40]!r}")
         return  # not a proven stop: the obligation stays open
     conn = connect()
     try:
@@ -424,7 +439,7 @@ def main() -> int:
             # Only the receiver's gates read this record: outside it, and with no
             # ledger at all, the call goes on as it would without this hook.
             if not missing and tool != "TaskStop":
-                record_unrecorded(session, call, tool, error)
+                record_observation(session, "launch_unrecorded", f"{tool} {call}: {error}")
             return 0
         if event == "PreToolUse":
             print(json.dumps({"hookSpecificOutput": {

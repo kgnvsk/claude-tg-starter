@@ -7,7 +7,12 @@
 Вердикт для цього боксу за KTD9 враховує лише поточний період shadow: вікно не коротше
 48 годин, нуль receiver_blind, no_end_signal, no_turn_record, incomplete_result і launch_unrecorded,
 не менше 100 agree разом
-і не менше 10 у кожному типі чату (private, group, topic). Кожен would_interrupt і
+і не менше 10 у кожному типі чату, який бот обслуговує. Без --scope це всі три: private, group, topic.
+--scope називає погоджений обсяг (private входить завжди); тип поза ним не вимагається лише тоді, коли це
+підтверджує сам бокс: у access.json немає погоджених груп (для group), в історії вхідних немає тем у
+погоджених чатах (для topic), і в періоді немає жодного запису цього типу. Нуль записів сам нічого не
+доводить: погоджена група без руху — це прогалина покриття, а не «поза обсягом». Якщо access.json чи історію
+не прочитано, поза обсягом не опиняється ніщо. Кожен would_interrupt і
 expected_forward потребує ручного перегляду: після нього передайте показані ідентифікатори
 через --reviewed-ids. Зміна запису або періоду робить такий ідентифікатор нечинним.
 Звіт нічого не записує. Без достатнього вікна чи спостережень вердикту немає; відомий дефект,
@@ -16,8 +21,12 @@ incomplete_result означає завершений хід без фіналь
 відповіді його не закриває. Пізній результат залишає нейтральний result_complete, не новий agree.
 launch_unrecorded означає фоновий запуск, який журнал не зміг записати: у shadow він пішов, а приймач
 відхилив би такий виклик.
-guard_wrong_origin (старий сторож зарахував голові відправку іншого запиту) і would_interrupt_no_reply
-(закритий хід, усі повідомлення якого з груп і закриті через no_reply) лише рахуються. Записи без чату
+unrecognized_task_end означає кінець фонової роботи (сповіщення чи TaskStop) у формі, якої хуки не знають,
+наприклад після оновлення Claude: її запит і далі чекає на неї. Кожен такий запис потребує ручного перегляду.
+guard_wrong_origin (старий сторож зарахував голові відправку іншого запиту), would_interrupt_no_reply
+(закритий хід, усі повідомлення якого з груп і закриті через no_reply) і would_defer_continuation (приймач
+відклав би запит до ще одного кінця воркера, чий записаний запуск уже повернувся саме для нього) лише
+рахуються. Записи без чату
 належать ходу: їхній тип turn показано окремо, і в покриття private, group, topic вони не входять.
 Вердикту немає, поки хоч один збережений запит не в кінцевому стані (complete, no_reply, cancelled, failed):
 queued, deferred, pending, paused, resume_pending, blocked чи будь-який новий стан.
@@ -43,7 +52,7 @@ STATE_DIR = pathlib.Path(os.environ.get("TELEGRAM_STATE_DIR") or AGENT_ROOT / ".
 VALUES = ("guard", "shadow", "receiver")
 CHAT_TYPES = ("private", "group", "topic")
 BLOCKING = ("receiver_blind", "no_end_signal", "no_turn_record", "incomplete_result", "launch_unrecorded")
-REVIEW = ("would_interrupt", "expected_forward", "incomplete_result_cancelled")
+REVIEW = ("would_interrupt", "expected_forward", "incomplete_result_cancelled", "unrecognized_task_end")
 WINDOW_HOURS = 48
 MIN_AGREE_TOTAL = 100
 MIN_AGREE_PER_TYPE = 10
@@ -83,6 +92,34 @@ def file_value(path: pathlib.Path) -> str | None:
     return value
 
 
+def authorised_chats(path: pathlib.Path) -> tuple[set[str], set[str]] | None:
+    """The groups and the people access.json lets in; None when it cannot be read as that."""
+    try:
+        access = json.loads(path.read_text(encoding="utf-8"))
+        groups, people = access["groups"], access.get("allowFrom", [])
+        if not isinstance(groups, dict) or not isinstance(people, list):
+            return None
+        return {str(chat) for chat in groups}, {str(person) for person in people}
+    except (OSError, UnicodeError, ValueError, KeyError, TypeError):
+        return None
+
+
+def read_inventory(connection: sqlite3.Connection, tables: set[str], access: pathlib.Path) -> dict | None:
+    """Where this box's bot works, by its own files: the authorised groups, and the topics its inbound
+    history holds in chats that are still authorised. Counts only. None when either cannot be read: then
+    no chat kind can be shown as outside the scope."""
+    chats = authorised_chats(access)
+    if chats is None or "messages" not in tables:
+        return None
+    groups, people = chats
+    try:
+        threads = {(row[0], row[1]) for row in connection.execute(
+            "SELECT DISTINCT chat_id, thread_id FROM messages WHERE direction='in' AND thread_id IS NOT NULL")}
+    except sqlite3.Error:
+        return None
+    return {"groups": len(groups), "topic_threads": sum(1 for chat, _ in threads if str(chat) in groups | people)}
+
+
 def read_database(path: pathlib.Path) -> tuple[list[dict], dict | None]:
     if not path.exists():
         return [], None
@@ -96,6 +133,8 @@ def read_database(path: pathlib.Path) -> tuple[list[dict], dict | None]:
         if "delivery_runtime" in tables:
             row = connection.execute("SELECT value, updated_at FROM delivery_runtime WHERE key='authority'").fetchone()
             effective = dict(row) if row else None
+        if effective:
+            effective["inventory"] = read_inventory(connection, tables, path.parent / "access.json")
         if effective and "delivery_results" in tables:
             effective["result_states"] = {row[0]: row[1] for row in connection.execute(
                 "SELECT state, count(*) FROM delivery_results GROUP BY state")}
@@ -121,8 +160,32 @@ def read_database(path: pathlib.Path) -> tuple[list[dict], dict | None]:
         connection.close()
 
 
+def chat_scope(declared: list[str] | None, inventory: dict | None, seen: dict[str, int]) -> dict[str, dict]:
+    """Each chat kind: whether this box must cover it, and on what basis. A kind is outside the scope only
+    when the operator left it out AND the box's own inventory shows no such chat AND the period holds no
+    record of it; anything unknown keeps the kind required."""
+    kinds = {}
+    for kind in CHAT_TYPES:
+        if declared is None:
+            kinds[kind] = {"required": True, "basis": "обсяг не заявлено"}
+        elif kind == "private" or kind in declared:
+            kinds[kind] = {"required": True, "basis": "у погодженому обсязі"}
+        elif seen.get(kind):
+            kinds[kind] = {"required": True, "basis": f"записів цього типу в періоді: {seen[kind]}"}
+        elif inventory is None:
+            kinds[kind] = {"required": True, "basis": "access.json або історію вхідних не прочитано"}
+        elif kind == "group" and inventory["groups"]:
+            kinds[kind] = {"required": True, "basis": f"погоджених груп: {inventory['groups']}"}
+        elif kind == "topic" and inventory["topic_threads"]:
+            kinds[kind] = {"required": True, "basis": f"тем у погоджених чатах: {inventory['topic_threads']}"}
+        else:
+            kinds[kind] = {"required": False, "basis": "погоджених груп немає" if kind == "group"
+                           else "тем у погоджених чатах в історії немає"}
+    return kinds
+
+
 def summarize(records: list[dict], effective: dict | None, in_file: str | None,
-              reviewed_ids: list[str] | None = None) -> dict:
+              reviewed_ids: list[str] | None = None, scope: list[str] | None = None) -> dict:
     since = effective["updated_at"] if effective and effective["value"] == "shadow" else None
     records = [r for r in records if r["created_at"] >= since] if since is not None else []
     classes: dict[str, int] = {}
@@ -147,6 +210,13 @@ def summarize(records: list[dict], effective: dict | None, in_file: str | None,
     hours = (window["last"] - window["first"]) / HOUR_MS if records else 0.0
     window["hours"] = round(hours, 1)
 
+    seen: dict[str, int] = {}
+    for record in records:
+        kind = chat_type(record["chat_id"], record["thread_id"])
+        seen[kind] = seen.get(kind, 0) + 1
+    inventory = (effective or {}).get("inventory")
+    kinds = chat_scope(scope, inventory, seen)
+
     no_verdict: list[str] = []
     if effective is None:
         no_verdict.append("чинний режим не записаний")
@@ -160,8 +230,11 @@ def summarize(records: list[dict], effective: dict | None, in_file: str | None,
             no_verdict.append(f"agree {agree}, потрібно {MIN_AGREE_TOTAL}")
         for kind in CHAT_TYPES:
             per_type = chat_types.get("agree", {}).get(kind, 0)
-            if per_type < MIN_AGREE_PER_TYPE:
-                no_verdict.append(f"agree у {kind}: {per_type}, потрібно {MIN_AGREE_PER_TYPE}")
+            if kinds[kind]["required"] and per_type < MIN_AGREE_PER_TYPE:
+                # A kind the operator left out and the box still serves: say why it is required after all.
+                left_out = scope is not None and kind != "private" and kind not in scope
+                no_verdict.append(f"agree у {kind}: {per_type}, потрібно {MIN_AGREE_PER_TYPE}"
+                                  + (f" ({kinds[kind]['basis']})" if left_out else ""))
     blocking = {cls: classes[cls] for cls in BLOCKING if classes.get(cls)}
     states = (effective or {}).get("result_states", {})
     for state, count in states.items():
@@ -207,6 +280,7 @@ def summarize(records: list[dict], effective: dict | None, in_file: str | None,
         "classes": dict(sorted(classes.items())),
         "chat_types": chat_types,
         "chats": chats,
+        "scope": {"declared": scope, "inventory": inventory, "kinds": kinds},
         "review": review,
         "review_pending": review_pending,
         "blocking": blocking,
@@ -237,6 +311,9 @@ def render(summary: dict) -> str:
     for cls, kinds in sorted(summary["chat_types"].items()):
         lines.append(f"    {cls}: " + ", ".join(f"{kind} {kinds.get(kind, 0)}" for kind in CHAT_TYPES)
                      + (f"; turn {kinds['turn']}" if kinds.get("turn") else ""))
+    lines.append("  обсяг: " + "; ".join(
+        f"{kind} — потрібен ({row['basis']})" if row["required"] else f"{kind} — поза погодженим обсягом ({row['basis']})"
+        for kind, row in summary["scope"]["kinds"].items()))
     lines.append("  за чатами:")
     for key, chat in sorted(summary["chats"].items()):
         lines.append(f"    {key} ({chat['type']}): " + ", ".join(f"{cls} {n}" for cls, n in sorted(chat["classes"].items())))
@@ -266,9 +343,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--json", action="store_true", help="машинний вивід")
     parser.add_argument("--reviewed-ids", nargs="+", metavar="ID:REV",
                         help="ідентифікатори записів, які оператор уже переглянув вручну; не зберігаються")
+    parser.add_argument("--scope", nargs="+", choices=CHAT_TYPES, metavar="ТИП",
+                        help="погоджений обсяг бота: private, group, topic (private входить завжди); не зберігається")
     args = parser.parse_args(argv)
     records, effective = read_database(STATE_DIR / "messages.db")
-    summary = summarize(records, effective, file_value(STATE_DIR / ".env"), args.reviewed_ids)
+    summary = summarize(records, effective, file_value(STATE_DIR / ".env"), args.reviewed_ids,
+                        sorted(set(args.scope) | {"private"}, key=CHAT_TYPES.index) if args.scope else None)
     code = {"ready": 0, "not_ready": 1, None: 2}[summary["verdict"]]
     if args.json:
         print(json.dumps({**summary, "exit_code": code}, ensure_ascii=False, indent=2))

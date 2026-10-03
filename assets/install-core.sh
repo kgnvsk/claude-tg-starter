@@ -88,7 +88,7 @@ RECALL_API_KEY="${RECALL_API_KEY:-}"
 RECALL_REGION_INPUT="${RECALL_REGION:-}"   # explicit operator value this run, if any
 RECALL_REGION="${RECALL_REGION:-eu-central-1}"
 TG_DELIVERY_AUTHORITY_INPUT="${TG_DELIVERY_AUTHORITY:-}"   # explicit operator value this run, if any
-TG_DELIVERY_AUTHORITY="${TG_DELIVERY_AUTHORITY:-guard}"
+TG_DELIVERY_AUTHORITY="${TG_DELIVERY_AUTHORITY:-shadow}"
 CALENDAR_EMAIL="${CALENDAR_EMAIL:-}"
 OWNER_EMAIL="${OWNER_EMAIL:-}"
 VAULT_LOCALE="${VAULT_LOCALE:-en-US}"
@@ -343,8 +343,10 @@ fi
 unset _installed_token
 # Every paid install and retry verifies this bot before package or runtime writes.
 NOVSKY_LICENSE_KEY="${NOVSKY_LICENSE_KEY:-$(python3 "$KIT/assets/lib/merge-env.py" --value "$CONFIG_FILE" NOVSKY_LICENSE_KEY)}"
-export NOVSKY_LICENSE_KEY
-python3 "$KIT/assets/lib/agent-license.py" --saved-env "$CONFIG_FILE"
+# The license check is the only process that reads the key from its environment. Nothing else this installer
+# starts inherits it: package installs run third-party scripts, and the key is reusable.
+export -n NOVSKY_LICENSE_KEY
+NOVSKY_LICENSE_KEY="$NOVSKY_LICENSE_KEY" python3 "$KIT/assets/lib/agent-license.py" --saved-env "$CONFIG_FILE"
 # The late corporate-module check also guards a restart during installation;
 # this early check prevents partial overwrites even for non-corporate kits.
 if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "$AGENT_SERVICE" 2>/dev/null; then
@@ -642,18 +644,22 @@ if [ "$STARTER_FOUNDATION_REQUIRED" = 1 ]; then
   install -m 600 /dev/null "$H/.claude/product/starter-foundation-pending"
 fi
 
+# Package installs run their packages' own scripts: none of the bot's secrets goes into their environment.
+NO_SECRETS=(-u NOVSKY_LICENSE_KEY -u TELEGRAM_BOT_TOKEN -u OPENAI_API_KEY -u OPENAI_API_KEY_FALLBACK
+  -u RECALL_API_KEY -u SITE_PASSWORD -u GOG_KEYRING_PASSWORD)
+
 # Agent runtimes, installed into the account's OWN prefix. bun must resolve from
 # $H/.local/bin: Claude spawns MCP servers with a trimmed PATH that excludes
 # /usr/local/bin, and a bun that lives only there fails to launch the Telegram
 # poller with no useful error. Both installs are idempotent.
 if [ ! -x "$H/.local/bin/bun" ]; then
   echo "  встановлюю середовище виконання bun"
-  runuser -u "$AGENT_USER" -- env HOME="$H" \
+  runuser -u "$AGENT_USER" -- env "${NO_SECRETS[@]}" HOME="$H" \
     npm install -g --prefix "$H/.local" bun >/dev/null
 fi
 if [ ! -x "$H/.local/bin/claude" ]; then
   echo "  встановлюю Claude Code CLI"
-  runuser -u "$AGENT_USER" -- env HOME="$H" \
+  runuser -u "$AGENT_USER" -- env "${NO_SECRETS[@]}" HOME="$H" \
     npm install -g --prefix "$H/.local" @anthropic-ai/claude-code >/dev/null
 fi
 # The --prefix flag above applies to that one command and is never written to
@@ -997,6 +1003,9 @@ fi
 if [ -z "$TG_DELIVERY_AUTHORITY_INPUT" ] && [ -r "$CHANNEL_ENV" ]; then
   _existing_authority="$(read_channel_value "$CHANNEL_ENV" TG_DELIVERY_AUTHORITY)"
   [ -n "$_existing_authority" ] && TG_DELIVERY_AUTHORITY="$_existing_authority"
+  # Owner, 02.10.2026: every kit bot keeps the receipts in shadow. guard was only the old default, so an update
+  # moves it to shadow; shadow and receiver stay, and an operator who passes guard this run still gets guard.
+  [ "$TG_DELIVERY_AUTHORITY" = guard ] && TG_DELIVERY_AUTHORITY=shadow
 fi
 case "$TG_DELIVERY_AUTHORITY" in
   guard|shadow|receiver) ;;
@@ -1338,7 +1347,7 @@ fi
 if product_has_feature media-downloads; then
   if [ ! -x "$H/.local/bin/yt-dlp" ]; then
     if [ "$CLAUDE_UPDATE_MAINTENANCE" != 1 ]; then
-      runuser -u "$AGENT_USER" -- env HOME="$H" \
+      runuser -u "$AGENT_USER" -- env "${NO_SECRETS[@]}" HOME="$H" \
         PIPX_HOME="$H/.local/share/pipx" PIPX_BIN_DIR="$H/.local/bin" \
         pipx install yt-dlp >/dev/null
     fi
@@ -1349,7 +1358,7 @@ if product_has_feature media-downloads; then
   }
   if [ ! -x "$H/.local/bin/deno" ]; then
     if [ "$CLAUDE_UPDATE_MAINTENANCE" != 1 ]; then
-      runuser -u "$AGENT_USER" -- env HOME="$H" \
+      runuser -u "$AGENT_USER" -- env "${NO_SECRETS[@]}" HOME="$H" \
         npm install -g --prefix "$H/.local" deno >/dev/null
     fi
   fi
@@ -1361,7 +1370,7 @@ fi
 
 if product_has_feature vercel; then
   if [ "$CLAUDE_UPDATE_MAINTENANCE" != 1 ]; then
-    runuser -u "$AGENT_USER" -- env HOME="$H" \
+    runuser -u "$AGENT_USER" -- env "${NO_SECRETS[@]}" HOME="$H" \
       npm install -g --prefix "$H/.npm-global" vercel@latest >/dev/null
   fi
   [ -x "$H/.npm-global/bin/vercel" ] || {

@@ -28,12 +28,51 @@ UPSTREAM_SERVER_SHA256 = (
 )
 UPSTREAM_PACKAGE_START = "bun install --no-summary 1>&2 && bun server.ts"
 GOLDEN_SERVER_SHA256 = (
-    "dd57dbd4d5b045ac6c2643f3747ecbbbb11b5b5d1e28c128d34c760d5a611144"
+    "4265fea73d010cae7b788b8f7e71f68fbf3e200f68cbf0d57f51c836aad45bf0"
 )
 PREVIOUS_GOLDEN_SERVER_SHA256S = frozenset(
     {
+        # The golden before the merge that joins the receipts branch with the receiver main released on 01.10 (limit notices, answered heads).
+        "650f218654ab43f69763c705a5bb3c35ddbda5defc756afa519eb2743211be21",
+        # The golden main released as 2026-10-01.03f6e71697c7, before its merge with the receipts branch.
+        "dd57dbd4d5b045ac6c2643f3747ecbbbb11b5b5d1e28c128d34c760d5a611144",
         # The golden before a limit notice saved what it says together with its reservation.
         "553aa57d18b0a7617b7e955eca592736d18bf9b19a57391210025767c03f7cdf",
+        # The golden before the start that gives up the fence of a progress a restart cut off.
+        "bb37dc3073ccce561d726dbf43a7597e8040de6b5a963b828d75c5b012bb4cea",
+        # The golden before a request may wait for one more end of a returned worker, and a reopened request no longer counts its turn's earlier launches.
+        "cefc9e2034146c367a18ad965b564dab33eaa48e79ed2a71dc414a6412095afb",
+        # f6a96e38e787 Count a reopened request's work in its response turn only from the mom
+        "12df32038a88989fdd0267f20bfce95a25dcf386e7a0f4245e64b050c657681e",
+        # 896666173617 Let the terminal receipt of an unfamiliar end's own final free its tas
+        "1812bba2d044130b124afdca1b00b92d356f3bda207a236a08a9fbf3d10a19dd",
+        # 3bc2f351a1dd Answer the request in the current turn when its unfamiliar end's final
+        "458dbc21aafbf45eb8842bd674eca1c1998adbf4bf0724173854cc2dfe2c31da",
+        # 445b9fae1c27 Keep the recorded-launch proof an observation outside the receiver, an
+        "3915a89563beac598ed1fa9eeca9d09c1a0ba6a9e6b2aa152bac972e6fa4d460",
+        # 1e402f6fe69d Register a worker resumed after a service restart by the launch this r
+        "9d73f421483e56d35edfa5edae18819f630827b761c1a6e1a1ef0ad74fa84c59",
+        # fba745b8cc35 Keep the owner's notice of an unfamiliar end with that end, so a quick
+        "9542bf4204aca61ec97cd0a4ff1fcd578800315269309bcc230b888bc2a930d7",
+        # 6fbd5effa9dd Only O_WRONLY or O_RDWR is a writer, and an unreadable notice is obser
+        "6ee634202b4a976bfe0c898da75728c818aa4ff0934e5252336399d1383ae3d2",
+        # efe14ac7798c Name a worker released after its unfamiliar end truthfully, and free i
+        "8f8717974d1dc3a212fdd326ef83c12d95acd5afe328efebf30869df3b54ddad",
+        # 6497c59ec482 End a worker's unfamiliarly ended run with its request's own final, as
+        "cd845322e4452fccd1485499c38a3e449f5666ef07afebe0646669e36d28abe7",
+        # bbf51ea1b64f Only a descriptor that can write a task's output keeps the task alive
+        "5ea7220a4dc50772627448a2132c97bfb47f63558d4d9bede395bdf5883ae37e",
+        # f86180e120ef A task output file some process still holds open is a living worker
+        "62e393351ef7bdf1423b8633a45a459209e2d0f0acb0630cf14d2e6463b5765f",
+        # 49abb1496650 A worker's own writes are life: no silent-worker notice or release whi
+        "797bd2524e8ab7cf1a5950f4619c604d9fa273fdf31c183ce46fa9913da5d861",
+        # 3e51e44c7e03 Receiver: the guard/shadow launch observation only watches; its failed
+        "1b7147219ca472178d3044e2cff39cce610f24ba8db65b85ff6ce9a6a9b7eac6",
+        # bffec4c2eafb Receiver: a finished worker is refused a new round only where its laun
+        "a67bb0b3a28cf6d6c00e85b1ec6e956d4ec3dcda0275ce2bd5ffe92ec489b152",
+        # b4357e1b0fe9 Receiver: a progress is no launch; a finished worker is not owned agai
+        "f9ef9d2968d66b98104d9af5d55e1f17fc7ce0861b4f78b3de406d4e87dfb379",
+        # ee75c694dd0f Receiver: a request's own legacy obligation still waits for exact proo
         # The golden before a limit notice without the reset is followed by the reset, and the queue waits out the reset margin.
         "5d7dcc06ef83cc4d51a77abc8ec746c84acb620ba312f26a308b05e959ca5833",
         # The golden before only another request's legacy worker moving to the registering request.
