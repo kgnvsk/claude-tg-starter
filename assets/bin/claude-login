@@ -20,8 +20,34 @@ BEFORE="${TMPDIR:-/tmp}/claude-login.$(id -u).before"
 SWITCH=""
 if [ "${1:-}" = "--switch" ]; then SWITCH=1; shift; fi
 
-authed() { claude auth status 2>/dev/null | grep -q '"loggedIn": *true'; }
-account() { claude auth status 2>/dev/null | grep -oE '"email": *"[^"]*"' | head -1 | sed -E 's/.*: *"([^"]*)"/\1/'; }
+# CLI 2.1.288 renews in `auth status` near the token's end and drops the answer, which wipes the login (kit
+# #186): a live login in its last ten minutes is read from the files, never asked of the CLI.
+near_end() {
+  python3 - "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/.credentials.json" <<'PY' 2>/dev/null
+import json, sys, time
+try:
+    login = json.load(open(sys.argv[1], encoding="utf-8")).get("claudeAiOauth") or {}
+except (OSError, ValueError, AttributeError):
+    sys.exit(1)
+live = login.get("accessToken") and login.get("refreshToken")
+sys.exit(0 if live and int(login.get("expiresAt") or 0) <= (time.time() + 600) * 1000 else 1)
+PY
+}
+authed() { near_end && return 0; claude auth status 2>/dev/null | grep -q '"loggedIn": *true'; }
+account_record() {  # the record the bot reads, as the launcher selects it
+  if [ -z "${CLAUDE_CONFIG_DIR:-}" ]; then printf '%s' "$HOME/.claude.json"
+  elif [ -f "$CLAUDE_CONFIG_DIR/.config.json" ]; then printf '%s' "$CLAUDE_CONFIG_DIR/.config.json"
+  else printf '%s' "$CLAUDE_CONFIG_DIR/.claude.json"; fi
+}
+account() {
+  if near_end; then
+    local record; record="$(account_record)"
+    python3 -c 'import json, sys; print((json.load(open(sys.argv[1])).get("oauthAccount") or {}).get("emailAddress") or "")' \
+      "$record" 2>/dev/null
+    return
+  fi
+  claude auth status 2>/dev/null | grep -oE '"email": *"[^"]*"' | head -1 | sed -E 's/.*: *"([^"]*)"/\1/'
+}
 landed() {
   authed || return 1
   local before
@@ -38,12 +64,25 @@ mark_auth_established() {
 
 if [ -z "$SWITCH" ] && [ -z "$(cat "$BEFORE" 2>/dev/null)" ] && authed; then
   mark_auth_established
-  echo "✅ Вже авторизовано:"; claude auth status 2>/dev/null | grep -E '"(email|subscriptionType|authMethod)"'
+  echo "✅ Вже авторизовано:"
+  if near_end; then echo "  обліковий запис: $(account) (вхід саме оновлюється)"
+  else claude auth status 2>/dev/null | grep -E '"(email|subscriptionType|authMethod)"'; fi
   exit 0
 fi
 
 if [ $# -eq 0 ]; then
   # ШАГ 1 — старт логина, поймать URL
+  # A switch remembers the current account to prove the new one. Near the live login's end the CLI is not asked
+  # for it (kit #186): the login is renewed first through a closed call that waits for the answer, so every try
+  # moves it on (an expired login nobody renews would otherwise stay «near» for good, Codex review of 52aa9b74).
+  # Only a renewal that did not land asks for another try; a renewed or a dead login goes on.
+  if [ -n "$SWITCH" ] && near_end; then
+    ATARAX_SUPPRESS_TELEGRAM=1 timeout 120 claude -p --safe-mode --tools "" --no-session-persistence \
+      --model haiku "Reply with OK" </dev/null >/dev/null 2>&1 || true
+    if near_end; then
+      echo "⚠ Вхід у Claude саме оновлюється — повтори перемикання за кілька хвилин."; exit 75
+    fi
+  fi
   screen -S "$SES" -X quit 2>/dev/null || true
   : > "$LOG"
   if [ -n "$SWITCH" ]; then account > "$BEFORE"; else : > "$BEFORE"; fi

@@ -49,7 +49,22 @@ check_version() {
   exit 1
 }
 check_version "Claude Code" "$CLAUDE_BIN"
-check_cli "вхід у Claude Code" "$CLAUDE_BIN" auth status
+# CLI 2.1.288 renews in `auth status` near the token's end and drops the answer, which wipes the login (kit
+# #186): a live login in its last ten minutes is read from the file, never asked of the CLI.
+if python3 - "${CLAUDE_CONFIG_DIR:-$H/.claude}/.credentials.json" <<'PY' 2>/dev/null
+import json, sys, time
+try:
+    login = json.load(open(sys.argv[1], encoding="utf-8")).get("claudeAiOauth") or {}
+except (OSError, ValueError, AttributeError):
+    sys.exit(1)
+live = login.get("accessToken") and login.get("refreshToken")
+sys.exit(0 if live and int(login.get("expiresAt") or 0) <= (time.time() + 600) * 1000 else 1)
+PY
+then
+  echo "вхід у Claude Code: є (саме оновлюється — прочитано з файлу)"
+else
+  check_cli "вхід у Claude Code" "$CLAUDE_BIN" auth status
+fi
 # update.sh uses these commands later in the same stopped maintenance window.
 # Their help paths exercise the installed CLI's command surface without
 # downloading a marketplace or changing the owner's plugin cache.

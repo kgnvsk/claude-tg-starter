@@ -168,8 +168,32 @@ def login_environment() -> dict:
     return {**os.environ, "HOME": str(HOME), **CLI_CONFIG_ENV, "ATARAX_SUPPRESS_TELEGRAM": "1"}
 
 
+def _login_near_end() -> bool:
+    """A live login in its last ten minutes (or past them). CLI 2.1.288 renews inside `auth status` then and
+    exits before keeping the answer, which wipes the login 8 hours later (kit #186)."""
+    try:
+        login = json.loads((CLAUDE_CONFIG_DIR / ".credentials.json").read_text(encoding="utf-8")).get("claudeAiOauth") or {}
+        return bool(login.get("accessToken") and login.get("refreshToken")
+                    and int(login.get("expiresAt") or 0) <= (time.time() + 600) * 1000)
+    except (OSError, ValueError, AttributeError, TypeError):
+        return False
+
+
 def _auth_status() -> dict | None:
-    """`claude auth status` as JSON; None when blocked, malformed or timed out."""
+    """`claude auth status` as JSON; None when blocked, malformed or timed out. A live login near its end is read
+    from the files instead: the login itself, and the account from the record the bot reads (CLI_CONFIG_ENV)."""
+    if _login_near_end():
+        # The record the bot reads, as the launcher selects it: an explicit root prefers its .config.json.
+        record = HOME / ".claude.json"
+        if CLI_CONFIG_ENV:
+            record = CLAUDE_CONFIG_DIR / ".config.json"
+            if not record.exists():
+                record = CLAUDE_CONFIG_DIR / ".claude.json"
+        try:
+            email = (json.loads(record.read_text(encoding="utf-8")).get("oauthAccount") or {}).get("emailAddress")
+        except (OSError, ValueError, AttributeError):
+            email = None
+        return {"loggedIn": True, **({"email": email} if isinstance(email, str) else {})}
     try:
         probe = subprocess.run(
             [str(CLAUDE_BIN), "auth", "status"],

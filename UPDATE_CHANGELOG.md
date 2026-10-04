@@ -1,8 +1,8 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-10-04.14f33c3b979d`
+- Реліз: `2026-10-04.9f21f91661d7`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `14f33c3b979df828d2904b2fba656c4091ac24e8`
+- Ревізія вихідного комплекту: `9f21f91661d75fc5eef438c1f3fad97bee8f921c`
 - Дата релізу: `2026-10-04`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
@@ -19,12 +19,11 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    An owner line, its retry and its delivery credit belong to one pause
-    The plain owner line survives Telegram's wait-and-retry, and only a delivered one makes its end due
-    inbox-secretary: the lead's forward carries the reason when Claude is limited or logged out
-    Company receiver: silent only while the bot's own notifier owns a Claude outage; else one plain line
-    inbox-secretary: a Claude limit or a lost login adds no line of its own; the lead's message still comes
-    A Claude limit or a lost login reaches the owner once, from the bot, never again from the company receiver
+    Restore the explicit-root rescue and updater-root tests dropped with the onboarding cases
+    onboarding-status stays as published: it is pinned in the readiness manifest
+    A near-end account switch renews the login first instead of waiting for time to do it
+    The near-end guard reads the CLI's own root and record, and wants proof of a renewal
+    No Claude CLI status or plugin command on a live login in its last ten minutes
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не

@@ -184,6 +184,33 @@ raise SystemExit(0 if any(
 ' "$marketplace" "$S" "$POLICY" <<<"$listing"
 }
 
+# CLI 2.1.288 starts renewing the login in the startup of `plugin …` when the token is in its last five minutes
+# (or past them) and exits before keeping the answer: the refresh token is spent, the next renewal is refused and
+# the login is wiped (kit #186). Near a live login's end, renew first through a run that waits for the answer
+# (a closed one-word model call), or stop before any plugin command; nothing to renew means nothing to spend.
+claude_login_state() {  # near: a live login in its last ten minutes; fresh: a live login beyond them; other
+  python3 - "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/.credentials.json" <<'PY' 2>/dev/null || echo other
+import json, sys, time
+try:
+    login = json.load(open(sys.argv[1], encoding="utf-8")).get("claudeAiOauth") or {}
+    live = bool(login.get("accessToken") and login.get("refreshToken"))
+    near = int(login.get("expiresAt") or 0) <= (time.time() + 600) * 1000
+except (OSError, ValueError, AttributeError, TypeError):
+    live = near = False
+print("near" if live and near else "fresh" if live else "other")
+PY
+}
+if [ "$(claude_login_state)" = near ]; then
+  ATARAX_SUPPRESS_TELEGRAM=1 timeout 120 "$CLAUDE" -p --safe-mode --tools "" --no-session-persistence \
+    --model haiku "Reply with OK" </dev/null >/dev/null 2>&1 || true
+  # Only a live login renewed beyond its last ten minutes lets plugin commands run now; a renewal that wiped,
+  # removed or broke the file is retried later, when nothing is left to spend.
+  if [ "$(claude_login_state)" != fresh ]; then
+    echo "✗ вхід у Claude саме оновлюється — повтори за кілька хвилин" >&2
+    exit 75
+  fi
+fi
+
 failures=0
 
 echo "==> узгодження плагінів (застарілий стан, керований комплектом)"
