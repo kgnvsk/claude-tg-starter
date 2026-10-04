@@ -1,8 +1,8 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-10-04.838821dd6c27`
+- Реліз: `2026-10-04.c03ffa290b23`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `838821dd6c27223c5b608cb9016d63712f164b1f`
+- Ревізія вихідного комплекту: `c03ffa290b23022311cb80f545e667456bd57209`
 - Дата релізу: `2026-10-04`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
@@ -19,16 +19,8 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    The vault autosave alert is bounded, reads only the log's end and names only this streak's place
-    The place never shows a name that still matches a secret family the guard knows
-    A closing-word trim is written beside the result and swapped in, so a failed write keeps the whole report
-    Only a whole task result is silence; a closing word is dropped and reminders are spared
-    Exact words rank before their stems, and apostrophe words keep their whole form
-    The history check is linear, judges saved values on their own bytes, and masks whole keys
-    The owner hears when the vault autosave has been failing for hours
-    A note name holding «sk-» inside a word no longer stops the vault autosave
-    memory-search finds the note an owner's question names in its own words
-    A scheduled task's service word is silence, alone or closing a comment
+    healthcheck: read a live Claude login from the file, never renew it through auth status
+    health-state.json reports owner.stalled on every bot, by the watchdog's own rule
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не

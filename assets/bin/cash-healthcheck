@@ -315,9 +315,35 @@ fi
 # Auto-relogin is recovery, not onboarding. Do not send an OAuth link until a
 # successful Claude login has been observed at least once on this agent.
 AUTH_ESTABLISHED="$H/.claude/auth-established"
+# A login on disk (claude.ai tokens present, not wiped) is read, never asked of the CLI. CLI 2.1.288
+# starts renewing the login inside `claude auth status` when the access token is in its last five
+# minutes (or past them) and exits without waiting for the answer: the server has already replaced
+# the refresh token, the new one is lost with the process, and the next renewal is refused and wipes
+# the login. Run every 2 minutes on an idle bot, that check was the first to renew — Арти, Сорька,
+# Лилу, Мартин, Манзик lost their logins 8 hours after logging in (02–04.10.2026); 2.1.280 does not
+# renew there. The CLI is asked only when the file holds no live login (wiped, missing, a key or an
+# env token): with nothing to renew, asking spends nothing.
+claude_login_on_disk() {
+    python3 - "${CLAUDE_CONFIG_DIR:-$H/.claude}/.credentials.json" <<'PY' 2>/dev/null
+import json, sys
+try:
+    login = json.load(open(sys.argv[1], encoding="utf-8")).get("claudeAiOauth") or {}
+except (OSError, ValueError, AttributeError):
+    sys.exit(1)
+scopes = login.get("scopes")
+sys.exit(0 if login.get("accessToken") and login.get("refreshToken") and login.get("expiresAt")
+         and isinstance(scopes, list) and "user:inference" in scopes else 1)
+PY
+}
+claude_auth_status() {
+    if claude_login_on_disk; then
+        printf '%s\n' '{"loggedIn": true}'
+    else
+        timeout 20 env HOME="$H" ATARAX_SUPPRESS_TELEGRAM=1 "$H/.local/bin/claude" auth status 2>/dev/null || true
+    fi
+}
 if [ ! -f "$AUTH_ESTABLISHED" ]; then
-    INITIAL_AUTH_STATUS=$(timeout 20 env HOME="$H" ATARAX_SUPPRESS_TELEGRAM=1 \
-        "$H/.local/bin/claude" auth status 2>/dev/null || true)
+    INITIAL_AUTH_STATUS=$(claude_auth_status)
     if printf '%s' "$INITIAL_AUTH_STATUS" | grep -Fq '"loggedIn": true'; then
         (umask 077; : > "$AUTH_ESTABLISHED")
         chmod 0600 "$AUTH_ESTABLISHED"
@@ -765,8 +791,8 @@ if ! pgrep -u "$ME_UID" -f "^claude $" >/dev/null 2>&1 && ! pgrep -u "$ME_UID" -
 fi
 
 # 2a. A live PID is not enough: Claude can receive Telegram updates while logged out.
-AUTH_STATUS=$(timeout 20 env HOME="$H" ATARAX_SUPPRESS_TELEGRAM=1 \
-    $H/.local/bin/claude auth status 2>/dev/null || true)
+# Read from the file first (claude_auth_status above): asking the CLI near the token's end spends it.
+AUTH_STATUS=$(claude_auth_status)
 if printf '%s' "$AUTH_STATUS" | grep -Fq '"loggedIn": true'; then
     CLAUDE_AUTHENTICATED=true
     # A live login ends the outage its automatic link belonged to, however it came back
@@ -1345,6 +1371,10 @@ if [ -f "$DB" ] && command -v sqlite3 >/dev/null 2>&1; then
 fi
 case "$OWNER_QUEUE" in ''|*[!0-9]*) OWNER_QUEUE=0 ;; esac
 OWNER_STUCK=false
+# owner.stalled: an owner message waits over 6 min, its turn is not handled, no owner-session record
+# came for RECENT_SECONDS and no Claude limit holds the queue — the watchdog's own rule below, on every
+# bot. Novsky restarts on it alone, so a long answer (a recent record) never reads as stalled (task 90).
+OWNER_STALLED=false
 
 # Log heartbeat (only on anomaly — to avoid log spam)
 if [ "$RESTARTS" -gt 1 ] || [ "$DISK_PCT" -lt 20 ]; then
@@ -1377,7 +1407,11 @@ fi
 if [ -f "$DB" ] && ! command -v sqlite3 >/dev/null 2>&1; then
     echo "[$(date -u +%FT%TZ)] WARN: sqlite3 missing — stuck-turn watchdog disabled; apt-get install -y sqlite3" >> "$LOG"
 fi
-if [ -f "$DB" ] && command -v sqlite3 >/dev/null 2>&1 && [ "$DELIVERY_AUTHORITY" != receiver ] && [ "$DURABLE_REQUEST_RECOVERY" -eq 0 ]; then
+if [ -f "$DB" ] && command -v sqlite3 >/dev/null 2>&1; then
+    # The rule is read on every bot for owner.stalled; it acts (restart, owner alert, stamps,
+    # owner.stuck) only where it always has: guard-era bots without durable request recovery.
+    WATCHDOG_ACTS=0
+    [ "$DELIVERY_AUTHORITY" != receiver ] && [ "$DURABLE_REQUEST_RECOVERY" -eq 0 ] && WATCHDOG_ACTS=1
     # Before corporate isolation is activated, every private chat still shares
     # the legacy owner process and needs the old watchdog. Afterwards employee
     # DMs have independent workers, so only the exact owner may trigger a global
@@ -1598,10 +1632,15 @@ PY
                 ;;
             *)
                 CHAT_INCIDENT_SELECTED=1
-                echo "[$(date -u +%FT%TZ)] stuck-turn mutation suppressed: exact transcript status unavailable" >> "$LOG"
+                [ "$WATCHDOG_ACTS" -eq 0 ] ||
+                    echo "[$(date -u +%FT%TZ)] stuck-turn mutation suppressed: exact transcript status unavailable" >> "$LOG"
                 continue
                 ;;
         esac
+        # A queue held by a Claude limit is the limit watcher's to release; a restart there helps nothing,
+        # and a status that cannot be read fails busy like the restart below.
+        [ -n "$RECENT_JSONL" ] || [ "$LIMIT_RECOVERY_STATUS" != clear ] || OWNER_STALLED=true
+        [ "$WATCHDOG_ACTS" -eq 1 ] || continue
         # A handled or interrupted turn is answered work, not a stuck queue: the
         # flag is raised only for a turn the transcript cannot vouch for.
         OWNER_STUCK=true
@@ -1709,7 +1748,7 @@ cat > "$STATE.tmp" <<STATE_EOF
   "streampost_active": $(systemctl is-active streampost.service >/dev/null 2>&1 && echo true || echo false),
   "gateway": {"poller": "${GATEWAY_POLLER}"},
   "delivery_authority": "${DELIVERY_AUTHORITY}",
-  "owner": {"queue": ${OWNER_QUEUE}, "stuck": ${OWNER_STUCK}},
+  "owner": {"queue": ${OWNER_QUEUE}, "stuck": ${OWNER_STUCK}, "stalled": ${OWNER_STALLED}},
   "corporate": {"enabled": ${CORPORATE_ENABLED}, "admissionState": "${CORPORATE_ADMISSION}", "active": ${CORPORATE_ACTIVE}, "queued": ${CORPORATE_QUEUED}, "blocked": ${CORPORATE_BLOCKED}, "maxWorkers": 3}
 }
 STATE_EOF
