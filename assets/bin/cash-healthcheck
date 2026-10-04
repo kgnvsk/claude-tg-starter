@@ -483,7 +483,9 @@ alert() {
     # answered-unsettled: the answer went out, the request still holds the
     # queue and nothing here may remove it (22.09, Мартин: 1 h 40 min).
     # malformed-tool: the restart that would clear a broken tool-call loop failed.
-    case "$key" in browser-down|crash-loop|low-disk|service-down|stuck-escalate|corporate-paused|corporate-unavailable|limit-detector-silent|api-error-turns|answered-unsettled|malformed-tool) ;; *) return 0 ;; esac
+    # vault-sync-failing: the notes have had no history and no backup for hours, and
+    # vault-sync's own log was the only place that said so (03.10.2026: 11 days).
+    case "$key" in browser-down|crash-loop|low-disk|service-down|stuck-escalate|corporate-paused|corporate-unavailable|limit-detector-silent|api-error-turns|answered-unsettled|malformed-tool|vault-sync-failing) ;; *) return 0 ;; esac
     if [ -n "$scope" ] && ! [[ "$scope" =~ ^-?[0-9]+_[0-9]+$ ]]; then
         return 0
     fi
@@ -855,6 +857,73 @@ fi
 DISK_PCT=$(disk_free_pct)
 if [ "$DISK_PCT" -lt 10 ]; then
     alert "low-disk" "На сервері закінчується місце (вільно ${DISK_PCT}%). Коли воно скінчиться, я перестану працювати. Напиши нам — треба почистити сервер."
+fi
+
+# 8b. Vault autosave. vault-sync writes one line per run and nothing else said it failed: a note
+# name read as a key stopped Volodymyr's autosave for 11 days and Максимус's and Руфус's for a week
+# (03.10.2026). Six hours of failed runs since the last success is told once a day, in plain words.
+vault_sync_stall() {
+    local limit=""
+    command -v timeout >/dev/null && limit="timeout 20"
+    $limit python3 - "$H/logs/vault-sync.log" "$H/logs/history-unsafe.last" <<'VAULT_SYNC_PY' 2>/dev/null
+import datetime, html, re, sys
+
+
+def tail(path, size):
+    """The last size bytes of path, from its first whole line: a growing log costs a bounded read."""
+    with open(path, "rb") as stream:
+        stream.seek(0, 2)
+        length = stream.tell()
+        stream.seek(max(0, length - size))
+        data = stream.read(size)
+    if length > size:
+        data = data.split(b"\n", 1)[-1]
+    return data.decode("utf-8", "replace")
+
+
+def moment(text):
+    return datetime.datetime.strptime(text, "%Y-%m-%dT%H:%M:%S").replace(tzinfo=datetime.timezone.utc)
+
+
+try:
+    lines = tail(sys.argv[1], 256 * 1024).splitlines()
+except OSError:
+    sys.exit()
+first = code = None
+for line in lines:
+    found = re.match(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})Z (.*)", line)
+    if not found:
+        continue
+    failed = re.match(r"ERROR: vault sync failed \(([a-z-]+)\)", found.group(2))
+    if failed:
+        first = first or moment(found.group(1))
+        code = failed.group(1)
+    elif found.group(2).startswith("vault sync complete"):
+        first = code = None
+if first is None or (datetime.datetime.now(datetime.timezone.utc) - first).total_seconds() < 6 * 3600:
+    sys.exit()
+why = {"history-unsafe": "у нотатках трапилось щось схоже на ключ доступу",
+       "history-unverifiable": "історію нотаток не вдається перевірити (буває через файл понад 100 МБ)",
+       "index-dirty": "у git лишились незавершені зміни"}.get(code, code)
+place = ""
+if code == "history-unsafe":
+    try:
+        record = open(sys.argv[2], "rb").read(65536).decode("utf-8", "replace")
+        written = moment(record[:19])
+    except (OSError, ValueError):
+        record, written = "", None
+    # Only a place written during this run of failures; an older one may name another note.
+    if written is not None and (written - first).total_seconds() >= -600:
+        # Telegram takes 4096 characters per message: the place, the only open-ended part, is cut.
+        parts = [part if len(part) <= 140 else part[:139] + "…" for part in re.findall(r"«([^»]*)»", record)[:3]]
+        place = (" Де: " + " у ".join(f"«{part}»" for part in parts) + ".") if parts else ""
+print(html.escape(f"нові зміни нотаток не потрапляють в історію змін і резервну копію з {first:%d.%m %H:%M} UTC:"
+                  f" автозбереження не проходить, бо {why}.{place} Нотатки на сервері на місці. Напиши нам — полагодимо."))
+VAULT_SYNC_PY
+}
+VAULT_SYNC_STALL=$(vault_sync_stall)
+if [ -n "$VAULT_SYNC_STALL" ]; then
+    alert "vault-sync-failing" "$VAULT_SYNC_STALL" 86400
 fi
 
 # Corporate work has its own durable queue. Never infer a global Telegram hang

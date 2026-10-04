@@ -696,6 +696,122 @@ def head_revision() -> str:
     return revision
 
 
+# agent-backup's key pattern (pinned for connection readiness, so it stays as released) takes «sk-»
+# anywhere, followed by any 20 of letters, digits, - and _: a transliterated note name such as
+# «…zapusk-reklamy-dla-kliniky-u-varsavi…» or «war-risk-…» read as an OpenAI key, and every vault-sync
+# failed history-unsafe from then on, seen only in its log: Volodymyr's vault for 11 days (03.10.2026),
+# Максимус and Руфус about 2000 times each. The history check judges each such match by the rule real
+# keys follow — a word start and a run of 20+ letters and digits, which old sk- keys are and sk-proj-,
+# sk-ant-, sk-svcacct-, sk-or- keys hold between their separators — and defuses the rest before asking.
+KEY_WORD = re.compile(rb"[A-Za-z0-9_-]+")
+KEY_RUN = re.compile(rb"[A-Za-z0-9]{20,}")
+SECRET_WORD = re.compile(rb"(?:sk-|\b\d{8,12}:AA|ghp_|github_pat_|xox[baprs]-)[A-Za-z0-9_-]*")
+
+
+def without_word_keys(payload: bytes) -> bytes:
+    """payload with «sk-» defused (sk- → sk_) in every word not shaped like a key.
+
+    A word is a run of letters, digits, - and _. It holds a key when one of its «sk-» starts it or follows
+    - or _, and a run of 20+ letters and digits begins after that «sk-». Each word is judged once, so the
+    cost is linear in the payload whatever it holds (Codex AGENTS 03.10, re-review of d0585b36 P1-2)."""
+    if b"sk-" not in payload:
+        return payload
+    defused = None
+    for word in KEY_WORD.finditer(payload):
+        text = word.group(0)
+        first = text.find(b"sk-")
+        if first < 0:
+            continue
+        runs = [run.start() for run in KEY_RUN.finditer(text)]
+        last_run, at, is_key = (runs[-1] if runs else -1), first, False
+        while at >= 0 and not is_key:
+            is_key = (at == 0 or text[at - 1:at] in (b"-", b"_")) and last_run >= at + 3
+            at = text.find(b"sk-", at + 1)
+        if is_key:
+            continue
+        defused = defused if defused is not None else bytearray(payload)
+        at = first
+        while at >= 0:
+            defused[word.start() + at + 2] = ord("_")
+            at = text.find(b"sk-", at + 1)
+    return payload if defused is None else bytes(defused)
+
+
+def saved_literal_in(backup: ModuleType, data: bytes) -> bool:
+    """agent-backup's saved-connection half of contains_secret, on the bytes as they are: a value the
+    owner saved is caught whatever it looks like, before any defusing (re-review of d0585b36 P1-3)."""
+    private = backup.HOME / ".config/novsky/secrets.json"
+    for candidate in (private, private.parent, private.parent.parent):
+        if candidate.is_symlink():
+            raise ValueError("unsafe connection store")
+    try:
+        info = private.stat()
+    except FileNotFoundError:
+        return False
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        raise ValueError("unsafe connection store")
+    fingerprint = (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+    return any(value in data for value in backup.connection_literals(str(backup.HOME), fingerprint))
+
+
+def history_secret(backup: ModuleType, payload: bytes) -> bool:
+    return saved_literal_in(backup, payload) or backup.contains_secret(without_word_keys(payload))
+
+
+def mask_secrets(raw: bytes) -> str:
+    """raw as text with every key-like word cut to its first three characters, to its end (P1-1)."""
+    return SECRET_WORD.sub(lambda match: match.group(0)[:3] + "…".encode(), raw).decode("utf-8", "replace")
+
+
+def unsafe_object_place(backup: ModuleType, revision: str, identifier: str, kind: str, payload: bytes) -> str:
+    """Where history-unsafe was found, in words, with secret-like text masked: the owner can find the
+    note without the value reaching a log (Volodymyr, 03.10.2026: the bare code took hours to trace)."""
+    def shown(raw: bytes) -> str:
+        """A name with key-like words masked and control characters as «?». A name holding a saved value,
+        or still matching any family the guard knows after masking (a private-key block), is not shown
+        at all (re-review of 731469ce)."""
+        if saved_literal_in(backup, raw):
+            return "a name that holds a saved secret"
+        masked = re.sub(r"[\x00-\x1f\x7f]", "?", mask_secrets(raw))
+        if backup.contains_secret(without_word_keys(masked.encode("utf-8", "replace"))):
+            return "a name that holds a secret"
+        return masked
+
+    if kind == "commit":
+        return f"secret-like text in the message of commit {identifier[:12]}"
+    name = ""
+    listed = git("rev-list", "--objects", revision)
+    if listed.returncode == 0:
+        for line in decoded(listed).splitlines():
+            if line.startswith(identifier + " "):
+                name = line[len(identifier) + 1:]
+                break
+    name = shown(name.encode("utf-8", "surrogateescape"))
+    if kind == "tree":
+        offset = 0
+        while offset < len(payload):  # tree entries: <mode> <name>\0<20-byte id>
+            space = payload.find(b" ", offset)
+            end = payload.find(b"\0", space)
+            if space < 0 or end < 0:
+                break
+            entry = payload[space + 1:end]
+            if history_secret(backup, entry):
+                return f"secret-like text in the name «{shown(entry)}» inside «{name or '/'}»"
+            offset = end + 21
+        return f"secret-like text in a file or folder name inside «{name or '/'}»"
+    return f"secret-like text in «{name}»" if name else f"secret-like text in {kind} {identifier[:12]}"
+
+
+def note_unsafe_place(detail: str) -> None:
+    """The place goes to ~/logs/history-unsafe.last: the callers' own logs keep their one-line codes."""
+    try:
+        target = Path.home() / "logs/history-unsafe.last"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ ") + detail + "\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
 def require_safe_history(
     backup: ModuleType, revision: str, checked: set[str] | None = None,
 ) -> set[str]:
@@ -754,8 +870,11 @@ def require_safe_history(
             payload = result.stdout[offset:offset + size]
             if len(payload) != size or result.stdout[offset + size:offset + size + 1] != b"\n":
                 raise BackupError("history-unverifiable")
-            if backup.contains_secret(payload):
-                raise BackupError("history-unsafe")
+            if history_secret(backup, payload):
+                error = BackupError("history-unsafe")
+                error.detail = unsafe_object_place(backup, revision, identifier, kind, payload)
+                note_unsafe_place(error.detail)
+                raise error
             checked.add(identifier)
             offset += size + 1
         if offset != len(result.stdout):

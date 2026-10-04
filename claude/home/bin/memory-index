@@ -473,7 +473,7 @@ def embed_missing(connection: sqlite3.Connection, budget: int) -> int:
 
 
 def vector_ranking(
-    connection: sqlite3.Connection, query: str, scope_sql: str, scope_args: list[object]
+    connection: sqlite3.Connection, query: str, scope_sql: str, scope_args: list[object], top: int = 40
 ) -> list[str]:
     """doc_ids by meaning, closest first. Empty when embeddings are unavailable."""
     if not openai_keys():
@@ -503,7 +503,7 @@ def vector_ranking(
         return []
     # Both sides are already unit length from the API, so a dot product is the
     # cosine. 40k documents take about 3ms — no approximate index needed.
-    order = numpy.argsort(matrix @ wanted)[::-1][:40]
+    order = numpy.argsort(matrix @ wanted)[::-1][:top]
     return [rows[i]["doc_id"] for i in order]
 
 
@@ -513,11 +513,19 @@ def fuse(keyword: list[str], semantic: list[str], limit: int) -> list[str]:
     BM25 scores are negative and cosines run 0..1, so the two scores cannot be
     compared directly. Each list votes with rank instead, which needs no tuning.
     """
+    return fuse_all([keyword, semantic], limit)
+
+
+def fuse_all(rankings: list[list[str]], limit: int, tiebreak: dict[str, object] | None = None) -> list[str]:
+    """Rank fusion over any number of rankings. Equal votes are settled by tiebreak, lower first: whether
+    the exact words found it, then the weighted keyword score, so the first note and the first chat
+    message keep the order relevance gave."""
     scores: dict[str, float] = {}
-    for ranking in (keyword, semantic):
+    for ranking in rankings:
         for position, doc_id in enumerate(ranking):
             scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (60 + position)
-    ordered = sorted(scores, key=lambda doc_id: (-scores[doc_id], doc_id))
+    tiebreak = tiebreak or {}
+    ordered = sorted(scores, key=lambda doc_id: (-scores[doc_id], tiebreak.get(doc_id, (True, 0.0)), doc_id))
     return ordered[:limit]
 
 
@@ -631,11 +639,112 @@ def readable_timestamp(value: object) -> str:
         return ""
 
 
-def fts_query(raw: str) -> str:
-    tokens = re.findall(r"[\w-]{2,}", raw, flags=re.UNICODE)
-    if not tokens:
+# Words that carry no subject. «не», «що», «за» matched 70% of an index and buried the one rare word
+# of the question (Volodymyr, 04.10.2026).
+STOP_WORDS = frozenset("""
+і й та а але або чи що щоб як де коли хто який яка яке які якого якій мені мене мій моя моє мої мого ти тобі
+тебе ми нам нас ви вам вас він вона воно вони його її їх це цей ця ці той те ті тут там не ні так вже ще теж
+також у в на за до від з із зі по про для без через при над під між після перед чого чому бо ж же би б є був
+була було були буде можна треба нема немає усе все всі
+и во что он я с со как то она его но да к вы бы только ее было вот от меня еще нет о из ему когда даже ну ли
+если уже или быть был него вас ведь потом себя ей может они где есть надо ней мы тебя их чем была сам чтобы
+будто раз тоже себе будет тогда кто этот того потому этого какой здесь этом мой тем нее сейчас были куда
+зачем всех можно нельзя об эти эту этой такой между
+the a an and or of to in on for with is are was were be it this that what which who how why when where me my
+we our you your he she they them at by from as not no do does did
+""".split())
+# Endings cut to reach a stem of four or more letters: «нирки» → «нирк», which also finds «нирковий».
+_ENDINGS = sorted("""
+ються ється уться ться тися лися лася лося ського ському ськими ських ській ської ська ське ські ський ями ами
+ові еві ого ому ими іми ої ій ий ою ею єю ів їв ах ях ам ям ом ем єм ти ть ся сь ла ло ли ні ну ня ая ое ые ую
+ей ой ых их ым им юю яя ее а я о е є и і ї у ю ь й
+""".split(), key=len, reverse=True)
+_APOSTROPHES = re.compile("[\u0027\u2019\u2018\u02bc\u0060\u00b4]")
+_UK_LATIN = {"а": "a", "б": "b", "в": "v", "г": "h", "ґ": "g", "д": "d", "е": "e", "є": "ye", "ж": "zh",
+             "з": "z", "и": "y", "і": "i", "ї": "yi", "й": "y", "к": "k", "л": "l", "м": "m", "н": "n",
+             "о": "o", "п": "p", "р": "r", "с": "s", "т": "t", "у": "u", "ф": "f", "х": "kh", "ц": "ts",
+             "ч": "ch", "ш": "sh", "щ": "shch", "ь": "", "ю": "yu", "я": "ya", "ы": "y", "э": "e", "ъ": "",
+             "ё": "yo"}
+_LATIN_UK = (("shch", "щ"), ("zh", "ж"), ("kh", "х"), ("ts", "ц"), ("ch", "ч"), ("sh", "ш"), ("ya", "я"),
+             ("yu", "ю"), ("ye", "є"), ("yi", "ї"), ("a", "а"), ("b", "б"), ("c", "к"), ("d", "д"), ("e", "е"),
+             ("f", "ф"), ("g", "г"), ("h", "х"), ("i", "і"), ("j", "й"), ("k", "к"), ("l", "л"), ("m", "м"),
+             ("n", "н"), ("o", "о"), ("p", "п"), ("q", "к"), ("r", "р"), ("s", "с"), ("t", "т"), ("u", "у"),
+             ("v", "в"), ("w", "в"), ("x", "кс"), ("y", "и"), ("z", "з"))
+
+
+def _stem(token: str) -> str:
+    if not re.fullmatch(r"[а-яіїєґёыэъ]+", token):
+        return token
+    for ending in _ENDINGS:
+        if token.endswith(ending) and len(token) - len(ending) >= 4:
+            return token[: -len(ending)]
+    return token
+
+
+def _spellings(token: str) -> list[str]:
+    """The same name written in the other script: «неоклінік» ↔ «neoklinik», «neoclinic»; «явір» → «yavir»."""
+    if len(token) < 4:
+        return []
+    if re.fullmatch(r"[а-яіїєґёыэъ]+", token):
+        plain = "".join(_UK_LATIN.get(letter, letter) for letter in token)
+        return list(dict.fromkeys([plain, plain.replace("k", "c").replace("ts", "c"),
+                                   plain.replace("ya", "ja").replace("yu", "ju").replace("ye", "je")]))
+    if re.fullmatch(r"[a-z]+", token):
+        word, out = token, ""
+        while word:
+            for latin, cyrillic in _LATIN_UK:
+                if word.startswith(latin):
+                    out, word = out + cyrillic, word[len(latin):]
+                    break
+            else:
+                out, word = out + word[0], word[1:]
+        return [out]
+    return []
+
+
+def fts_queries(raw: str) -> tuple[str, str | None]:
+    """(exact, widened): the question's subject words as written, and the same plus stems and parts.
+
+    Exact is each word whole (a prefix from four letters), in the other script too, and a word with an
+    apostrophe joined by ʼ as the tokenizer keeps it («памʼять»). Widened adds stems («нирки» → «нирк»*)
+    and an apostrophe word's parts, as the tokenizer splits words written with ’ or ' («здоров’я»); it
+    is None when it would add nothing. The two rank separately, so an exact name stays ahead of its
+    stem's neighbours («Кнопа» before «кнопки»; Codex AGENTS 03.10, review of 08d54c8a). Stop words go
+    unless nothing else is left.
+    """
+    words = re.findall(r"[\w-]+(?:" + _APOSTROPHES.pattern + r"[\w-]+)*", raw.lower(), flags=re.UNICODE)
+    words = [word for word in words if len(word) >= 2]
+    if not words:
         raise ValueError("query must contain at least one searchable word")
-    return " OR ".join('"' + token.replace('"', '""') + '"*' for token in tokens[:12])
+    subject = [word for word in words if _APOSTROPHES.sub("", word) not in STOP_WORDS] or words
+    exact: list[str] = []
+    wider: list[str] = []
+
+    def add(terms: list[str], form: str, prefix: bool) -> None:
+        term = '"' + form.replace('"', '""') + '"' + ("*" if prefix else "")
+        if term not in exact and term not in terms:
+            terms.append(term)
+
+    for word in subject[:16]:
+        split = bool(_APOSTROPHES.search(word))
+        if split:
+            joined = _APOSTROPHES.sub("\u02bc", word)
+            add(exact, joined, len(joined) >= 5)
+        for form in ([part for part in _APOSTROPHES.split(word) if len(part) >= 2] if split else [word]):
+            for spelling in [form, *_spellings(form)]:
+                add(wider if split else exact, spelling, len(spelling) >= 4)
+                stem = _stem(spelling)
+                if stem != spelling:
+                    add(wider, stem, True)
+    if not exact:
+        exact, wider = wider, []
+    return " OR ".join(exact), (" OR ".join(exact + wider) if wider else None)
+
+
+def fts_query(raw: str) -> str:
+    """Every term of fts_queries in one OR."""
+    exact, widened = fts_queries(raw)
+    return widened or exact
 
 
 def is_direct_admin_chat(chat_id: str | None) -> bool:
@@ -660,7 +769,7 @@ def search(
     corporate_key: str | None = None,
     before_message_id: int | None = None,
 ) -> str:
-    expression = fts_query(query)
+    exact_expression, widened_expression = fts_queries(query)
     # A missing chat identity cannot prove an owner context. Shared groups and
     # allowlisted guests get only their own Telegram scope; global vault notes
     # are available solely in a direct (positive-id) admin chat.
@@ -717,15 +826,14 @@ def search(
         current_chat_scope,
         current_chat_prefix,
         int(direct_admin),
-        expression,
-        *scope_args,
     ]
     limit = max(1, min(limit, 20))
     # Keep a wider keyword pool than the caller asked for: the meaning-based
-    # ranking gets to promote something from further down.
-    parameters.append(40)
+    # ranking gets to promote something from further down. Notes and chat fill
+    # pools of their own: one pool of 40, where the owner's messages weigh ×4,
+    # held no note at all for many of his questions (Volodymyr, 04.10.2026).
     # FTS5 BM25 scores are negative: weights above 1 boost, below 1 demote.
-    rows = connection.execute(
+    pools = [connection.execute(
         f"""
         SELECT docs_fts.doc_id AS doc_id, d.source, d.scope, d.path, d.title, d.body,
                snippet(docs_fts, 2, '', '', '...', 18) AS excerpt,
@@ -743,17 +851,33 @@ def search(
                END AS trust_weight
         FROM docs_fts
         JOIN documents d ON d.doc_id = docs_fts.doc_id
-        WHERE docs_fts MATCH ? AND {scope_sql}
+        WHERE docs_fts MATCH ? AND {scope_sql} AND {source_sql}
         ORDER BY score * trust_weight, score, d.path
         LIMIT ?
         """,
-        parameters,
-    ).fetchall()
+        [*parameters, expression, *scope_args, limit_rows],
+    ).fetchall() for expression, limit_rows in ((exact_expression, 25), (widened_expression, 75)) if expression
+        for source_sql in ("d.source='vault'", "d.source!='vault'")]
+    # The widened pools hold only what the exact words did not find: a document votes once from the
+    # keyword side, and the stems only add what the words as written miss.
+    exact_ids = {row["doc_id"] for pool in pools[:2] for row in pool}
+    pools[2:] = [[row for row in pool if row["doc_id"] not in exact_ids][:25] for pool in pools[2:]]
+    rows = [row for pool in pools for row in pool]
 
-    by_id = {row["doc_id"]: row for row in rows}
-    semantic = vector_ranking(connection, query, scope_sql, scope_args)
+    by_id = {}
+    for row in rows:
+        by_id.setdefault(row["doc_id"], row)
+    closest = vector_ranking(connection, query, scope_sql, scope_args, top=400)
+    sources = {}
+    for start in range(0, len(closest), 200):
+        part = closest[start:start + 200]
+        sources.update(connection.execute(
+            f"SELECT doc_id, source FROM documents WHERE doc_id IN ({','.join('?' * len(part))})", part
+        ).fetchall())
+    semantic_pools = [[doc_id for doc_id in closest if sources.get(doc_id) == "vault"][:20],
+                      [doc_id for doc_id in closest if doc_id in sources and sources[doc_id] != "vault"][:20]]
     # A document the keywords missed entirely still needs its excerpt.
-    for doc_id in semantic:
+    for doc_id in [*semantic_pools[0], *semantic_pools[1]]:
         if doc_id in by_id:
             continue
         found = connection.execute(
@@ -781,8 +905,9 @@ def search(
             del by_id[doc_id]
         else:
             solution_dates[doc_id] = date
-    chosen = fuse([row["doc_id"] for row in rows if row["doc_id"] in by_id],
-                  [doc_id for doc_id in semantic if doc_id in by_id], limit)
+    chosen = fuse_all([[row["doc_id"] for row in pool if row["doc_id"] in by_id] for pool in pools]
+                      + [[doc_id for doc_id in pool if doc_id in by_id] for pool in semantic_pools], limit,
+                      {row["doc_id"]: (row["doc_id"] not in exact_ids, row["score"] * row["trust_weight"]) for row in rows})
     ordered = [by_id[doc_id] for doc_id in chosen if doc_id in by_id]
 
     if not ordered:

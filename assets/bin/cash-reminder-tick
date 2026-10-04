@@ -584,6 +584,43 @@ sys.stdout.write("\0".join(parts))
 ' "${1:-0}"
 }
 
+# A task with nothing to report answers with a service word; the owner must hear silence, not the
+# word. Мартин got NO_REPLY (23 and 25.09), Yuriy got NOTHING (Максимус, 26 and 28.09) and NOREPLY six
+# times (24.08); Максимус's box carried a check for it by hand.
+SILENCE_WORDS='NOTHING|NOREPLY|NO_REPLY|NONE|SKIP|NOCHANGE|NOUPDATE'
+nothing_to_report() {
+  tr -d '[:space:]*`."' < "$1" | grep -qxE "$SILENCE_WORDS"
+}
+
+# The same word closing a result after real lines («групи тихі, нового нічого.» + NOTHING) is dropped,
+# with a <<<SPLIT>>> line or blank lines left before it, and the lines go out: judging the whole result
+# by its last line threw useful parts away (Codex AGENTS 03.10, review of 0cfb4750).
+drop_closing_silence_word() {
+  # The result is rewritten whole beside itself and swapped in: a failed write leaves it as it was
+  # (re-review of c4f096c6: an in-place write cut short by a full disk lost the report).
+  python3 - "$1" "$SILENCE_WORDS" <<'SILENCE_PY'
+import os, re, sys, tempfile
+from pathlib import Path
+path = Path(sys.argv[1])
+lines = path.read_text(encoding="utf-8").rstrip().split("\n")
+if len(lines) > 1 and re.fullmatch(sys.argv[2], re.sub(r'[\s*`."]', "", lines[-1])):
+    lines.pop()
+    while lines and (not lines[-1].strip() or re.fullmatch(r"[ \t]*<<<SPLIT>>>[ \t]*", lines[-1])):
+        lines.pop()
+    if lines:
+        handle, temporary = tempfile.mkstemp(dir=path.parent, prefix=".trim.")
+        try:
+            with os.fdopen(handle, "w", encoding="utf-8") as stream:
+                stream.write("\n".join(lines) + "\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+        except BaseException:
+            Path(temporary).unlink(missing_ok=True)
+            raise
+SILENCE_PY
+}
+
 delivered() {
   printf '%s' "$1" | grep -Eq '"ok"[[:space:]]*:[[:space:]]*true'
 }
@@ -1038,10 +1075,9 @@ deliver_saved_run() {
     return 1
   }
   cursor=$(decimal_value "$cursor")
-  if [ "$cursor" -eq 0 ] && [ "$(tr -d '[:space:]' < "$result")" = NO_REPLY ]; then
-    # A task with nothing to report ends with the silence sentinel. It is not a
-    # message, yet it reached the owner as one (Мартин, 23 and 25.09).
-    log_message "scheduled run $(basename "$journal") returned NO_REPLY; nothing to send"
+  # Only a task's own result can be silence: a reminder's text is the owner's, word for word.
+  if [ "$cursor" -eq 0 ] && [ "$(header_value "$source" RUN)" = "1" ] && nothing_to_report "$result"; then
+    log_message "scheduled run $(basename "$journal") had nothing to report; nothing to send"
     rm -rf -- "$journal"
     return 0
   fi
@@ -1122,7 +1158,9 @@ run_occurrence() {
        log_message "UNCERTAIN scheduled run $(basename "$journal"): agent exited without a savable result"
        return ;;
   esac
-  if [ -n "$late" ] && [ "$(tr -d '[:space:]' < "$result_temp")" != NO_REPLY ]; then
+  drop_closing_silence_word "$result_temp" ||
+    log_message "scheduled run $(basename "$journal"): closing service word left in place"
+  if [ -n "$late" ] && ! nothing_to_report "$result_temp"; then
     { printf '%s\n\n' "$late" && cat "$result_temp"; } > "$result_temp.late" &&
       mv -f "$result_temp.late" "$result_temp"
   fi

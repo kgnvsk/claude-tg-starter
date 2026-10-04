@@ -1,9 +1,9 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-10-03.ac5451dc50a1`
+- Реліз: `2026-10-04.838821dd6c27`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `ac5451dc50a1fd5e10d8109c6deef8655f3a9ef1`
-- Дата релізу: `2026-10-03`
+- Ревізія вихідного комплекту: `838821dd6c27223c5b608cb9016d63712f164b1f`
+- Дата релізу: `2026-10-04`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
 
@@ -19,15 +19,16 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    A left freeze is continued at the start of every tick
-    An unresolved freeze is kept, and the guard thaws only under its lock
-    The marker split belongs to results made under it
-    The Claude CLI does not update itself on an agent
-    A scheduled task's result can arrive as several separate messages
-    A freeze of the CLI is bounded whatever happens to the watcher, and catches a late child
-    Restart a held CLI only when nothing runs, proven again with the CLI frozen
-    Restart a ledger bot whose CLI holds the receiver's offer after a limit
-    A Pro plan compacts the conversation around 450K instead of 747K
+    The vault autosave alert is bounded, reads only the log's end and names only this streak's place
+    The place never shows a name that still matches a secret family the guard knows
+    A closing-word trim is written beside the result and swapped in, so a failed write keeps the whole report
+    Only a whole task result is silence; a closing word is dropped and reminders are spared
+    Exact words rank before their stems, and apostrophe words keep their whole form
+    The history check is linear, judges saved values on their own bytes, and masks whole keys
+    The owner hears when the vault autosave has been failing for hours
+    A note name holding «sk-» inside a word no longer stops the vault autosave
+    memory-search finds the note an owner's question names in its own words
+    A scheduled task's service word is silence, alone or closing a comment
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не
