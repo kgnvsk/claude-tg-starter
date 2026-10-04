@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import base64
+import copy
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -12,11 +14,13 @@ import re
 import shlex
 import stat
 import sys
+import tarfile
 import tempfile
 import urllib.error
 import urllib.request
 
 ENDPOINT = "https://kgnvsk.dev/api/novsky/redeem"
+BACKUPS = Path("/root/backups")
 SSH_HOST_KEYS = tuple(Path("/etc/ssh") / ("ssh_host_" + kind + "_key.pub") for kind in ("ed25519", "ecdsa", "rsa"))
 
 
@@ -45,12 +49,14 @@ def machine_fingerprint():
 def activate(*, key, bot_token, product, machine=None):
     if product == "starter":
         return {"ok": True, "slug": "starter", "bound": False}
-    key = validate_key(key)
+    # The purchase key is used once, at the bot's first installation, and kept nowhere (owner, 04.10.2026). Later
+    # installs and updates of the same bot go without it: the store confirms the bot with Telegram and finds its purchase.
+    key = validate_key(key) if isinstance(key, str) and key.strip() else None
     if not isinstance(bot_token, str) or not re.fullmatch(r"[1-9][0-9]{4,15}:[A-Za-z0-9_-]{20,100}", bot_token):
         raise ValueError("License activation needs a valid Telegram bot token supplied privately.")
     if not isinstance(product, str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,50}", product):
         raise ValueError("License activation needs a valid product.")
-    payload = {"key": key, "botToken": bot_token, "product": product, "download": False}
+    payload = {**({"key": key} if key else {}), "botToken": bot_token, "product": product, "download": False}
     machine = machine if machine is not None else machine_fingerprint()
     if machine:
         if not isinstance(machine, str) or not re.fullmatch(r"SHA256:[A-Za-z0-9+/=_-]{1,100}", machine):
@@ -76,6 +82,8 @@ def activate(*, key, bot_token, product, machine=None):
             429: "The activation service is busy. Retry shortly.",
             503: "The activation service is unavailable. Check connectivity and retry with the same key and bot.",
         }
+        if error.code == 404 and not key:
+            raise ValueError("License activation refused. This bot is not activated yet: its first installation needs the purchase key, provided privately.") from None
         raise ValueError("License activation refused. " + messages.get(error.code, "Check the purchased product and key, then retry.")) from None
     except (OSError, ValueError, urllib.error.URLError):
         raise ValueError("License activation could not be verified. Check connectivity and retry with the same key and bot.") from None
@@ -112,21 +120,80 @@ def read_key(path):
             raise ValueError("The saved license key is invalid; provide it privately again.") from None
 
 
-def store_key(path, key):
-    path = private_path(path)
-    key = validate_key(key)
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    descriptor, name = tempfile.mkstemp(dir=path.parent)
-    try:
-        with os.fdopen(descriptor, "w") as stream:
-            stream.write(key + "\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.chmod(name, 0o600)
-        os.replace(name, path)
-    finally:
-        if os.path.exists(name):
-            os.unlink(name)
+def _without_key(payload):
+    return b"".join(line for line in payload.splitlines(keepends=True) if not line.startswith(b"NOVSKY_LICENSE_KEY="))
+
+
+def _scrub_archive(archive, key_member, env_member):
+    """Rewrite one archive without the key, every other member kept as it was. False when it holds none."""
+    with tarfile.open(archive, "r:gz") as source:
+        members = source.getmembers()
+        def holds_key(member):
+            if member.name == key_member:
+                return True
+            return member.name == env_member and member.isreg() and b"\nNOVSKY_LICENSE_KEY=" in b"\n" + source.extractfile(member).read()
+        if not any(holds_key(member) for member in members):
+            return False
+        before = os.stat(archive, follow_symlinks=False)
+        descriptor, temporary = tempfile.mkstemp(prefix=archive.name + ".", dir=archive.parent)
+        try:
+            raw = os.fdopen(descriptor, "wb")
+            try:
+                with tarfile.open(fileobj=raw, mode="w:gz") as target:
+                    for member in members:
+                        if member.name == key_member:
+                            continue
+                        if member.isreg() and member.name in (env_member, "novsky-rollback.json"):
+                            payload = source.extractfile(member).read()
+                            if member.name == env_member:
+                                payload = _without_key(payload)
+                            else:
+                                # A rollback image records the key as absent: a restore removes it, never brings it back.
+                                manifest = json.loads(payload)
+                                if key_member in manifest.get("paths", {}):
+                                    manifest["paths"][key_member] = None
+                                payload = json.dumps(manifest, sort_keys=True).encode()
+                            member = copy.copy(member)
+                            member.size = len(payload)
+                            target.addfile(member, io.BytesIO(payload))
+                        else:
+                            target.addfile(member, source.extractfile(member) if member.isreg() else None)
+                raw.flush()
+                os.fsync(raw.fileno())
+            finally:
+                raw.close()
+            os.chown(temporary, before.st_uid, before.st_gid)
+            os.chmod(temporary, stat.S_IMODE(before.st_mode))
+            os.replace(temporary, archive)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+    return True
+
+
+def scrub_backups(user, backups=BACKUPS):
+    """The key is kept nowhere (owner, 04.10.2026): drop it from the archives older kits and installers made for this
+    agent — its Codex backup and rollback images and an instance's record from its first own kit folder. Only those
+    names are read; an archive is rewritten only when it holds a key. A marker skips later passes: once the live
+    copies are gone, no new archive can hold one. Returns the number of archives rewritten."""
+    if not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", user):
+        raise ValueError("Invalid agent account")
+    backups = Path(backups)
+    if not backups.is_dir() or backups.is_symlink():
+        return 0
+    marker = backups / (".novsky-license-scrubbed-" + user)
+    if marker.exists() or marker.is_symlink():
+        return 0
+    names = re.compile("novsky-codex-" + re.escape(user) + r"-[0-9TZ]+(?:\.rollback)?\.tar\.gz"
+                       + "|novsky-before-own-kit-" + re.escape(user) + r"-[0-9TZ]+\.tar\.gz")
+    key_member = "etc/novsky/codex/" + user + ".license-key"
+    env_member = "etc/claude-tg-starter/agent-" + user + ".env"
+    rewritten = 0
+    for archive in sorted(backups.iterdir()):
+        if names.fullmatch(archive.name) and not archive.is_symlink() and archive.is_file():
+            rewritten += _scrub_archive(archive, key_member, env_member)
+    os.close(os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600))
+    return rewritten
 
 
 def saved_values(path):
@@ -156,7 +223,11 @@ def main():
     parser.add_argument("--product")
     parser.add_argument("--saved-env", type=Path)
     parser.add_argument("--bot-env", type=Path)
+    parser.add_argument("--scrub-backups", metavar="USER")
     args = parser.parse_args()
+    if args.scrub_backups:
+        print(json.dumps({"rewritten": scrub_backups(args.scrub_backups)}))
+        return
     product = args.product
     if product is None:
         try:

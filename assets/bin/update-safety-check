@@ -96,6 +96,24 @@ def legacy_main() -> int:
         print(f"чекаут комплекту не знайдено: {reference}", file=sys.stderr)
         return 2
 
+    # Templates are filled in at installation (the agent's name, the owner's chat, the calendar, the home), so
+    # the installed copy is compared with the filled-in one: Мелісса named six such files as owner edits (Лера, 04.10).
+    try:
+        update = load_update_module()
+        values = update.render_context(HOME, include_environment=False)
+    except Exception:
+        update = None
+
+    def expected(source: pathlib.Path) -> set[str | None]:
+        found = {digest(source)}
+        if update is not None:
+            try:
+                found.add(hashlib.sha256(update.rendered_target_bytes(
+                    HOME, reference.parents[1], "bin/" + source.name, values)).hexdigest())
+            except Exception:
+                pass
+        return found
+
     changed, missing = [], []
     for source in sorted(reference.iterdir()):
         if not source.is_file():
@@ -104,7 +122,7 @@ def legacy_main() -> int:
         if not live.exists():
             missing.append(source.name)
             continue
-        if digest(live) != digest(source):
+        if digest(live) not in expected(source):
             changed.append(source.name)
 
     if as_json:

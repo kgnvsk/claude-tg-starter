@@ -58,7 +58,7 @@ validate_chat_id() { [[ "$1" =~ ^[0-9]{4,20}$ ]]; }
 validate_admin_ids() { [[ -z "$1" || "$1" =~ ^[0-9]{4,20}(,[0-9]{4,20})*$ ]]; }
 validate_bot_username() { local value="${1#@}"; [[ "$value" =~ ^[A-Za-z0-9_]{1,27}_bot$ ]]; }  # Telegram allows 5-32 chars total, e.g. ab_bot
 validate_bot_token() { [[ "$1" =~ ^[0-9]{6,12}:[A-Za-z0-9_-]{30,}$ ]]; }
-validate_license_key() { [[ -n "$1" && "$1" != *[[:space:]]* && ${#1} -le 1024 ]]; }
+validate_license_key() { [[ -z "$1" ]] || [[ "$1" != *[[:space:]]* && ${#1} -le 1024 ]]; }
 validate_timezone() { [ -f "/usr/share/zoneinfo/$1" ] && [[ "$1" != *..* ]]; }
 validate_email() { [[ -z "$1" || "$1" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]]; }
 validate_openai_key() { [[ -z "$1" || "$1" =~ ^sk-[A-Za-z0-9_-]{20,}$ ]]; }
@@ -489,8 +489,8 @@ case "${confirmed:-}" in y|Y|yes|YES|да|Да|так|Так|т|Т) ;; *) echo "
 
 NOVSKY_LICENSE_KEY="${NOVSKY_LICENSE_KEY:-}"
 if [ "$(python3 "$PRODUCT_CONFIG" get productId)" != starter ] && [ -z "$NOVSKY_LICENSE_KEY" ]; then
-  echo "Один придбаний ключ — один Telegram-бот. Повторне встановлення й оновлення цього бота використовують той самий ключ."
-  ask_secret NOVSKY_LICENSE_KEY "Ключ придбаного комплекту (введення приховано)" 1 validate_license_key
+  echo "Один придбаний ключ — один Telegram-бот. Ключ потрібен лише для першого встановлення бота і ніде не зберігається: повторне встановлення й оновлення цей бот проходить сам."
+  ask_secret NOVSKY_LICENSE_KEY "Ключ придбаного комплекту (введення приховано; Enter — якщо цей бот уже встановлювався)" 0 validate_license_key
 fi
 export NOVSKY_LICENSE_KEY TELEGRAM_BOT_TOKEN
 python3 "$KIT/assets/lib/agent-license.py" --saved-env "$ENV_OUT"
@@ -508,7 +508,7 @@ env_umask="$(umask)"
 umask 077
 : > "$ENV_OUT"
 for name in AGENT_NAME OWNER_NAME OWNER_TG_USERNAME OWNER_CHAT_ID ADDITIONAL_ADMIN_CHAT_IDS ALERT_COPY_CHAT_IDS OWNER_EMAIL \
-            BOT_USERNAME TIMEZONE TELEGRAM_BOT_TOKEN NOVSKY_LICENSE_KEY OPENAI_API_KEY VOICE_SETUP_STATUS \
+            BOT_USERNAME TIMEZONE TELEGRAM_BOT_TOKEN OPENAI_API_KEY VOICE_SETUP_STATUS \
             MEMORY_EMBEDDINGS_OPENAI \
             RECALL_API_KEY RECALL_REGION CALENDAR_EMAIL VAULT_LOCALE OWNER_NOTICE_LOCALE TG_DROP_PENDING_ON_BOOT \
             MODULE_DESIGN_PACK MODULE_CHANNEL_PUBLISH MODULE_SOCIAL_BROWSER \

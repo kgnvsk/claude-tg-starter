@@ -1,9 +1,9 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-10-04.9f21f91661d7`
+- Реліз: `2026-10-05.ba472c164c50`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `9f21f91661d75fc5eef438c1f3fad97bee8f921c`
-- Дата релізу: `2026-10-04`
+- Ревізія вихідного комплекту: `ba472c164c5006b586a95f63e5aa679814eb953c`
+- Дата релізу: `2026-10-05`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
 
@@ -19,11 +19,13 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    Restore the explicit-root rescue and updater-root tests dropped with the onboarding cases
-    onboarding-status stays as published: it is pinned in the readiness manifest
-    A near-end account switch renews the login first instead of waiting for time to do it
-    The near-end guard reads the CLI's own root and record, and wants proof of a renewal
-    No Claude CLI status or plugin command on a live login in its last ten minutes
+    Turn ledger test holds the receiver still while the hooks alone write
+    Operator access test: the baseline script's 10 s timeout becomes a 120 s ceiling
+    Corporate revocation test waits for its provider process, not 2 seconds
+    Old backups lose the purchase key too
+    Codex: drop the saved key before the rollback snapshot instead of editing the pinned bootstrap
+    The purchase key is used once and kept nowhere
+    update-safety-check: templates filled in at installation are not owner edits
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не

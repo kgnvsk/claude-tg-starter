@@ -7,7 +7,7 @@
     "local-foundation-v1"
   ],
   "source": "codex/starter/product.json",
-  "sourceRevision": "9f21f91661d75fc5eef438c1f3fad97bee8f921c",
+  "sourceRevision": "ba472c164c5006b586a95f63e5aa679814eb953c",
   "sourceDirty": false,
   "features": [
     "browser"
@@ -46,10 +46,10 @@
     "codex/starter/product.json": "71cf9bae55acfc1b64466557dbbafce19130ffed24a81ea7801f8a10b29ebcb7",
     "codex/build.py": "27c720604f79472252d80a66e178c4fb2b2511ba8fd1f6aa78c6b6697022c176",
     "native/build_claude.py": "d8e2abd369bbed16fc74b05ccf1f2dc423cf65cf4207167a4069f59961fdbb70",
-    "codex/install.py": "9dbb9871064e4620976094bc11a6c0d5e39e1120a13b73da81dc5b8362b2fd15",
+    "codex/install.py": "ef66afed24e8314ad477512e75643609f6c44a3b2d71a859bd3a248c09c27a24",
     "codex/setup.py": "d950735dde0ed1cdd9a96edd5e52b2573ce4691c938c47b4b56a39176af39e8b",
     "native/local_claude.py": "ebdba3706e15a1f1843e66150493a3f51a6866a6c92390b491ec0ecdb06a9ce6",
-    "assets/lib/agent-license.py": "95c523edbfb2a1149b83c6ac2bc7b9e56cd3ae4cd1f942886d437cef8d9ac335",
+    "assets/lib/agent-license.py": "cdd70579e18386b64fb6b238ed818330815cadf0c3e55e820a7a6740a8b01d84",
     "assets/skills/research/SKILL.md": "9f6607fcb2029d90d5b40d98918c2d3aa2da2058edec5907b647e784b02d569e",
     "assets/skills/backup-recovery/SKILL.md": "7019d953d90502fe714945495b46767f20ce6565085c4877b3d5e6a32599dfe1",
     "assets/skills/backup-recovery/guide-uk.md": "5081bbb1b68f54712a66e550ea4fb98e11a6a9d85866523d8c1552a5dcee77ea",
@@ -196,8 +196,8 @@
     "home/bin/transcribe-telegram": "4915b7c98635f5338ea6ab9a246d739c3e649b0c509fc5cbec1780c8f4f0f049",
     "home/bin/ukargparse.py": "50bae922beaa0173a070b5d27aefefa73f64bcd89bb18223f4c3a29ca3e28ecc",
     "home/bin/vault-sync": "071a71046acffb6cdc7e8d51e94297b0e1f04e198d896880d7f31742957597dc",
-    "installer/agent_license.py": "95c523edbfb2a1149b83c6ac2bc7b9e56cd3ae4cd1f942886d437cef8d9ac335",
-    "installer/install.py": "9dbb9871064e4620976094bc11a6c0d5e39e1120a13b73da81dc5b8362b2fd15",
+    "installer/agent_license.py": "cdd70579e18386b64fb6b238ed818330815cadf0c3e55e820a7a6740a8b01d84",
+    "installer/install.py": "ef66afed24e8314ad477512e75643609f6c44a3b2d71a859bd3a248c09c27a24",
     "installer/local.py": "ebdba3706e15a1f1843e66150493a3f51a6866a6c92390b491ec0ecdb06a9ce6",
     "installer/setup.py": "d950735dde0ed1cdd9a96edd5e52b2573ce4691c938c47b4b56a39176af39e8b",
     "plugin-contract.json": "c5ea9ff8efabb69e2ec79e9082f7fbd3ee6b389376a22227702e446a49ba94d3",

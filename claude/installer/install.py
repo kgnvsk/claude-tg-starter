@@ -653,8 +653,11 @@ def main():
         print(json.dumps({"ok": True, "action": action, "productId": manifest["productId"],
                           "revision": manifest["sourceRevision"]}))
         return
-    if licensing and not data.get("maintenance"):
-        licensing.store_key(key_path, key)
+    # The key has done its one job: a copy an older kit saved goes now, and so do the copies older backup and
+    # rollback images of this agent took (owner, 04.10.2026: kept nowhere).
+    if licensing:
+        key_path.unlink(missing_ok=True)
+        licensing.scrub_backups(user)
     # Every managed path, config conflict and owner check above is read-only.
     # Dependency installation and native discovery still need runtime checks.
     runtime_log(home, account.pw_uid, account.pw_gid)

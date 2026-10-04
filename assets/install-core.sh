@@ -341,7 +341,9 @@ if [ -n "$_installed_token" ] && [ "${_installed_token%%:*}" != "${TELEGRAM_BOT_
   exit 1
 fi
 unset _installed_token
-# Every paid install and retry verifies this bot before package or runtime writes.
+# Every paid install and retry verifies this bot before package or runtime writes: with the purchase key at its first
+# installation (or the copy an older kit saved, used one last time), afterwards by the bot alone. The key is never
+# written back (owner, 04.10.2026).
 NOVSKY_LICENSE_KEY="${NOVSKY_LICENSE_KEY:-$(python3 "$KIT/assets/lib/merge-env.py" --value "$CONFIG_FILE" NOVSKY_LICENSE_KEY)}"
 # The license check is the only process that reads the key from its environment. Nothing else this installer
 # starts inherits it: package installs run third-party scripts, and the key is reusable.
@@ -1037,7 +1039,7 @@ chmod 600 "$CHANNEL_ENV"
 
 : > "$CONFIG_FILE"
 for name in AGENT_NAME OWNER_NAME OWNER_TG_USERNAME OWNER_CHAT_ID ADDITIONAL_ADMIN_CHAT_IDS ALERT_COPY_CHAT_IDS \
-  OWNER_EMAIL BOT_USERNAME TIMEZONE TELEGRAM_BOT_TOKEN NOVSKY_LICENSE_KEY OPENAI_API_KEY VOICE_SETUP_STATUS \
+  OWNER_EMAIL BOT_USERNAME TIMEZONE TELEGRAM_BOT_TOKEN OPENAI_API_KEY VOICE_SETUP_STATUS \
   MEMORY_EMBEDDINGS_OPENAI \
   RECALL_API_KEY RECALL_REGION TG_DROP_PENDING_ON_BOOT TG_CORPORATE_SESSIONS \
   CALENDAR_EMAIL VAULT_LOCALE OWNER_NOTICE_LOCALE MODULE_DESIGN_PACK MODULE_CHANNEL_PUBLISH \
@@ -1047,6 +1049,13 @@ for name in AGENT_NAME OWNER_NAME OWNER_TG_USERNAME OWNER_CHAT_ID ADDITIONAL_ADM
   write_shell_value "$CONFIG_FILE" "$name"
 done
 chmod 600 "$CONFIG_FILE"
+# The purchase key is kept nowhere: the copies older onboarding runs left in their backups go as well.
+for backup in "$CONFIG_FILE".backup.*; do
+  if [ -f "$backup" ] && [ ! -L "$backup" ]; then sed -i '/^NOVSKY_LICENSE_KEY=/d' "$backup"; fi
+done
+# … and the archives older kits and Novsky made for this agent (an instance's record from its first own kit folder).
+python3 "$KIT/assets/lib/agent-license.py" --scrub-backups "$AGENT_USER" >/dev/null \
+  || echo "WARN: старі архіви агента ще містять ключ покупки; наступне оновлення спробує знову" >&2
 
 PROFILE_FILE="$H/.agent-profile.env"
 : > "$PROFILE_FILE"
