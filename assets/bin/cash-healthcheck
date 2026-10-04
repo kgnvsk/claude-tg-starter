@@ -1352,7 +1352,11 @@ if [ -f "$DB" ] && command -v sqlite3 >/dev/null 2>&1; then
         PAUSED_MS=$(sqlite3 "$DB" "SELECT COALESCE(updated_at,0) FROM corporate_runtime_state WHERE singleton=1;" 2>/dev/null || echo 0)
         case "$PAUSED_MS" in ''|*[!0-9]*) PAUSED_MS=0 ;; esac
         PAUSED_MIN=$(( ($(date +%s) - PAUSED_MS / 1000) / 60 ))
-        if [ "$PAUSE_REASON" != usage_limit ] && [ "$PAUSED_MIN" -ge 10 ]; then
+        # A lost login (its link goes out from claude-auth-rescue) and a Claude limit (the limit
+        # watcher's notice) are each told once; a company pause on top only confused the owner (04.10).
+        if [ "$PAUSE_REASON" != usage_limit ] && [ "$PAUSE_REASON" != auth ] \
+            && [ "${CLAUDE_AUTHENTICATED:-true}" != false ] && [ "$LIMIT_RECOVERY_STATUS" != active ] \
+            && [ "$PAUSED_MIN" -ge 10 ]; then
             alert "corporate-paused" "⏸ Співробітникам я не відповідаю вже ~${PAUSED_MIN} хв: корпоративний режим на паузі ($(case "$PAUSE_REASON" in auth) printf 'злетів вхід у Claude' ;; startup) printf 'не вдалося запуститися' ;; manual|owner) printf 'поставлено вручну' ;; *) printf 'причина: %s' "${PAUSE_REASON:-невідома}" ;; esac)). Твій чат працює. Напиши мені «віднови корпоративний приймач»." 3600
         fi
     fi

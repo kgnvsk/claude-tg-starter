@@ -7,7 +7,7 @@
     "local-foundation-v1"
   ],
   "source": "codex/starter/product.json",
-  "sourceRevision": "c03ffa290b23022311cb80f545e667456bd57209",
+  "sourceRevision": "14f33c3b979df828d2904b2fba656c4091ac24e8",
   "sourceDirty": false,
   "features": [
     "browser"
@@ -76,7 +76,7 @@
     "assets/bin/agent-nightly-github-backup": "830e627cd7289fa644b4a7a2de58085c2f54bff6fbb21e32e02c81f5a4577c51",
     "assets/bin/agent-provider-run": "b0d5700a1a356231b9d5f264db1c08794ad5cc5e30b32b9f83eaed4d030660e2",
     "assets/bin/agent_connections.py": "83bc42d8140c5f4a0f623b8ae4e1eae2318a3134726f5c50fda202cce0b78296",
-    "assets/bin/agent_notice_locale.py": "0b0b42b4a680b9682cf503b3b7c88b7f05f2e5d90192efb741b064fff994bbe0",
+    "assets/bin/agent_notice_locale.py": "3f7dfbac3eea8840345d611e3af183d8d9e2349e3514679701110030d662417b",
     "assets/bin/browser-pdf.mjs": "8c5ef5cfe0f4110401353bb4e07196ea3c9b30e61b0a81ae70b27341337a3552",
     "assets/bin/gh": "eb68b88e4a852b27ac6554b6913f4165fefcf0588133dcc7746b239552623d3e",
     "assets/bin/learning-review": "7c61f7214dac384f1b284d33d9e4e31cf1d946f8a5dd7ba0853058136e920507",
@@ -123,7 +123,7 @@
     "modules/telegram-corporate/codex-worker.ts": "658255ee754fdca99f1a8f8bc827c6b156dafbf56c08da641717483d119804a9",
     "modules/telegram-corporate/delegated-integrations.ts": "249f6c49f81179dfc576ca08211c17336231796107e2b62bb04cbecd397e2d7c",
     "modules/telegram-corporate/group-action.ts": "21501bd7028d59fa1977a1e0d5fe7450ba9308a1dd6fecafc38b3edfed2c16b1",
-    "modules/telegram-corporate/index.ts": "6954c2a8b763785eba725a418760290c4c4690ce52550a172853657bca36bbc5",
+    "modules/telegram-corporate/index.ts": "a93085be81198ab2ef648a626344b50a98bee4216293afbc907b45caa4fcd5ab",
     "modules/telegram-corporate/integration-readiness.ts": "bc1729f202c7447f7bb45f442d0b1582fe6f128a080142cdfe046d0014cf2ddf",
     "modules/telegram-corporate/media.ts": "4f9ed8585eb51a78043d1f81c96f6b6dc56ac173b9ccd4ba5d39121c1739cf48",
     "modules/telegram-corporate/migration-plan.ts": "ab5d008feb4e5aa07320dff9cbb7803cab1fe2dba3375cdc8e04a7c458629968",
@@ -143,15 +143,15 @@
     "modules/telegram-corporate/resource-meta-accounts.ts": "92b5678d28236f65c5d68fc5638b97c88a0cda401a86cebfa3abe345c2e5c5a0",
     "modules/telegram-corporate/resource-sheets.ts": "079155f75d48f2aed3d74d8be79a821aac3d976ac05781990b9d72afbbe5c881",
     "modules/telegram-corporate/resource-telegram-groups.ts": "331a591b94e5f82002bfcf791a1017516ab7d535610c22ad382f24f2f6fadd66",
-    "modules/telegram-corporate/runtime.ts": "c6acfdc576b4d0021f292f55c5ee6014db57a9f8b8cd088cdb58c59a3261004e",
+    "modules/telegram-corporate/runtime.ts": "d87bc9d2ee819ba7a07787146a1708c64f62f1d46d7f1756ff2ea64e8ed262ec",
     "modules/telegram-corporate/settings-access.ts": "344ef31374db78cb7f9b900ca27579d3e8f0f01beff710f920058d0598d096b8",
     "modules/telegram-corporate/store.ts": "277f662b84a13a7ea453dccc26c6a662ac66b16f66173cfdecd03b51170613a0",
     "modules/telegram-corporate/team-access.ts": "f0b2d4bb089d3ace90cd701ccd81b8ee11b8ad9a6543e90405b03b0baa381651",
-    "modules/telegram-corporate/tests/helpers.ts": "a34f87b66f841c64749821abd3f71bd9726abac83ae9119e6e7f5f92c9b0b768",
+    "modules/telegram-corporate/tests/helpers.ts": "3d95ab5f9661663f83072f0b085062ef8b04ac0ad34976f75eafe53e0c4f1edc",
     "modules/telegram-corporate/tests/native-cli-canary.ts": "2a4186fd218fbd87d47a6bddbbf59bb53cfa2c8c33059b3ec92c23aee98e6ccb",
     "modules/telegram-corporate/types.ts": "0e57a6bd3e08efd3bfe0e96c1af9c09cd7695076eb20a3c77aa1e95c1c7efaa0",
     "modules/telegram-corporate/worker-activity.ts": "dd5ffec7bd7d6665bcc1d7ed8456d543d3de43c29acee8238ef08ced2fc81aa2",
-    "modules/telegram-corporate/worker.ts": "cb2880d6b73342ede041b8c68b78f0ef697202854dce546bd097e44b43494366"
+    "modules/telegram-corporate/worker.ts": "8f5e38c0dc56c0436e9d7d63f2453a63f47c4fd45e5fef67c3006e8f9f872592"
   },
   "files": {
     "home/.claude/agents/researcher.md": "d3781912006696258dc84032c2bd56ef8bbadb91848c04f793da35e55b4d2390",
@@ -176,7 +176,7 @@
     "home/bin/agent-nightly-github-backup": "830e627cd7289fa644b4a7a2de58085c2f54bff6fbb21e32e02c81f5a4577c51",
     "home/bin/agent-provider-run": "b0d5700a1a356231b9d5f264db1c08794ad5cc5e30b32b9f83eaed4d030660e2",
     "home/bin/agent_connections.py": "83bc42d8140c5f4a0f623b8ae4e1eae2318a3134726f5c50fda202cce0b78296",
-    "home/bin/agent_notice_locale.py": "0b0b42b4a680b9682cf503b3b7c88b7f05f2e5d90192efb741b064fff994bbe0",
+    "home/bin/agent_notice_locale.py": "3f7dfbac3eea8840345d611e3af183d8d9e2349e3514679701110030d662417b",
     "home/bin/browser-pdf.mjs": "8c5ef5cfe0f4110401353bb4e07196ea3c9b30e61b0a81ae70b27341337a3552",
     "home/bin/gh": "eb68b88e4a852b27ac6554b6913f4165fefcf0588133dcc7746b239552623d3e",
     "home/bin/learning-review": "7c61f7214dac384f1b284d33d9e4e31cf1d946f8a5dd7ba0853058136e920507",

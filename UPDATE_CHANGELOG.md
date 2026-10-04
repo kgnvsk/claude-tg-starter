@@ -1,8 +1,8 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-10-04.c03ffa290b23`
+- Реліз: `2026-10-04.14f33c3b979d`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `c03ffa290b23022311cb80f545e667456bd57209`
+- Ревізія вихідного комплекту: `14f33c3b979df828d2904b2fba656c4091ac24e8`
 - Дата релізу: `2026-10-04`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
@@ -19,8 +19,12 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    healthcheck: read a live Claude login from the file, never renew it through auth status
-    health-state.json reports owner.stalled on every bot, by the watchdog's own rule
+    An owner line, its retry and its delivery credit belong to one pause
+    The plain owner line survives Telegram's wait-and-retry, and only a delivered one makes its end due
+    inbox-secretary: the lead's forward carries the reason when Claude is limited or logged out
+    Company receiver: silent only while the bot's own notifier owns a Claude outage; else one plain line
+    inbox-secretary: a Claude limit or a lost login adds no line of its own; the lead's message still comes
+    A Claude limit or a lost login reaches the owner once, from the bot, never again from the company receiver
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не
