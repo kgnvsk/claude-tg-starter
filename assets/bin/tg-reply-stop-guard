@@ -2357,7 +2357,11 @@ def completed_visible_callbacks(
                 ).fetchone()
                 if receipt is None:
                     return False
-                final = result[3] == 'complete' and result[5] == turn[0]
+                # A final given after the return proves it, its reply receipt above being after the return too,
+                # whether or not the turn that gave it was recorded (Мартин, 05.10: response_turn_id stayed NULL
+                # and every Stop of that turn was refused, 157 times by morning).
+                final = result[3] == 'complete' and (
+                    result[5] == turn[0] or (result[9] is not None and result[9] >= observed_at))
                 # A progress receipt after the callback defers the request to a task
                 # launched after it, or to another of its obligations still running.
                 successor = (result[3] == 'deferred' and result[6] >= observed_at

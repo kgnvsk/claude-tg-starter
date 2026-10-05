@@ -28,10 +28,26 @@ UPSTREAM_SERVER_SHA256 = (
 )
 UPSTREAM_PACKAGE_START = "bun install --no-summary 1>&2 && bun server.ts"
 GOLDEN_SERVER_SHA256 = (
-    "c5c7c7c35fca23038224178d0d52110c5acfde0bb0308e4f1295e27788939aec"
+    "f3ff61971f1afbc8d12b62ddf968f4e3ddc862b16963ff109d3c1db4b9a5c709"
 )
 PREVIOUS_GOLDEN_SERVER_SHA256S = frozenset(
     {
+        # The golden before the live host turned on only by the launcher.
+        "b05204269fc3bf4d93b00cbe5a44969332e40460a1176731bc57a89b54bc1720",
+        # c3d237426598 Owner live host: bridge credential off argv, notice backoff and locale
+        "e0526e6d4082251447d49265239741c3585ddefc6d6a09164a8b91cca44e6240",
+        # c435f32557a0 Name the Claude limit and its reset in the person's language, and remi
+        "c5c7c7c35fca23038224178d0d52110c5acfde0bb0308e4f1295e27788939aec",
+        # 0c7226fece3f Owner live host: nothing runs while any written message is not yet acc
+        "7c0e435092ba9dc4e2b5fd41c46565b4bc14b0cf71a6b78dba0c0d9d20b55d19",
+        # 631f15eb9bb3 Owner live host: every tool asks the host first; an uncertain message
+        "775aea24b7f1bae463253b57d5b0a4a3f32b59947592bdc250c3efe52ae8d917",
+        # fa93d107a985 Owner live host: an ended life is admitted, untouched or uncertain; th
+        "f7671a5f6f1578c9842f10c50481a92deedb5e1a72f80651557059143a06c364",
+        # 7b1540d39fff Owner live host: acceptance needs the echo and the hook's committed ad
+        "7f1d97478123b92b806bc25cb64162f7a46c93acc741caceb9f59d066e0e0d3b",
+        # 9cafb62d5d8a Owner live host (P2 v6): the receiver runs the owner's conversation in
+        "83c4314b19aec58e1261c0cbcef4708c978ae3563b8bc5d5954b12e3b8ce35ba",
         # The golden released as 2026-10-03.bf3ac4233ee6 (receipts release 3), before the limit line named the limit.
         "4265fea73d010cae7b788b8f7e71f68fbf3e200f68cbf0d57f51c836aad45bf0",
         # The golden before the merge that joins the receipts branch with the receiver main released on 01.10 (limit notices, answered heads).

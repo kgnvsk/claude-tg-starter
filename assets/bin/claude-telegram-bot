@@ -273,4 +273,40 @@ PERMISSION_MODE=""
 if [ "$(id -u)" -ne 0 ]; then
   PERMISSION_MODE="--permission-mode bypassPermissions"
 fi
+# OWNER_ENGINE=live (whole-agent receipts, P2 v6): the receiver hosts the owner's conversation and launches the
+# CLI itself. Until that release is switched on bot by bot it runs only where root created the marker below (the
+# test server); a saved channel setting alone never enables it.
+LIVE_ENGINES_MARKER=/etc/claude-tg-starter/live-engines-allowed
+# Root's own regular file only: a link or a file the agent could have made grants nothing.
+live_engines_allowed() {
+  python3 -c 'import os, stat, sys; i = os.lstat(sys.argv[1]); sys.exit(0 if stat.S_ISREG(i.st_mode) and i.st_uid == 0 else 1)' \
+    "$LIVE_ENGINES_MARKER" 2>/dev/null
+}
+if [ "${OWNER_ENGINE:-}" = live ] && ! live_engines_allowed; then
+  echo "telegram launcher: OWNER_ENGINE=live is not enabled on this server; starting the interactive owner session" >&2
+  unset OWNER_ENGINE
+fi
+# A root agent runs without bypassPermissions: its permission requests reach the owner only through the interactive
+# session's channel relay, which a --print session does not have.
+if [ "${OWNER_ENGINE:-}" = live ] && [ "$(id -u)" -eq 0 ]; then
+  echo "telegram launcher: the live owner engine never runs as root; starting the interactive owner session" >&2
+  unset OWNER_ENGINE
+fi
+if [ "${OWNER_ENGINE:-}" = live ]; then
+  PLUGIN_ROOT=$(python3 -c '
+import json, sys
+print(json.load(open(sys.argv[1], encoding="utf-8"))["plugins"]["telegram@claude-plugins-official"][0]["installPath"])
+' "$CLAUDE_CONFIG_ROOT/plugins/installed_plugins.json" 2>/dev/null) || PLUGIN_ROOT=""
+  if [ -z "$PLUGIN_ROOT" ] || [ ! -f "$PLUGIN_ROOT/server.ts" ]; then
+    echo "telegram launcher: the live owner engine needs the installed Telegram plugin; not starting" >&2
+    exit 1
+  fi
+  # The owner's flags go to the CLI the receiver launches. The plugin is off inside that CLI, so it never starts
+  # a second receiver: the receiver serves the same tools itself.
+  OWNER_CLAUDE_ARGS=$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1:]))' $PERMISSION_MODE ${AGENT_EFFORT:+--effort "$AGENT_EFFORT"} ${AGENT_MODEL:+--model "$AGENT_MODEL"} --settings '{"enabledPlugins":{"telegram@claude-plugins-official":false}}')
+  export OWNER_CLAUDE_ARGS OWNER_RESUME_SESSION="$RESUME_SESSION" OWNER_CWD="$PWD"
+  cd "$PLUGIN_ROOT"
+  "$BUN_INSTALL/bin/bun" install --no-summary 1>&2
+  exec "$BUN_INSTALL/bin/bun" server.ts
+fi
 exec $HOME/.local/bin/claude $PERMISSION_MODE ${AGENT_EFFORT:+--effort "$AGENT_EFFORT"} ${AGENT_MODEL:+--model "$AGENT_MODEL"} ${RESUME_SESSION:+--resume "$RESUME_SESSION"} --channels plugin:telegram@claude-plugins-official

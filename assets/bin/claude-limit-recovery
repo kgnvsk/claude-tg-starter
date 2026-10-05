@@ -2671,6 +2671,11 @@ def ledger_busy(db: Path) -> bool:
         ).fetchone():
             return True
         tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        # A message written to the owner's live session and not yet accepted is work in flight (P2 v5 §3).
+        if "owner_submissions" in tables and connection.execute(
+            "SELECT 1 FROM owner_submissions WHERE state='submitted' LIMIT 1"
+        ).fetchone():
+            return True
         return "conversation_jobs" in tables and connection.execute(
             f"SELECT 1 FROM conversation_jobs WHERE state IN ({','.join('?' * len(CORPORATE_RUNNING))}) LIMIT 1",
             CORPORATE_RUNNING,
@@ -2722,6 +2727,31 @@ def _proc_stat(proc: Path, pid: int) -> tuple[int, str, str] | None:
     if len(fields) < 20:
         raise ProcUnreadable(pid)
     return int(fields[1]), fields[0], fields[19]
+
+
+LIVE_ENGINES_MARKER = Path("/etc/claude-tg-starter/live-engines-allowed")
+LIVE_ENGINES_OWNER = 0
+
+
+def owner_live(agent_root: Path) -> bool:
+    """OWNER_ENGINE=live in the channel file, where root allowed live engines (P2 v6).
+
+    The marker counts only as root's own regular file: a link or a file the agent could have made grants nothing.
+    A root agent never gets the live host: the launcher starts its interactive session.
+    """
+    try:
+        info = os.lstat(LIVE_ENGINES_MARKER)
+        if agent_root.stat().st_uid == 0:
+            return False
+    except OSError:
+        return False
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != LIVE_ENGINES_OWNER:
+        return False
+    try:
+        text = (agent_root / ".claude/channels/telegram/.env").read_text(encoding="utf-8")
+    except OSError:
+        return False
+    return any(re.fullmatch(r"""OWNER_ENGINE=["']?live["']?\s*""", line) for line in text.splitlines())
 
 
 def cli_tree(service: str, proc: Path = Path("/proc")) -> list[int]:
@@ -3499,6 +3529,13 @@ def tick(mode: str) -> int:
             _record_suppression(agent_root, decision.suppression or "suppressed")
             return 0
 
+        # Under the owner's live host the receiver and the company's workers keep admitting work while the owner CLI
+        # is frozen, so no idle proof would hold through a whole-unit restart (v10 code review P1-2): no automatic
+        # restart there; the incident and the work stay for the receiver's own recovery.
+        if ledger and owner_live(agent_root):
+            atomic_write_state(state_path, state)
+            _record_suppression(agent_root, "owner_live_no_auto_restart")
+            return 0
         frozen = False
         # The cron budget ends this process with SIGTERM: under a freeze that continues the CLI first.
         previous = {sig: signal.signal(sig, _thaw_and_exit(record)) for sig in (signal.SIGTERM, signal.SIGHUP)} \

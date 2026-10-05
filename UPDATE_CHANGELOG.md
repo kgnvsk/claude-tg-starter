@@ -1,8 +1,8 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-10-05.ba472c164c50`
+- Реліз: `2026-10-05.e713d8c1e164`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `ba472c164c5006b586a95f63e5aa679814eb953c`
+- Ревізія вихідного комплекту: `e713d8c1e164752f2ac56c1b5eaf36f833d23419`
 - Дата релізу: `2026-10-05`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
@@ -19,13 +19,28 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    Turn ledger test holds the receiver still while the hooks alone write
-    Operator access test: the baseline script's 10 s timeout becomes a 120 s ceiling
-    Corporate revocation test waits for its provider process, not 2 seconds
-    Old backups lose the purchase key too
-    Codex: drop the saved key before the rollback snapshot instead of editing the pinned bootstrap
-    The purchase key is used once and kept nowhere
-    update-safety-check: templates filled in at installation are not owner edits
+    Stop guard: a final given after a worker returned proves that callback, recorded turn or not
+    The corporate feature's runtime paths in the build test name live-session.ts and live-engines.ts
+    Runtime inventory names the corporate module's live-session.ts and live-engines.ts
+    Root launcher test: the fake id goes first on the PATH the launcher sets
+    Pin the receiver with the launcher-only live host as the kit golden
+    Owner live host: only the launcher turns it on; never for a root agent; review fixes from the targeted rerun
+    Keep the receiver's handler and instruction text where the kit's tests read it; serve the instructions on the bridge
+    Pin the receiver with the owner live host as the kit golden
+    Owner live host: bridge credential off argv, notice backoff and locale, backout settles; watcher never restarts under the live host
+    Owner live host: nothing runs while any written message is not yet accepted
+    Owner live host: every tool asks the host first; an uncertain message is held and told once
+    Owner live host: an ended life is admitted, untouched or uncertain; the marker must be root's own file
+    Limit watcher: under the live host freeze only the proven owner CLI; an unaccepted message is busy
+    Healthcheck: the owner's live session's headless records are work
+    Owner live host: acceptance needs the echo and the hook's committed admission
+    Live engines stay off unless root allows them; launcher starts the receiver as the owner's host
+    Owner live host (P2 v6): the receiver runs the owner's conversation in one warm CLI process
+    fix(corporate/live): a restart never rebuilds a background job's answer; only the CLI's wrapper means background
+    fix(corporate/live): pass --replay-user-messages; unanswered returns are bounded by the ordinary limit
+    fix(corporate/live): exact continuation provenance, per-process bridge, failed launches (Codex HOLD on 42f3b790)
+    fix(corporate/live): close Codex HOLD on 4ba8b469 (P1-1..P1-7, P2-1, P2-2)
+    feat(corporate): live engine — one warm Claude Code session per company conversation
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не

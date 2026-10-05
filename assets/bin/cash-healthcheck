@@ -355,6 +355,14 @@ fi
 
 # Load bot credentials for alerts
 BOT_TOKEN=$(grep "^TELEGRAM_BOT_TOKEN=" "$H/.claude/channels/telegram/.env" 2>/dev/null | cut -d= -f2)
+# The owner's live session (OWNER_ENGINE=live, only where root allowed live engines and never for a root agent, as
+# the launcher decides) is itself a headless run.
+OWNER_LIVE=""
+if grep -Eq "^OWNER_ENGINE=[\"']?live[\"']?[[:space:]]*$" "$H/.claude/channels/telegram/.env" 2>/dev/null \
+  && python3 -c 'import os, stat, sys; i = os.lstat(sys.argv[1]); sys.exit(0 if stat.S_ISREG(i.st_mode) and i.st_uid == 0 and os.stat(sys.argv[2]).st_uid != 0 else 1)' \
+    /etc/claude-tg-starter/live-engines-allowed "$H" 2>/dev/null; then
+  OWNER_LIVE=1
+fi
 RENDERED_OWNER_ID={{OWNER_CHAT_ID}}  # compatibility fallback rendered by install-core
 PROFILE_FILE=$H/.agent-profile.env
 ACCESS_FILE=$H/.claude/channels/telegram/access.json
@@ -1476,8 +1484,9 @@ if [ -f "$DB" ] && command -v sqlite3 >/dev/null 2>&1; then
     # JSON records instead of depending on whitespace or cutting through a
     # large tool result. Unsafe input fails BUSY so recovery never destroys
     # work it cannot classify.
-    RECENT_JSONL=$(python3 - "$SESS_DIR" <<'PY'
+    RECENT_JSONL=$(OWNER_LIVE="$OWNER_LIVE" python3 - "$SESS_DIR" <<'PY'
 import json
+import os
 import sys
 import time
 from datetime import datetime, timezone
@@ -1533,8 +1542,10 @@ def recent_turn(path: Path, now: float) -> bool | None:
         if event.get("type") not in TURN_RECORD_TYPES:
             continue
         # A headless run (`claude -p`, the SDK) in the same project is another
-        # session; the bot's own session and its subagents are interactive.
-        if str(event.get("entrypoint", "")).startswith("sdk"):
+        # session; the bot's own session and its subagents are interactive —
+        # except the owner's live session, which is headless itself: there any
+        # headless record counts as work (fail busy, never a wrong restart).
+        if os.environ.get("OWNER_LIVE") != "1" and str(event.get("entrypoint", "")).startswith("sdk"):
             continue
         stamp = event.get("timestamp")
         if not isinstance(stamp, str):
