@@ -631,17 +631,18 @@ def classify_limit(
     event: dict,
     events_by_uuid: dict[str, dict],
 ) -> dict | None:
-    """Classify one exact main-chain Telegram session-limit event."""
+    """Classify one exact Telegram session-limit event of the main chain, or the account's limit a subagent hit."""
     if not isinstance(event, dict):
         return None
     event_uuid = event.get("uuid")
     status = event.get("apiErrorStatus")
+    sidechain = event.get("isSidechain")
     if (
         event.get("type") != "assistant"
         or event.get("isApiErrorMessage") is not True
         or type(status) is not int
         or status != 429
-        or event.get("isSidechain") is not False
+        or (sidechain is not False and sidechain is not True)
         or event.get("userType") != "external"
         or not isinstance(event_uuid, str)
         or not event_uuid
@@ -650,15 +651,27 @@ def classify_limit(
 
     event_epoch_ms = _event_epoch_ms(event)
     error = rendered_error(event)
-    channel = telegram_origin(events_by_uuid, event)
-    if event_epoch_ms is None or error is None or channel is None:
+    if event_epoch_ms is None or error is None:
         return None
+    if sidechain:
+        # Арти, 04.10.2026: two Agent subagents hit the account's weekly limit and the main chain made no call
+        # after it, so no incident started: nobody was told, the queue was not held, nothing resumed, and the
+        # CLI queued every message for 13 hours. A subagent's limit is the account's. Only the CLI's own limit
+        # wording counts, and the incident is bound to no request: its chats are those whose messages queue.
+        if LIMIT_ERROR_PATTERN.match(error) is None:
+            return None
+        chat_id = message_id = None
+    else:
+        channel = telegram_origin(events_by_uuid, event)
+        if channel is None:
+            return None
+        chat_id, message_id = channel.chat_id, channel.message_id
     reset = parse_reset(error, event_epoch_ms)
     return {
         "event_uuid": event_uuid,
         "event_epoch_ms": event_epoch_ms,
-        "chat_id": channel.chat_id,
-        "message_id": channel.message_id,
+        "chat_id": chat_id,
+        "message_id": message_id,
         "reset_key": (
             f"{reset.kind}:{reset.key}" if reset is not None else None
         ),
@@ -870,7 +883,9 @@ def _validate_incident(value: object) -> dict | None:
         or not _nonnegative_int(reset_epoch_ms)
     ):
         raise StateError("invalid incident reset")
-    _validate_channel_ref(value.get("limit_origin"))
+    # A subagent's limit is bound to no request (classify_limit).
+    if value.get("limit_origin") != {"chat_id": None, "message_id": None}:
+        _validate_channel_ref(value.get("limit_origin"))
 
     queue = value.get("queue")
     if not isinstance(queue, list):
@@ -2050,6 +2065,11 @@ def _start_incident_if_new(
     classified = classify_limit(event, events_by_uuid)
     if classified is None:
         return False
+    if event.get("isSidechain") is True:
+        # Its queue and its answers are the parent session's: the incident follows the main transcript.
+        transcript = _parent_transcript(transcript, event)
+        if transcript is None:
+            return False
     event_uuid = classified["event_uuid"]
     reset_key = classified["reset_key"]
     if event_uuid in state["handled_event_uuids"] or (
@@ -2062,6 +2082,20 @@ def _start_incident_if_new(
     if reset_key is not None:
         state["handled_reset_keys"].append(reset_key)
     return True
+
+
+def _parent_transcript(transcript: str, event: dict) -> str | None:
+    """<project>/<session>.jsonl for a subagent's <project>/<session>/subagents/agent-<id>.jsonl, else None."""
+    parts = PurePosixPath(transcript).parts
+    if (
+        len(parts) != 4
+        or parts[2] != "subagents"
+        or not parts[3].startswith("agent-")
+        or event.get("sessionId") not in (None, parts[1])
+    ):
+        return None
+    parent = f"{parts[0]}/{parts[1]}.jsonl"
+    return parent if _valid_relative_transcript(parent) else None
 
 
 def _reset_key_is_handled(handled_keys: list[str], reset_key: str) -> bool:
@@ -2271,7 +2305,10 @@ def incident_expires_at(incident: dict) -> int:
     expiry = incident["event_epoch_ms"] + INCIDENT_TTL_MS
     reset = incident.get("reset_epoch_ms")
     if type(reset) is int and incident["event_epoch_ms"] <= reset <= incident["event_epoch_ms"] + 8 * INCIDENT_TTL_MS:
-        expiry = max(expiry, reset + RESET_MARGIN_MS)
+        # The reset retry opens at reset + RESET_MARGIN_MS and the expiry is checked first, so a reset more than a
+        # day away (a weekly limit) expired at the very moment its retry opened and never resumed (Codex, HOLD on
+        # cb096d2a). The incident lives a whole TTL past that boundary.
+        expiry = max(expiry, reset + RESET_MARGIN_MS + INCIDENT_TTL_MS)
     return expiry
 
 
@@ -2754,9 +2791,10 @@ def owner_live(agent_root: Path) -> bool:
     return any(re.fullmatch(r"""OWNER_ENGINE=["']?live["']?\s*""", line) for line in text.splitlines())
 
 
-def cli_tree(service: str, proc: Path = Path("/proc")) -> list[int]:
+def cli_tree(service: str, proc: Path = Path("/proc"), *, supervisors: bool = False) -> list[int]:
     """The service's Claude CLI and every process under it: its hooks, receiver and workers."""
     parents: dict[int, int] = {}
+    same_service: set[int] = set()
     roots = []
     try:
         entries = list(proc.iterdir())
@@ -2787,10 +2825,24 @@ def cli_tree(service: str, proc: Path = Path("/proc")) -> list[int]:
             continue
         parents[pid] = info[0]
         in_service = any(service in line.rsplit(":", 1)[-1].split("/") for line in groups.splitlines())
-        if in_service and os.path.basename(argv[0].decode("utf-8", "replace")) in ("claude", "claude.exe") \
+        if in_service and owner == mine:
+            same_service.add(pid)
+        if in_service and owner == mine and os.path.basename(argv[0].decode("utf-8", "replace")) in ("claude", "claude.exe") \
                 and b"--channels" in argv:
             roots.append(pid)
     tree = set(roots)
+    if supervisors:
+        # screen resumes a stopped foreground child. Stop its owning wrappers
+        # first, but never an ancestor outside this unit or Unix account.
+        for root in roots:
+            seen = {root}
+            parent = parents.get(root, 0)
+            while parent > 1 and parent in same_service:
+                if parent in seen:
+                    raise ProcUnreadable(parent)
+                seen.add(parent)
+                tree.add(parent)
+                parent = parents.get(parent, 0)
     grown = True
     while grown:
         grown = False
@@ -2798,7 +2850,17 @@ def cli_tree(service: str, proc: Path = Path("/proc")) -> list[int]:
             if parent in tree and pid not in tree:
                 tree.add(pid)
                 grown = True
-    return sorted(tree)
+    if not supervisors:
+        return sorted(tree)
+    def depth(pid: int) -> int:
+        seen = set()
+        while pid in tree:
+            if pid in seen:
+                raise ProcUnreadable(pid)
+            seen.add(pid)
+            pid = parents.get(pid, 0)
+        return len(seen)
+    return sorted(tree, key=lambda pid: (depth(pid), pid))
 
 
 def owner_of(entry: Path) -> int | None:
@@ -2837,7 +2899,7 @@ def _stopped_or_gone(proc: Path, pid: int, start: str) -> bool:
 
 
 def freeze_cli(service: str, record: Path, proc: Path = Path("/proc")) -> list[int] | None:
-    """Stop the service's CLI tree (SIGSTOP), so nothing in it opens a turn or works on.
+    """Stop the service's owning wrappers before its CLI tree, so screen cannot resume it.
 
     The proof that the CLI only holds input is read again under this freeze
     (Codex AGENTS 03.10, #173 P1-2); a hook or worker caught before its commit
@@ -2855,7 +2917,7 @@ def freeze_cli(service: str, record: Path, proc: Path = Path("/proc")) -> list[i
     try:
         for _ in range(5):
             fresh: dict[int, str] = {}
-            for pid in cli_tree(service, proc):
+            for pid in cli_tree(service, proc, supervisors=True):
                 if pid in stopped or pid in me:
                     continue
                 info = _proc_stat(proc, pid)
@@ -3166,13 +3228,38 @@ def _refresh_transcripts(agent_root: Path, state: dict, now_ms: int) -> dict:
     )
     # scan_incremental returns its own deep copy and validates it. Reusing that
     # private state avoids copying/checking all transcript baselines per batch.
+    applied: dict[str, list[dict]] = {}
     for batch in batches:
+        before = state["incident"]
         _apply_batch_in_place(
             state,
             batch["transcript"],
             batch["events"],
             now_ms,
         )
+        applied[batch["transcript"]] = batch["events"]
+        started = state["incident"]
+        if started is not before and started is not None and started["transcript"] in applied \
+                and started["transcript"] != batch["transcript"]:
+            # A subagent's limit started an incident on its parent session, whose rows of this same scan were read
+            # first (the parent's file sorts before its subagents) while no incident existed: its messages queued
+            # after the limit were lost (Codex, HOLD on cb096d2a). They are applied now; rows from before the limit
+            # are not the incident's.
+            _apply_batch_in_place(state, started["transcript"], [
+                envelope for envelope in applied[started["transcript"]]
+                if (_event_epoch_ms(envelope["record"]) or -1) >= started["event_epoch_ms"]
+            ], now_ms)
+    incident = state["incident"]
+    if (
+        incident is not None
+        and not incident["resolved"]
+        and incident["limit_origin"] == {"chat_id": None, "message_id": None}
+        and _account_success_at(batches) > incident["event_epoch_ms"]
+    ):
+        # A subagent's limit is bound to no request, so no reply to an affected chat may ever come to end it; a
+        # later real answer of the account does: the limit is over and nothing may stay held for it (Codex, HOLD
+        # on cb096d2a).
+        incident["resolved"] = True
     if state["incident"] is not None:
         _recompute_pending(state["incident"], now_ms)
     _validate_state(state)
@@ -3260,6 +3347,56 @@ def _complete_notice_checkpoint(handled: list[str], event_uuid: str) -> None:
     _append_notice_checkpoint(handled, event_uuid)
 
 
+def _subagent_limit_interruption(agent_root: Path, transcript: str, event: dict) -> dict | None:
+    """A subagent's limit for the notice path: told to the request that launched the worker, else to the owner.
+
+    Codex, HOLD on cb096d2a: the discovery notice was bound to nobody, since classify_interruption takes main-chain
+    events only. The worker is named by its transcript (agent-<task id>.jsonl) and the ledger keeps the request
+    that owns that task (delivery_task_owners; Арти 05.10: task acf6e4c16672b5da8, delivery 5523138323:1355).
+    """
+    classified = classify_limit(event, {})
+    if classified is None or event.get("isSidechain") is not True or _parent_transcript(transcript, event) is None:
+        return None
+    task_id = PurePosixPath(transcript).name[len("agent-"):-len(".jsonl")]
+    chat_id = message_id = thread_id = None
+    db = agent_root / ".claude" / "channels" / "telegram" / "messages.db"
+    connection = None
+    try:
+        connection = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=1)
+        row = connection.execute(
+            "SELECT delivery_id FROM delivery_task_owners WHERE task_id=? AND delivery_id IS NOT NULL "
+            "ORDER BY rowid DESC LIMIT 1", (task_id,)).fetchone()
+        if row is not None and isinstance(row[0], str):
+            chat_id, _, message_id = row[0].rpartition(":")
+            request = connection.execute(
+                "SELECT request_payload FROM delivery_results WHERE delivery_id=?", (row[0],)).fetchone()
+            if request is not None:
+                thread_id = json.loads(request[0])["params"]["meta"].get("thread_id")
+    except (sqlite3.Error, TypeError, ValueError, KeyError, AttributeError):
+        pass
+    finally:
+        if connection is not None:
+            connection.close()
+    if not chat_id or not _valid_channel_identifier(chat_id) or not _valid_message_identifier(message_id):
+        try:
+            chat_id, message_id, thread_id = _owner_chat_id(agent_root), None, None
+        except StateError:
+            return None
+        if chat_id is None:
+            return None
+    return {
+        "event_uuid": classified["event_uuid"],
+        "event_epoch_ms": classified["event_epoch_ms"],
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "kind": "limit",
+        "subagent": True,
+        **({"thread_id": str(thread_id)} if isinstance(thread_id, (str, int)) and str(thread_id).isdigit() else {}),
+        **({"reset_key": classified["reset_key"], "reset_epoch_ms": classified["reset_epoch_ms"]}
+           if classified["reset_key"] is not None else {}),
+    }
+
+
 def notification_tick(mode: str) -> int:
     """Initialize or deliver interruption notices after confirmed sends."""
     if mode not in {"initialize-notices", "notify"}:
@@ -3303,7 +3440,7 @@ def notification_tick(mode: str) -> int:
                 classified = classify_interruption(
                     envelope["record"],
                     events_by_uuid,
-                )
+                ) or _subagent_limit_interruption(agent_root, batch["transcript"], envelope["record"])
                 if classified is None:
                     continue
                 event_uuid = classified["event_uuid"]
@@ -3328,8 +3465,10 @@ def notification_tick(mode: str) -> int:
         )
         for interruption in reserved:
             event_uuid = interruption["event_uuid"]
-            receiver_owned = receiver_notices and interruption["kind"] == "limit"
-            latched = receiver_owned or interruption["kind"] in ACCOUNT_NOTICE_KINDS
+            # The receiver tells the chats whose messages wait in its queue; a worker's requester waits on no new
+            # message, so a subagent's limit is told here, once per reset, and only while it lasts.
+            receiver_owned = receiver_notices and interruption["kind"] == "limit" and not interruption.get("subagent")
+            latched = receiver_owned or interruption.get("subagent") or interruption["kind"] in ACCOUNT_NOTICE_KINDS
             account_prefix = f"{ACCOUNT_NOTICE_PREFIX}{interruption['kind']}:"
             if latched and (
                 interruption["event_epoch_ms"] <= success_at

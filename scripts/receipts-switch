@@ -1,0 +1,362 @@
+#!/usr/bin/env bash
+# Move one kit bot from the Stop guard to delivery receipts, and on to the whole agent on receipts (RECEIPTS_UPGRADE.md).
+# Run as root from the kit release, never from the agent's own ~/bin:
+#
+#   receipts-switch [--user claude] [--home /home/claude] [--config /home/claude/.claude] [--service claude-telegram.service] status
+#   receipts-switch [...] receiver     shadow -> receiver: the receipts decide delivery
+#   receipts-switch [...] shadow       receiver -> shadow: the way back, never waits for an empty queue
+#   receipts-switch [...] live on      the whole agent on receipts: owner chat and company chats on the live engines
+#   receipts-switch [...] live off     back to the interactive owner session and the per-request company workers
+#
+# Entering the receiver refuses unless the bot runs the release golden receiver, its Stop guard steps aside under the
+# receiver (R13) and it is idle; a failure after the stop puts the old line back and starts the service (exit 5).
+# A resumed session that predates callback tracking would be refused by the receiver, so the next start is fresh:
+# the session selector stays off until a new session has claimed a Telegram message (receipts-fresh-session).
+# Leaving the receiver works on a stuck or failing bot: it waits only LEAVE_WAIT for a live worker and keeps every
+# turn, result and queue row. DRY_RUN=1 checks everything and changes nothing. Exit: 0 done or nothing to do,
+# 2 refused before any change, 3 not idle in IDLE_WAIT, 5 failed after the stop and rolled back.
+# Ported from the operations scripts used on Cash, Manzik and Menni (05.10.2026; Codex reviewed 44fbf027, fabcfc0f).
+set -eEuo pipefail  # -E: the ERR trap must fire inside main() too
+OWN=claude; H=""; CONFIG=""; SVC=claude-telegram.service
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --user) OWN=${2:?--user needs a name}; shift 2 ;;
+    --home) H=${2:?--home needs a path}; shift 2 ;;
+    --config) CONFIG=${2:?--config needs a path}; shift 2 ;;
+    --service) SVC=${2:?--service needs a unit}; shift 2 ;;
+    *) break ;;
+  esac
+done
+H=${H:-/home/$OWN}
+CONFIG=${CONFIG:-$H/.claude}
+COMMAND=${1:-status}; ARG=${2:-}
+HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+AS="runuser -u $OWN --"
+FILE_OPS=$HERE/receipts-files.py
+BACKUP_ROOT=${BACKUP_ROOT:-/root/backups}
+HOLD_UNTIL=""; FRESH_RECORD=""; CHANGED_SHA=""; LIVE_SWITCH=0
+CH=$CONFIG/channels/telegram
+DB=$CH/messages.db
+ENVF=$CH/.env
+GUARD=$H/bin/tg-reply-stop-guard
+SELECTOR=$H/bin/tg-resume-session
+MARKER=/etc/claude-tg-starter/live-engines-allowed
+IDLE_WAIT=${IDLE_WAIT:-900}
+LEAVE_WAIT=${LEAVE_WAIT:-120}
+say() { echo "[receipts-switch $OWN $(date -u +%H:%M:%S)] $*"; }
+q() {  # one value, read-only, as the agent: root must not create -wal/-shm
+  $AS python3 -c 'import sqlite3,sys
+c=sqlite3.connect("file:%s?mode=ro" % sys.argv[1], uri=True, timeout=10)
+try: r=c.execute(sys.argv[2]).fetchone()
+except sqlite3.OperationalError as e:
+    if str(e) == "no such table: conversation_jobs" and "conversation_jobs" in sys.argv[2]: r=(0,)
+    else: raise
+print("" if r is None or r[0] is None else r[0])' "$DB" "$1"
+}
+env_value() {  # <file> <NAME>: the value of the one NAME= line, or nothing when there is not exactly one
+  $AS python3 "$FILE_OPS" value "$1" "$2"
+}
+authority_line() { env_value "$1" TG_DELIVERY_AUTHORITY; }
+flip_line() { $AS python3 "$FILE_OPS" authority "$@" >/dev/null; }
+set_engines() { $AS python3 "$FILE_OPS" engines "$@" >/dev/null; }
+env_hash() { $AS python3 "$FILE_OPS" hash "$ENVF"; }
+backup_env() {
+  B=$(python3 "$FILE_OPS" new-backup "$BACKUP_ROOT" "$OWN")
+  ENV0_SHA=$($AS python3 "$FILE_OPS" read "$ENVF" | python3 "$FILE_OPS" save-backup "$B/channel.env")
+  [ "$(env_hash)" = "$ENV0_SHA" ] || { say "environment changed during backup — service kept running"; exit 2; }
+}
+under_lock() {
+  $AS python3 "$FILE_OPS" ensure-lock "$H/logs/transport-lifecycle.lock"
+  if [ -z "${RECEIPTS_LOCK_FD:-}" ]; then
+    exec python3 "$FILE_OPS" lock-run "$H/logs/transport-lifecycle.lock" "$OWN" /bin/bash "$0" --user "$OWN" --home "$H" --config "$CONFIG" --service "$SVC" "$COMMAND" "$ARG"
+  fi
+  python3 "$FILE_OPS" lock-check "$H/logs/transport-lifecycle.lock" "$RECEIPTS_LOCK_FD" "$OWN"
+}
+idle_under_lock() {
+  local why; why=$(busy_reason)
+  [ -z "$why" ] || { say "work arrived while waiting for the lock:$why — service kept running"; exit 3; }
+}
+hold_restart() {
+  local until=$(( $(date +%s) + 900 ))
+  $AS python3 "$FILE_OPS" hold "$H/logs/restart-hold.until" "$until"
+  HOLD_UNTIL=$until
+}
+clear_hold() {
+  [ -z "$HOLD_UNTIL" ] || $AS python3 "$FILE_OPS" unhold "$H/logs/restart-hold.until" "$HOLD_UNTIL"
+}
+restore_env() {
+  [ -n "$CHANGED_SHA" ] || return 0
+  [ "$(env_hash)" = "$ENV0_SHA" ] && return 0
+  $AS python3 "$FILE_OPS" restore "$ENVF" "$CHANGED_SHA" < "$B/channel.env"
+}
+guard_steps_aside() {  # the guard's main() returns at once under the receiver (R13), so only one authority decides
+  $AS python3 - "$1" <<'PY'
+import re, sys
+src = open(sys.argv[1]).read()
+sys.exit(0 if re.search(r'\ndef main\(\)[^\n]*:\n(?:[ \t]*#[^\n]*\n)*[ \t]+if delivery_authority\(\) == "receiver":\n[ \t]+return\n', src) else 1)
+PY
+}
+resumed_session() {  # one service only; the Unix user may run neighbouring profiles
+  python3 - "$SVC" "$OWN" <<'PYPROC'
+import os,pathlib,pwd,re,subprocess,sys
+unit,user=sys.argv[1:];uid=pwd.getpwnam(user).pw_uid
+raw=subprocess.check_output(['systemctl','show',unit,'-p','ControlGroup','--value'],text=True).strip()
+if not raw.startswith('/') or '..' in raw.split('/'):raise ValueError('unreadable service scope')
+root=pathlib.Path('/sys/fs/cgroup')/raw.lstrip('/')
+if not root.is_dir():raise ValueError('missing service scope')
+sessions=set()
+for scope,dirs,files in os.walk(root):
+ if 'cgroup.procs' not in files:continue
+ for pid in (pathlib.Path(scope)/'cgroup.procs').read_text().split():
+  if not pid.isdigit():raise ValueError('invalid service process')
+  proc=pathlib.Path('/proc')/pid
+  try:
+   if proc.stat().st_uid!=uid:continue
+   args=proc.joinpath('cmdline').read_bytes().decode().split('\0')
+  except FileNotFoundError:continue
+  if '--channels' not in args or '--resume' not in args:continue
+  session=args[args.index('--resume')+1]
+  if not re.fullmatch('[0-9a-f-]{36}',session):raise ValueError('invalid session')
+  sessions.add(session)
+if len(sessions)>1:raise ValueError('ambiguous service session')
+print(next(iter(sessions),'') )
+PYPROC
+}
+selected_session() {  # the session the launcher would resume now, asked of the selector as it runs
+  [ -x "$SELECTOR" ] || return 0
+  (cd "$H" && $AS env HOME="$H" CLAUDE_CONFIG_DIR="$CONFIG" "$SELECTOR" 2>/dev/null || true) | head -1
+}
+legacy() { [ -n "$1" ] && [ -n "$(q "SELECT 1 FROM delivery_legacy_native_sessions WHERE session_id='$1'")" ]; }
+busy_reason() {  # the installer's idle rule
+  local r="" n
+  [ "$(systemctl is-active "$SVC" 2>/dev/null || true)" = active ] || r="$r service-not-active"
+  n=$(q "SELECT count(*) FROM pending_inbound_deliveries"); [ "$n" = 0 ] || r="$r queue=$n"
+  n=$(q "SELECT count(*) FROM delivery_turns WHERE closed_at IS NULL"); [ "$n" = 0 ] || r="$r open-turns=$n"
+  n=$(q "SELECT count(*) FROM delivery_results WHERE state NOT IN ('complete','no_reply','cancelled','failed','blocked')")
+  [ "$n" = 0 ] || r="$r unfinished-results=$n"
+  n=$(q "SELECT count(*) FROM conversation_jobs WHERE state IN ('queued','leased','prompt_submitted','result_persisted','outbound_sending')")
+  [ "$n" = 0 ] || r="$r company-jobs=$n"
+  [ -z "$(find "$CONFIG/projects" -name '*.jsonl' -mmin -3 2>/dev/null | head -1)" ] || r="$r transcript-active<3min"
+  [ -z "$(find "/tmp/claude-$(id -u "$OWN")" -path '*/tasks/*' -mmin -3 2>/dev/null | head -1)" ] || r="$r task-output<3min"
+  echo "$r"
+}
+live_worker() {  # a native worker or background command wrote in the last 3 minutes
+  [ -n "$(find "$CONFIG/projects" -path '*/subagents/*' -name '*.jsonl' -mmin -3 2>/dev/null | head -1)" ] ||
+    [ -n "$(find "/tmp/claude-$(id -u "$OWN")" -path '*/tasks/*' -mmin -3 2>/dev/null | head -1)" ]
+}
+wait_idle() {
+  local deadline why
+  deadline=$(( $(date +%s) + IDLE_WAIT ))
+  while :; do
+    why=$(busy_reason)
+    [ -z "$why" ] && return 0
+    [ "$(date +%s)" -lt "$deadline" ] || { say "not idle:$why — nothing changed"; exit 3; }
+    say "busy:$why — waiting 30 s"; sleep 30
+  done
+}
+frozen_refusal() {  # a frozen server moves only with the owner's one-time approval (OWNER_APPROVED = FREEZE_APPROVAL)
+  [ -e /etc/claude-tg-starter/updates-frozen ] || return 0
+  [ -n "${FREEZE_APPROVAL:-}" ] && [ "${OWNER_APPROVED:-}" = "$FREEZE_APPROVAL" ] && return 0
+  say "this server is frozen (/etc/claude-tg-starter/updates-frozen) — nothing changed"; exit 2
+}
+wait_receiver_start() {  # <t0 ms>: contract 6 and a fresh start mark within 180 s
+  local c u
+  for _ in $(seq 1 180); do
+    c=$(q "SELECT value FROM delivery_runtime WHERE key='receipt_contract'" || true)
+    u=$(q "SELECT updated_at FROM delivery_runtime WHERE key='limit_notice_owner'" || true)
+    if [ "$c" = 6 ] && [ "${u:-0}" -ge "$1" ] 2>/dev/null; then return 0; fi
+    sleep 1
+  done
+  return 1
+}
+
+status() {
+  local auth engines session
+  auth=$(authority_line "$ENVF" || true)
+  engines="owner=$(env_value "$ENVF" OWNER_ENGINE || true) company=$(env_value "$ENVF" CORPORATE_ENGINE || true)"
+  session=$(resumed_session)
+  echo "authority: ${auth:-unset (guard)}"
+  echo "live engines: $engines marker=$([ -e "$MARKER" ] && echo yes || echo no)"
+  echo "session: ${session:-fresh or live host}$(legacy "$session" && echo ' (legacy: the receiver refuses its background work)' || true)"
+  echo "service: $(systemctl is-active "$SVC" 2>/dev/null || true)"
+}
+
+stopped=0; flipped=0; AUTH0=""; TARGET=""; FRESH=0
+fail() {
+  trap - ERR; trap '' TERM INT HUP
+  say "FAILED: $1"
+  if [ "$LIVE_SWITCH" = 1 ] || { [ "$flipped" = 1 ] && [ "$TARGET" = receiver ]; }; then
+    if [ "$stopped" = 1 ]; then
+      systemctl stop "$SVC" || { say "RECOVERY HOLD: service did not stop; keep environment and backup $B"; exit 5; }
+      [ "$(systemctl show -p MainPID --value "$SVC")" = 0 ] || { say "RECOVERY HOLD: process remains; environment unchanged"; exit 5; }
+    fi
+    if restore_env; then say "the previous environment is restored"
+    else say "RECOVERY HOLD: ENVIRONMENT CHANGED OR UNREADABLE — left untouched; backup $B/channel.env"; exit 5; fi
+  elif [ "$flipped" = 1 ]; then
+    say "leaving the receiver: keeping the currently written authority"
+  fi
+  [ "$FRESH" = 0 ] || python3 "$HERE/receipts-fresh-session" restore "$FRESH_RECORD" || true
+  [ "$stopped" = 0 ] || { systemctl start "$SVC" || true; say "started again: $(systemctl is-active "$SVC" 2>&1 || true)"; }
+  clear_hold || true
+  exit 5
+}
+
+switch_authority() {
+  TARGET=$1
+  frozen_refusal
+  AUTH0=$(authority_line "$ENVF") || true
+  case "$AUTH0" in receiver|shadow) ;; *) say "the channel .env has no single shadow/receiver authority line ('$AUTH0'): update the kit first — nothing changed"; exit 2 ;; esac
+  [ "$AUTH0" != "$TARGET" ] || { say "authority is already $TARGET — nothing changed"; exit 0; }
+  local rc; rc=$($AS env HOME="$H" "$H/bin/reconcile-telegram-plugin" --json) || { say "reconcile check refused — nothing changed"; exit 2; }
+  printf '%s' "$rc" | grep -q '"status":"golden"' || { say "receiver is not the release golden ($rc) — nothing changed"; exit 2; }
+  if [ "$TARGET" = receiver ]; then
+    guard_steps_aside "$GUARD" || { say "$GUARD does not step aside under the receiver: update the kit first — nothing changed"; exit 2; }
+    say "authority $AUTH0 → receiver; waiting up to ${IDLE_WAIT}s for an idle bot"
+    wait_idle
+  else
+    say "authority $AUTH0 → $TARGET (leaving the receiver): as is —$(busy_reason)"
+    local deadline=$(( $(date +%s) + LEAVE_WAIT ))
+    while live_worker && [ "$(date +%s)" -lt "$deadline" ]; do say "a worker is live — waiting up to ${LEAVE_WAIT}s"; sleep 15; done
+    ! live_worker || say "NOTE: a worker was still live after ${LEAVE_WAIT}s; the restart ends it and its request stays open"
+  fi
+  local session0 pid0 nr0 next
+  session0=$(resumed_session); next=$(selected_session)
+  pid0=$(systemctl show -p MainPID --value "$SVC"); nr0=$(systemctl show -p NRestarts --value "$SVC")
+  [ -z "${DRY_RUN:-}" ] || { say "dry run: golden receiver, session ${session0:-fresh}$(legacy "$next" && echo ' (legacy: the next start would be fresh)' || true) — nothing changed"; exit 0; }
+  under_lock
+  [ "$TARGET" != receiver ] || idle_under_lock
+  session0=$(resumed_session); next=$(selected_session)
+  pid0=$(systemctl show -p MainPID --value "$SVC"); nr0=$(systemctl show -p NRestarts --value "$SVC")
+  backup_env
+  say "MainPID=$pid0 NRestarts=$nr0 session=${session0:-fresh}; .env kept in $B"
+  trap 'fail "line $LINENO"' ERR
+  trap 'fail "cancelled by a signal"' TERM INT HUP
+  hold_restart
+
+  say "stop $SVC"
+  stopped=1
+  systemctl stop "$SVC"
+  for _ in $(seq 1 60); do [ "$(systemctl is-active "$SVC" 2>/dev/null || true)" = active ] || break; sleep 1; done
+  [ "$(systemctl is-active "$SVC" 2>/dev/null || true)" != active ] || fail "service did not stop"
+  CHANGED_SHA=$($AS python3 "$FILE_OPS" plan-authority "$ENVF" "$AUTH0" "$TARGET" "$ENV0_SHA")
+  flipped=1
+  flip_line "$ENVF" "$AUTH0" "$TARGET" "$ENV0_SHA" || fail "authority line not written"
+  [ "$(authority_line "$ENVF")" = "$TARGET" ] || fail "authority line is not exactly $TARGET"
+  if [ "$TARGET" = receiver ] && legacy "$next"; then
+    # Knopa 30.09, Manzik 05.10: a session from before callback tracking would be refused by the receiver.
+    FRESH_RECORD=$B/fresh-session.json
+    FRESH=1
+    python3 "$HERE/receipts-fresh-session" disable "$SELECTOR" "$FRESH_RECORD" || fail "selector not disabled"
+    say "session $next is legacy: the next start is fresh"
+  fi
+
+  say "start $SVC"
+  local t0 pid1 nr1 session1; t0=$(( $(date +%s) * 1000 ))
+  systemctl start "$SVC"
+  wait_receiver_start "$t0" || fail "receiver did not start (contract 6 and a fresh start mark) within 180 s"
+  [ "$(q "SELECT value FROM delivery_runtime WHERE key='authority'")" = "$TARGET" ] || fail "the receiver runs as $(q "SELECT value FROM delivery_runtime WHERE key='authority'"), not $TARGET"
+  nr1=$(systemctl show -p NRestarts --value "$SVC"); pid1=$(systemctl show -p MainPID --value "$SVC")
+  [ "$nr1" = "$nr0" ] || fail "NRestarts changed $nr0 → $nr1"
+  sleep 20
+  [ "$(systemctl is-active "$SVC")" = active ] && [ "$(systemctl show -p MainPID --value "$SVC")" = "$pid1" ] || fail "service did not stay up"
+  local pid; pid=$(cat "$CH/bot.pid" 2>/dev/null || true)
+  { [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; } || fail "no live poller pid"
+  session1=$(resumed_session)
+  if [ "$TARGET" = receiver ] && legacy "$session1"; then
+    fail "session $session1 is legacy: the receiver would refuse its background work"
+  fi
+  clear_hold
+  if [ "$FRESH" = 1 ]; then
+    # The selector stays off until the fresh session has claimed a Telegram message (Codex, 30.09 P1), at most a day.
+    systemd-run --collect --unit "receipts-fresh-session-$OWN" -p StandardOutput=append:"$B/fresh-session.log" \
+      python3 "$HERE/receipts-fresh-session" watch "$FRESH_RECORD" "$next" "$DB" "$H" "$OWN" 24 HOME="$H" >/dev/null
+  fi
+  trap - ERR TERM INT HUP
+  say "OK: authority $TARGET, MainPID $pid0 → $pid1, NRestarts $nr1, session ${session1:-fresh}, queue $(q 'SELECT count(*) FROM pending_inbound_deliveries')"
+  say "way back: $0 --user $OWN --home $H --config $CONFIG --service $SVC $AUTH0"
+}
+
+switch_live() {
+  local mode=$1 t0 ok="" eng0 owner perm
+  frozen_refusal
+  case "$mode" in on|off) ;; *) say "live on or live off"; exit 2 ;; esac
+  if [ "$mode" = on ]; then
+    [ "$(authority_line "$ENVF" || true)" = receiver ] || { say "the authority is not receiver: run «receiver» first — nothing changed"; exit 2; }
+    wait_idle
+  fi
+  [ -z "${DRY_RUN:-}" ] || { say "dry run: live $mode — nothing changed"; exit 0; }
+  under_lock
+  [ "$mode" != on ] || idle_under_lock
+  backup_env
+  LIVE_SWITCH=1
+  trap 'fail "line $LINENO"' ERR
+  trap 'fail "cancelled by a signal"' TERM INT HUP
+  hold_restart
+  if [ "$mode" = on ]; then
+    # A host allowance is additive. Leaving the mode or compensation never removes another agent's allowance.
+    python3 - "$MARKER" <<'PYMARKER'
+import os, stat, sys
+from pathlib import Path
+p=Path(sys.argv[1]);p.parent.mkdir(mode=0o755,exist_ok=True)
+d=os.open(p.parent,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+try:
+ s=os.fstat(d)
+ if s.st_uid!=0 or s.st_mode&0o022:raise SystemExit('unsafe host allowance folder')
+ try:fd=os.open(p.name,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o644,dir_fd=d)
+ except FileExistsError:
+  s=os.stat(p.name,dir_fd=d,follow_symlinks=False)
+  if not stat.S_ISREG(s.st_mode) or s.st_uid!=0 or s.st_nlink!=1 or s.st_mode&0o022:raise SystemExit('unsafe host allowance')
+ else:os.fsync(fd);os.close(fd);os.fsync(d)
+finally:os.close(d)
+PYMARKER
+    CHANGED_SHA=$($AS python3 "$FILE_OPS" plan-engines "$ENVF" live "$ENV0_SHA")
+    set_engines "$ENVF" live "$ENV0_SHA"
+  else
+    CHANGED_SHA=$($AS python3 "$FILE_OPS" plan-engines "$ENVF" - "$ENV0_SHA")
+    set_engines "$ENVF" - "$ENV0_SHA"
+  fi
+  t0=$(date +%s)
+  say "restart $SVC"
+  stopped=1
+  systemctl restart "$SVC"
+  for _ in $(seq 1 60); do
+    sleep 2
+    if [ "$mode" = on ]; then
+      [ -s "$CH/owner-runtime.json" ] && [ "$(stat -c %Y "$CH/owner-runtime.json")" -ge "$t0" ] && { ok=1; break; }
+    else
+      [ "$(systemctl is-active "$SVC")" = active ] && [ -s "$CH/bot.pid" ] && kill -0 "$(cat "$CH/bot.pid")" 2>/dev/null && { ok=1; break; }
+    fi
+  done
+  if [ -z "$ok" ] || [ "$(systemctl is-active "$SVC")" != active ]; then
+    fail "no $( [ "$mode" = on ] && echo 'live owner host' || echo 'poller') within 2 minutes"
+  fi
+  clear_hold
+  trap - ERR TERM INT HUP
+  say "OK: live $mode; service $(systemctl is-active "$SVC"), .env kept in $B; way back: $0 --user $OWN --home $H --config $CONFIG --service $SVC live $( [ "$mode" = on ] && echo off || echo on )"
+}
+
+main() {
+  [ "$(id -u)" = 0 ] || { say "run as root"; exit 2; }
+  [[ "$OWN" =~ ^[a-z][a-z0-9-]{0,30}$ ]] && [[ "$SVC" =~ ^[a-zA-Z0-9@_.-]+\.service$ ]] || { say "invalid agent or service"; exit 2; }
+  $AS python3 - "$H" "$CONFIG" <<'PYPROFILE'
+import os,pathlib,pwd,stat,sys
+home,config=map(pathlib.Path,sys.argv[1:]);base=pathlib.Path(pwd.getpwuid(os.geteuid()).pw_dir)
+for path in (home,config):
+ if not path.is_absolute() or '..' in path.parts or not (path==base or base in path.parents):raise ValueError('outside the agent profile')
+ current=pathlib.Path('/')
+ for part in path.parts[1:]:
+  current/=part;info=current.lstat()
+  if not stat.S_ISDIR(info.st_mode):raise ValueError('symlinked or unreadable profile')
+ if path.lstat().st_uid!=os.geteuid():raise ValueError('profile belongs to another user')
+PYPROFILE
+  [ "$OWN" != root ] && [ "$(id -u "$OWN")" != 0 ] || { say "target must be the agent Unix user"; exit 2; }
+  [ -f "$ENVF" ] || { say "no channel .env at $ENVF — nothing changed"; exit 2; }
+  case "$COMMAND" in
+    status) status ;;
+    receiver|shadow) switch_authority "$COMMAND" ;;
+    live) switch_live "$ARG" ;;
+    *) say "unknown command '$COMMAND' (status, receiver, shadow, live on|off)"; exit 2 ;;
+  esac
+}
+
+[ "${RECEIPTS_SWITCH_LIB:-}" = 1 ] || main

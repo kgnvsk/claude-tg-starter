@@ -384,11 +384,44 @@ failure_reason() {
     *"401"*|*authentication_error*|*"ot logged in"*|*"OAuth token"*|*"nvalid API key"*|*invalid_api_key*)
       printf 'помилка входу в Claude — потрібен повторний вхід' ;;
     *"429"*|*"rate limit"*|*"usage limit"*|*"weekly limit"*|*"ut of usage"*|*"hit your"*)
-      printf 'вичерпано ліміт Claude' ;;
+      local reset
+      reset=$(limit_reset_text "$out")
+      printf 'вичерпано ліміт Claude%s' "${reset:+, він скинеться о $reset}" ;;
     *)
       last=$(printf '%s' "$out" | grep -v '^[[:space:]]*$' | tail -n 1 | cut -c1-160)
       printf 'помилка виконання%s' "${last:+ — $last}" ;;
   esac
+}
+
+# The reset the CLI names, read by the limit watcher's own parser and worded in the agent's clock as the limit
+# line words it (Арти, 05.10.2026: the notice said only «вичерпано ліміт Claude», and the person asked the silent bot
+# «А когда лимит заканчивается?»). Nothing when no line names a reset.
+limit_reset_text() {
+  python3 - "$(dirname "${BASH_SOURCE[0]}")" "$HOME" "${now:-$(date +%s)}" "$1" <<'PY' 2>/dev/null
+import importlib.machinery
+import importlib.util
+import sys
+from pathlib import Path
+
+bin_dir, home, now, out = sys.argv[1:]
+
+
+def load(name, path):
+    loader = importlib.machinery.SourceFileLoader(name, path)
+    module = importlib.util.module_from_spec(importlib.util.spec_from_loader(name, loader))
+    loader.exec_module(module)
+    return module
+
+
+watcher = load("claude_limit_recovery", f"{bin_dir}/claude-limit-recovery")
+notices = load("agent_notice_locale", f"{bin_dir}/agent_notice_locale.py")
+now_ms = int(now) * 1000
+for line in out.splitlines():
+    reset = watcher.parse_reset(line.strip(), now_ms)
+    if reset is not None:
+        print(notices.reset_time_text(Path(home), reset.epoch_ms, now_ms, "uk"), end="")
+        break
+PY
 }
 
 # A headless run loads the agent's @-imported persona and rules only when its

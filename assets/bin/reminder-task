@@ -99,8 +99,10 @@ def quiet_pair(start, end, timezone):
         return None, None
     if timezone is None:
         raise TaskError("TIMEZONE is required with quiet hours")
-    if not QUIET_RE.fullmatch(start) or not QUIET_RE.fullmatch(end) or start == end:
+    if not QUIET_RE.fullmatch(start) or not QUIET_RE.fullmatch(end):
         raise TaskError("invalid quiet hours")
+    if start == end:
+        return None, None
     return start, end
 
 
@@ -562,10 +564,10 @@ def create_single(rem_dir, args, repeat=False):
             [
                 ("REPEAT_SECONDS", str(args.every)),
                 ("TIMEZONE", args.timezone),
-                ("QUIET_START", args.quiet_start),
-                ("QUIET_END", args.quiet_end),
             ]
         )
+        if args.quiet_start is not None:
+            headers.extend([("QUIET_START", args.quiet_start), ("QUIET_END", args.quiet_end)])
         if args.until is not None:
             headers.append(("UNTIL_EPOCH", str(args.until)))
         headers.append(("COUNT", "0"))

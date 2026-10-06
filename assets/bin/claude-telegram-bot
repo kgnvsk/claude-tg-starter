@@ -305,8 +305,11 @@ print(json.load(open(sys.argv[1], encoding="utf-8"))["plugins"]["telegram@claude
   # a second receiver: the receiver serves the same tools itself.
   OWNER_CLAUDE_ARGS=$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1:]))' $PERMISSION_MODE ${AGENT_EFFORT:+--effort "$AGENT_EFFORT"} ${AGENT_MODEL:+--model "$AGENT_MODEL"} --settings '{"enabledPlugins":{"telegram@claude-plugins-official":false}}')
   export OWNER_CLAUDE_ARGS OWNER_RESUME_SESSION="$RESUME_SESSION" OWNER_CWD="$PWD"
+  # The bun the interactive plugin gets from this PATH: ~/.local/bin first, ~/.bun/bin otherwise (Manzik and Menni
+  # have only ~/.local/bin/bun; the host refused to start there on 05.10.2026).
+  BUN=$(command -v bun) || { echo "telegram launcher: the live owner engine needs bun on PATH; not starting" >&2; exit 1; }
   cd "$PLUGIN_ROOT"
-  "$BUN_INSTALL/bin/bun" install --no-summary 1>&2
-  exec "$BUN_INSTALL/bin/bun" server.ts
+  "$BUN" install --no-summary 1>&2
+  exec "$BUN" server.ts
 fi
 exec $HOME/.local/bin/claude $PERMISSION_MODE ${AGENT_EFFORT:+--effort "$AGENT_EFFORT"} ${AGENT_MODEL:+--model "$AGENT_MODEL"} ${RESUME_SESSION:+--resume "$RESUME_SESSION"} --channels plugin:telegram@claude-plugins-official

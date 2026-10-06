@@ -51,6 +51,12 @@ case "$AGENT_USER" in
     echo "FATAL: значення AGENT_USER '$AGENT_USER' зарезервовано" >&2; exit 1 ;;
 esac
 H=/home/$AGENT_USER
+# Owner, 05.10.2026: receipts are the kit's foundation. Taken before this run writes anything: a new agent starts with
+# the receiver deciding delivery and the whole agent on the live engines; an agent that already runs keeps its mode
+# and moves on by RECEIPTS_UPGRADE.md (scripts/receipts-switch).
+NEW_AGENT=0
+[ -e "$H/.claude/product/runtime.json" ] || [ -e "$H/CLAUDE.md" ] || [ -e "$H/.claude/channels/telegram/messages.db" ] \
+  || NEW_AGENT=1
 NOVSKY_ALLOW_PINNED_LEGACY_SHARED_CONTEXT="${NOVSKY_ALLOW_PINNED_LEGACY_SHARED_CONTEXT:-0}"
 case "$NOVSKY_ALLOW_PINNED_LEGACY_SHARED_CONTEXT" in
   0|1) ;;
@@ -1000,7 +1006,9 @@ fi
 # the poller records what it started with, the cron block never carries it, and
 # the saved installer config does not either, so an update cannot roll a
 # hand-switched box back to the value of its first install.
-if [ -z "$TG_DELIVERY_AUTHORITY_INPUT" ] && [ -r "$CHANNEL_ENV" ]; then
+if [ -z "$TG_DELIVERY_AUTHORITY_INPUT" ] && [ "$NEW_AGENT" = 1 ]; then
+  TG_DELIVERY_AUTHORITY=receiver
+elif [ -z "$TG_DELIVERY_AUTHORITY_INPUT" ] && [ -r "$CHANNEL_ENV" ]; then
   _existing_authority="$(read_channel_value "$CHANNEL_ENV" TG_DELIVERY_AUTHORITY)"
   [ -n "$_existing_authority" ] && TG_DELIVERY_AUTHORITY="$_existing_authority"
   # Owner, 02.10.2026: every kit bot keeps the receipts in shadow. guard was only the old default, so an update
@@ -1027,6 +1035,16 @@ for name in TELEGRAM_BOT_TOKEN OPENAI_API_KEY MEMORY_EMBEDDINGS_OPENAI RECALL_AP
   TG_DELIVERY_AUTHORITY OWNER_CHAT_ID TG_CORPORATE_SESSIONS GOG_KEYRING_BACKEND GOG_KEYRING_PASSWORD; do
   write_shell_value "$MANAGED_CHANNEL_ENV" "$name"
 done
+# The whole agent on receipts for a new agent only: an update never writes these lines, so it cannot switch a
+# running agent's engines (LIVE_ENGINES=0 installs a new agent without them). The root marker lets the launcher run
+# the live engines on this box at all.
+if [ "$NEW_AGENT" = 1 ] && [ "$TG_DELIVERY_AUTHORITY" = receiver ] && [ "${LIVE_ENGINES:-1}" = 1 ]; then
+  OWNER_ENGINE=live CORPORATE_ENGINE=live
+  write_shell_value "$MANAGED_CHANNEL_ENV" OWNER_ENGINE
+  write_shell_value "$MANAGED_CHANNEL_ENV" CORPORATE_ENGINE
+  install -d -m 755 "$CONFIG_DIR"
+  [ -e "$CONFIG_DIR/live-engines-allowed" ] || install -o root -g root -m 0644 /dev/null "$CONFIG_DIR/live-engines-allowed"
+fi
 if ! python3 "$KIT/assets/lib/merge-env.py" \
     "$CHANNEL_ENV" "$MANAGED_CHANNEL_ENV" "$CHANNEL_ENV"; then
   rm -f "$MANAGED_CHANNEL_ENV"

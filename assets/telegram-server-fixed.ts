@@ -1660,12 +1660,29 @@ function assertAllowedChat(chat_id: string): void {
   throw new Error(`chat ${chat_id} is not allowlisted — add via /telegram:access`)
 }
 
+// Company answers render like the owner's (owner, 05.10.2026: «в корпоративном режиме в чатах он не форматирует»):
+// Markdown through the same tg-escape as the reply tool, and a whole answer wrapped in <rich>…</rich> as a Telegram
+// rich message (tables, headings, lists — Bot API 10.1, as tg-rich). Only Telegram's own refusal (nothing was created)
+// sends that answer once more as plain text; previews with buttons and host notices stay plain.
+// ponytail: a <rich> answer longer than one 4096-character chunk is split by the module and goes as plain text.
+const RICH_ANSWER = /^\s*<rich>([\s\S]*)<\/rich>\s*$/
+function richToPlain(html: string): string {
+  return html.replace(/<br\s*\/?>|<\/(?:p|h[1-6]|li|tr|blockquote|pre|details|summary|div)>/gi, '\n')
+    .replace(/<li[^>]*>/gi, '• ').replace(/<\/t[dh]>/gi, ' | ').replace(/<hr[^>]*>/gi, '\n———\n')
+    .replace(/<[^>]+>/g, '').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&amp;/g, '&')
+    .replace(/[ \t]*\|[ \t]*\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim()
+}
+function telegramRefused(error: unknown): boolean {
+  return (error as { error_code?: unknown })?.error_code === 400
+    || /can.?t parse|can not parse|too long|bad request/i.test(error instanceof Error ? error.message : String(error))
+}
+
 async function sendCorporateText(
   chatId: string,
   threadId: number | null,
   replyTo: number | null,
   text: string,
-  options?: { actionToken?: string; policyToken?: string; resourceToken?: string; teamToken?: string; settingsToken?: string },
+  options?: { actionToken?: string; policyToken?: string; resourceToken?: string; teamToken?: string; settingsToken?: string; delivery?: unknown },
 ): Promise<number> {
   assertAllowedChat(chatId)
   const keyboard = options?.actionToken
@@ -1689,17 +1706,41 @@ async function sendCorporateText(
             .text('✅ Підтвердити', `corp-settings:approve:${options.settingsToken}`)
             .text('❌ Скасувати', `corp-settings:cancel:${options.settingsToken}`)
         : undefined
-  const sent = await bot.api.sendMessage(chatId, text, {
+  const where = {
     ...(threadId != null ? { message_thread_id: threadId } : {}),
     ...(replyTo != null ? { reply_parameters: { message_id: replyTo, allow_sending_without_reply: true } } : {}),
-    ...(keyboard ? { reply_markup: keyboard } : {}),
-  })
+  }
+  const common = { ...where, ...(keyboard ? { reply_markup: keyboard } : {}) }
+  const answer = options?.delivery != null && !keyboard
+  const rich = answer ? RICH_ANSWER.exec(text) : null
+  let logged = text
+  let sent: { message_id: number } | undefined
+  if (rich) {
+    try {
+      sent = await (bot.api.raw as unknown as { sendRichMessage: (payload: Record<string, unknown>) => Promise<{ message_id: number }> })
+        .sendRichMessage({ chat_id: chatId, rich_message: { html: rich[1]!.trim() }, ...where })
+      logged = richToPlain(rich[1]!)
+    } catch (error) {
+      if (!telegramRefused(error)) throw error
+      logged = richToPlain(rich[1]!)
+      sent = await bot.api.sendMessage(chatId, logged, common)
+    }
+  } else if (answer) {
+    let escaped = text
+    try { escaped = await tgEscape(text) } catch {}
+    if (escaped.length <= 4096) {
+      try { sent = await bot.api.sendMessage(chatId, escaped, { ...common, parse_mode: 'MarkdownV2' }) } catch (error) {
+        if (!telegramRefused(error)) throw error
+      }
+    }
+    if (!sent) sent = await bot.api.sendMessage(chatId, text, common)
+  } else sent = await bot.api.sendMessage(chatId, text, common)
   logMsg({
     chat_id: chatId,
     user_id: '',
     username: botUsername || 'bot',
     direction: 'out',
-    text,
+    text: logged,
     ts: Date.now(),
     message_id: sent.message_id,
     thread_id: threadId ?? undefined,
@@ -1949,18 +1990,21 @@ function gate(ctx: Context): GateResult {
 // same topic belongs to that request — the mention simply came first (Mani,
 // 14.09: «the screenshot never arrived»). It is delivered: the burst folds it
 // into the mention while that turn is still waiting, otherwise it is a turn of
-// its own marked as the mention's continuation. A mention is noted only when it
-// enters this bot's own queue, the one that folds; a company session keeps
-// binding such files to the next mention instead of answering each photo.
+// its own marked as the mention's continuation. A company conversation folds a
+// burst too since 05.10, so its mentions are noted as well; a document gets ten
+// minutes — finding the file takes longer than a screenshot (Manzik, 01.10:
+// «Orders.xlsx до мене не дійшов: він надісланий окремим повідомленням без тегу»).
 const CONTINUATION_WINDOW_MS = 60_000
+const DOCUMENT_CONTINUATION_WINDOW_MS = 10 * 60_000
 const lastAddressed = new Map<string, { at: number, messageId: number }>()
 function continuesOwnMention(ctx: Context, now = Date.now()): number | undefined {
   const message = ctx.message
   if ((!message?.photo && !message?.document && !message?.video && !message?.video_note)
-    || message.sender_chat) return undefined
+    || message.sender_chat || message.media_group_id) return undefined
   const threadId = message.is_topic_message === true ? message.message_thread_id : undefined
   const last = lastAddressed.get(inboundSenderKey(String(ctx.chat!.id), threadId, String(ctx.from!.id)))
-  return last && now - last.at < CONTINUATION_WINDOW_MS ? last.messageId : undefined
+  const window = message.document ? DOCUMENT_CONTINUATION_WINDOW_MS : CONTINUATION_WINDOW_MS
+  return last && now - last.at < window ? last.messageId : undefined
 }
 
 // A group that hands the bot every message (requireMention false) hands it people's chatter
@@ -6259,6 +6303,33 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      // Арти, 04.10.2026: «удалять я не могу», «закрепить не могу — такой кнопки нет». Telegram allows both.
+      name: 'delete_message',
+      description: 'Delete a Telegram message: your own messages (sent less than 48 hours ago) in any chat, the person\'s messages in a private chat, and any message in a group where you are an administrator allowed to delete. Use it when asked to remove interim, wrong or outdated messages. If Telegram refuses, say exactly what is needed (e.g. admin rights) instead of «I can\'t».',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          chat_id: { type: 'string' },
+          message_id: { type: 'string' },
+        },
+        required: ['chat_id', 'message_id'],
+      },
+    },
+    {
+      name: 'pin_message',
+      description: 'Pin a Telegram message, or unpin it with unpin: true. Any message can be pinned in a private chat; in a group you must be an administrator allowed to pin. silent: true pins without notifying the chat. If Telegram refuses, say exactly what is needed (e.g. admin rights) instead of «I can\'t».',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          chat_id: { type: 'string' },
+          message_id: { type: 'string' },
+          unpin: { type: 'boolean' },
+          silent: { type: 'boolean' },
+        },
+        required: ['chat_id', 'message_id'],
+      },
+    },
+    {
       name: 'download_attachment',
       description: 'Download a file attachment from a Telegram message to the local inbox. Use when the inbound <channel> meta shows attachment_file_id. Returns the local file path ready to Read. Telegram caps bot downloads at 20MB.',
       inputSchema: {
@@ -6642,6 +6713,20 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           { type: 'emoji', emoji: args.emoji as ReactionTypeEmoji['emoji'] },
         ])
         return { content: [{ type: 'text', text: 'reacted' }] }
+      }
+      case 'delete_message': {
+        assertAllowedChat(args.chat_id as string)
+        await bot.api.deleteMessage(args.chat_id as string, Number(args.message_id))
+        return { content: [{ type: 'text', text: 'deleted' }] }
+      }
+      case 'pin_message': {
+        assertAllowedChat(args.chat_id as string)
+        if (args.unpin === true) {
+          await bot.api.unpinChatMessage(args.chat_id as string, Number(args.message_id))
+          return { content: [{ type: 'text', text: 'unpinned' }] }
+        }
+        await bot.api.pinChatMessage(args.chat_id as string, Number(args.message_id), { disable_notification: args.silent === true })
+        return { content: [{ type: 'text', text: 'pinned' }] }
       }
       case 'download_attachment': {
         const path = await downloadAttachmentById(args.file_id as string)
@@ -8234,6 +8319,7 @@ async function routeInbound(
   attachment: AttachmentMeta | undefined,
   legacyInbound: (deliveryId: string) => Promise<void>,
   unaddressed = false,
+  continues?: number,
 ): Promise<void> {
   const from = ctx.from!
   const chat_id = String(ctx.chat!.id)
@@ -8370,6 +8456,8 @@ async function routeInbound(
       if (spoken.length) corporateText = [corporateText, ...spoken].join('\n')
     }
     if (unopened.length) corporateText = `${corporateText}\n${unopenedLine(unopened)}`
+    // A file posted right after its author's own mention belongs to that request.
+    if (continues != null) corporateText = `До мого повідомлення ${continues}:\n${corporateText}`
 
     // The words a reply answers: the legacy tag carries them as reply_to_text.
     const answered = ctx.message?.reply_to_message
@@ -8403,6 +8491,11 @@ async function routeInbound(
       ...(ctx.message?.forward_origin ? { forwarded: true as const } : {}),
       createdAt: Date.now(),
     })
+    // A group mention is noted for the file its author posts right after it (continuesOwnMention).
+    if (!unaddressed && continues == null && lateSender && msgId != null && ctx.chat?.type !== 'private') {
+      if (lastAddressed.size > 1024) lastAddressed.clear()
+      lastAddressed.set(lateSender, { at: Date.now(), messageId: msgId })
+    }
     const health = corporate.health()
     if (health.admissionState !== 'active') {
       // During a limit, login or start pause the runtime tells each waiting chat «Прийняв…»
@@ -8720,8 +8813,10 @@ async function handleInbound(
   // people talking to each other too. Such a message addressed nobody here: the
   // model sees addressed="false" as observation, and no service notice about it
   // goes to the group (Кнопа 03.09 and 15.09).
+  const continues = result.action === 'deliver' ? result.continues : undefined
+  // A file that continues its author's own mention asked the bot as much as the mention did.
   const unaddressed = ctx.chat?.type !== 'private' && !isMentioned(ctx, access.mentionPatterns)
-    && !matchesAutoAnswer(ctx, access.groups[chat_id]?.autoAnswerPatterns)
+    && !matchesAutoAnswer(ctx, access.groups[chat_id]?.autoAnswerPatterns) && continues == null
 
   // Ack reaction — says "received"; "in work" is the typing indicator, which
   // follows the turn ledger (see syncTypingWithTurnLedger). Fire-and-forget.
@@ -8735,7 +8830,6 @@ async function handleInbound(
       .catch(() => {})
   }
 
-  const continues = result.action === 'deliver' ? result.continues : undefined
   // Until this update is queued, a waiting request of the same person holds on.
   await routeInbound(ctx, text, downloadImage, attachment, deliveryId => takingIn(sender, async () => {
     const imagePath = downloadImage ? await downloadImage() : undefined
@@ -8839,7 +8933,7 @@ async function handleInbound(
         throw new RetryableInboundDeliveryError(err)
       }
     }
-  }), unaddressed)
+  }), unaddressed, continues)
   await removeIntegrationInput()
 }
 

@@ -501,6 +501,12 @@ def accepted_line(home: Path, reset_epoch_ms: int | None, now_ms: int) -> str:
     later, after = LIMIT_REACHED[locale]
     if not reset_epoch_ms:
         return later
+    return f"{after} {reset_time_text(home, reset_epoch_ms, now_ms, locale)}"
+
+
+def reset_time_text(home: Path, reset_epoch_ms: int, now_ms: int, locale: str) -> str:
+    """The reset in the agent's zone: its time, the date only when that is not today there, the zone only when the
+    profile names none. The scheduler's task notice words its limit with it too (Арти, 05.10.2026)."""
     from datetime import datetime
     from zoneinfo import ZoneInfo
     named = named_time_zone(home)
@@ -508,7 +514,7 @@ def accepted_line(home: Path, reset_epoch_ms: int | None, now_ms: int) -> str:
     at = datetime.fromtimestamp(reset_epoch_ms / 1000, ZoneInfo(zone))
     today = datetime.fromtimestamp(now_ms / 1000, ZoneInfo(zone)).date()
     day = "" if at.date() == today else f" {at.day} {MONTHS[locale][at.month - 1]}"
-    return f"{after} {at:%H:%M}{day}" + ("" if named else f" ({zone})")
+    return f"{at:%H:%M}{day}" + ("" if named else f" ({zone})")
 
 
 def notice_text(key: str, ukrainian: str, *, home: Path) -> str:

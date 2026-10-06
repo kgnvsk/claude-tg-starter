@@ -247,7 +247,15 @@ var CAPABILITY_CATALOG = Object.freeze({
     kind: "write",
     adapter: "image",
     operations: ["generate", "edit"],
-    sharedAllowed: false,
+    sharedAllowed: true,
+    requiresResource: true,
+    requiresConfirmation: false
+  }),
+  "site.publish": capability("site.publish", {
+    kind: "write",
+    adapter: "vercel",
+    operations: ["deploy"],
+    sharedAllowed: true,
     requiresResource: true,
     requiresConfirmation: false
   }),
@@ -1357,7 +1365,7 @@ class CapabilityStore {
     const label = resource.label.trim();
     if (label.length === 0 || label.length > 120)
       throw new Error("invalid resource label");
-    if (!["memory", "google", "sql", "meta", "gads", "telegram", "image", "browser"].includes(resource.connector)) {
+    if (!["memory", "google", "sql", "meta", "gads", "telegram", "image", "browser", "vercel"].includes(resource.connector)) {
       throw new Error("unknown resource connector");
     }
     if (resource.capabilityIds.length === 0)
@@ -2201,8 +2209,52 @@ var cellFields = (value) => typeof value === "string" && value.length > 0 && val
 var gridRange = (value) => object({ sheetId, startRowIndex: index, endRowIndex: index, startColumnIndex: integer(0, 18278), endColumnIndex: integer(1, 18278) }, ["sheetId", "endRowIndex", "endColumnIndex"])(value) && Number(value.endRowIndex) > Number(value.startRowIndex ?? 0) && Number(value.endColumnIndex) > Number(value.startColumnIndex ?? 0);
 var dimensionRange = (value) => object({ sheetId, dimension: oneOf("ROWS", "COLUMNS"), startIndex: index, endIndex: index }, ["sheetId", "dimension", "endIndex"])(value) && Number(value.endIndex) > Number(value.startIndex ?? 0) && (value.dimension !== "COLUMNS" || Number(value.endIndex) <= 18278);
 var gridProperties = object({ rowCount: integer(1, 1e6), columnCount: integer(1, 18278), frozenRowCount: index, frozenColumnCount: integer(0, 18278), hideGridlines: boolean });
-var sheetProperties = object({ sheetId, title: (value) => string(100)(value) && value.trim().length > 0, gridProperties, tabColor: color, tabColorStyle: colorStyle }, ["sheetId"]);
-var sheetFields = (value) => typeof value === "string" && value.length > 0 && value.length <= 500 && value.split(",").every((field) => /^(?:title|tabColor|tabColorStyle|gridProperties(?:\.(?:rowCount|columnCount|frozenRowCount|frozenColumnCount|hideGridlines))?)$/.test(field));
+var sheetProperties = object({ sheetId, title: (value) => string(100)(value) && value.trim().length > 0, hidden: boolean, gridProperties, tabColor: color, tabColorStyle: colorStyle }, ["sheetId"]);
+var sheetFields = (value) => typeof value === "string" && value.length > 0 && value.length <= 500 && value.split(",").every((field) => /^(?:title|hidden|tabColor|tabColorStyle|gridProperties(?:\.(?:rowCount|columnCount|frozenRowCount|frozenColumnCount|hideGridlines))?)$/.test(field));
+var chartData = object({ sourceRange: object({ sources: array(gridRange, 10) }, ["sources"]) }, ["sourceRange"]);
+var chartType = oneOf("BAR", "LINE", "AREA", "COLUMN", "SCATTER", "COMBO", "STEPPED_AREA");
+var basicChart = object({
+  chartType,
+  legendPosition: oneOf("BOTTOM_LEGEND", "LEFT_LEGEND", "RIGHT_LEGEND", "TOP_LEGEND", "NO_LEGEND"),
+  axis: array(object({ position: oneOf("BOTTOM_AXIS", "LEFT_AXIS", "RIGHT_AXIS"), title: string(500) }, ["position"]), 3),
+  domains: array(object({ domain: chartData, reversed: boolean }, ["domain"]), 3),
+  series: array(object({ series: chartData, targetAxis: oneOf("LEFT_AXIS", "RIGHT_AXIS", "BOTTOM_AXIS"), type: chartType, color, colorStyle }, ["series"]), 50),
+  headerCount: integer(0, 10),
+  stackedType: oneOf("NOT_STACKED", "STACKED", "PERCENT_STACKED"),
+  interpolateNulls: boolean,
+  compareMode: oneOf("DATUM", "CATEGORY")
+}, ["chartType", "domains", "series"]);
+var pieChart = object({
+  domain: chartData,
+  series: chartData,
+  legendPosition: oneOf("BOTTOM_LEGEND", "LEFT_LEGEND", "RIGHT_LEGEND", "TOP_LEGEND", "NO_LEGEND", "LABELED_LEGEND"),
+  pieHole: (value) => finite(value) && Number(value) >= 0 && Number(value) <= 1,
+  threeDimensional: boolean
+}, ["domain", "series"]);
+var chartSpec = (value) => object({
+  title: string(500),
+  subtitle: string(500),
+  altText: string(1000),
+  basicChart,
+  pieChart,
+  backgroundColor: color
+}, [])(value) && Object.hasOwn(value, "basicChart") !== Object.hasOwn(value, "pieChart");
+var chartPosition = (value) => object({
+  newSheet: (value2) => value2 === true,
+  overlayPosition: object({
+    anchorCell: object({ sheetId, rowIndex: index, columnIndex: integer(0, 18277) }, ["sheetId"]),
+    offsetXPixels: integer(-5000, 5000),
+    offsetYPixels: integer(-5000, 5000),
+    widthPixels: integer(1, 5000),
+    heightPixels: integer(1, 5000)
+  }, ["anchorCell"])
+})(value) && Object.hasOwn(value, "newSheet") !== Object.hasOwn(value, "overlayPosition");
+var dimensionProperties = object({ pixelSize: integer(1, 2000), hiddenByUser: boolean });
+var dimensionUpdate = (value) => object({
+  range: dimensionRange,
+  properties: dimensionProperties,
+  fields: (value2) => typeof value2 === "string" && value2.split(",").every((key) => ["pixelSize", "hiddenByUser"].includes(key))
+}, ["range", "properties", "fields"])(value) && Object.keys(value.properties).sort().join(",") === value.fields.split(",").sort().join(",");
 var REQUESTS = {
   repeatCell: object({ range: gridRange, cell, fields: cellFields }, ["range", "cell", "fields"]),
   updateCells: (value) => object({
@@ -2211,10 +2263,12 @@ var REQUESTS = {
     rows: array(object({ values: array(cell, 1000) }, ["values"]), 1000),
     fields: cellFields
   }, ["rows", "fields"])(value) && Object.hasOwn(value, "start") !== Object.hasOwn(value, "range"),
-  updateDimensionProperties: object({ range: dimensionRange, properties: object({ pixelSize: integer(1, 2000) }, ["pixelSize"]), fields: oneOf("pixelSize") }, ["range", "properties", "fields"]),
+  updateDimensionProperties: dimensionUpdate,
   autoResizeDimensions: object({ dimensions: dimensionRange }, ["dimensions"]),
   updateSheetProperties: object({ properties: sheetProperties, fields: sheetFields }, ["properties", "fields"]),
   addSheet: (value) => object({ properties: sheetProperties }, ["properties"])(value) && Object.hasOwn(value.properties, "title"),
+  deleteSheet: object({ sheetId }, ["sheetId"]),
+  addChart: object({ chart: object({ spec: chartSpec, position: chartPosition }, ["spec", "position"]) }, ["chart"]),
   mergeCells: object({ range: gridRange, mergeType: oneOf("MERGE_ALL", "MERGE_COLUMNS", "MERGE_ROWS") }, ["range", "mergeType"]),
   unmergeCells: object({ range: gridRange }, ["range"]),
   updateBorders: object({ range: gridRange, top: border, bottom: border, left: border, right: border, innerHorizontal: border, innerVertical: border }, ["range"]),

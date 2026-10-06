@@ -1,0 +1,164 @@
+#!/usr/bin/env python3
+"""One fresh native session for a bot whose resumed session predates callback tracking (Knopa, 30.09).
+The bot's launcher starts fresh when its session selector (tg-resume-session) is not executable.
+Run by scripts/receipts-switch as root (RECEIPTS_UPGRADE.md); ported from the operations tool (Codex reviewed fabcfc0f).
+
+  disable <helper> <record>        record the selector's mode, clear its exec bits
+  watch <record> <old-session> <db> <workspace> <user> <timeout-hours> [NAME=VALUE ...]
+                                   keep it disabled until the selector itself returns a new session that is
+                                   not legacy (the fresh session has claimed a Telegram message), then restore
+                                   the recorded mode; on timeout restore it anyway and say so (Codex, 30.09 P1)
+  restore <record>                 put the recorded mode back at once (a failed install or a rollback)
+  current <helper> <workspace> <user> [NAME=VALUE ...]
+                                   print the session the selector returns now
+"""
+import json
+import os
+import signal
+import sqlite3
+import stat
+import pwd
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+
+def _private_parent(record):
+    info = Path(record).parent.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o022:
+        raise ValueError('selector record needs a private maintenance folder')
+
+
+def _read_record(record):
+    _private_parent(record)
+    fd = os.open(record, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_nlink != 1 or info.st_mode & 0o077:
+            raise ValueError('unsafe selector record')
+        data = json.loads(os.read(fd, 4096))
+    finally:
+        os.close(fd)
+    if (not isinstance(data, dict) or set(data) != {'helper','mode','dev','ino','uid','gid'}
+        or not isinstance(data['helper'], str) or not Path(data['helper']).is_absolute()
+        or Path(data['helper']).name != 'tg-resume-session'
+        or any(type(data[k]) is not int for k in ('mode','dev','ino','uid','gid'))
+        or data['uid'] <= 0
+        or not 0 <= data['mode'] <= 0o777):
+        raise ValueError('invalid selector record')
+    return data
+
+
+def _file_command(helper, uid, *args):
+    # The helper's Unix user opens and chmods its own file. Root never chmods an agent-controlled path.
+    prefix = [] if uid == os.geteuid() else ['runuser', '-u', pwd.getpwuid(uid).pw_name, '--']
+    done = subprocess.run(prefix + [sys.executable, str(Path(__file__).with_name('receipts-files.py')), *args],
+                          capture_output=True, text=True, timeout=30)
+    if done.returncode:
+        raise ValueError('selector file check refused')
+    return done.stdout
+
+
+def disable(helper, record):
+    helper = str(Path(helper).absolute())
+    if Path(helper).name != 'tg-resume-session':
+        raise ValueError('not the session selector')
+    _private_parent(record)
+    info = Path(helper).lstat()
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid == 0:
+        raise ValueError('unsafe selector')
+    metadata = json.loads(_file_command(helper, info.st_uid, 'inspect', helper))
+    data = {'helper': helper, **metadata}
+    try:
+        fd = os.open(record, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    except FileExistsError:
+        kept = _read_record(record)
+        if any(kept[k] != data[k] for k in ('helper','dev','ino','uid','gid')):
+            raise ValueError('record belongs to another selector')
+        data = kept
+    else:
+        with os.fdopen(fd, 'w') as out:
+            json.dump(data, out); out.flush(); os.fsync(out.fileno())
+        directory = os.open(Path(record).parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try: os.fsync(directory)
+        finally: os.close(directory)
+    _file_command(helper, data['uid'], 'mode', helper, json.dumps(data), str(data['mode'] & ~0o111))
+
+
+def restore(record):
+    try:
+        data = _read_record(record)
+    except FileNotFoundError:
+        return None
+    _file_command(data['helper'], data['uid'], 'mode', data['helper'], json.dumps(data), str(data['mode']))
+    Path(record).unlink()
+    return data
+
+
+def selected(helper, workspace, user, env):
+    """The session the bot's launcher would resume now, asked of the selector exactly as it runs."""
+    pairs = [f'{k}={v}' for k, v in env.items()]
+    argv = (['runuser', '-u', user, '--'] if user else []) + ['env', *pairs, sys.executable, str(helper)]
+    done = subprocess.run(argv, cwd=workspace, capture_output=True, text=True, timeout=60)
+    return done.stdout.strip() or None
+
+
+def legacy(db, session, user=None):
+    # The ledger belongs to the agent: never open it as root, even read-only (SQLite can create -shm).
+    query = '''import sqlite3,sys
+c=sqlite3.connect('file:'+sys.argv[1]+'?mode=ro',uri=True,timeout=5)
+try:print(int(c.execute('SELECT 1 FROM delivery_legacy_native_sessions WHERE session_id=?',(sys.argv[2],)).fetchone() is not None))
+finally:c.close()
+'''
+    prefix = ['runuser','-u',user,'--'] if user and pwd.getpwnam(user).pw_uid != os.geteuid() else []
+    done = subprocess.run(prefix+[sys.executable,'-c',query,str(db),session],capture_output=True,text=True,timeout=30)
+    if done.returncode or done.stdout.strip() not in ('0','1'):
+        raise OSError('ledger check refused')
+    return done.stdout.strip() == '1'
+
+
+def watch(record, old, db, workspace, user, timeout_s, env, interval=60, select=selected, clock=time.time,
+          sleep=time.sleep):
+    """Whatever ends the watch (success, timeout, an error, a stop) restores the recorded mode first."""
+    helper = _read_record(record)['helper']
+    deadline = clock() + timeout_s
+    try:
+        while clock() < deadline:
+            try:
+                session = select(helper, workspace, user, env)
+                fresh = bool(session) and session != old and not legacy(db, session, user)
+            except (OSError, subprocess.SubprocessError, sqlite3.Error):
+                fresh = False  # an unreadable selector or ledger is no proof; the next check decides (P1-1)
+            if fresh:
+                print(f'fresh session {session} is what the selector returns; its mode is restored', flush=True)
+                return 0
+            sleep(interval)
+        print('no fresh session claimed a Telegram message before the timeout; the selector is restored and '
+              'the next restart resumes the old session', flush=True)
+        return 1
+    finally:
+        restore(record)
+
+
+def main(argv):
+    if argv[:1] == ['disable']:
+        disable(argv[1], argv[2]); return 0
+    if argv[:1] == ['restore']:
+        restore(argv[1]); return 0
+    if argv[:1] == ['watch']:
+        record, old, db, workspace, user, hours = argv[1:7]
+        env = dict(pair.split('=', 1) for pair in argv[7:])
+        signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))  # a stop runs the restoring finally
+        return watch(record, old, db, workspace, user or None, float(hours) * 3600, env)
+    if argv[:1] == ['current']:
+        helper, workspace, user = argv[1:4]
+        print(selected(helper, workspace, user or None, dict(pair.split('=', 1) for pair in argv[4:])) or '')
+        return 0
+    print(__doc__, file=sys.stderr)
+    return 2
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))

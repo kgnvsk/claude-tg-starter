@@ -28,10 +28,18 @@ UPSTREAM_SERVER_SHA256 = (
 )
 UPSTREAM_PACKAGE_START = "bun install --no-summary 1>&2 && bun server.ts"
 GOLDEN_SERVER_SHA256 = (
-    "f3ff61971f1afbc8d12b62ddf968f4e3ddc862b16963ff109d3c1db4b9a5c709"
+    "1f214052ab6f39acd3a3a3558e74fa7e98d7e3fe3adaddf96f36fd70dae5b8f8"
 )
 PREVIOUS_GOLDEN_SERVER_SHA256S = frozenset(
     {
+        # The golden before scoped standalone attachment continuation without re-admitting album parts.
+        "0aa2a7ec48e3b69a2a6901d2f0657ff24c5951ece5fb4bbcc72b362c326095e1",
+        # The golden before a file right after a company mention reached the request (Manzik, 05.10.2026).
+        "728da1903abb7526cbf14f42a53cad075f782d6f3e04b5cf64c0d7446b287db1",
+        # The golden before the agent could delete and pin messages (Арти, 05.10.2026).
+        "319e37685acd2b6548c68984ee49eaf0943a21dbe6c6d79a5d8617181fcf6541",
+        # The golden before company answers render formatting and rich messages (owner, 05.10.2026).
+        "f3ff61971f1afbc8d12b62ddf968f4e3ddc862b16963ff109d3c1db4b9a5c709",
         # The golden before the live host turned on only by the launcher.
         "b05204269fc3bf4d93b00cbe5a44969332e40460a1176731bc57a89b54bc1720",
         # c3d237426598 Owner live host: bridge credential off argv, notice backoff and locale
