@@ -983,6 +983,7 @@ type CorporateGatewayRuntime = {
     },
     actorUserId: string,
   ): Promise<CorporateGatewayPolicyPreviewResult>
+  previewResource(input: Record<string, unknown>, actorUserId: string): Promise<CorporateGatewayPolicyPreviewResult>
   shutdown(): Promise<void>
 }
 
@@ -6403,6 +6404,29 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         },
         required: ['subject', 'proposedGrants'],
       },
+    }, {
+      name: 'corporate_resource_preview',
+      description: 'Prepare registration or revocation of an exact work resource for the primary owner in their personal chat. The owner already has authority; no superadmin role or Novsky access is needed. For a Google calendar use the connected account email, calendarId and access=read or read_write. Other supported kinds name their exact file, account, group or origin. Never guess the target or share a personal calendar by default. This only sends Confirm/Cancel to the owner; it neither verifies/connects Google nor grants employee access. After confirmation grant the selected resource with corporate_policy_preview. Do not pause/resume the company in the shell: confirmation performs its own maintenance and queues current company work again.',
+      inputSchema: {
+        type: 'object', additionalProperties: false,
+        properties: {
+          action: { type: 'string', enum: ['register', 'revoke'] },
+          id: { type: 'string', pattern: '^[a-z0-9][a-z0-9._-]{0,63}$' },
+          label: { type: 'string', maxLength: 120 },
+          connector: { type: 'string', enum: ['google', 'meta', 'gads', 'browser', 'memory', 'image', 'telegram'] },
+          kind: { type: 'string', enum: ['sheet', 'doc', 'slide', 'file', 'folder', 'mailbox', 'calendar', 'contacts', 'tasks', 'ad_account', 'customer', 'origin', 'company', 'generator', 'group'] },
+          account: { type: 'string', maxLength: 254 },
+          spreadsheetId: { type: 'string', pattern: '^[A-Za-z0-9_-]{10,256}$' },
+          fileId: { type: 'string', pattern: '^[A-Za-z0-9_-]{10,256}$' },
+          calendarId: { type: 'string', maxLength: 254 },
+          accountId: { type: 'string', pattern: '^act_[0-9]{4,30}$' },
+          customerId: { type: 'string', pattern: '^[0-9]{6,12}$' },
+          origin: { type: 'string', maxLength: 2048 },
+          chatId: { type: 'string', pattern: '^-[0-9]{5,20}$' },
+          access: { type: 'string', enum: ['read', 'read_write'] },
+        },
+        required: ['action', 'id'],
+      },
     }] : []),
   ],
 }))
@@ -6411,6 +6435,22 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
   const args = (req.params.arguments ?? {}) as Record<string, unknown>
   try {
     switch (req.params.name) {
+      case 'corporate_resource_preview': {
+        if (!OWNER_CHAT_ID) throw new Error('corporate resource controls are unavailable')
+        const allowed = args.action === 'revoke' ? ['action', 'id']
+          : ['action', 'id', 'label', 'connector', 'kind', 'account', 'spreadsheetId', 'fileId', 'calendarId', 'accountId', 'customerId', 'origin', 'chatId', 'access']
+        if (!['register', 'revoke'].includes(String(args.action)) || typeof args.id !== 'string'
+          || !/^[a-z0-9][a-z0-9._-]{0,63}$/.test(args.id)
+          || Object.keys(args).some(key => !allowed.includes(key)) || JSON.stringify(args).length > 4096) {
+          throw new Error('invalid corporate resource preview')
+        }
+        const corporate = await corporateRuntimeReady()
+        if (!corporate?.previewResource) throw new Error('corporate resource controls are unavailable')
+        const preview = await corporate.previewResource(args, OWNER_CHAT_ID)
+        if (!preview.ok) throw new Error('corporate resource preview rejected')
+        await sendCorporateText(OWNER_CHAT_ID, null, null, preview.summary, { resourceToken: preview.token })
+        return { content: [{ type: 'text', text: 'Ресурс ще не змінено. Власнику надіслано точний опис і кнопки підтвердження та скасування; доступ співробітників налаштовується окремо.' }] }
+      }
       case 'corporate_policy_preview': {
         if (!OWNER_CHAT_ID) {
           throw new Error('corporate policy controls are unavailable')
