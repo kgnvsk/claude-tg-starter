@@ -1028,7 +1028,12 @@ def recovery_context(prompt: str, data: dict) -> str:
         "This request was waiting for one more result from a background task that had already ended, and none came. "
         "Do not start that task again and do not wait for it: read what it has produced so far and answer now with "
         "reply phase=final and this exact delivery_id, saying plainly what is still missing. This is the one retry. "
-    ) if row["recovery_reason"] == "continuation_quiet" else ""
+    ) if row["recovery_reason"] == "continuation_quiet" else (
+        "The background worker of this request was explicitly stopped; this is not a completed worker result. "
+        "Read its existing work and answer the original request now with reply phase=final and this exact "
+        "delivery_id, saying plainly what remains missing. Do not restart the stopped worker merely because "
+        "no callback arrived. "
+    ) if row["recovery_reason"] == "worker_stopped" else ""
     return (
         '<recovery-context source="durable-request-ledger">\n'
         + forgotten + acknowledged_note(next((receipt["created_at"] for receipt in receipts

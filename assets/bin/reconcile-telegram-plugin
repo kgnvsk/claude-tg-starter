@@ -28,10 +28,12 @@ UPSTREAM_SERVER_SHA256 = (
 )
 UPSTREAM_PACKAGE_START = "bun install --no-summary 1>&2 && bun server.ts"
 GOLDEN_SERVER_SHA256 = (
-    "6233d28a36519f8d453301fa6352b632c68d8b9251f09090fbcbbd99720e5dd5"
+    "09167595ba014d1d9f965b2cc0711d065e5e462d03e695135749e8dcba78bace"
 )
 PREVIOUS_GOLDEN_SERVER_SHA256S = frozenset(
     {
+        # The golden before recovering a request whose exact background worker was stopped.
+        "6233d28a36519f8d453301fa6352b632c68d8b9251f09090fbcbbd99720e5dd5",
         # a9741fc55d4b fix(telegram): join a group silently, no «Вітаю! Я — …»
         "52c95ee0799b49086556d2dc6c5b9d6272dc16228b5d402e08d115432a734f84",
         # 905df367e8db Preserve full primary-owner tools in addressed Telegram groups

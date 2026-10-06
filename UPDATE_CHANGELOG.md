@@ -1,8 +1,8 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-10-06.db3c2ca44015`
+- Реліз: `2026-10-06.db82be104338`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `db3c2ca440153785d8fd74515075765368416aa5`
+- Ревізія вихідного комплекту: `db82be104338d9d908ec51f454f2138741e7929b`
 - Дата релізу: `2026-10-06`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
@@ -19,9 +19,7 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    Keep group join test source free of trailing blank lines
-    Retain both reviewed receiver histories after group join integration
-    fix(telegram): join a group silently, no «Вітаю! Я — …»
+    Recover requests after their background worker is stopped
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не

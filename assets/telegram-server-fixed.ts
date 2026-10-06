@@ -5628,7 +5628,15 @@ async function settleResults(): Promise<void> {
       WHERE r.state IN ('pending','deferred') AND r.outbound_attempt_at IS NULL AND r.forgot_reply_at IS NULL AND (
         (r.stamp IS NOT NULL AND ? IS NOT NULL AND r.stamp != ?)
         OR (r.state = 'pending' AND t.closed_at IS NOT NULL
-          AND t.close_kind IN ('stop','stop_failure','escape','session_replaced','session_end')))
+          AND t.close_kind IN ('stop','stop_failure','escape','session_replaced','session_end'))
+        OR (r.state = 'deferred' AND t.closed_at IS NOT NULL AND t.close_kind = 'stop'
+          AND r.superseded_by IS NULL AND r.superseded_ack IS NULL
+          AND r.continuation_generation IS NULL AND r.final_admitted_generation IS NOT r.result_generation
+          AND EXISTS (SELECT 1 FROM delivery_task_owners o JOIN delivery_task_launches l
+            ON l.launch_ref=o.launch_ref AND l.session_id=o.session_id AND l.stamp=o.stamp
+              AND l.task_id=o.task_id AND l.state='resolved'
+            WHERE o.session_id=r.session_id AND o.stamp=r.stamp
+              AND o.delivery_id=r.delivery_id AND o.state='stopped')))
       ORDER BY r.created_at, r.delivery_id`).all(DELIVERY_STAMP, DELIVERY_STAMP) as Array<
         DurableResult & { closed_at: number | null; close_kind: string | null; close_detail: string | null }>
     for (const result of interrupted) {
@@ -5636,7 +5644,10 @@ async function settleResults(): Promise<void> {
       // its scope still runs, registered or not, waits for that worker's
       // callback or stop like a deferred one. After a restart its old stamp's
       // workers are gone and it is recovered as before.
-      if (WORKER_GATES && result.stamp === DELIVERY_STAMP && result.state === 'pending'
+      // A proven direct TaskStop produces no callback. Recover its deferred
+      // request through the ordinary queue once every other scoped worker ended.
+      // Guard/shadow owe this answer too; stopping one of two workers is not idle.
+      if (result.stamp === DELIVERY_STAMP && (result.state === 'deferred' || WORKER_GATES)
         && scopeWork(result).length) continue
       if (result.close_kind === 'escape' && result.close_detail === 'interrupted by the owner') {
         MSG_DB.transaction(() => {
@@ -5650,7 +5661,8 @@ async function settleResults(): Promise<void> {
       // B4: the request's one recovery turn for a forgotten reply ended without
       // an answer too. No further recovery: the last resort takes it after the grace.
       if (WORKER_GATES && result.state === 'pending' && result.close_kind === 'stop'
-        && (result.recovery_reason === 'stop' || result.recovery_reason === 'continuation_quiet')
+        && (result.recovery_reason === 'stop' || result.recovery_reason === 'continuation_quiet'
+          || result.recovery_reason === 'worker_stopped')
         && result.recovery_count > 0 && holdForgottenReply(result)) continue
       // The re-offer cap is the receiver's liveness policy; under guard and shadow a hang is
       // recovered as before K, with no failure and no notice (Codex, task 46 P0-2).
@@ -5659,7 +5671,9 @@ async function settleResults(): Promise<void> {
         continue
       }
       const limit = result.close_kind === 'stop_failure' && LIMIT_ERROR_CLASS.test(result.close_detail ?? '')
-      pauseRequest(result, limit ? 'provider_limit' : result.close_kind ?? 'process_interrupted', limit,
+      const reason = result.state === 'deferred' && result.stamp === DELIVERY_STAMP
+        ? 'worker_stopped' : result.close_kind ?? 'process_interrupted'
+      pauseRequest(result, limit ? 'provider_limit' : reason, limit,
         result.closed_at ?? undefined, result.close_detail)
     }
     if (WORKER_GATES) recoverQuietContinuations()
