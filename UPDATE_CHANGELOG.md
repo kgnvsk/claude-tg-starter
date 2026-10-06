@@ -1,8 +1,8 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-10-06.6a4a6ea373a2`
+- Реліз: `2026-10-06.f9af9160536a`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `6a4a6ea373a248d4eebc7dc5a7402d26497ca9e6`
+- Ревізія вихідного комплекту: `f9af9160536ae24aef497ddc27a1a98883b8ce16`
 - Дата релізу: `2026-10-06`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
@@ -19,8 +19,8 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    Keep the primary owner integration identity in private confirmations
-    fix(corporate): preserve primary owner access to approved resources
+    test: align product audit and private voice fixtures with owner routing
+    Preserve full primary-owner tools in addressed Telegram groups
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не

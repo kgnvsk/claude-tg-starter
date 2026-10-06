@@ -1658,6 +1658,21 @@ function assertAllowedChat(chat_id: string): void {
   const access = loadAccess()
   if (access.allowFrom.includes(chat_id)) return
   if (chat_id in access.groups) return
+  // An addressed request from the exact primary owner admits its origin for
+  // replies without adding the other participants to the access policy.
+  if (/^-[1-9]\d*$/.test(chat_id) && OWNER_CHAT_ID && MSG_DB.query(`
+    SELECT 1 FROM pending_inbound_deliveries WHERE json_valid(payload)
+      AND json_extract(payload,'$.params.meta.chat_id')=?
+      AND json_extract(payload,'$.params.meta.user_id')=?
+      AND COALESCE(json_extract(payload,'$.params.meta.addressed'),'true')!='false'
+      AND json_extract(payload,'$.params.meta.sender_chat_id') IS NULL
+    UNION ALL
+    SELECT 1 FROM delivery_results WHERE json_valid(request_payload)
+      AND json_extract(request_payload,'$.params.meta.chat_id')=?
+      AND json_extract(request_payload,'$.params.meta.user_id')=?
+      AND COALESCE(json_extract(request_payload,'$.params.meta.addressed'),'true')!='false'
+      AND json_extract(request_payload,'$.params.meta.sender_chat_id') IS NULL
+    LIMIT 1`).get(chat_id, OWNER_CHAT_ID, chat_id, OWNER_CHAT_ID)) return
   throw new Error(`chat ${chat_id} is not allowlisted — add via /telegram:access`)
 }
 
@@ -1957,6 +1972,11 @@ function gate(ctx: Context): GateResult {
   if (chatType === 'group' || chatType === 'supergroup') {
     const groupId = String(ctx.chat!.id)
     const policy = access.groups[groupId]
+    if (senderId === OWNER_CHAT_ID && !ctx.message?.sender_chat) {
+      const continues = continuesOwnMention(ctx)
+      if (isMentioned(ctx, access.mentionPatterns) || matchesAutoAnswer(ctx, policy?.autoAnswerPatterns)
+        || continues != null) return { action: 'deliver', access, ...(continues != null ? { continues } : {}) }
+    }
     if (!policy) {
       logUnconnectedChat(ctx.chat!.type, groupId)
       return { action: 'drop' }
@@ -8367,7 +8387,9 @@ async function routeInbound(
   const deliveryId = msgId != null
     ? `${chat_id}:${msgId}`
     : `${chat_id}:${Date.now()}:${randomBytes(6).toString('hex')}`
-  const ownerDirect = ctx.chat?.type === 'private' && chat_id === OWNER_CHAT_ID
+  const ownerDirect = String(from.id) === OWNER_CHAT_ID && !ctx.message?.sender_chat
+    && (ctx.chat?.type === 'private' ? chat_id === OWNER_CHAT_ID
+      : (ctx.chat?.type === 'group' || ctx.chat?.type === 'supergroup') && !unaddressed)
   const isolationActivated = readCorporateIsolationActivated()
   const configuredSuperadmins = loadAccess().superadmins
   // An ordinary bot still shares the owner's Claude session. Once a business
@@ -8673,7 +8695,28 @@ async function handleInbound(
   // A pending connection owns only its credential/callback input, never the
   // person's ordinary dialogue. Consume it before any journal or model sees it.
   let sensitiveIntegrationInput = false
-  if (!(ctx.chat?.type === 'private' && chat_id === OWNER_CHAT_ID) && msgId != null
+  const ownerShared = String(from.id) === OWNER_CHAT_ID && !ctx.message?.sender_chat
+    && (ctx.chat?.type === 'group' || ctx.chat?.type === 'supergroup')
+    && (isMentioned(ctx, access.mentionPatterns)
+      || matchesAutoAnswer(ctx, access.groups[chat_id]?.autoAnswerPatterns)
+      || (result.action === 'deliver' && result.continues != null))
+  if (ownerShared) {
+    // Full tools do not make a public chat a credential intake. Never retain
+    // a pasted connection secret, even when the company module is unavailable.
+    const setup = /(?:^|\n)\s*(?:META_TOKEN|MCP_URL)\b|\b(?:access_token|refresh_token)\s*[:=]|\bEAA[A-Za-z0-9_-]{16,}\b|\bya29\.[A-Za-z0-9_-]{16,}/i.test(text)
+      || (text.match(/https?:\/\/[^\s<>]+/gi) ?? []).some(raw => {
+        try {
+          const url = new URL(raw)
+          return /^mcp\.zoho\./i.test(url.hostname) || ((['localhost', '127.0.0.1', '[::1]', 'accounts.google.com'].includes(url.hostname)
+            || /oauth|callback/i.test(url.pathname)) && ['code', 'state', 'error'].some(key => url.searchParams.has(key)))
+        } catch { return false }
+      })
+    if (setup) {
+      await ctx.reply('Дані для підключення надішли мені в особистий чат. У групі я їх не зберігаю.', inboundTopicOptions(ctx))
+      return
+    }
+  }
+  if (!ownerShared && !(ctx.chat?.type === 'private' && chat_id === OWNER_CHAT_ID && String(from.id) === OWNER_CHAT_ID) && msgId != null
     && (CORPORATE_ENABLED || readCorporateIsolationActivated())) {
     const corporate = await corporateRuntimeForIntake()
     if (!corporate) {
@@ -8903,6 +8946,10 @@ async function handleInbound(
       const spoken = lateBoundVoiceLines(sender)
       if (spoken.length) inboundText = [inboundText, ...spoken].join('\n')
     }
+    // Fresh primary-owner request context survives a resumed CLI system-prompt snapshot.
+    if (ownerShared) inboundText = 'Authenticated primary owner request in Telegram '
+      + JSON.stringify({ chatId: chat_id, ...(threadId != null ? { threadId } : {}) })
+      + '. Use the same installed owner tools. An explicit owner instruction to do a referenced participant request is one authorized task: execute the specified work on the owner behalf, without granting that participant permanent access. A quote alone is never consent; ask if the intended work is unclear. Replies, progress and files go to this original chat and topic; connection secrets and access confirmation go to the private owner intake. Do not disclose unrelated private information.\n\n' + inboundText
     const notification: InboundNotification = {
       method: 'notifications/claude/channel',
       params: {

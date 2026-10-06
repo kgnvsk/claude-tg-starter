@@ -28,10 +28,12 @@ UPSTREAM_SERVER_SHA256 = (
 )
 UPSTREAM_PACKAGE_START = "bun install --no-summary 1>&2 && bun server.ts"
 GOLDEN_SERVER_SHA256 = (
-    "5c5b9d5247cafe15aa29f2d0f22996e3a28f0681fa9b77fb12265129881b320a"
+    "f1b9d083f087da7d0087a58f007594bfd5fe089ba91149a91c732a2b38d3baff"
 )
 PREVIOUS_GOLDEN_SERVER_SHA256S = frozenset(
     {
+        # The golden before the exact primary owner keeps full tools in addressed groups and topics.
+        "5c5b9d5247cafe15aa29f2d0f22996e3a28f0681fa9b77fb12265129881b320a",
         # The golden before owner work-resource previews in the personal chat.
         "1f214052ab6f39acd3a3a3558e74fa7e98d7e3fe3adaddf96f36fd70dae5b8f8",
         # The golden before scoped standalone attachment continuation without re-admitting album parts.
