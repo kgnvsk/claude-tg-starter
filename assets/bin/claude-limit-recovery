@@ -4,10 +4,12 @@
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 import copy
+import contextlib
 import fcntl
 from heapq import nlargest
 import io
 import importlib.util
+import importlib.machinery
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -154,6 +156,7 @@ LIMIT_ERROR_PATTERN = re.compile(
     rf"|You've hit your (?:{UNTIMED_LIMITS})"
     r"|You're out of usage credits)\b"
 )
+PROVIDER_LIMIT_CLASS = re.compile(r"(?:session|weekly|usage|rate)[ _-]?limit|usage[ _-]?credits", re.IGNORECASE)
 OVERLOAD_PATTERN = re.compile(r"\bOverloaded\b", re.IGNORECASE)
 LIMIT_PATTERN = re.compile(
     # Клас ліміту є частиною стабільного ключа дедуплікації.
@@ -2452,6 +2455,76 @@ def _read_small_regular(path: Path, maximum: int = MAX_STATE_BYTES) -> bytes | N
         os.close(descriptor)
 
 
+def _quota_reader(agent_root: Path) -> bool | None:
+    """Read the same native login, never launch a short Claude command."""
+    try:
+        path = Path(__file__).with_name('provider-quota')
+        loader = importlib.machinery.SourceFileLoader('watcher_provider_quota', str(path))
+        module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+        loader.exec_module(module)
+        return module.available('claude', agent_root)
+    except (OSError, ValueError, ImportError):
+        return None
+
+
+def _release_available_quota(agent_root: Path, state: dict, checked_since: int) -> dict:
+    """An actual upgrade/reset may end the former wait before its printed date.
+
+    Only limit deadlines older than the read are reconsidered. Request text,
+    fences, occurrences, receipts, login failures and uncertain actions stay.
+    Called under the existing watcher lifecycle lock, as the agent Unix user.
+    """
+    incident = state.get('incident')
+    if not incident or incident.get('resolved') or incident.get('expired'):
+        return state
+    reset = incident.get('reset_epoch_ms')
+    if type(reset) is not int or reset + RESET_MARGIN_MS <= checked_since:
+        return state
+    if incident.get('event_epoch_ms', checked_since + 1) > checked_since:
+        return state
+    db_path = agent_root / '.claude/channels/telegram/messages.db'
+    try:
+        metadata = db_path.lstat()
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1 or metadata.st_uid != os.geteuid():
+            return state
+        with contextlib.closing(sqlite3.connect(db_path.as_uri() + '?mode=rw', uri=True, timeout=1)) as db, db:
+            def snapshot():
+                rows = db.execute("""SELECT r.delivery_id,r.result_generation,r.resume_after,r.updated_at,t.close_detail,r.recovery_reason
+                    FROM delivery_results r JOIN delivery_turns t ON t.turn_id=r.recovery_from_turn
+                    WHERE r.state='paused' AND r.recovery_reason IN ('provider_limit','stop_failure') AND r.outbound_attempt_at IS NULL
+                      AND r.resume_after>? AND t.close_kind='stop_failure' ORDER BY r.delivery_id""",
+                    (checked_since,)).fetchall()
+                pause = db.execute("SELECT value,updated_at FROM delivery_runtime WHERE key='provider_pause_until'").fetchone()
+                return rows, pause
+            before = snapshot()
+            if _quota_reader(agent_root) is not True: return state
+            db.execute('BEGIN IMMEDIATE')
+            # Compare the actual pre-read rows, including generations. Equal
+            # deadline/millisecond values do not identify a new refusal.
+            if snapshot() != before: return state
+            paused, pause = before
+            for delivery_id, generation, after, updated, detail, reason in paused:
+                if updated > checked_since or not PROVIDER_LIMIT_CLASS.search(detail or ''): continue
+                changed = db.execute("""UPDATE delivery_results SET resume_after=?,updated_at=?
+                    WHERE delivery_id=? AND result_generation=? AND state='paused' AND recovery_reason=?
+                    AND outbound_attempt_at IS NULL AND resume_after=? AND updated_at=?""",
+                    (checked_since, checked_since, delivery_id, generation, reason, after, updated)).rowcount
+                if changed:
+                    db.execute("""UPDATE pending_inbound_deliveries SET next_attempt_at=?
+                        WHERE delivery_id=? AND state='recovering' AND next_attempt_at=?""",
+                        (checked_since, delivery_id, after))
+            if pause and pause[1] <= checked_since and int(pause[0]) > checked_since:
+                db.execute("""UPDATE delivery_runtime SET value=?,updated_at=?
+                    WHERE key='provider_pause_until' AND value=? AND updated_at=?""",
+                    (str(checked_since), checked_since, pause[0], pause[1]))
+    except (OSError, sqlite3.Error, ValueError):
+        return state
+    current = copy.deepcopy(state)
+    current['incident']['reset_key'] = None
+    current['incident']['reset_epoch_ms'] = None
+    return current
+
+
 def _drop_pending_value(agent_root: Path) -> str:
     environment_value = os.environ.get("TG_DROP_PENDING_ON_BOOT")
     if environment_value is not None:
@@ -3616,6 +3689,18 @@ def tick(mode: str) -> int:
             atomic_write_state(state_path, state)
             _record_suppression(agent_root, "observe_mode")
             return 0
+
+        # A tariff change or replenished quota is authoritative before the old
+        # reset date. Re-read transcript errors after the bounded account read;
+        # a new refusal must keep its own incident and deadline.
+        previous_reset = incident.get('reset_epoch_ms') if incident else None
+        state = _release_available_quota(agent_root, state, now_ms)
+        state = _refresh_transcripts(agent_root, state, _now_ms())
+        incident = state['incident']
+        if previous_reset is not None and incident and incident.get('reset_epoch_ms') is None:
+            atomic_write_state(state_path, state)
+            _record_suppression(agent_root, 'quota_restored_wait_released')
+            return 0  # The receiver resumes its original requests; no restart.
 
         # On the ledger the receiver owns the head; see ledger_decision.
         ledger = durable_scheduler_owns_recovery(messages_db)

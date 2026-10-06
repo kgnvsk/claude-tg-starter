@@ -1,8 +1,8 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-10-06.77a4f4bb6c4f`
+- Реліз: `2026-10-06.77953fb2c023`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `77a4f4bb6c4fec6a6365d4d8cdcc5a87107e8006`
+- Ревізія вихідного комплекту: `77953fb2c0236da91222e698484bd6eb14667384`
 - Дата релізу: `2026-10-06`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
@@ -19,12 +19,12 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    Fix fresh document-tool installs with the supported APT option
-    Keep private system config out of artifact tools and respect scoped data operations
-    Make document rendering work inside isolated company sessions
-    Read complete scoped messages and insert public images into work documents
-    Keep uncertain reminder sends from replaying and snapshot ledgers as their owner
-    Preserve old corporate reminder cancellation within its verified scope
+    Include quota adapter in the product runtime inventory control
+    Close quota runtime packaging and fail closed on tool inspection
+    Read live provider quota windows separately from dashboard metadata
+    Resume provider-limit rows through the real Telegram receiver
+    Automatically recover saved private and corporate work after quota replenishment
+    fix(receipts-switch): a running tool command keeps the agent busy
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не

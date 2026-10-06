@@ -138,10 +138,17 @@ busy_reason() {  # the installer's idle rule
   [ "$n" = 0 ] || r="$r company-jobs=$n"
   [ -z "$(find "$CONFIG/projects" -name '*.jsonl' -mmin -3 2>/dev/null | head -1)" ] || r="$r transcript-active<3min"
   [ -z "$(find "/tmp/claude-$(id -u "$OWN")" -path '*/tasks/*' -mmin -3 2>/dev/null | head -1)" ] || r="$r task-output<3min"
+  ! tool_running || r="$r tool-running"
   echo "$r"
 }
-live_worker() {  # a native worker or background command wrote in the last 3 minutes
-  [ -n "$(find "$CONFIG/projects" -path '*/subagents/*' -name '*.jsonl' -mmin -3 2>/dev/null | head -1)" ] ||
+tool_running() {  # a Claude tool command of the agent runs: it can write nothing for minutes (Арти 06.10, a 5-minute ffmpeg check)
+  # Only pgrep's explicit no-match (1) proves no command. Missing/failed process inspection keeps the wait.
+  local rc=0
+  pgrep -u "$OWN" -f '/shell-snapshots/snapshot-' >/dev/null 2>&1 || rc=$?
+  [ "$rc" -ne 1 ]
+}
+live_worker() {  # a native worker or background command wrote in the last 3 minutes, or a tool command runs
+  tool_running || [ -n "$(find "$CONFIG/projects" -path '*/subagents/*' -name '*.jsonl' -mmin -3 2>/dev/null | head -1)" ] ||
     [ -n "$(find "/tmp/claude-$(id -u "$OWN")" -path '*/tasks/*' -mmin -3 2>/dev/null | head -1)" ]
 }
 wait_idle() {

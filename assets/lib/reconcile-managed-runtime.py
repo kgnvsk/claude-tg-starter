@@ -45,6 +45,7 @@ MANAGED_BIN_NAMES = frozenset(
         "claude-auth-rescue",
         "claude-browser-recover",
         "claude-limit-recovery",
+        "provider-quota",
         "claude-login",
         "claude-telegram-bot",
         "codex-image-generate",
