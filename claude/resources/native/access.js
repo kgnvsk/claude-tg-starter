@@ -460,6 +460,13 @@ var CAPABILITY_CATALOG = Object.freeze({
     requiresConfirmation: false
   })
 });
+function resolveSubject(input) {
+  if (input.chatType === "private")
+    return `user:${input.userId}`;
+  if (input.chatType === "supergroup" && input.isTopicMessage === true && input.threadId != null)
+    return `topic:${input.chatId}:${input.threadId}`;
+  return `group:${input.chatId}`;
+}
 function isSharedSubject(subject) {
   return subject.startsWith("group:") || subject.startsWith("topic:");
 }
@@ -734,11 +741,14 @@ class CapabilityStore {
     this.db.exec(SCHEMA);
     this.db.transaction(() => {
       const columns = new Set(this.db.query("PRAGMA table_info(corporate_policy_previews)").all().map((c) => c.name));
-      for (const name of ["resource_versions_json", "agent_request_id", "agent_request_json", "agent_message_json"]) {
+      for (const name of ["resource_versions_json", "agent_request_id", "agent_request_json", "agent_message_json", "conversation_json"]) {
         if (!columns.has(name))
           this.db.exec(`ALTER TABLE corporate_policy_previews ADD COLUMN ${name} TEXT`);
       }
       this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS corporate_agent_request ON corporate_policy_previews(agent_request_id)");
+      if (!this.db.query("PRAGMA table_info(corporate_policies)").all().some((c) => c.name === "chat_authorized")) {
+        this.db.exec("ALTER TABLE corporate_policies ADD COLUMN chat_authorized INTEGER NOT NULL DEFAULT 0");
+      }
     })();
     if (!this.db.query("PRAGMA table_info(corporate_resources)").all().some((column) => column.name === "revision")) {
       this.db.exec("ALTER TABLE corporate_resources ADD COLUMN revision INTEGER NOT NULL DEFAULT 1");
@@ -919,7 +929,7 @@ class CapabilityStore {
       throw new Error("invalid policy subject");
     const row = this.policyRow(subject);
     if (row != null)
-      return { subject, version: row.version, grants: this.activeGrants(row) };
+      return { subject, version: row.version, grants: this.activeGrants(row), ...row.chatAuthorized === 1 ? { chatAuthorized: true } : {} };
     const fallback = subject === AGENT_DEFAULT_SUBJECT || isInstalledAgentSubject(subject) ? null : this.policyRow(AGENT_DEFAULT_SUBJECT);
     if (fallback == null)
       return { subject, version: 0, grants: [] };
@@ -953,6 +963,8 @@ class CapabilityStore {
       }
       return policy;
     }
+    if (policy.chatAuthorized)
+      return policy;
     if (actorUserId === this.primaryOwnerId) {
       return { ...policy, grants: policy.grants.filter((grant) => this.catalog[grant.capabilityId]?.sharedAllowed === true) };
     }
@@ -960,7 +972,7 @@ class CapabilityStore {
     return { ...policy, grants: policy.grants.filter((grant) => this.catalog[grant.capabilityId]?.sharedAllowed === true && actor.grants.some((personal) => personal.capabilityId === grant.capabilityId && personal.resourceId === grant.resourceId)) };
   }
   policyRow(subject) {
-    return this.db.query(`SELECT version,grants_json AS grantsJson
+    return this.db.query(`SELECT version,grants_json AS grantsJson,chat_authorized AS chatAuthorized
        FROM corporate_policies WHERE subject=?`).get(subject);
   }
   activeGrants(row) {
@@ -974,6 +986,8 @@ class CapabilityStore {
     }
     if (!isValidSubject(input.subject))
       throw new Error("invalid policy subject");
+    if (input.conversation && (input.requestedBy !== this.primaryOwnerId || input.conversation.userId !== this.primaryOwnerId || !["group", "supergroup"].includes(input.conversation.chatType) || !/^-[1-9]\d{0,19}$/.test(input.conversation.chatId) || resolveSubject(input.conversation) !== input.subject))
+      throw new Error("rule must name the verified owner conversation");
     if (!Number.isSafeInteger(input.expiresAt) || input.expiresAt <= now) {
       throw new Error("policy preview expiry must be in the future");
     }
@@ -983,13 +997,13 @@ class CapabilityStore {
       throw new Error("owner private resource");
     const protectedGrants = input.requestedBy === this.primaryOwnerId ? [] : this.resolve(input.subject).grants.filter((grant) => grant.resourceId != null && !visibleResources.has(grant.resourceId));
     const proposedGrants = sortedUniqueGrants([...requested, ...protectedGrants]);
-    this.validateGrants(input.subject, proposedGrants);
+    this.validateGrants(input.subject, proposedGrants, !!input.conversation || this.resolve(input.subject).chatAuthorized === true);
     const baseVersion = this.resolve(input.subject).version;
     const token = randomUUID();
     this.db.transaction(() => {
       this.db.query(`INSERT INTO corporate_policy_previews(
-           token,subject,base_version,grants_json,requested_by,expires_at,state,created_at,resource_versions_json
-         ) VALUES(?,?,?,?,?,?,'pending',?,?)`).run(token, input.subject, baseVersion, safeJson(proposedGrants), input.requestedBy, input.expiresAt, now, this.resourceVersions(proposedGrants));
+           token,subject,base_version,grants_json,requested_by,expires_at,state,created_at,resource_versions_json,conversation_json
+         ) VALUES(?,?,?,?,?,?,'pending',?,?,?)`).run(token, input.subject, baseVersion, safeJson(proposedGrants), input.requestedBy, input.expiresAt, now, this.resourceVersions(proposedGrants), input.conversation ? safeJson({ chatId: input.conversation.chatId, threadId: input.conversation.threadId ?? null, messageId: null }) : null);
       this.audit(input.subject, input.requestedBy, "policy_previewed", {
         tokenHash: token.slice(0, 8),
         baseVersion,
@@ -1006,6 +1020,24 @@ class CapabilityStore {
       expiresAt: input.expiresAt
     };
   }
+  bindPolicyMessage(token, message) {
+    const row = this.preview(token);
+    if (!row?.conversationJson || row.state !== "pending" || !Number.isSafeInteger(message.messageId) || message.messageId <= 0)
+      return false;
+    const context = JSON.parse(row.conversationJson);
+    if (context.messageId != null || context.chatId !== message.chatId || context.threadId !== (message.threadId ?? null))
+      return false;
+    return this.db.query("UPDATE corporate_policy_previews SET conversation_json=? WHERE token=? AND state='pending' AND conversation_json=?").run(safeJson({ ...context, messageId: message.messageId }), token, row.conversationJson).changes === 1;
+  }
+  policyTokenForMessage(message) {
+    return this.db.query(`SELECT token FROM corporate_policy_previews WHERE state='pending'
+      AND requested_by=? AND json_valid(conversation_json)
+      AND json_extract(conversation_json,'$.chatId')=? AND json_extract(conversation_json,'$.messageId')=?
+      AND json_extract(conversation_json,'$.threadId') IS ?`).get(this.primaryOwnerId, message.chatId, message.messageId, message.threadId ?? null)?.token ?? null;
+  }
+  isConversationPolicyPreview(token) {
+    return !!this.preview(token)?.conversationJson;
+  }
   approvePolicyPreview(token, actorUserId, now, message) {
     return this.db.transaction(() => {
       const row = this.preview(token);
@@ -1015,6 +1047,8 @@ class CapabilityStore {
         return { ok: false, reason: "actor" };
       }
       if (!this.validAgentMessage(row, message))
+        return { ok: false, reason: "actor" };
+      if (!this.validConversationMessage(row, message))
         return { ok: false, reason: "actor" };
       if (row.state !== "pending")
         return { ok: false, reason: "used" };
@@ -1032,14 +1066,15 @@ class CapabilityStore {
         this.resolvePreview(token, "stale", now);
         return { ok: false, reason: "stale" };
       }
-      this.validateGrants(row.subject, grants);
+      const chatAuthorized = !!row.conversationJson || this.resolve(row.subject).chatAuthorized === true;
+      this.validateGrants(row.subject, grants, chatAuthorized);
       const version = row.baseVersion + 1;
       if (row.baseVersion === 0) {
-        this.db.query(`INSERT INTO corporate_policies(subject,version,grants_json,updated_at)
-           VALUES(?,?,?,?)`).run(row.subject, version, row.grantsJson, now);
+        this.db.query(`INSERT INTO corporate_policies(subject,version,grants_json,updated_at,chat_authorized)
+           VALUES(?,?,?,?,?)`).run(row.subject, version, row.grantsJson, now, chatAuthorized ? 1 : 0);
       } else {
-        const update = this.db.query(`UPDATE corporate_policies SET version=?,grants_json=?,updated_at=?
-           WHERE subject=? AND version=?`).run(version, row.grantsJson, now, row.subject, row.baseVersion);
+        const update = this.db.query(`UPDATE corporate_policies SET version=?,grants_json=?,updated_at=?,chat_authorized=?
+           WHERE subject=? AND version=?`).run(version, row.grantsJson, now, chatAuthorized ? 1 : 0, row.subject, row.baseVersion);
         if (update.changes !== 1) {
           this.resolvePreview(token, "stale", now);
           return { ok: false, reason: "stale" };
@@ -1063,6 +1098,8 @@ class CapabilityStore {
         return { ok: false, reason: "actor" };
       }
       if (!this.validAgentMessage(row, message))
+        return { ok: false, reason: "actor" };
+      if (!this.validConversationMessage(row, message))
         return { ok: false, reason: "actor" };
       if (row.state !== "pending")
         return { ok: false, reason: "used" };
@@ -1392,7 +1429,7 @@ class CapabilityStore {
     }
     safeJson(resource.config);
   }
-  validateGrants(subject, grants) {
+  validateGrants(subject, grants, chatAuthorized = false) {
     const resources = new Map(this.listResources().map((resource) => [resource.id, resource]));
     for (const grant of grants) {
       const definition = this.catalog[grant.capabilityId];
@@ -1402,12 +1439,13 @@ class CapabilityStore {
       if (definition.namedPersonOnly && !/^user:[1-9]\d{0,15}$/.test(subject)) {
         throw new Error("integration management is only for one named person");
       }
-      if (isSharedSubject(subject) && (!definition.sharedAllowed || definition.requiresConfirmation)) {
+      const chatWrite = chatAuthorized && isSharedSubject(subject) && definition.requiresResource && definition.requiresConfirmation && grant.trusted === true;
+      if (isSharedSubject(subject) && (!definition.sharedAllowed || definition.requiresConfirmation) && !chatWrite) {
         throw new Error("write capabilities are not allowed in shared conversations");
       }
       if (grant.trusted === true) {
-        if (!/^user:\d+$/.test(subject))
-          throw new Error("trust is only for one named person");
+        if (!/^user:\d+$/.test(subject) && !chatWrite)
+          throw new Error("trust is only for one named person or an owner-confirmed chat rule");
         if (!definition.requiresConfirmation)
           throw new Error("capability never asks for confirmation");
       }
@@ -1525,11 +1563,19 @@ class CapabilityStore {
     const bound = JSON.parse(row.agentMessageJson);
     return bound.chatId === this.primaryOwnerId && message.chatId === bound.chatId && message.messageId === bound.messageId;
   }
+  validConversationMessage(row, message) {
+    if (!row.conversationJson)
+      return true;
+    if (!message || row.requestedBy !== this.primaryOwnerId)
+      return false;
+    const bound = JSON.parse(row.conversationJson);
+    return Number.isSafeInteger(bound.messageId) && bound.messageId > 0 && bound.chatId === message.chatId && bound.messageId === message.messageId && (bound.threadId ?? null) === (message.threadId ?? null);
+  }
   preview(token) {
     return this.db.query(`SELECT token,subject,base_version AS baseVersion,grants_json AS grantsJson,
               requested_by AS requestedBy,expires_at AS expiresAt,state,
               resource_versions_json AS resourceVersionsJson,agent_request_id AS agentRequestId,
-              agent_request_json AS agentRequestJson,agent_message_json AS agentMessageJson
+              agent_request_json AS agentRequestJson,agent_message_json AS agentMessageJson,conversation_json AS conversationJson
        FROM corporate_policy_previews WHERE token=?`).get(token);
   }
   action(token) {

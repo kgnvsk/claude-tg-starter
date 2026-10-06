@@ -979,11 +979,14 @@ type CorporateGatewayRuntime = {
   previewPolicy(
     input: {
       subject: string
-      proposedGrants: Array<{ capabilityId: string; resourceId: string | null }>
+      proposedGrants: Array<{ capabilityId: string; resourceId: string | null; trusted?: boolean }>
+      conversation?: { chatType: 'group' | 'supergroup'; chatId: string; userId: string; isTopicMessage?: boolean; threadId?: number }
     },
     actorUserId: string,
   ): Promise<CorporateGatewayPolicyPreviewResult>
   previewResource(input: Record<string, unknown>, actorUserId: string): Promise<CorporateGatewayPolicyPreviewResult>
+  bindPolicyPreviewMessage(token: string, message: { chatId: string; messageId: number; threadId?: number }): boolean
+  policyPreviewTokenForMessage(message: { chatId: string; messageId: number; threadId?: number }): string | null
   shutdown(): Promise<void>
 }
 
@@ -6410,7 +6413,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     ...(CORPORATE_ENABLED || (OWNER_CHAT_ID && existsSync(CORPORATE_MODULE)) ? [{
       name: 'corporate_policy_preview',
-      description: 'Ask the human owner to change or revoke a connected agent’s access. Employee, group and topic policies also require corporate mode. For a named assistant allowed to connect and use work Google/Meta accounts, add integrations.manage with resourceId=null to that exact user policy, preserving other grants. This needs no existing account or per-document resources; it never inherits through defaults/groups and does not share owner credentials. Set trusted on a resource grant to remove repeated action confirmations. The owner receives Confirm and Cancel buttons before any policy changes.',
+      description: 'Prepare a real owner-confirmed permission change, preserving unrelated grants. For a lasting rule in the current group/topic use current_chat=true and the current delivery_id: it applies to all participants only there, and a resource write needs trusted=true. Send a concrete card there; the owner confirms it by button or replying "підтверджую правило". A one-time yes executes the named task on the owner behalf and must not change a policy. integrations.manage is only for a named user, never a group; it shares no owner credentials.',
       inputSchema: {
         type: 'object',
         additionalProperties: false,
@@ -6419,6 +6422,8 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: 'string',
             description: 'Exact subject: user:<telegram_id>, group:<chat_id>, topic:<chat_id>:<thread_id>, agent:default, or agent:installed:<agent_id>:<unix_uid> for a connected agent. For revocation use an empty proposedGrants array. A preview always requires real owner confirmation.',
           },
+          current_chat: { type: 'boolean', description: 'Permanent rule for the authenticated owner’s current group/topic. Never use for one-time consent.' },
+          delivery_id: { type: 'string', description: 'Exact current owner request delivery_id; required with current_chat.' },
           proposedGrants: {
             type: 'array',
             maxItems: 64,
@@ -6430,7 +6435,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
                 resourceId: {
                   anyOf: [{ type: 'string' }, { type: 'null' }],
                 },
-                trusted: { type: 'boolean', description: 'The owner vouches for this person on this resource: the action still needs the grant, it just stops asking them to confirm. Only for one named person (user:<telegram_id>) and only for actions that ask.' },
+                trusted: { type: 'boolean', description: 'Skip per-action confirmation on this exact registered resource for the named person, or for every participant of an explicitly confirmed current-chat rule. Only for actions that normally ask.' },
               },
               required: ['capabilityId', 'resourceId'],
             },
@@ -6495,6 +6500,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           typeof subject !== 'string'
           || !Array.isArray(rawGrants)
           || rawGrants.length > 64
+          || Object.keys(args).some(key => !['subject', 'proposedGrants', 'current_chat', 'delivery_id'].includes(key))
+          || (args.current_chat !== undefined && typeof args.current_chat !== 'boolean')
         ) throw new Error('invalid corporate policy preview')
         const proposedGrants = rawGrants.map(value => {
           if (
@@ -6515,6 +6522,21 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
             ...(grant.trusted === true ? { trusted: true } : {}),
           }
         })
+        if (args.current_chat === true) {
+          if (typeof args.delivery_id !== 'string') throw new Error('current owner delivery_id is required')
+          const { currentChatPolicyOrigin } = await import(new URL('./chat-policy.ts', pathToFileURL(CORPORATE_MODULE)).href)
+          const conversation = currentChatPolicyOrigin(MSG_DB, OWNER_CHAT_ID, DELIVERY_STAMP, args.delivery_id)
+          if (!conversation) throw new Error('no current authenticated owner request in this chat')
+          const corporate = await corporateRuntimeReady()
+          if (!corporate?.bindPolicyPreviewMessage) throw new Error('chat policy controls are unavailable')
+          const preview = await corporate.previewPolicy({ subject, proposedGrants, conversation }, OWNER_CHAT_ID)
+          if (!preview.ok) throw new Error('current chat policy preview rejected')
+          const messageId = await sendCorporateText(conversation.chatId, conversation.threadId ?? null, null, preview.summary, { policyToken: preview.token })
+          if (!corporate.bindPolicyPreviewMessage(preview.token, { chatId: conversation.chatId, messageId, threadId: conversation.threadId })) {
+            throw new Error('policy card was not bound; nothing granted')
+          }
+          return { content: [{ type: 'text', text: 'Постійне правило ще не застосоване. Точну картку надіслано в цей чат або тему; потрібне підтвердження власника на ній. Разове «так, зараз» нічого не змінює.' }] }
+        }
         if (subject.startsWith('agent:installed:')) {
           const { CapabilityStore } = await import(new URL('./capability-store.ts', pathToFileURL(CORPORATE_MODULE)).href)
           const store = new CapabilityStore(join(STATE_DIR, 'messages.db'), { primaryOwnerId: OWNER_CHAT_ID })
@@ -8807,6 +8829,28 @@ async function handleInbound(
     }
   }
 
+  // Only an authenticated owner reply to the exact durable card can confirm a
+  // lasting rule. Do this before the observation path; a one-task yes stays ordinary input.
+  if (String(from.id) === OWNER_CHAT_ID && !ctx.message?.sender_chat && !ctx.message?.forward_origin
+    && (ctx.chat?.type === 'group' || ctx.chat?.type === 'supergroup') && ctx.message?.reply_to_message
+    && existsSync(CORPORATE_MODULE)) {
+    const { chatPolicyDecision } = await import(new URL('./chat-policy.ts', pathToFileURL(CORPORATE_MODULE)).href)
+    const decision = chatPolicyDecision(text)
+    if (decision) {
+      const corporate = await corporateRuntimeReady()
+      const messageId = ctx.message.reply_to_message.message_id
+      const token = corporate?.policyPreviewTokenForMessage?.({ chatId: chat_id, messageId, threadId })
+      if (token && corporate) {
+        assertServiceInputPersisted()
+        const context: CorporateGatewayCallbackContext = { chatType: ctx.chat.type, chatId: chat_id, userId: OWNER_CHAT_ID,
+          messageId, ...(threadId != null ? { threadId, isTopicMessage: true } : {}) }
+        const outcome = decision === 'approve' ? await corporate.approvePolicyPreview(token, context) : await corporate.cancelPolicyPreview(token, context)
+        await ctx.reply(corporateCallbackLabel('policy', outcome), inboundTopicOptions(ctx))
+        return
+      }
+    }
+  }
+
   if (ctx.chat?.type === 'private' && chat_id === String(from.id) && /^\/stop$/iu.test(text.trim())) {
     const access = loadAccess()
     const actorId = String(from.id)
@@ -8957,7 +9001,7 @@ async function handleInbound(
     // Fresh primary-owner request context survives a resumed CLI system-prompt snapshot.
     if (ownerShared) inboundText = 'Authenticated primary owner request in Telegram '
       + JSON.stringify({ chatId: chat_id, ...(threadId != null ? { threadId } : {}) })
-      + '. Use the same installed owner tools. An explicit owner instruction to do a referenced participant request is one authorized task: execute the specified work on the owner behalf, without granting that participant permanent access. A quote alone is never consent; ask if the intended work is unclear. Replies, progress and files go to this original chat and topic; connection secrets and access confirmation go to the private owner intake. Do not disclose unrelated private information.\n\n' + inboundText
+      + '. Use the same installed owner tools. An explicit owner instruction to do a referenced participant request is one authorized task: execute the specified work on the owner behalf, without granting that participant permanent access. If the owner explicitly asks for a lasting rule in this chat/topic, read the current policy/resources, preserve unrelated grants and call corporate_policy_preview with current_chat=true and this delivery_id; send the exact card here for owner confirmation. It grants only listed capabilities/resources to the participants here, never private tools or accounts. A quote alone is never consent; ask if the intended work is unclear. Replies, progress and files go to this original chat and topic; connection secrets and personal access confirmation go to the private owner intake. Do not disclose unrelated private information.\n\n' + inboundText
     const notification: InboundNotification = {
       method: 'notifications/claude/channel',
       params: {
