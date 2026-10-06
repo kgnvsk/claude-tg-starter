@@ -1,8 +1,8 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-10-06.1c1f9410fc43`
+- Реліз: `2026-10-06.6a4a6ea373a2`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `1c1f9410fc43fd9b42ec443d80dcf62df108054c`
+- Ревізія вихідного комплекту: `6a4a6ea373a248d4eebc7dc5a7402d26497ca9e6`
 - Дата релізу: `2026-10-06`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
@@ -19,7 +19,8 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    Let primary owners configure work resources from their Telegram chat
+    Keep the primary owner integration identity in private confirmations
+    fix(corporate): preserve primary owner access to approved resources
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не

@@ -7,7 +7,7 @@
     "local-foundation-v1"
   ],
   "source": "codex/starter/product.json",
-  "sourceRevision": "1c1f9410fc43fd9b42ec443d80dcf62df108054c",
+  "sourceRevision": "6a4a6ea373a248d4eebc7dc5a7402d26497ca9e6",
   "sourceDirty": false,
   "features": [
     "browser"
@@ -121,7 +121,7 @@
     "modules/telegram-corporate/agent-access.ts": "b29412eb6d2a8c6b86afaa4be3fbd5cbd055bd6b62584bf43cd4da337089cb1a",
     "modules/telegram-corporate/broker.ts": "a738571ec2c526bd3a990112d1a8f5368ebac468b7f95604ae0a3d7514867b24",
     "modules/telegram-corporate/capabilities.ts": "ef61fd4a8ba0359557726af446318f8702a2053f246ae080a045b135fad687b4",
-    "modules/telegram-corporate/capability-store.ts": "f155fc23caca78d2cba22d554f4199ec09c0066ace7b051c8154c2cc311b413f",
+    "modules/telegram-corporate/capability-store.ts": "7a330335b0a773d1986b6b662fba6c4864bcdbb3b0fc4c5775769c61021417d7",
     "modules/telegram-corporate/codex-profile.ts": "a2b9e91604757878b781a7f0d751c178244a2441b898e82ae6b3cf9c11b40b0e",
     "modules/telegram-corporate/codex-worker.ts": "658255ee754fdca99f1a8f8bc827c6b156dafbf56c08da641717483d119804a9",
     "modules/telegram-corporate/delegated-integrations.ts": "db0f7dd8929d1e563c82ea80e37b1483a31d1fe8615962ee91da00b541a1abf4",
@@ -149,7 +149,7 @@
     "modules/telegram-corporate/resource-meta-accounts.ts": "92b5678d28236f65c5d68fc5638b97c88a0cda401a86cebfa3abe345c2e5c5a0",
     "modules/telegram-corporate/resource-sheets.ts": "079155f75d48f2aed3d74d8be79a821aac3d976ac05781990b9d72afbbe5c881",
     "modules/telegram-corporate/resource-telegram-groups.ts": "331a591b94e5f82002bfcf791a1017516ab7d535610c22ad382f24f2f6fadd66",
-    "modules/telegram-corporate/runtime.ts": "6d07fed7be75587b0c7eca1d2075055992d6a899c98cb51eab4c46a81ae2fbdc",
+    "modules/telegram-corporate/runtime.ts": "ea4155e06611e702a6630a3acd7a6fe946cd3589b2fc1e59e47b672d7abf5e0b",
     "modules/telegram-corporate/settings-access.ts": "344ef31374db78cb7f9b900ca27579d3e8f0f01beff710f920058d0598d096b8",
     "modules/telegram-corporate/store.ts": "b36b36dbcd2ed553afd613538be9c1ba2e0935ac7fd509320aff8c85d77229a8",
     "modules/telegram-corporate/team-access.ts": "f0b2d4bb089d3ace90cd701ccd81b8ee11b8ad9a6543e90405b03b0baa381651",
@@ -209,7 +209,7 @@
     "installer/local.py": "ebdba3706e15a1f1843e66150493a3f51a6866a6c92390b491ec0ecdb06a9ce6",
     "installer/setup.py": "d950735dde0ed1cdd9a96edd5e52b2573ce4691c938c47b4b56a39176af39e8b",
     "plugin-contract.json": "c5ea9ff8efabb69e2ec79e9082f7fbd3ee6b389376a22227702e446a49ba94d3",
-    "resources/native/access.js": "43d371ae641722ff1e0773eb13a81c57d3a373f807cc432775c207471878ba7e",
+    "resources/native/access.js": "5c0d55e3c983e7c2e6d5747ca5398f9242804de460085853a6602cbbf0a91055",
     "workspace/CLAUDE.md": "049410896d264e07ad2ea725cb7d7bc8e4d694c12712f04d6c368fc4907837d3",
     "workspace/NOVSKY.md": "e26d7d9af91e300e970935022b9260793f7175656632b4e6e5ee634ebbb5687c",
     "workspace/OWNER.md": "739b3bb0b79f8abd5facfb14e19372371216402b183c6c7eb3969c0e0e995d33",

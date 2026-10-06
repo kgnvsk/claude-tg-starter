@@ -928,6 +928,8 @@ class CapabilityStore {
   integrationAuthorizationKey(identity) {
     if (identity.chatType !== "private" || !/^[1-9]\d{0,15}$/.test(identity.userId) || identity.chatId !== identity.userId)
       return null;
+    if (identity.userId === this.primaryOwnerId)
+      return `owner:${identity.userId}`;
     if (this.isVerifiedSuperadmin(identity.userId))
       return `superadmin:${identity.userId}`;
     const subject = `user:${identity.userId}`;
@@ -943,13 +945,16 @@ class CapabilityStore {
     if (!isSharedSubject(subject)) {
       if (subject !== `user:${actorUserId}`)
         return { ...policy, grants: [] };
-      if (this.isVerifiedSuperadmin(actorUserId)) {
+      if (actorUserId === this.primaryOwnerId || this.isVerifiedSuperadmin(actorUserId)) {
         return { ...policy, version: Math.max(1, policy.version), grants: [
           ...expandFullAccess(this.catalog, this.businessResources(actorUserId)),
           { capabilityId: "integrations.manage", resourceId: null }
         ] };
       }
       return policy;
+    }
+    if (actorUserId === this.primaryOwnerId) {
+      return { ...policy, grants: policy.grants.filter((grant) => this.catalog[grant.capabilityId]?.sharedAllowed === true) };
     }
     const actor = this.resolve(`user:${actorUserId}`);
     return { ...policy, grants: policy.grants.filter((grant) => this.catalog[grant.capabilityId]?.sharedAllowed === true && actor.grants.some((personal) => personal.capabilityId === grant.capabilityId && personal.resourceId === grant.resourceId)) };
@@ -1114,7 +1119,7 @@ class CapabilityStore {
     const resource = this.getResource(request.resourceId);
     if (definition == null || definition.kind !== "write" || !definition.requiresConfirmation || !definition.delegable || !definition.operations.includes(request.operation) || readId === request.capability || read?.kind !== "read" || !read.sharedAllowed || read.requiresConfirmation || resource == null || resource.connector !== definition.adapter || read.adapter !== definition.adapter || !resource.capabilityIds.includes(request.capability) || !resource.capabilityIds.includes(readId) || request.capability === "google.docs.write" && resource.config.docsAppendOnly === true && request.operation !== "append")
       return null;
-    const actor = this.resolve(`user:${actorUserId}`);
+    const actor = actorUserId === this.primaryOwnerId ? this.resolveForActor(`user:${actorUserId}`, actorUserId) : this.resolve(`user:${actorUserId}`);
     const group = this.resolve(groupSubject);
     return actor.grants.some((grant) => grant.capabilityId === request.capability && grant.resourceId === request.resourceId) && group.grants.some((grant) => grant.capabilityId === readId && grant.resourceId === request.resourceId) ? group.version : null;
   }
