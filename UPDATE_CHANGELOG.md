@@ -1,8 +1,8 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-10-06.7dc1ca7fa710`
+- Реліз: `2026-10-06.77a4f4bb6c4f`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `7dc1ca7fa710f55aac7cbe61f9a30739d2934d92`
+- Ревізія вихідного комплекту: `77a4f4bb6c4fec6a6365d4d8cdcc5a87107e8006`
 - Дата релізу: `2026-10-06`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
@@ -19,36 +19,12 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    fix(onboarding): use the timezone selected for the agent owner
-    fix(packaging): declare corporate image provisioning in runtime inventory
-    fix(telegram): keep late album media inside its original admission boundary
-    fix(recovery): freeze screen supervisors before their Claude children
-    Allow durable interval reminders without quiet hours and keep private Google files private
-    Check current capabilities before declining an owner task
-    Keep receipts maintenance within the agent file boundary and lifecycle lock
-    Make company images, spreadsheets, hosting and topic reminders work within their grants
-    A file posted right after its author's company mention reaches that request
-    Company sessions: the agent asks the owner for access itself; several images per request
-    Receipts foundation: the host marker is an additive write; the switch scripts are customer runtime
-    Persona probe rule: no Russian quote in the Ukrainian persona
-    Company sessions tell the owner when a connection breaks, once per connector
-    Persona: one probe before any «не могу»
-    Receipts are the kit's foundation: a new agent starts on them, a running one moves by the guide
-    Limit watcher: close the four holes Codex found in the subagent limit
-    A task's limit notice says when the limit resets
-    Company sessions open a shared Google Drive link without any login
-    The agent deletes and pins messages, and names what is missing instead of «can't»
-    Company chats answer a burst once, as the owner's chat does
-    Image helper runs on Python 3.10: chunked SHA-256 instead of hashlib.file_digest
-    Migration plan knows the vercel connector, so a registered sites resource does not block resume
-    Site publishing uses the Vercel token connected through Novsky, in the CLI's environment only
-    Company sessions: images in groups and topics, site publishing on Vercel
-    Company sandbox: the network proxy is reached by name — /etc/hosts and resolv.conf are readable
-    Company sessions: any ordinary file, a clear path error, package and hosting network
-    Company answers render formatting and Telegram rich messages
-    Live owner host: run on the bun the launcher PATH finds
-    Privacy alert to the owner; a Google sign-in guide people actually read
-    Limit watcher: a limit a subagent hits is the account's limit
+    Fix fresh document-tool installs with the supported APT option
+    Keep private system config out of artifact tools and respect scoped data operations
+    Make document rendering work inside isolated company sessions
+    Read complete scoped messages and insert public images into work documents
+    Keep uncertain reminder sends from replaying and snapshot ledgers as their owner
+    Preserve old corporate reminder cancellation within its verified scope
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не

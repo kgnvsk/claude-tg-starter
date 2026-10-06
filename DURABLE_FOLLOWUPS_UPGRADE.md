@@ -8,9 +8,16 @@ Use this runbook to add generic durable commitments to an existing Telegram Clau
 |---|---|
 | One-shot-only queue, promise-only replies with no durable artifact, or session-only timers | One-shot, repeat-until-closed, and guided sequence tasks stored as queue artifacts |
 | An agent could say “I will remind you” before persistence was proved | The agent may promise a follow-up only after the helper returns `VERIFIED` |
-| Some legacy workers deleted a reminder even when Telegram rejected delivery | A Telegram failure is retained unchanged for retry; only an `"ok": true` response consumes or advances it |
+| Some legacy workers deleted a reminder on failure or replayed a possibly accepted send | A confirmed delivery consumes or advances it. Definite refusals may retry; ambiguous sends remain saved and are never automatically replayed |
 
 Old one-shot `.rem` files remain compatible. New repeat and sequence records add lifecycle headers, helper-managed status, cancellation, locking, and quiet-hour behavior.
+
+Plain reminders also reserve every source of a coalesced message before sending.
+A killed sender, a lost response, a Telegram 5xx/408, or a failure after an
+earlier chunk was accepted leaves a delivery record in `.run-delivery`. The
+owner is told when `OWNER_CHAT_ID` is configured. Do not delete that record to
+retry without checking what arrived; releasing a process lock proves nothing
+about delivery. A definite markup rejection may still fall back to plain text.
 
 ## Portable component map
 

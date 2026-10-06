@@ -498,6 +498,11 @@ validate_starter_foundation() {
 # END Starter foundation preflight
 validate_starter_foundation
 
+# Declared document tools work in personal and isolated company workspaces.
+# This exports only root-managed package configuration, never an agent's venv.
+python3 "$KIT/assets/lib/install-artifact-tools.py" --install \
+  --plugins-file "$KIT/assets/product/managed-plugins.json"
+
 # The stuck-turn watchdog queries the message log through the sqlite3 CLI and is
 # silently inert without it. onboard.sh installs no system packages, so a bare
 # check would dead-end a customer install; take the package ourselves (we are

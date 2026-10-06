@@ -302,7 +302,7 @@ var CAPABILITY_CATALOG = Object.freeze({
   "google.docs.write": capability("google.docs.write", {
     kind: "write",
     adapter: "google",
-    operations: ["replace", "append", "create"],
+    operations: ["replace", "append", "create", "insert_image"],
     sharedAllowed: false,
     requiresResource: true,
     requiresConfirmation: true
@@ -318,7 +318,7 @@ var CAPABILITY_CATALOG = Object.freeze({
   "google.slides.write": capability("google.slides.write", {
     kind: "write",
     adapter: "google",
-    operations: ["create"],
+    operations: ["create", "insert_image"],
     sharedAllowed: false,
     requiresResource: true,
     requiresConfirmation: true
@@ -438,7 +438,7 @@ var CAPABILITY_CATALOG = Object.freeze({
   "telegram.group.read": capability("telegram.group.read", {
     kind: "read",
     adapter: "telegram",
-    operations: ["history"],
+    operations: ["history", "get_message"],
     sharedAllowed: true,
     requiresResource: true,
     requiresConfirmation: false
@@ -1865,6 +1865,22 @@ import { Database as Database2 } from "bun:sqlite";
 import { mkdtemp, rm, writeFile } from "fs/promises";
 import { tmpdir } from "os";
 import { join } from "path";
+
+// modules/telegram-corporate/adapters/public-image-url.ts
+function publicImageUrl(value) {
+  if (typeof value !== "string" || value.length > 2048 || /[\x00-\x20\x7f]/.test(value))
+    return null;
+  try {
+    const url = new URL(value);
+    if (url.protocol !== "https:" || url.username || url.password || url.hash || url.port !== "" && url.port !== "443" || !/^(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z][a-z0-9-]*$/i.test(url.hostname) || /(?:^|\.)(?:localhost|local|internal|lan|home|test|invalid)$/i.test(url.hostname))
+      return null;
+    return url.href;
+  } catch {
+    return null;
+  }
+}
+
+// modules/telegram-corporate/adapters/slides.ts
 var SHARE_EMAIL = /^[A-Za-z0-9_%+-]+(?:\.[A-Za-z0-9_%+-]+)*@(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$/;
 function exactKeys2(args, keys) {
   return Object.keys(args).length === keys.length && keys.every((key) => Object.hasOwn(args, key));
@@ -1920,7 +1936,58 @@ class SlidesAdapter {
     if (request.capability === "google.slides.write" && request.operation === "create") {
       return this.create(request, account, signal);
     }
+    if (request.capability === "google.slides.write" && request.operation === "insert_image") {
+      return this.insertImage(request, account, signal);
+    }
     return { ok: false, code: "invalid", message: "\u0414\u043B\u044F Slides \u0434\u043E\u0441\u0442\u0443\u043F\u043D\u0456 \u043B\u0438\u0448\u0435 get(presentationId, slideId?) \u0442\u0430 create(title, markdown)." };
+  }
+  async insertImage(request, account, signal) {
+    const args = request.arguments;
+    const { presentationId, slideId, imageUrl, widthPt, heightPt, xPt = 0, yPt = 0 } = args;
+    const uri = publicImageUrl(imageUrl);
+    if (Object.keys(args).some((key) => !["presentationId", "slideId", "imageUrl", "widthPt", "heightPt", "xPt", "yPt"].includes(key)) || typeof presentationId !== "string" || !GOOGLE_FILE_ID.test(presentationId) || typeof slideId !== "string" || !/^[A-Za-z0-9_][A-Za-z0-9_:-]{0,255}$/.test(slideId) || uri == null || ![widthPt, heightPt].every((value) => typeof value === "number" && Number.isFinite(value) && value > 0 && value <= 2000) || ![xPt, yPt].every((value) => typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 2000)) {
+      return { ok: false, code: "invalid", message: "\u041F\u043E\u0442\u0440\u0456\u0431\u043D\u0456 presentationId, slideId, imageUrl \u043F\u0443\u0431\u043B\u0456\u0447\u043D\u043E\u0433\u043E HTTPS-\u0437\u043E\u0431\u0440\u0430\u0436\u0435\u043D\u043D\u044F, widthPt \u0456 heightPt. \u041F\u0440\u0438\u0432\u0430\u0442\u043D\u0438\u0439 \u0444\u0430\u0439\u043B \u0441\u0430\u043C \u043D\u0435 \u043F\u0443\u0431\u043B\u0456\u043A\u0443\u044E." };
+    }
+    let created = [];
+    try {
+      created = this.createdSlideIds(request.resource.id);
+    } catch {}
+    if (!Object.hasOwn(request.resource.config, `slide.${presentationId}`) && !Object.hasOwn(request.resource.config, `file.${presentationId}`) && !created.some((id) => GOOGLE_FILE_ID.test(id) && id === presentationId)) {
+      return { ok: false, code: "invalid", message: "\u041F\u0440\u0435\u0437\u0435\u043D\u0442\u0430\u0446\u0456\u044F \u043D\u0435 \u0432\u0445\u043E\u0434\u0438\u0442\u044C \u0434\u043E \u044F\u0432\u043D\u043E \u0434\u043E\u0437\u0432\u043E\u043B\u0435\u043D\u0438\u0445 \u0444\u0430\u0439\u043B\u0456\u0432 \u0446\u044C\u043E\u0433\u043E \u0440\u0435\u0441\u0443\u0440\u0441\u0443." };
+    }
+    if (signal.aborted)
+      return { ok: false, code: "unavailable" };
+    const uncertain = () => ({ ok: false, code: "uncertain", message: "\u0412\u0441\u0442\u0430\u0432\u043A\u0430 \u0437\u043E\u0431\u0440\u0430\u0436\u0435\u043D\u043D\u044F \u043D\u0435 \u043F\u0456\u0434\u0442\u0432\u0435\u0440\u0434\u0436\u0435\u043D\u0430. \u041F\u0435\u0440\u0435\u0432\u0456\u0440 \u0446\u0435\u0439 \u0436\u0435 \u0441\u043B\u0430\u0439\u0434; \u0430\u0432\u0442\u043E\u043C\u0430\u0442\u0438\u0447\u043D\u043E \u043F\u043E\u0432\u0442\u043E\u0440\u044E\u0432\u0430\u0442\u0438 \u0432\u0441\u0442\u0430\u0432\u043A\u0443 \u043D\u0435 \u043C\u043E\u0436\u043D\u0430." });
+    try {
+      const result = await this.run(this.command(account, "slides.insert-image", [
+        presentationId,
+        slideId,
+        `--url=${uri}`,
+        `--width=${widthPt}`,
+        `--height=${heightPt}`,
+        `--x=${xPt}`,
+        `--y=${yPt}`,
+        "--unit=PT"
+      ]), signal);
+      if (result.exitCode !== 0)
+        return disabledApi(result.stderr) ?? uncertain();
+      const receipt = JSON.parse(result.stdout);
+      if (receipt == null || typeof receipt !== "object" || Array.isArray(receipt) || receipt.presentationId !== presentationId || receipt.slideObjectId !== slideId || typeof receipt.imageObjectId !== "string" || !/^img_\d+$/.test(receipt.imageObjectId) || receipt.dry_run === true || receipt.queued === true || Object.hasOwn(receipt, "error"))
+        return uncertain();
+      return {
+        ok: true,
+        receiptId: receipt.imageObjectId,
+        data: JSON.stringify({
+          presentationId,
+          slideId,
+          imageObjectId: receipt.imageObjectId,
+          presentationUrl: `https://docs.google.com/presentation/d/${presentationId}/edit`,
+          imageInserted: true
+        })
+      };
+    } catch {
+      return uncertain();
+    }
   }
   command(account, command, args, readonly = false) {
     return {
@@ -2073,9 +2140,11 @@ class DocsWriteAdapter {
     if (signal.aborted)
       return { ok: false, code: "unavailable" };
     const account = request.resource.config.account;
-    if (request.resource.connector !== "google" || request.capability !== "google.docs.write" || request.operation !== "append" || typeof account !== "string" || account.length > 254 || account.startsWith("-") || !/^[^\s@]+@[^\s@]+$/.test(account)) {
+    if (request.resource.connector !== "google" || request.capability !== "google.docs.write" || !["append", "insert_image"].includes(request.operation) || typeof account !== "string" || account.length > 254 || account.startsWith("-") || !/^[^\s@]+@[^\s@]+$/.test(account)) {
       return { ok: false, code: "invalid" };
     }
+    if (request.operation === "insert_image")
+      return this.insertImage(request, account, signal);
     const { docId } = request.arguments;
     const field = Object.hasOwn(request.arguments, "text") ? "text" : "content";
     const text2 = request.arguments[field];
@@ -2130,6 +2199,65 @@ class DocsWriteAdapter {
       };
     } catch {
       return uncertainAppend();
+    }
+  }
+  async insertImage(request, account, signal) {
+    const args = request.arguments;
+    const { docId, imageUrl, widthPt, heightPt } = args;
+    const uri = publicImageUrl(imageUrl);
+    if (Object.keys(args).some((key) => !["docId", "imageUrl", "widthPt", "heightPt"].includes(key)) || typeof docId !== "string" || !GOOGLE_FILE_ID.test(docId) || docId.startsWith("-") || uri == null || widthPt !== undefined && (typeof widthPt !== "number" || !Number.isFinite(widthPt) || widthPt <= 0 || widthPt > 1200) || heightPt !== undefined && (typeof heightPt !== "number" || !Number.isFinite(heightPt) || heightPt <= 0 || heightPt > 1200)) {
+      return { ok: false, code: "invalid", message: "\u041F\u043E\u0442\u0440\u0456\u0431\u043D\u0456 docId \u0442\u0430 imageUrl \u0432\u0436\u0435 \u043F\u0443\u0431\u043B\u0456\u0447\u043D\u043E\u0433\u043E HTTPS-\u0437\u043E\u0431\u0440\u0430\u0436\u0435\u043D\u043D\u044F. widthPt/heightPt \u2014 \u0432\u0456\u0434 0 \u0434\u043E 1200 \u043F\u0443\u043D\u043A\u0442\u0456\u0432. \u041F\u0440\u0438\u0432\u0430\u0442\u043D\u0438\u0439 \u0444\u0430\u0439\u043B \u0441\u0430\u043C \u043D\u0435 \u043F\u0443\u0431\u043B\u0456\u043A\u0443\u044E." };
+    }
+    if (this.authorizeFile) {
+      try {
+        const denial = await this.authorizeFile(request, account, signal);
+        if (denial != null)
+          return { ok: false, code: "invalid", message: denial };
+      } catch {
+        return { ok: false, code: "unavailable" };
+      }
+    } else if (!Object.hasOwn(request.resource.config, `doc.${docId}`) && !this.createdDocumentIds(request.resource.id).includes(docId)) {
+      return { ok: false, code: "invalid", message: "\u0414\u043E\u043A\u0443\u043C\u0435\u043D\u0442 \u043D\u0435 \u0432\u0445\u043E\u0434\u0438\u0442\u044C \u0434\u043E \u0434\u043E\u0437\u0432\u043E\u043B\u0435\u043D\u0438\u0445 \u0444\u0430\u0439\u043B\u0456\u0432 \u0446\u044C\u043E\u0433\u043E \u0440\u0435\u0441\u0443\u0440\u0441\u0443." };
+    }
+    if (signal.aborted)
+      return { ok: false, code: "unavailable" };
+    const uncertain = () => ({ ok: false, code: "uncertain", message: "\u0412\u0441\u0442\u0430\u0432\u043A\u0430 \u0437\u043E\u0431\u0440\u0430\u0436\u0435\u043D\u043D\u044F \u043D\u0435 \u043F\u0456\u0434\u0442\u0432\u0435\u0440\u0434\u0436\u0435\u043D\u0430. \u041F\u0435\u0440\u0435\u0432\u0456\u0440 \u043A\u0456\u043D\u0435\u0446\u044C \u0446\u044C\u043E\u0433\u043E \u0436 \u0434\u043E\u043A\u0443\u043C\u0435\u043D\u0442\u0430; \u0430\u0432\u0442\u043E\u043C\u0430\u0442\u0438\u0447\u043D\u043E \u043F\u043E\u0432\u0442\u043E\u0440\u044E\u0432\u0430\u0442\u0438 \u0432\u0441\u0442\u0430\u0432\u043A\u0443 \u043D\u0435 \u043C\u043E\u0436\u043D\u0430." });
+    try {
+      const result = await this.run({
+        argv: [
+          join2(this.home, "bin", "gog"),
+          "--no-input",
+          "--json",
+          "--enable-commands-exact=docs.insert-image",
+          "docs",
+          "insert-image",
+          docId,
+          `--url=${uri}`,
+          "--at=end",
+          `--width=${widthPt ?? 468}`,
+          ...heightPt === undefined ? [] : [`--height=${heightPt}`]
+        ],
+        cwd: this.home,
+        env: { HOME: this.home, PATH: "/usr/local/bin:/usr/bin:/bin", GOG_ACCOUNT: account },
+        timeoutMs: 60000
+      }, signal);
+      if (result.exitCode !== 0)
+        return uncertain();
+      const receipt = JSON.parse(result.stdout);
+      if (receipt == null || typeof receipt !== "object" || Array.isArray(receipt) || receipt.documentId !== docId || receipt.url !== uri || receipt.requests !== 1 || !Number.isSafeInteger(receipt.atIndex) || receipt.atIndex < 1 || receipt.dry_run === true || receipt.queued === true || receipt.fallbackLink === true || Object.hasOwn(receipt, "error") || Object.hasOwn(receipt, "uploadedFileId"))
+        return uncertain();
+      return {
+        ok: true,
+        receiptId: docId,
+        data: JSON.stringify({
+          documentId: docId,
+          documentUrl: `https://docs.google.com/document/d/${docId}/edit`,
+          imageInserted: true,
+          atIndex: receipt.atIndex
+        })
+      };
+    } catch {
+      return uncertain();
     }
   }
 }
@@ -2702,7 +2830,7 @@ class GoogleAdapter {
       if (request.resource.config.docsAppendOnly === true && request.operation !== "append") {
         return { ok: false, code: "invalid", message: "\u0426\u0435\u0439 \u0440\u043E\u0431\u043E\u0447\u0438\u0439 \u0440\u0435\u0441\u0443\u0440\u0441 \u0434\u043E\u0437\u0432\u043E\u043B\u044F\u0454 \u043B\u0438\u0448\u0435 \u0434\u043E\u043F\u0438\u0441\u0443\u0432\u0430\u043D\u043D\u044F; \u043D\u0430\u044F\u0432\u043D\u0438\u0439 \u0432\u043C\u0456\u0441\u0442 \u0456 \u041A\u0420\u0406 \u043D\u0435 \u0437\u0430\u043C\u0456\u043D\u044E\u044E\u0442\u044C\u0441\u044F." };
       }
-      if (request.operation === "append")
+      if (request.operation === "append" || request.operation === "insert_image")
         return this.docsWrite.execute(request, signal);
     }
     const account = text2(request.resource.config.account, 254);

@@ -694,8 +694,8 @@ sys.exit(0 if good else 1)
 # One message to one chat. Telegram rejects the WHOLE message when the markup
 # does not parse, and a single stray `_` inside a word like bot_id is enough.
 # Markup is decoration; the reminder is the point. Any refusal of a formatted
-# message therefore gets one plain retry — no error-code archaeology,
-# formatting is never worth a lost reminder. Prints Telegram's last answer.
+# message gets one plain retry only after Telegram definitively rejected it.
+# A timeout or server error may follow an accepted message. Never resend that.
 send_text() {
   local chat="$1" text="$2" parse="$3" thread="${4:-}" strict_receipt="${5:-0}" resp confirmed=0
   local args=(-s -m 10 -X POST "https://api.telegram.org/bot${token}/sendMessage"
@@ -716,7 +716,8 @@ send_text() {
       message_confirmed "$chat" "$thread" "$resp" &&
         log_message "delivered $(basename "$f") as plain text (markup rejected)"
     fi
-  elif ! delivered "$resp" && [ -n "${parse:-}" ] && [ "$parse" != "text" ]; then
+  elif ! delivered "$resp" && [ -n "${parse:-}" ] && [ "$parse" != "text" ] &&
+       definite_markup_rejection "$resp"; then
     resp=$(curl -s -m 10 -X POST "https://api.telegram.org/bot${token}/sendMessage" \
            --data-urlencode "chat_id=${chat}" --data-urlencode "text=${text}" 2>&1)
     delivered "$resp" && log_message "delivered $(basename "$f") as plain text (markup rejected)"
@@ -752,6 +753,61 @@ run_delivery_key() {
   python3 -c 'import hashlib,sys; print(hashlib.sha256("\0".join(sys.argv[1:]).encode()).hexdigest())' "$1" "$2"
 }
 
+# Reserve every source of a merged plain reminder before its first API call.
+# Existing delivery records are also read by reminder-task and the startup
+# recovery loop. A killed sender leaves 'sending', never another automatic send.
+reserve_plain_delivery() {
+  python3 - "$RUN_DELIVERY_DIR" "$f" ${merged[@]+"${merged[@]}"} <<'PY'
+import hashlib, os, pathlib, shutil, stat, sys, tempfile
+root = pathlib.Path(sys.argv[1])
+root.mkdir(mode=0o700, exist_ok=True)
+info = root.lstat()
+if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
+    sys.exit(1)
+created = []
+try:
+    for name in sys.argv[2:]:
+        source = pathlib.Path(name)
+        fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_nlink != 1 or info.st_size > 1024 * 1024:
+                raise ValueError('unsafe reminder')
+            data = os.read(fd, 1024 * 1024 + 1)
+        finally: os.close(fd)
+        headers = {}
+        for line in data.decode().splitlines():
+            key, sep, value = line.partition('=')
+            if not sep or not key.replace('_', '').isupper(): break
+            headers.setdefault(key, value)
+        epoch = headers['EPOCH']
+        if not epoch.isascii() or not epoch.isdecimal(): raise ValueError('invalid epoch')
+        epoch = str(int(epoch))
+        key = hashlib.sha256((str(source) + '\0' + epoch).encode()).hexdigest()
+        journal = root / key
+        stage = pathlib.Path(tempfile.mkdtemp(prefix='.plain.', dir=root))
+        try:
+            for leaf, content in [('source.rem', data), ('result.txt', data), ('name', source.stem.encode()), ('state', b'sending')]:
+                with (stage / leaf).open('xb') as out:
+                    out.write(content + (b'\n' if leaf != 'source.rem' else b'')); out.flush(); os.fsync(out.fileno())
+            directory = os.open(stage, os.O_RDONLY | os.O_DIRECTORY)
+            try: os.fsync(directory)
+            finally: os.close(directory)
+            # The worker owns the queue lock; an existing record must hold it.
+            if journal.exists() or journal.is_symlink(): raise ValueError('occurrence already reserved')
+            os.rename(stage, journal); created.append(journal)
+        finally:
+            if stage.exists(): shutil.rmtree(stage)
+    directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    try: os.fsync(directory)
+    finally: os.close(directory)
+except BaseException:
+    # No network call has happened yet. Drop only this invocation's records.
+    for journal in created: shutil.rmtree(journal)
+    sys.exit(1)
+PY
+}
+
 run_delivery_response_class() {
   python3 -c '
 import json,sys
@@ -766,10 +822,12 @@ else:
         # ambiguous without a confirmed message ID and must not be resent.
         if code==429:
             print("retry")
-        elif isinstance(code,int) and 500<=code<=599:
+        elif code==408 or isinstance(code,int) and 500<=code<=599:
             print("uncertain")
-        else:
+        elif isinstance(code,int) and 400<=code<=499:
             print("blocked")
+        else:
+            print("uncertain")
     else:
         print("uncertain")
 '
@@ -1509,6 +1567,13 @@ for f in "$REM_DIR"/*.rem; do
   fi
 
   body=$(message_body "$f")
+  if [ -z "$thread_id" ] && [ "${run_mode:-}" != "1" ]; then
+    key=$(run_delivery_key "$f" "$epoch") || continue
+    if [ -e "$RUN_DELIVERY_DIR/$key" ] || [ -L "$RUN_DELIVERY_DIR/$key" ]; then
+      log_message "hold $(basename "$f"): plain occurrence already has a delivery record"
+      continue
+    fi
+  fi
   if [ -n "$thread_id" ] && [ "${run_mode:-}" != "1" ]; then
     # A topic receipt must prove the exact thread. Save the occurrence before
     # sending so an ambiguous reply cannot be retried into another topic.
@@ -1677,6 +1742,8 @@ for f in "$REM_DIR"/*.rem; do
         [ "$(header_value "$other" RUN)" != "1" ] &&
         ! has_header "$other" REPEAT_SECONDS || continue
       other_body=$(message_body "$other")
+      other_key=$(run_delivery_key "$other" "$(decimal_value "$other_epoch")") || continue
+      [ ! -e "$RUN_DELIVERY_DIR/$other_key" ] && [ ! -L "$RUN_DELIVERY_DIR/$other_key" ] || continue
       [ -n "$other_body" ] || continue
       seen=0
       for text in "${texts[@]}"; do
@@ -1694,11 +1761,26 @@ for f in "$REM_DIR"/*.rem; do
   fi
   # Every piece must land, in order; the first refusal stops the rest and is
   # what the retry/give-up path below sees.
+  # RUN and topic paths have already returned above. Plain messages need the
+  # same durable send boundary, including every source in a coalesced message.
+  if ! reserve_plain_delivery; then
+    log_message "hold $(basename "$f"): plain delivery reservation refused"
+    continue
+  fi
+  # macOS's Bash 3 has no associative arrays. Keep the source/epoch pairs in
+  # parallel arrays; each index refers to the exact reserved occurrence.
+  plain_sources=("$f" ${merged[@]+"${merged[@]}"})
+  plain_epochs=()
+  for source in "${plain_sources[@]}"; do
+    plain_epochs+=("$(decimal_value "$(header_value "$source" EPOCH)")")
+  done
   resp=""
   sent=0
+  accepted=0
   while IFS= read -r -d '' chunk || [ -n "$chunk" ]; do
     if resp=$(send_text "$chat" "$chunk" "${parse:-}" "$thread_id"); then
       sent=1
+      accepted=$((accepted + 1))
     else
       sent=0
       break
@@ -1706,13 +1788,31 @@ for f in "$REM_DIR"/*.rem; do
   done < <(printf '%s' "$body" | split_chunks)
 
   if [ "$sent" -eq 1 ]; then
-    [ "$settled" -eq 1 ] || settle_reminder
+    if [ "$settled" -ne 1 ] && ! settle_reminder; then
+      log_message "hold plain delivery: confirmed send could not settle its source"
+      continue
+    fi
     rm -f "$f.attempts"
+    merge_settled=1
     for other in ${merged[@]+"${merged[@]}"}; do
-      rm -f "$other" "$other.attempts" &&
+      if rm -f "$other" "$other.attempts"; then
         log_message "fired $(basename "$other") → chat=$chat in one message with $(basename "$f")"
+      else
+        merge_settled=0
+      fi
     done
+    [ "$merge_settled" -eq 1 ] || continue
   else
+    response_class=$(printf '%s' "$resp" | run_delivery_response_class)
+    if [ "$response_class" = uncertain ] || [ "$accepted" -gt 0 ]; then
+      for i in "${!plain_sources[@]}"; do
+        key=$(run_delivery_key "${plain_sources[$i]}" "${plain_epochs[$i]}") || continue
+        atomic_text "$RUN_DELIVERY_DIR/$key/state" uncertain
+        alert_owner_issue "$RUN_DELIVERY_DIR/$key"
+      done
+      log_message "FAILED, UNCERTAIN plain delivery $(basename "$f"): no automatic replay"
+      continue
+    fi
     attempts=$(( $(cat "$f.attempts" 2>/dev/null || echo 0) + 1 ))
     printf '%s\n' "$attempts" > "$f.attempts"
     log_message "FAILED $(basename "$f") attempt $attempts: $resp"
@@ -1733,6 +1833,11 @@ for f in "$REM_DIR"/*.rem; do
         >/dev/null 2>&1
     fi
   fi
+  for i in "${!plain_sources[@]}"; do
+    key=$(run_delivery_key "${plain_sources[$i]}" "${plain_epochs[$i]}") || continue
+    rm -rf -- "$RUN_DELIVERY_DIR/$key"
+  done
+  rmdir "$RUN_DELIVERY_DIR" 2>/dev/null || true
 done
 
 exit 0

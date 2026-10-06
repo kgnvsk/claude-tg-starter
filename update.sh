@@ -546,6 +546,11 @@ elif [ -e "$CORPORATE_MARKER" ]; then
   CORPORATE_ISOLATION_ACTIVATED=1
 fi
 
+# SQLite must never interpret an agent-writable database as root.
+agent_sqlite() {
+  runuser -u "$AGENT_USER" -- sqlite3 -readonly "$CORPORATE_DB" "$@"
+}
+
 if [ -L "$CORPORATE_DB" ]; then
   echo "FATAL: база Telegram не може бути символьним посиланням" >&2
   exit 2
@@ -554,7 +559,7 @@ elif [ -e "$CORPORATE_DB" ]; then
     echo "FATAL: база Telegram має бути звичайним файлом" >&2
     exit 2
   }
-  corporate_tables="$(sqlite3 -readonly "$CORPORATE_DB" \
+  corporate_tables="$(agent_sqlite \
     "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('corporate_runtime_state','corporate_conversations','conversation_jobs','outbound_chunks','corporate_audit_events');")" || {
       echo "FATAL: не вдалося прочитати стан корпоративної ізоляції" >&2
       exit 2
@@ -562,13 +567,13 @@ elif [ -e "$CORPORATE_DB" ]; then
   case "$corporate_tables" in
     0) ;;
     1|2|3|4|5)
-      runtime_table="$(sqlite3 -readonly "$CORPORATE_DB" \
+      runtime_table="$(agent_sqlite \
         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='corporate_runtime_state';")"
       [ "$runtime_table" = 1 ] || {
         echo "FATAL: неповна схема корпоративної ізоляції потребує ручного відновлення" >&2
         exit 2
       }
-      corporate_latch="$(sqlite3 -readonly "$CORPORATE_DB" \
+      corporate_latch="$(agent_sqlite \
         "SELECT isolation_activated FROM corporate_runtime_state WHERE singleton=1;")" || {
           echo "FATAL: пошкоджений стан активації корпоративних сесій" >&2
           exit 2
@@ -588,18 +593,18 @@ elif [ -e "$CORPORATE_DB" ]; then
       ;;
   esac
 
-  owner_fifo_table="$(sqlite3 -readonly "$CORPORATE_DB" \
+  owner_fifo_table="$(agent_sqlite \
     "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='pending_inbound_deliveries';")"
   if [ "$owner_fifo_table" = 1 ]; then
-    if sqlite3 -readonly "$CORPORATE_DB" "PRAGMA table_info(pending_inbound_deliveries);" \
+    if agent_sqlite "PRAGMA table_info(pending_inbound_deliveries);" \
         | cut -d'|' -f2 | grep -qx state; then
-      owner_fifo_pending="$(sqlite3 -readonly "$CORPORATE_DB" \
+      owner_fifo_pending="$(agent_sqlite \
         "SELECT COUNT(*) FROM pending_inbound_deliveries WHERE state IN ('started','recovering','queued','offered');")"
     else
       # A plugin older than the state column (delivery_id, payload, created_at)
       # keeps a row only while a message is undelivered; the query above made
       # sqlite fail and the whole update stop on such a box (Buhtych, 03.09).
-      owner_fifo_pending="$(sqlite3 -readonly "$CORPORATE_DB" \
+      owner_fifo_pending="$(agent_sqlite \
         "SELECT COUNT(*) FROM pending_inbound_deliveries;")"
     fi
     [ "$owner_fifo_pending" = 0 ] || {
@@ -664,7 +669,8 @@ if [ -f "$CORPORATE_DB" ]; then
   fi
   CORPORATE_BACKUP_DIR="$CORPORATE_BACKUP_ROOT/update-$(date -u +%Y%m%dT%H%M%SZ)-$$"
   install -d -m 700 -o root -g root "$CORPORATE_BACKUP_DIR"
-  sqlite3 "$CORPORATE_DB" ".backup '$CORPORATE_BACKUP_DIR/messages.db'" || {
+  python3 -B "$KIT/assets/lib/agent-sqlite-backup.py" \
+    "$CORPORATE_DB" "$CORPORATE_BACKUP_DIR/messages.db" "$AGENT_USER" || {
     echo "FATAL: не вдалося створити узгоджену резервну копію messages.db" >&2
     exit 2
   }

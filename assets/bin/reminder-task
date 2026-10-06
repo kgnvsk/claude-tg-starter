@@ -228,12 +228,38 @@ def task_records(rem_dir, task):
     return records
 
 
-def require_scope(records, actor, chat):
+def legacy_scope(headers, actor, chat, prefix):
+    return bool(prefix and actor and chat and headers.get("ACTOR") is None
+                and not headers.get("THREAD_ID") and headers.get("CHAT") == chat
+                and headers.get("TASK", "").startswith(prefix))
+
+
+def require_scope(records, actor, chat, legacy_prefix=None):
     if actor is None:
         return
     for record in records:
-        if record.headers.get("ACTOR") != actor or record.headers.get("CHAT") != chat:
+        if (record.headers.get("ACTOR") != actor or record.headers.get("CHAT") != chat) and not legacy_scope(record.headers, actor, chat, legacy_prefix):
             raise TaskError("task is outside this actor and chat")
+
+
+def resolve_legacy_task(rem_dir, args):
+    """Only an absent new namespace may reach an old, same-chat unthreaded task.
+
+    Runs under the queue lock, before status/cancel. An existing actor remains
+    authoritative; this never permits another actor's or topic's reminder.
+    """
+    legacy = getattr(args, "legacy_task", None)
+    if not legacy or task_records(rem_dir, args.task) or delivery_journals(rem_dir, args.task):
+        return
+    records = task_records(rem_dir, legacy)
+    journals = delivery_journals(rem_dir, legacy)
+    headers = [record.headers for record in records] + [saved_run_headers(journal / "source.rem") for journal in journals]
+    if not headers:
+        return
+    if any(header.get("CHAT") != args.chat or header.get("THREAD_ID")
+           or header.get("ACTOR") not in (None, args.actor) for header in headers):
+        raise TaskError("legacy task is outside this actor, chat or unthreaded scope")
+    args.task, args.legacy_prefix = legacy, "corp-"
 
 
 def require_equivalent(records, args, requested_mode):
@@ -303,13 +329,13 @@ def require_equivalent(records, args, requested_mode):
             raise TaskError(f"existing sequence checkpoint {index} differs: {args.task}")
 
 
-def verified_status(rem_dir, task, actor=None, chat=None):
+def verified_status(rem_dir, task, actor=None, chat=None, legacy_prefix=None):
     if any(small_text(journal / "state") == "cancelled"
            for journal in delivery_journals(rem_dir, task)):
         raise TaskError(f"cancellation in progress for {task}; retry cancel")
     records = task_records(rem_dir, task)
     mode, epochs = infer_mode(records, task)
-    require_scope(records, actor, chat)
+    require_scope(records, actor, chat, legacy_prefix)
     records.sort(key=lambda record: (int(record.headers["EPOCH"]), record.path.name))
     fields = [f"task={task}", f"mode={mode}", f"files={len(records)}"]
     if mode == "sequence":
@@ -637,17 +663,17 @@ def create_sequence(rem_dir, args):
         raise
 
 
-def cancel_task(rem_dir, task, actor=None, chat=None):
+def cancel_task(rem_dir, task, actor=None, chat=None, legacy_prefix=None):
     records = task_records(rem_dir, task)
     journals = delivery_journals(rem_dir, task)
     if actor is not None and records:
         infer_mode(records, task)
-        require_scope(records, actor, chat)
+        require_scope(records, actor, chat, legacy_prefix)
     stoppable = []
     unresolved = []
     for journal in journals:
         headers = saved_run_headers(journal / "source.rem")
-        if actor is not None and (headers.get("ACTOR") != actor or headers.get("CHAT") != chat):
+        if actor is not None and (headers.get("ACTOR") != actor or headers.get("CHAT") != chat) and not legacy_scope(headers, actor, chat, legacy_prefix):
             raise TaskError("task is outside this actor and chat")
         state = small_text(journal / "state")
         if state == "cancelled":
@@ -760,6 +786,8 @@ def parser():
     status = commands.add_parser("status", help="verify queued task state")
     identity(status)
     status.add_argument("--chat")
+    status.add_argument("--legacy-prefix", help="host-bound old unthreaded task namespace; never bypasses CHAT or an existing ACTOR")
+    status.add_argument("--legacy-task", help="host-bound old corp task, considered only when the new scoped task is absent")
 
     delivery = commands.add_parser("delivery-status", help="show one task's unresolved result delivery")
     identity(delivery)
@@ -767,6 +795,8 @@ def parser():
     cancel = commands.add_parser("cancel", help="remove every queued file for a task")
     identity(cancel)
     cancel.add_argument("--chat")
+    cancel.add_argument("--legacy-prefix", help="host-bound old unthreaded task namespace; never bypasses CHAT or an existing ACTOR")
+    cancel.add_argument("--legacy-task", help="host-bound old corp task, considered only when the new scoped task is absent")
     return root
 
 
@@ -774,6 +804,14 @@ def normalize(args):
     args.task = task_id(args.task)
     if args.actor is not None:
         args.actor = actor_id(args.actor)
+    legacy_prefix = getattr(args, "legacy_prefix", None)
+    if legacy_prefix is not None and (args.actor is None or args.chat is None or legacy_prefix not in (f"u{args.actor}-", "corp-") or not args.task.startswith(legacy_prefix)):
+        raise TaskError("invalid legacy reminder scope")
+    legacy_task = getattr(args, "legacy_task", None)
+    if legacy_task is not None and (args.actor is None or args.chat is None
+            or not re.fullmatch(r"corp-[a-f0-9]{16}-[a-z0-9][a-z0-9-]*", args.task)
+            or not re.fullmatch(r"corp-[a-z0-9][a-z0-9-]*", legacy_task)):
+        raise TaskError("invalid legacy task alias")
     if args.command in {"one", "repeat", "sequence"}:
         args.chat = chat_id(args.chat)
         args.thread_id = thread_id(args.thread_id, args.chat)
@@ -823,6 +861,7 @@ def main():
             os.environ.get("LOCK_FILE", f"{rem_dir_value}.worker.lock")
         )
         with queue_lock(rem_dir, lock_file):
+            resolve_legacy_task(rem_dir, args)
             if args.command == "one":
                 result = create_single(rem_dir, args)
             elif args.command == "repeat":
@@ -830,9 +869,9 @@ def main():
             elif args.command == "sequence":
                 result = create_sequence(rem_dir, args)
             elif args.command == "status":
-                result = verified_status(rem_dir, args.task, args.actor, args.chat)
+                result = verified_status(rem_dir, args.task, args.actor, args.chat, args.legacy_prefix)
             else:
-                result = cancel_task(rem_dir, args.task, args.actor, args.chat)
+                result = cancel_task(rem_dir, args.task, args.actor, args.chat, args.legacy_prefix)
         print(result)
         return 2 if result.startswith("PENDING ") else 0
     except (TaskError, OSError) as exc:

@@ -521,6 +521,17 @@ def check_existing_dependencies(home: Path, user: str, manifest: dict):
     check(home, user, manifest)
 
 
+def prepare_artifact_renderer(root: Path, manifest: dict):
+    if not any(name.startswith("document-skills@") for name in manifest["nativePlugins"]):
+        return
+    result = subprocess.run(["python3", str(root / "installer/install-artifact-tools.py"),
+                             "--install", "--plugins-file", str(root / "manifest.json")],
+                            env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C.UTF-8"},
+                            capture_output=True, timeout=720)
+    if result.returncode:
+        raise ValueError("public offline document renderers are unavailable; agent files were not changed")
+
+
 def preflight_maintenance(root: Path, home: Path, user: str, manifest: dict, previous: dict, *,
                           allow_pinned_legacy_shared_context: bool = False):
     """Read only, while the old agent can still be restarted without a swap."""
@@ -666,6 +677,7 @@ def main():
         path.rename(path.with_name(path.name + ".retired"))
     if retired:
         subprocess.run(["systemctl", "daemon-reload"], check=True, capture_output=True, timeout=60)
+    prepare_artifact_renderer(root, manifest)
     apply_reconcile(plan, account.pw_uid, account.pw_gid)
     atomic(manifest_path, json.dumps(manifest), account.pw_uid, account.pw_gid)
     # Root-owned baseline is persisted before dependency work so an interrupted
