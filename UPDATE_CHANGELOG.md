@@ -1,8 +1,8 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-10-06.f9af9160536a`
+- Реліз: `2026-10-06.db3c2ca44015`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `f9af9160536ae24aef497ddc27a1a98883b8ce16`
+- Ревізія вихідного комплекту: `db3c2ca440153785d8fd74515075765368416aa5`
 - Дата релізу: `2026-10-06`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
@@ -19,8 +19,9 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    test: align product audit and private voice fixtures with owner routing
-    Preserve full primary-owner tools in addressed Telegram groups
+    Keep group join test source free of trailing blank lines
+    Retain both reviewed receiver histories after group join integration
+    fix(telegram): join a group silently, no «Вітаю! Я — …»
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не

@@ -7437,14 +7437,8 @@ bot.on('my_chat_member', async ctx => {
     }
     return
   }
-  // A channel is an audience, not a conversation: no greeting is posted to it.
-  if (channel) return
-  const name = bot.botInfo.first_name.trim() || botUsername
-  await ctx.reply(
-    `Вітаю! Я — ${name}.`,
-    undefined,
-    AbortSignal.timeout(5000),
-  )
+  // Joining is silent (owner, 06.10.2026: Kirill and Ilya did not want «Вітаю! Я — …» posted into their
+  // chats). The bot speaks in a group when it is mentioned, replied to or asked to introduce itself.
 })
 
 bot.command('health', async (ctx, next) => {
