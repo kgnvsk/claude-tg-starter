@@ -66,14 +66,27 @@ try:
     catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
     if catalog.get("schema") != "novsky-legacy-persona-hashes/v1":
         raise ValueError("persona provenance catalog is invalid")
-    expected = (
-        catalog["revisions"][release["sourceKitRevision"]]
-        [release["productId"]][relative.as_posix()]
-    )
-    if not isinstance(expected, str) or not re.fullmatch(r"[0-9a-f]{64}", expected):
-        raise ValueError("persona provenance digest is invalid")
-    if hashlib.sha256(old_source.read_bytes()).hexdigest() != expected:
-        raise ValueError("previous persona source differs from its published artifact")
+    digest = hashlib.sha256(old_source.read_bytes()).hexdigest()
+    if release["sourceKitRevision"] in catalog["revisions"]:
+        expected = (
+            catalog["revisions"][release["sourceKitRevision"]]
+            [release["productId"]][relative.as_posix()]
+        )
+        if not isinstance(expected, str) or not re.fullmatch(r"[0-9a-f]{64}", expected):
+            raise ValueError("persona provenance digest is invalid")
+        if digest != expected:
+            raise ValueError("previous persona source differs from its published artifact")
+    else:
+        # A premium kit built from a revision no pin names (archives were also
+        # built by hand for buyers outside the store) is trusted only with the
+        # exact bytes of a version this file has had in the kit's history:
+        # premium ships these sources as they are (Святослав, 07.10.2026).
+        history = catalog["premiumHistory"][relative.as_posix()]
+        if (release["productId"] != "premium" or not isinstance(history, list)
+                or not all(isinstance(item, str) and re.fullmatch(r"[0-9a-f]{64}", item)
+                           for item in history)
+                or digest not in history):
+            raise ValueError("previous persona source is not a published kit version")
     current_release = candidate / "RELEASE.json"
     if current_release.is_file():
         current = json.loads(current_release.read_text(encoding="utf-8"))

@@ -1,8 +1,8 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-10-07.1a7e11fc5517`
+- Реліз: `2026-10-07.6fc0cf685384`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `1a7e11fc5517a21b21e7a545b88537dead136564`
+- Ревізія вихідного комплекту: `6fc0cf68538478a760510826dc51682ba24b2458`
 - Дата релізу: `2026-10-07`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
@@ -19,11 +19,8 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    Repin the canary migration tool to the installer of kit #215
-    Drop no owner entry from the backup policy; keep a configured old backup's trigger
-    Move only a backup context a kit release wrote; every stop of step 3 fails
-    Accept an old corporate module by its own kit's copy rules; move a configured backup too
-    Move an old agent's backup context before the update window
+    Trust an unpinned premium kit's persona by the kit's own historical bytes
+    Pin the persona sources of the 15.09 kit dc428b71
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не
