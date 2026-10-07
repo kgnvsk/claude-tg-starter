@@ -1,8 +1,8 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-10-07.614e32c5aef2`
+- Реліз: `2026-10-07.1a7e11fc5517`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `614e32c5aef2bcc2ceb32ea9149660b5ee0a5c62`
+- Ревізія вихідного комплекту: `1a7e11fc5517a21b21e7a545b88537dead136564`
 - Дата релізу: `2026-10-07`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
@@ -19,18 +19,11 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    Update guide: «встановлено», not the Russian «установлено»
-    Update guide: read the CLI versions with npm ls, no path into a codex/ folder
-    Update contract tests: the poller still starts once, after step 4's refused-start proof
-    Update guide test: forbid an own stop or start, keep the refused-start proof
-    Update guide: the outer transaction holds the service's start from before the CLI window
-    Update guide: check everything first, change the CLIs only inside the guarded window
-    Update guide: a short path for the Claude that updates a customer's agent
-    Corporate scheduled work: Codex review of fe2f0214, all five findings
-    Corporate scheduled work: a person's confirmed task runs in its conversation
-    receipts-switch: a profile can name its own channel directory
-    queue-settle-sweep: press the real Ctrl+B in the agent's own screen, under the lifecycle lock
-    fix(queue-settle-sweep): move a long foreground command to the background when people wait
+    Repin the canary migration tool to the installer of kit #215
+    Drop no owner entry from the backup policy; keep a configured old backup's trigger
+    Move only a backup context a kit release wrote; every stop of step 3 fails
+    Accept an old corporate module by its own kit's copy rules; move a configured backup too
+    Move an old agent's backup context before the update window
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не

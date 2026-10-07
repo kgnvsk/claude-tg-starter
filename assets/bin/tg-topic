@@ -1,0 +1,111 @@
+#!/usr/bin/env python3
+"""tg-topic — topics (гілки) of a Telegram forum group through this agent's own bot.
+
+The bot's key is read here and never shown: an agent may not read its key itself (no-secrets-guard),
+so creating a topic goes through this helper, the way sending goes through tg-send (Луна, 07.10.2026).
+
+  tg-topic create  <chat_id> <name> [icon_color]   → {"ok": true, "thread_id": N, "name": ...}
+  tg-topic rename  <chat_id> <thread_id> <name>
+  tg-topic close   <chat_id> <thread_id>
+  tg-topic reopen  <chat_id> <thread_id>
+
+The bot must be an admin of the group with the right to manage topics. Deleting a topic is not offered.
+"""
+import json
+import os
+import re
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+COLORS = {7322096, 16766590, 13338331, 9367192, 16749490, 16478047}
+# A bot key wherever it appears, an error text from Telegram included: it is never printed.
+KEY_SHAPE = re.compile(r"\d{5,}:[A-Za-z0-9_-]{30,}")
+
+
+def token():
+    value = os.environ.get("TELEGRAM_BOT_TOKEN")
+    if value:
+        return value.strip()
+    state = os.environ.get("TELEGRAM_STATE_DIR") or os.path.expanduser("~/.claude/channels/telegram")
+    try:
+        for line in open(os.path.join(state, ".env"), encoding="utf-8"):
+            if line.startswith("TELEGRAM_BOT_TOKEN="):
+                return line.split("=", 1)[1].strip().strip("\"'")
+    except OSError:
+        pass
+    sys.exit("tg-topic: the bot's key is not configured")
+
+
+def call(method, params):
+    data = urllib.parse.urlencode(params).encode()
+    request = urllib.request.Request(f"https://api.telegram.org/bot{token()}/{method}", data=data)
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return json.load(response)
+    except urllib.error.HTTPError as error:
+        try:
+            return json.load(error)
+        except ValueError:
+            return {"ok": False, "description": f"HTTP {error.code}"}
+    except (urllib.error.URLError, TimeoutError, OSError) as error:
+        return {"ok": False, "description": f"network: {type(error).__name__}"}
+
+
+def usage():
+    sys.stderr.write(__doc__.split("\n\n", 2)[2])
+    sys.exit(2)
+
+
+def group(value):
+    if not re.fullmatch(r"-[0-9]{1,20}", value):
+        sys.exit("tg-topic: topics live in a group: chat_id starts with -")
+    return value
+
+
+def topic(value):
+    if not re.fullmatch(r"[1-9][0-9]{0,9}", value):
+        sys.exit("tg-topic: thread_id is the topic's number")
+    return value
+
+
+def name(value):
+    value = value.strip()
+    if not 1 <= len(value) <= 128:
+        sys.exit("tg-topic: a topic name has 1 to 128 characters")
+    return value
+
+
+def main(argv):
+    if len(argv) < 3:
+        usage()
+    action, chat = argv[1], group(argv[2])
+    if action == "create" and len(argv) in (4, 5):
+        params = {"chat_id": chat, "name": name(argv[3])}
+        if len(argv) == 5:
+            if not argv[4].isdigit() or int(argv[4]) not in COLORS:
+                sys.exit("tg-topic: icon_color is one of " + ", ".join(map(str, sorted(COLORS))))
+            params["icon_color"] = argv[4]
+        result = call("createForumTopic", params)
+        if result.get("ok"):
+            created = result.get("result") or {}
+            print(json.dumps({"ok": True, "thread_id": created.get("message_thread_id"), "name": created.get("name")},
+                             ensure_ascii=False))
+            return 0
+    elif action == "rename" and len(argv) == 5:
+        result = call("editForumTopic", {"chat_id": chat, "message_thread_id": topic(argv[3]), "name": name(argv[4])})
+    elif action in ("close", "reopen") and len(argv) == 4:
+        result = call("closeForumTopic" if action == "close" else "reopenForumTopic",
+                      {"chat_id": chat, "message_thread_id": topic(argv[3])})
+    else:
+        usage()
+    if result.get("ok"):
+        print(json.dumps({"ok": True}))
+        return 0
+    print(json.dumps({"ok": False, "error": KEY_SHAPE.sub("***", str(result.get("description") or "Telegram refused"))}, ensure_ascii=False))
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

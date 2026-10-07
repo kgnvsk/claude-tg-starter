@@ -115,6 +115,8 @@ MANAGED_BIN_NAMES = frozenset(
         "tg-rich",
         "tg-send",
         "tg-send-file",
+        "tg-topic",
+        "tg-download",
         "tg-turn-end",
         "threads-dl",
         "transcribe",

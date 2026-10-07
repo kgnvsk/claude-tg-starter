@@ -1,0 +1,120 @@
+#!/usr/bin/env python3
+"""tg-download — save a file posted in Telegram, by its file_id, through this agent's own bot.
+
+The bot's key is read here and never shown: an agent may not read its key itself (no-secrets-guard),
+so a scheduled task or a subagent without the download_attachment tool fetches a file this way
+(Максимус, 06.10.2026: a PDF from a work group's history for his digest).
+
+  tg-download <file_id>   → {"ok": true, "path": "...", "bytes": N}
+
+Telegram gives bots files up to 20 MB. The file lands in the bot's inbox, as with download_attachment.
+"""
+import json
+import os
+import re
+import secrets
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+LIMIT = 20 * 1024 * 1024
+# A bot key wherever it appears, an error text from Telegram included: it is never printed.
+KEY_SHAPE = re.compile(r"\d{5,}:[A-Za-z0-9_-]{30,}")
+
+
+def state_dir():
+    return os.environ.get("TELEGRAM_STATE_DIR") or os.path.expanduser("~/.claude/channels/telegram")
+
+
+def token():
+    value = os.environ.get("TELEGRAM_BOT_TOKEN")
+    if value:
+        return value.strip()
+    try:
+        for line in open(os.path.join(state_dir(), ".env"), encoding="utf-8"):
+            if line.startswith("TELEGRAM_BOT_TOKEN="):
+                return line.split("=", 1)[1].strip().strip("\"'")
+    except OSError:
+        pass
+    sys.exit("tg-download: the bot's key is not configured")
+
+
+def fetch(url, limit):
+    """The body, or an error text that never carries the URL (it holds the key)."""
+    try:
+        with urllib.request.urlopen(url, timeout=60) as response:
+            body = response.read(limit + 1)
+    except urllib.error.HTTPError as error:
+        try:
+            return None, str(json.load(error).get("description") or f"HTTP {error.code}")
+        except ValueError:
+            return None, f"HTTP {error.code}"
+    except (urllib.error.URLError, TimeoutError, OSError) as error:
+        return None, f"network: {type(error).__name__}"
+    if len(body) > limit:
+        return None, "the file is over 20 MB"
+    return body, None
+
+
+def main(argv):
+    if len(argv) != 2 or not re.fullmatch(r"[A-Za-z0-9_-]{10,256}", argv[1]):
+        sys.exit("usage: tg-download <file_id>")
+    key = token()
+    body, error = fetch(f"https://api.telegram.org/bot{key}/getFile?" + urllib.parse.urlencode({"file_id": argv[1]}), 64 * 1024)
+    info = {}
+    if body is not None:
+        try:
+            info = json.loads(body)
+        except ValueError:
+            error = "Telegram gave an unreadable answer"
+    file = info.get("result") or {}
+    if error is None and not (info.get("ok") and file.get("file_path")):
+        error = str(info.get("description") or "Telegram gave no file: it is over 20 MB or no longer kept")
+    if error is None:
+        body, error = fetch(f"https://api.telegram.org/file/bot{key}/{file['file_path']}", LIMIT)
+    if error is None:
+        ext = re.sub(r"[^A-Za-z0-9]", "", file["file_path"].rsplit(".", 1)[-1]) if "." in file["file_path"] else ""
+        unique = re.sub(r"[^A-Za-z0-9_-]", "", str(file.get("file_unique_id") or "")) or "dl"
+        path, error = save(body, f"{int(time.time() * 1000)}-{unique}", ext or "bin")
+    if error is not None:
+        print(json.dumps({"ok": False, "error": KEY_SHAPE.sub("***", error)}, ensure_ascii=False))
+        return 1
+    print(json.dumps({"ok": True, "path": path, "bytes": len(body)}, ensure_ascii=False))
+    return 0
+
+
+def save(body, stem, ext):
+    """A new file of this run in the inbox, or an error; nothing already there is followed or overwritten.
+
+    Codex, review of a333bb5c: the name of a Telegram file is not the name of one download, and a plain open
+    truncated a file of the same name or wrote through a link planted in the inbox.
+    """
+    inbox = os.path.join(state_dir(), "inbox")
+    try:
+        os.makedirs(inbox, exist_ok=True)
+    except OSError:
+        pass
+    if os.path.islink(inbox) or not os.path.isdir(inbox):
+        return None, "the inbox is not a plain folder"
+    for _ in range(5):
+        path = os.path.join(inbox, f"{stem}-{secrets.token_hex(4)}.{ext}")
+        try:
+            descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        except FileExistsError:
+            continue
+        except OSError as error:
+            return None, f"cannot save: {type(error).__name__}"
+        try:
+            with os.fdopen(descriptor, "wb") as out:
+                out.write(body)
+        except OSError as error:
+            os.unlink(path)
+            return None, f"cannot save: {type(error).__name__}"
+        return path, None
+    return None, "cannot save: no free name"
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

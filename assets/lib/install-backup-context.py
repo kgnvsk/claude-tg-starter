@@ -32,6 +32,35 @@ CLAUDE_DIRECTORY = Path("/etc/claude-tg-starter")
 # shared collector and sanitizer those kits shipped.
 LEGACY_SHARED_COLLECTOR_SHA256 = "19411aaa43ae7c21100cfac8da19924724a293fb99f8eded6841a12d7519b705"
 LEGACY_SHARED_SANITIZER_SHA256 = "09964c6d58b72da0b4198cc536e9c80052468df09ed756fd348015208db8d04a"
+# Every collector and sanitizer a kit release installed (their git history up to
+# 26.09.2026). A move before maintenance replaces or retires them, so it admits
+# these bytes and the staged kit's own pair, and nothing else.
+KIT_COLLECTOR_SHA256 = frozenset({
+    "5fe362a2dc964cb9e0c84bca0f348e0738df5f63da58569fae810bd317636f55",
+    "19411aaa43ae7c21100cfac8da19924724a293fb99f8eded6841a12d7519b705",
+    "1f42de9ec0daaf82080fef29f6b9f3cfca96b9df7772f22b305d8b35ec1441f2",
+    "f2f9abc9cb5ccf82ff464beb6a7921f69540815da6a9b513729a8339fe6f8f14",
+})
+KIT_SANITIZER_SHA256 = frozenset({
+    "09964c6d58b72da0b4198cc536e9c80052468df09ed756fd348015208db8d04a",
+    "7087f2e7b7a84f658386075a8c8651696ab0159cbd79f68c57787d5c6a9c772a",
+    "b743ec0d11e58aa2a933e109d2389200581fea5b5b35742d140566607bd58b0b",
+    "419ef2ae2418117c308c25c5817bca6d1f2f92920a7fdcc5672e0b6ac56a441e",
+    "dea6440b48f5670f41cb33f055292820a9e7a278a4cf345f3c8ab93e5450b9c3",
+    "efc52b142a49f7985d319bc4d90e9fc7425bd86dbca43dc674a1d032421e6c7e",
+    "3c1db9d9c13e03e4c29c44c1774b55fcf819e6fbd594f7dc4860a1f4a4accf79",
+    "b4066a4e894a5ac90b6fa3b802dbd369392c45145437c7fb095b0b1e28466af3",
+    "517a44a65e73f1604cad7436a4fad1b981a81ebbca93bf838d00b29c6264ac4a",
+    "a00c3fc8c1aa1d4aed100ab1dfcfa415029eb7538e5a6d49ca4558aec945abf4",
+})
+
+
+class LocalChanges(ValueError):
+    """The root backup context holds bytes no kit release wrote."""
+
+
+class ConfiguredBackup(ValueError):
+    """A configured backup still runs on an old kit's schedule."""
 
 # A temporary, explicit maintenance exception for the two owner canaries on
 # 38.49.212.20. Fresh installs and ordinary fleet updates always require the
@@ -564,6 +593,91 @@ def check_current(home, user, unit, engine, *, source_dir=None, python_binary=No
         raise ValueError("backup context requires reviewed migration before maintenance") from error
 
 
+def require_kit_origin(home, user, unit, engine, *, source_dir=None):
+    """Refuse a move over anything a kit release did not write.
+
+    The read-only check folds an older kit's files and an owner's edit into one
+    answer, and the move replaces or retires them, keeping the old bytes only in a
+    private backup (Codex, review of #215, 07.10.2026). Absent files and the exact
+    files of a kit release move; anything else stops before the first write.
+    """
+    account = pwd.getpwnam(user)
+    home = Path(home).absolute()
+    profile = hashlib.sha256(str(home).encode()).hexdigest()[:24]
+    source = Path(source_dir) if source_dir else Path(__file__).resolve().parent
+    bootstrap = source.parent / "bin/agent-full-backup"
+    if not bootstrap.is_file():
+        bootstrap = source / "agent-full-backup"
+    staged = {name: hashlib.sha256(_read(path, {0})).hexdigest()
+              for name, path in (("collector", source / "agent-backup-context.py"),
+                                 ("sanitizer", bootstrap.with_name("agent-backup-sanitize")))}
+
+    def current(path, owners=frozenset({0})):
+        no_links(path)
+        return _read(path, set(owners)) if path.exists() else None
+
+    for directory in (ROOT, ROOT / profile):
+        for name, known in (("agent-backup-context.py", KIT_COLLECTOR_SHA256 | {staged["collector"]}),
+                            ("agent-backup-sanitize", KIT_SANITIZER_SHA256 | {staged["sanitizer"]})):
+            data = current(directory / name)
+            if data is not None and hashlib.sha256(data).hexdigest() not in known:
+                raise LocalChanges(f"backup context file changed outside the kit: {directory / name}")
+    state = home / ".local/state/agent-full-backup"
+    # A backup an owner set up on an old kit runs from that kit's line; the scheduler
+    # that replaces it arrives only with this update. Moved now, the backup would have
+    # no working trigger if the update stops (Codex, review of 2fbec439).
+    no_links(state / "config.json")
+    if (state / "config.json").exists() and not (home / "bin/agent-nightly-github-backup").is_file():
+        raise ConfiguredBackup("a configured backup still runs on its old schedule")
+    settings = current(state / "context.json", {account.pw_uid})
+    settings = json.loads(settings) if settings is not None else {}
+    if not isinstance(settings, dict):
+        raise LocalChanges("backup context configuration changed outside the kit")
+    pythons = {"/usr/bin/python3"}
+    if isinstance(settings.get("pythonExecutable"), str):
+        pythons.add(settings["pythonExecutable"])
+    log = shlex.quote(str(state / "scheduled.log"))
+    minute = int(profile[:4], 16) % 60
+    agent_jobs = set()
+    for python in pythons:
+        full = shlex.join([python, str(home / "bin/agent-full-backup"), "--home", str(home), "scheduled"])
+        nightly = shlex.join([python, str(home / "bin/agent-nightly-github-backup"), "--home", str(home)])
+        agent_jobs.add((f"# Full encrypted backup for one agent; enabled only after owner setup.\n"
+                        f"{minute} * * * * {user} {full} >>{log} 2>&1\n").encode())
+        agent_jobs.add((f"# Local hourly check; one configured GitHub backup at 22:00 Europe/Lisbon.\n"
+                        f"0 * * * * {user} {nightly} >>{log} 2>&1\n").encode())
+    age = ROOT / "tools/age"
+    for path, known in (
+            (CRON_DIRECTORY / ("novsky-agent-full-backup-" + profile), agent_jobs),
+            (CRON_DIRECTORY / "novsky-backup-context", {context_job(ROOT / "agent-backup-context.py", age)}),
+            (CRON_DIRECTORY / ("novsky-backup-context-" + profile),
+             {context_job(ROOT / profile / "agent-backup-context.py", age, POLICIES / "agents" / (profile + ".json"))})):
+        data = current(path)
+        if data is not None and data not in known:
+            raise LocalChanges(f"backup schedule changed outside the kit: {path}")
+    # A move rewrites requiredFiles from the unit as it is now. It may add what the unit
+    # has gained; it drops nothing but the exact temporary holds a kit itself wrote in.
+    kept = set(required_files(home, unit, engine)) | {str(CRON_DIRECTORY / ("novsky-agent-full-backup-" + profile))}
+    kept |= {str(Path("/etc/systemd/system") / (unit + ".d") / name)
+             for name in ("zz-maintenance-hold.conf", "zy-novsky-transaction.conf")}
+    for path in (POLICIES / (profile + ".json"), POLICIES / "agents" / (profile + ".json")):
+        data = current(path)
+        if data is None:
+            continue
+        try:
+            policy = json.loads(data)
+        except ValueError:
+            policy = None
+        if (not isinstance(policy, dict)
+                or set(policy) != {"schemaVersion", "agentHome", "uid", "gid", "unit", "requiredFiles"}
+                or (policy["schemaVersion"], policy["agentHome"], policy["uid"], policy["gid"], policy["unit"])
+                != (1, str(home), account.pw_uid, account.pw_gid, unit)
+                or not isinstance(policy["requiredFiles"], list)
+                or not all(isinstance(name, str) and name in kept for name in policy["requiredFiles"])
+                or data != (json.dumps(policy, sort_keys=True) + "\n").encode()):
+            raise LocalChanges(f"backup policy changed outside the kit: {path}")
+
+
 def install(home, user, unit, engine, *, source_dir=None, python_binary=None):
     if os.geteuid() != 0 or not re.fullmatch(r"[a-zA-Z0-9@_.-]+\.service", unit):
         raise ValueError("root and an exact agent unit are required")
@@ -670,16 +784,28 @@ def main():
     parser.add_argument("--allow-maintenance-hold", action="store_true", help="Ignore this updater's exact temporary systemd hold")
     parser.add_argument("--allow-pinned-legacy-shared-context", action="store_true",
                         help="Maintenance only for two owner canaries on the exact witnessed legacy host")
+    parser.add_argument("--kit-origin-only", action="store_true",
+                        help="Move only absent files and the exact files of a kit release; stop on anything else")
     args = parser.parse_args()
     try:
         if args.allow_pinned_legacy_shared_context and not args.check_current:
             raise ValueError("legacy shared context is maintenance-only")
+        if args.kit_origin_only:
+            if args.check_current:
+                raise ValueError("a move is not a check")
+            require_kit_origin(args.home, args.user, args.unit, args.engine)
         action = check_current if args.check_current else install
         result = action(args.home, args.user, args.unit, args.engine, python_binary=args.python_binary,
                         **({"allow_maintenance_hold": args.allow_maintenance_hold,
                             "allow_pinned_legacy_shared_context": args.allow_pinned_legacy_shared_context}
                            if args.check_current else {}))
         print(json.dumps({"ok": True, **result}))
+    except LocalChanges as error:
+        print(json.dumps({"ok": False, "error": "backup-context-local-changes", "detail": str(error)}))
+        return 1
+    except ConfiguredBackup as error:
+        print(json.dumps({"ok": False, "error": "backup-context-configured-backup", "detail": str(error)}))
+        return 1
     except Exception:
         error_code = "backup-context-migration-required" if args.check_current else "backup-context-install-failed"
         print(json.dumps({"ok": False, "error": error_code}))

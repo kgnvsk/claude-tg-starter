@@ -13,6 +13,9 @@
 #
 # Запускать ОТ ИМЕНИ юзера бота:  runuser -l claude -c 'claude-login'
 set -uo pipefail
+# A login shell may not read ~/.profile (an empty ~/.bash_profile hides it): the CLI is found here, not by luck
+# of the caller's PATH — «claude: command not found» left Ґарет and Мерлін without a link (Володимир, 07.10.2026).
+export PATH="$HOME/.local/bin:$PATH"
 SES="clogin-$(id -u)"
 LOG="${TMPDIR:-/tmp}/claude-login.$(id -u).log"
 # Обліковий запис до перемикання; порожній файл = зараховується будь-який вхід.
@@ -83,7 +86,7 @@ if [ $# -eq 0 ]; then
       echo "⚠ Вхід у Claude саме оновлюється — повтори перемикання за кілька хвилин."; exit 75
     fi
   fi
-  screen -S "$SES" -X quit 2>/dev/null || true
+  screen -S "$SES" -X quit >/dev/null 2>&1 || true
   : > "$LOG"
   if [ -n "$SWITCH" ]; then account > "$BEFORE"; else : > "$BEFORE"; fi
   screen -dmS "$SES" bash -c "claude auth login --claudeai > '$LOG' 2>&1"
@@ -95,7 +98,7 @@ if [ $# -eq 0 ]; then
   done
   if [ -z "$URL" ]; then
     echo "⚠ OAuth-URL не з’явився за 40 с. Повний журнал входу:"; cat "$LOG"
-    screen -S "$SES" -X quit 2>/dev/null || true
+    screen -S "$SES" -X quit >/dev/null 2>&1 || true
     exit 1
   fi
   if [ -n "$SWITCH" ]; then
@@ -124,7 +127,7 @@ if landed; then
     echo "✅ Авторизовано через підписку:"; claude auth status 2>/dev/null | grep -E '"(email|subscriptionType|authMethod)"'
   fi
   : > "$BEFORE"
-  screen -S "$SES" -X quit 2>/dev/null || true
+  screen -S "$SES" -X quit >/dev/null 2>&1 || true
 else
   echo "⚠ Підтвердження ще не отримано. Кінець журналу:"; tail -10 "$LOG"
   echo "Перевір код або запусти claude-login знову."; exit 1
