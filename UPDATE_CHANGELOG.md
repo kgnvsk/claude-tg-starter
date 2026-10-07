@@ -1,9 +1,9 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-10-06.10810bdc1c59`
+- Реліз: `2026-10-07.614e32c5aef2`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `10810bdc1c59a25cb63f7c55cec2182b6603d24a`
-- Дата релізу: `2026-10-06`
+- Ревізія вихідного комплекту: `614e32c5aef2bcc2ceb32ea9149660b5ee0a5c62`
+- Дата релізу: `2026-10-07`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
 
@@ -19,7 +19,18 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    Keep owner-confirmed company rules in their Telegram chat or topic
+    Update guide: «встановлено», not the Russian «установлено»
+    Update guide: read the CLI versions with npm ls, no path into a codex/ folder
+    Update contract tests: the poller still starts once, after step 4's refused-start proof
+    Update guide test: forbid an own stop or start, keep the refused-start proof
+    Update guide: the outer transaction holds the service's start from before the CLI window
+    Update guide: check everything first, change the CLIs only inside the guarded window
+    Update guide: a short path for the Claude that updates a customer's agent
+    Corporate scheduled work: Codex review of fe2f0214, all five findings
+    Corporate scheduled work: a person's confirmed task runs in its conversation
+    receipts-switch: a profile can name its own channel directory
+    queue-settle-sweep: press the real Ctrl+B in the agent's own screen, under the lifecycle lock
+    fix(queue-settle-sweep): move a long foreground command to the background when people wait
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не

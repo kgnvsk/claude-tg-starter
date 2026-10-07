@@ -43,6 +43,19 @@ STUCK_SECONDS = int(os.environ.get("QUEUE_SETTLE_AFTER_SECONDS", "180"))
 # files grow to megabytes and this runs every minute.
 TRANSCRIPT_TAIL_BYTES = 4 * 1024 * 1024
 TRANSCRIPT_CANDIDATES = 12
+# Луна, 06.10.2026: the model ran a long command in the foreground of the main session and the owner's
+# messages waited 15 minutes behind it. Ctrl+B, the CLI's own «run in background», let her answer at once
+# while the command went on. A person waiting this long behind a foreground command gets that press.
+UNBLOCK_AFTER_SECONDS = int(os.environ.get("QUEUE_UNBLOCK_AFTER_SECONDS", "150"))
+UNBLOCK_PAUSE_SECONDS = 600
+UNBLOCK_STATE = AGENT_ROOT / "logs/queue-unblock.state"
+SCREEN_SNAPSHOT = AGENT_ROOT / "logs/.queue-unblock-screen"
+BACKGROUND_HINT = re.compile(r"ctrl\+b to run in background", re.IGNORECASE)
+# The byte itself: screen's stuff types the two characters "^B" literally (Codex, 06.10 21:18).
+CTRL_B = "\x02"
+# This agent's own unit. Its screen session is the unit's main process; other profiles of the
+# same Unix user run their own sessions (Knopa: main-bot beside a neighbour's).
+SERVICE = os.environ.get("CLAUDE_TELEGRAM_SERVICE") or "claude-telegram.service"
 
 
 def log(message: str) -> None:
@@ -99,6 +112,99 @@ def queue_head() -> tuple[str, int] | None:
     marked = marked or 0
     age = int(time.time() - (marked / 1000 if marked > 10 ** 11 else marked))
     return str(delivery_id), age
+
+
+def waiting_age() -> int | None:
+    """How long the oldest message nobody is working on yet has waited, in seconds."""
+    try:
+        with closing(sqlite3.connect(f"file:{STATE_DIR / 'messages.db'}?mode=ro", uri=True, timeout=5)) as db:
+            row = db.execute("SELECT min(created_at) FROM pending_inbound_deliveries "
+                             "WHERE state IN ('queued', 'offered')").fetchone()
+    except sqlite3.Error:
+        return None
+    if not row or not row[0]:
+        return None
+    return int(time.time() - (row[0] / 1000 if row[0] > 10 ** 11 else row[0]))
+
+
+def own_screen() -> str | None:
+    """`PID.name` of the screen session that is this agent's unit; None when there is none or it is unclear."""
+    try:
+        unit = subprocess.run(["systemctl", "show", "-p", "MainPID", "--value", SERVICE],
+                              capture_output=True, text=True, timeout=10)
+        listed = subprocess.run(["screen", "-ls"], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    pid = unit.stdout.strip()
+    if unit.returncode or not pid.isdigit() or pid == "0":
+        return None
+    # screen -ls exits non-zero even when it lists sessions; the listing itself is the answer.
+    sessions = re.findall(rf"^\s*({pid}\.\S+)\s", listed.stdout, re.MULTILINE)
+    return sessions[0] if len(sessions) == 1 else None
+
+
+def screen_text(session: str) -> str | None:
+    """What window 0 of that session (the CLI) shows now; None when screen refuses."""
+    try:
+        SCREEN_SNAPSHOT.parent.mkdir(parents=True, exist_ok=True)
+        SCREEN_SNAPSHOT.unlink(missing_ok=True)
+        copied = subprocess.run(["screen", "-S", session, "-p", "0", "-X", "hardcopy", str(SCREEN_SNAPSHOT)],
+                                capture_output=True, timeout=10)
+        if copied.returncode:
+            return None
+        # -X only hands the command to the screen server, which writes the file a moment later.
+        for _ in range(30):
+            if SCREEN_SNAPSHOT.exists() and SCREEN_SNAPSHOT.stat().st_size:
+                break
+            time.sleep(0.1)
+        return SCREEN_SNAPSHOT.read_bytes().replace(b"\0", b"").decode("utf-8", "replace")
+    except (OSError, subprocess.SubprocessError):
+        return None
+    finally:
+        SCREEN_SNAPSHOT.unlink(missing_ok=True)
+
+
+def unblock_foreground() -> None:
+    # A read only, without the lock: most minutes nobody waits and the lock stays free for its owners.
+    if (waiting_age() or 0) < UNBLOCK_AFTER_SECONDS:
+        return
+    lock = None
+    try:
+        LIFECYCLE_LOCK.parent.mkdir(parents=True, exist_ok=True)
+        lock = LIFECYCLE_LOCK.open("a")
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (OSError, BlockingIOError):
+        if lock is not None:
+            lock.close()
+        return  # a login, restart, update or another sweep owns the transport; the next minute looks again
+    try:
+        # Everything the press depends on is read again under the lock.
+        age = waiting_age()
+        if age is None or age < UNBLOCK_AFTER_SECONDS:
+            return
+        try:
+            if time.time() - float(UNBLOCK_STATE.read_text().split()[0]) < UNBLOCK_PAUSE_SECONDS:
+                return  # one press per pause: a hint that outlives it is the stuck-turn watchdog's
+        except (OSError, ValueError, IndexError):
+            pass
+        session = own_screen()
+        text = screen_text(session) if session else None
+        if not text or not BACKGROUND_HINT.search("\n".join(text.rstrip().splitlines()[-15:])):
+            return
+        try:
+            pressed = subprocess.run(["screen", "-S", session, "-p", "0", "-X", "stuff", CTRL_B],
+                                     capture_output=True, timeout=10)
+        except (OSError, subprocess.SubprocessError) as error:
+            log(f"a message waited {age}s behind a foreground command; Ctrl+B not sent: {error}")
+            return
+        if pressed.returncode:
+            log(f"a message waited {age}s behind a foreground command; Ctrl+B not sent: screen {session} answered {pressed.returncode}")
+            return
+        UNBLOCK_STATE.parent.mkdir(parents=True, exist_ok=True)
+        UNBLOCK_STATE.write_text(f"{time.time():.0f}\n", encoding="utf-8")
+        log(f"a message waited {age}s behind a foreground command: pressed Ctrl+B (run in background) in {session}")
+    finally:
+        lock.close()
 
 
 def transcript_for(delivery_id: str) -> pathlib.Path | None:
@@ -467,6 +573,7 @@ def settle_completed_durable_head() -> None:
 def main() -> int:
     if not GUARD.is_file() or not (STATE_DIR / "messages.db").exists():
         return 0
+    unblock_foreground()
     if durable_recovery():
         if delivery_authority() != "receiver":
             settle_completed_durable_head()

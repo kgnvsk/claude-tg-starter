@@ -2,7 +2,8 @@
 # Move one kit bot from the Stop guard to delivery receipts, and on to the whole agent on receipts (RECEIPTS_UPGRADE.md).
 # Run as root from the kit release, never from the agent's own ~/bin:
 #
-#   receipts-switch [--user claude] [--home /home/claude] [--config /home/claude/.claude] [--service claude-telegram.service] status
+#   receipts-switch [--user claude] [--home /home/claude] [--config /home/claude/.claude] [--state-dir <config>/channels/telegram]
+#                   [--service claude-telegram.service] status
 #   receipts-switch [...] receiver     shadow -> receiver: the receipts decide delivery
 #   receipts-switch [...] shadow       receiver -> shadow: the way back, never waits for an empty queue
 #   receipts-switch [...] live on      the whole agent on receipts: owner chat and company chats on the live engines
@@ -16,13 +17,16 @@
 # turn, result and queue row. DRY_RUN=1 checks everything and changes nothing. Exit: 0 done or nothing to do,
 # 2 refused before any change, 3 not idle in IDLE_WAIT, 5 failed after the stop and rolled back.
 # Ported from the operations scripts used on Cash, Manzik and Menni (05.10.2026; Codex reviewed 44fbf027, fabcfc0f).
+# --state-dir is for a profile whose channel does not live under its config (Knopa, 06.10.2026: home /home/claude/main,
+# config .../main/.claude-config, channel .../main/.claude/channels/telegram, unit claude-telegram-main.service).
 set -eEuo pipefail  # -E: the ERR trap must fire inside main() too
-OWN=claude; H=""; CONFIG=""; SVC=claude-telegram.service
+OWN=claude; H=""; CONFIG=""; STATE=""; SVC=claude-telegram.service
 while [ $# -gt 0 ]; do
   case "$1" in
     --user) OWN=${2:?--user needs a name}; shift 2 ;;
     --home) H=${2:?--home needs a path}; shift 2 ;;
     --config) CONFIG=${2:?--config needs a path}; shift 2 ;;
+    --state-dir) STATE=${2:?--state-dir needs a path}; shift 2 ;;
     --service) SVC=${2:?--service needs a unit}; shift 2 ;;
     *) break ;;
   esac
@@ -35,7 +39,9 @@ AS="runuser -u $OWN --"
 FILE_OPS=$HERE/receipts-files.py
 BACKUP_ROOT=${BACKUP_ROOT:-/root/backups}
 HOLD_UNTIL=""; FRESH_RECORD=""; CHANGED_SHA=""; LIVE_SWITCH=0
-CH=$CONFIG/channels/telegram
+CH=${STATE:-$CONFIG/channels/telegram}
+# The same profile on every re-run and in every way back that is printed.
+PROFILE=(--user "$OWN" --home "$H" --config "$CONFIG" --state-dir "$CH" --service "$SVC")
 DB=$CH/messages.db
 ENVF=$CH/.env
 GUARD=$H/bin/tg-reply-stop-guard
@@ -68,7 +74,7 @@ backup_env() {
 under_lock() {
   $AS python3 "$FILE_OPS" ensure-lock "$H/logs/transport-lifecycle.lock"
   if [ -z "${RECEIPTS_LOCK_FD:-}" ]; then
-    exec python3 "$FILE_OPS" lock-run "$H/logs/transport-lifecycle.lock" "$OWN" /bin/bash "$0" --user "$OWN" --home "$H" --config "$CONFIG" --service "$SVC" "$COMMAND" "$ARG"
+    exec python3 "$FILE_OPS" lock-run "$H/logs/transport-lifecycle.lock" "$OWN" /bin/bash "$0" "${PROFILE[@]}" "$COMMAND" "$ARG"
   fi
   python3 "$FILE_OPS" lock-check "$H/logs/transport-lifecycle.lock" "$RECEIPTS_LOCK_FD" "$OWN"
 }
@@ -124,7 +130,7 @@ PYPROC
 }
 selected_session() {  # the session the launcher would resume now, asked of the selector as it runs
   [ -x "$SELECTOR" ] || return 0
-  (cd "$H" && $AS env HOME="$H" CLAUDE_CONFIG_DIR="$CONFIG" "$SELECTOR" 2>/dev/null || true) | head -1
+  (cd "$H" && $AS env HOME="$H" CLAUDE_CONFIG_DIR="$CONFIG" TELEGRAM_STATE_DIR="$CH" "$SELECTOR" 2>/dev/null || true) | head -1
 }
 legacy() { [ -n "$1" ] && [ -n "$(q "SELECT 1 FROM delivery_legacy_native_sessions WHERE session_id='$1'")" ]; }
 busy_reason() {  # the installer's idle rule
@@ -276,11 +282,12 @@ switch_authority() {
   if [ "$FRESH" = 1 ]; then
     # The selector stays off until the fresh session has claimed a Telegram message (Codex, 30.09 P1), at most a day.
     systemd-run --collect --unit "receipts-fresh-session-$OWN" -p StandardOutput=append:"$B/fresh-session.log" \
-      python3 "$HERE/receipts-fresh-session" watch "$FRESH_RECORD" "$next" "$DB" "$H" "$OWN" 24 HOME="$H" >/dev/null
+      python3 "$HERE/receipts-fresh-session" watch "$FRESH_RECORD" "$next" "$DB" "$H" "$OWN" 24 HOME="$H" \
+        CLAUDE_CONFIG_DIR="$CONFIG" TELEGRAM_STATE_DIR="$CH" >/dev/null
   fi
   trap - ERR TERM INT HUP
   say "OK: authority $TARGET, MainPID $pid0 → $pid1, NRestarts $nr1, session ${session1:-fresh}, queue $(q 'SELECT count(*) FROM pending_inbound_deliveries')"
-  say "way back: $0 --user $OWN --home $H --config $CONFIG --service $SVC $AUTH0"
+  say "way back: $0 ${PROFILE[*]} $AUTH0"
 }
 
 switch_live() {
@@ -339,16 +346,16 @@ PYMARKER
   fi
   clear_hold
   trap - ERR TERM INT HUP
-  say "OK: live $mode; service $(systemctl is-active "$SVC"), .env kept in $B; way back: $0 --user $OWN --home $H --config $CONFIG --service $SVC live $( [ "$mode" = on ] && echo off || echo on )"
+  say "OK: live $mode; service $(systemctl is-active "$SVC"), .env kept in $B; way back: $0 ${PROFILE[*]} live $( [ "$mode" = on ] && echo off || echo on )"
 }
 
 main() {
   [ "$(id -u)" = 0 ] || { say "run as root"; exit 2; }
   [[ "$OWN" =~ ^[a-z][a-z0-9-]{0,30}$ ]] && [[ "$SVC" =~ ^[a-zA-Z0-9@_.-]+\.service$ ]] || { say "invalid agent or service"; exit 2; }
-  $AS python3 - "$H" "$CONFIG" <<'PYPROFILE'
+  $AS python3 - "$H" "$CONFIG" "$CH" <<'PYPROFILE'
 import os,pathlib,pwd,stat,sys
-home,config=map(pathlib.Path,sys.argv[1:]);base=pathlib.Path(pwd.getpwuid(os.geteuid()).pw_dir)
-for path in (home,config):
+paths=list(map(pathlib.Path,sys.argv[1:]));base=pathlib.Path(pwd.getpwuid(os.geteuid()).pw_dir)
+for path in paths:
  if not path.is_absolute() or '..' in path.parts or not (path==base or base in path.parents):raise ValueError('outside the agent profile')
  current=pathlib.Path('/')
  for part in path.parts[1:]:
