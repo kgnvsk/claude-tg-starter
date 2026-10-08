@@ -450,8 +450,104 @@ def reconcile_agents(
     return result
 
 
+def seed_baseline(
+    skills_root: Path,
+    policy_path: Path,
+    baseline_path: Path,
+    old_source: Path,
+    source: Path,
+    *,
+    old_external: Path | None = None,
+    external: Path | None = None,
+    keep_live: frozenset[str] = frozenset(),
+    take_kit: frozenset[str] = frozenset(),
+) -> tuple[dict[str, list[str]], bool]:
+    """First baseline, or the missing part of one, for an agent installed before baselines existed.
+
+    Without one, every kit skill that changed since the install reads as an owner
+    edit and stops install-core inside the window (Юрій, 07.10.2026: 34 skills on a
+    kit of 14.08). A skill whose live bytes equal the trusted old kit's render is the
+    kit's and takes the new version; a skill changed outside the kit is seeded only
+    by the owner's explicit choice: keep the live copy or take the kit's. Anything
+    else leaves the baseline unwritten.
+    """
+    # An existing baseline is only completed: its entries never change. A first run that
+    # stopped on an unresolved skill, or a baseline without some managed skill, takes
+    # the owner's later choices for the missing names alone (Codex, review of 24460c38).
+    existing = load_baseline(baseline_path)
+    policy = load_policy(policy_path)
+    disabled_root = skills_root.with_name(skills_root.name + ".disabled")
+    names = set(policy["managed"]) | {"manifest.json"}
+    unknown = sorted((keep_live | take_kit) - names)
+    if unknown or keep_live & take_kit:
+        raise PolicyError("рішення лише для керованих навичок і одне на навичку: " + ", ".join(unknown or sorted(keep_live & take_kit)))
+
+    def candidate(name: str, first_party: Path, third_party: Path | None) -> Snapshot | None:
+        value = snapshot(first_party / name, render=True)
+        if value is None and third_party is not None and name != "manifest.json":
+            value = snapshot(third_party / name)
+        return value
+
+    entries: dict[str, str] = {}
+    report: dict[str, list[str]] = {"same": [], "kit": [], "keptLive": [], "takeKit": [], "unresolved": []}
+    for name in sorted(names - set(existing)):
+        # The planner keeps a disabled skill where it is and updates that copy;
+        # the seed reads the same copy and refuses an ambiguous pair before writing.
+        active, disabled = skills_root / name, disabled_root / name
+        check_path(active)
+        check_path(disabled)
+        if active.exists() and disabled.exists():
+            raise PolicyError(f"конфлікт навички {name}: одночасно ввімкнена й вимкнена копії")
+        live_snapshot = snapshot(disabled if disabled.exists() else active)
+        if live_snapshot is None:
+            continue
+        live = checksum(live_snapshot)
+        target = candidate(name, source, external)
+        old = candidate(name, old_source, old_external)
+        if target is not None and checksum(target) == live:
+            kind, value = "same", live
+        elif old is not None and checksum(old) == live:
+            kind, value = "kit", live
+        elif name in keep_live and target is not None:
+            kind, value = "keptLive", checksum(target)
+        elif name in take_kit:
+            kind, value = "takeKit", live
+        else:
+            kind, value = "unresolved", None
+        report[kind].append(name)
+        if value is not None:
+            entries[name] = value
+    if report["unresolved"]:
+        return report, False
+    write_policy(baseline_path, {"schemaVersion": 1, "entries": {**existing, **entries}})
+    return report, True
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
+    if argv and argv[0] == "seed":
+        parser = argparse.ArgumentParser(description="Перша база навичок для інсталяції, старшої за неї")
+        parser.add_argument("skills_root", type=Path)
+        parser.add_argument("policy_path", type=Path)
+        parser.add_argument("baseline_path", type=Path)
+        parser.add_argument("--old-source", type=Path, required=True)
+        parser.add_argument("--old-external", type=Path)
+        parser.add_argument("--source", type=Path, required=True)
+        parser.add_argument("--external-source", type=Path)
+        parser.add_argument("--keep-live", default="")
+        parser.add_argument("--take-kit", default="")
+        args = parser.parse_args(argv[1:])
+        names = lambda value: frozenset(item for item in value.split(",") if item)
+        try:
+            report, written = seed_baseline(
+                args.skills_root, args.policy_path, args.baseline_path, args.old_source, args.source,
+                old_external=args.old_external, external=args.external_source,
+                keep_live=names(args.keep_live), take_kit=names(args.take_kit))
+        except (PolicyError, OSError) as error:
+            print(f"помилка засіву навичок: {error}", file=sys.stderr)
+            return 2
+        print(json.dumps({"written": written, **report}, ensure_ascii=False, sort_keys=True))
+        return 0 if written else 1
     agents_mode = bool(argv and argv[0] == "agents")
     parser = argparse.ArgumentParser(description="Обережне оновлення керованих навичок і субагентів")
     if agents_mode:

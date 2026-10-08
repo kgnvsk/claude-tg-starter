@@ -1,9 +1,9 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-10-07.6fc0cf685384`
+- Реліз: `2026-10-08.5fe5f57b6271`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `6fc0cf68538478a760510826dc51682ba24b2458`
-- Дата релізу: `2026-10-07`
+- Ревізія вихідного комплекту: `5fe5f57b6271b7b677ad1a1091e761b80216b365`
+- Дата релізу: `2026-10-08`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
 
@@ -19,8 +19,8 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    Trust an unpinned premium kit's persona by the kit's own historical bytes
-    Pin the persona sources of the 15.09 kit dc428b71
+    Seed disabled skills where they lie; complete an existing skills baseline
+    Seed the skills baseline of an agent older than baselines before the window
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не
