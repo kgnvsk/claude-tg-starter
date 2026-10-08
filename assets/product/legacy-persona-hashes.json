@@ -764,6 +764,2526 @@
         "assets/product/ROLE.md": "150eca42e84925a1e0a65e0212e34a84601d403f044310fb89cc5bf88f4ab87c",
         "assets/templates/CLAUDE.md.template": "7cae911d810bef239f57526fb59a83f9a957c991817bbc182e38a3b56e121d61"
       }
+    },
+    "c7fa3b9e26160792235eb59e4f272c3414bf761d": {
+      "creative-producer": {
+        "assets/product/ROLE.md": "91516b5083d3c6ccd7b95588dc1a2b237f9a253340a1f81e6141d677476b4b65",
+        "assets/templates/CLAUDE.md.template": "a27192bbd7429d822eb13db24869c1d21436180a6c537b1127abcf1317c0fa42"
+      },
+      "data-bi-analyst": {
+        "assets/product/ROLE.md": "1f0416711926fa12dddc7226b3d3c86a21a60483c5b128789840bf2b68f1af53",
+        "assets/templates/CLAUDE.md.template": "23c3a9b945b9b3892f03b50d6369d242c620bc8212bbbbd8f34d6df4a0efc58a"
+      },
+      "executive-assistant": {
+        "assets/product/ROLE.md": "522bb3d2d75bc1df50225b00f7c891b7b86e057d33d4d2ba6d90241042a07134",
+        "assets/templates/CLAUDE.md.template": "23c3a9b945b9b3892f03b50d6369d242c620bc8212bbbbd8f34d6df4a0efc58a"
+      },
+      "fpa-cfo-assistant": {
+        "assets/product/ROLE.md": "10e8eef70cf819eddfa32f1e6dda4e0e7ddb99feccf2310e7a1e0684a916b39e",
+        "assets/templates/CLAUDE.md.template": "23c3a9b945b9b3892f03b50d6369d242c620bc8212bbbbd8f34d6df4a0efc58a"
+      },
+      "investment-research-analyst": {
+        "assets/product/ROLE.md": "76be61420a6f339dad725e3df6e6c61682ba71e7f86a51331fc506f023c84353",
+        "assets/templates/CLAUDE.md.template": "23c3a9b945b9b3892f03b50d6369d242c620bc8212bbbbd8f34d6df4a0efc58a"
+      },
+      "marketing-strategist": {
+        "assets/product/ROLE.md": "3ed58252479325b0b3b76043df1c85379923b5886e1b7f3af2f76b678b233888",
+        "assets/templates/CLAUDE.md.template": "82dc8a27e25a367a91dc86f9e81e535c66fccc6ef8463577f8e5207799e61f9c"
+      },
+      "performance-marketer": {
+        "assets/product/ROLE.md": "5f76d8ce27437e4d5eab2f4fd7298127afe609222c9429f3da3221381a75e666",
+        "assets/templates/CLAUDE.md.template": "82dc8a27e25a367a91dc86f9e81e535c66fccc6ef8463577f8e5207799e61f9c"
+      },
+      "premium": {
+        "assets/product/ROLE.md": "50cfb76fe2f44a34db451a98e29a8399a16901c8b9c10e2b6fc8e2c9931de778",
+        "assets/roles/creative-producer/ROLE.md": "91516b5083d3c6ccd7b95588dc1a2b237f9a253340a1f81e6141d677476b4b65",
+        "assets/roles/data-bi-analyst/ROLE.md": "1f0416711926fa12dddc7226b3d3c86a21a60483c5b128789840bf2b68f1af53",
+        "assets/roles/executive-assistant/ROLE.md": "522bb3d2d75bc1df50225b00f7c891b7b86e057d33d4d2ba6d90241042a07134",
+        "assets/roles/fpa-cfo-assistant/ROLE.md": "10e8eef70cf819eddfa32f1e6dda4e0e7ddb99feccf2310e7a1e0684a916b39e",
+        "assets/roles/investment-research-analyst/ROLE.md": "76be61420a6f339dad725e3df6e6c61682ba71e7f86a51331fc506f023c84353",
+        "assets/roles/marketing-strategist/ROLE.md": "3ed58252479325b0b3b76043df1c85379923b5886e1b7f3af2f76b678b233888",
+        "assets/roles/performance-marketer/ROLE.md": "5f76d8ce27437e4d5eab2f4fd7298127afe609222c9429f3da3221381a75e666",
+        "assets/roles/project-operations-manager/ROLE.md": "130fc45b3db5a8dc381d47743504bc647f21e16bfe4f191299fe35a6200b7a7e",
+        "assets/roles/sales-sdr/ROLE.md": "b310368a6eb2d5092382b74ffb464f4d95941e2bec6b306fc09b0a1e365979cc",
+        "assets/roles/smm-manager/ROLE.md": "45ad011bbb6ecf93f151e29067998611ec8b774e7e99e16a74a9ef4224f16bbb",
+        "assets/templates/CLAUDE.md.template": "bf4f44f360e8635737af1509558364524716709e5b4b553c815b8e3669f415db"
+      },
+      "project-operations-manager": {
+        "assets/product/ROLE.md": "130fc45b3db5a8dc381d47743504bc647f21e16bfe4f191299fe35a6200b7a7e",
+        "assets/templates/CLAUDE.md.template": "a0d2ffbe27da239e38f90505a609f9f626b3bbb9bade336be9cd66c2cf1259f2"
+      },
+      "sales-sdr": {
+        "assets/product/ROLE.md": "b310368a6eb2d5092382b74ffb464f4d95941e2bec6b306fc09b0a1e365979cc",
+        "assets/templates/CLAUDE.md.template": "23c3a9b945b9b3892f03b50d6369d242c620bc8212bbbbd8f34d6df4a0efc58a"
+      },
+      "smm-manager": {
+        "assets/product/ROLE.md": "45ad011bbb6ecf93f151e29067998611ec8b774e7e99e16a74a9ef4224f16bbb",
+        "assets/templates/CLAUDE.md.template": "a27192bbd7429d822eb13db24869c1d21436180a6c537b1127abcf1317c0fa42"
+      },
+      "starter": {
+        "assets/product/ROLE.md": "150eca42e84925a1e0a65e0212e34a84601d403f044310fb89cc5bf88f4ab87c",
+        "assets/templates/CLAUDE.md.template": "23c3a9b945b9b3892f03b50d6369d242c620bc8212bbbbd8f34d6df4a0efc58a"
+      }
+    },
+    "c9803b0886554cf741b7d3099aab04b559605422": {
+      "creative-producer": {
+        "assets/product/ROLE.md": "91516b5083d3c6ccd7b95588dc1a2b237f9a253340a1f81e6141d677476b4b65",
+        "assets/templates/CLAUDE.md.template": "6bf17e3932abf077192a86fb0648713835f218bfc1271384f5f3e4aa9d369904"
+      },
+      "data-bi-analyst": {
+        "assets/product/ROLE.md": "1f0416711926fa12dddc7226b3d3c86a21a60483c5b128789840bf2b68f1af53",
+        "assets/templates/CLAUDE.md.template": "982e9b7cb20f93e8f45d3339287b9220b2a2ea0c2ab2dbe83f43aa0cc655cd4b"
+      },
+      "executive-assistant": {
+        "assets/product/ROLE.md": "522bb3d2d75bc1df50225b00f7c891b7b86e057d33d4d2ba6d90241042a07134",
+        "assets/templates/CLAUDE.md.template": "982e9b7cb20f93e8f45d3339287b9220b2a2ea0c2ab2dbe83f43aa0cc655cd4b"
+      },
+      "fpa-cfo-assistant": {
+        "assets/product/ROLE.md": "10e8eef70cf819eddfa32f1e6dda4e0e7ddb99feccf2310e7a1e0684a916b39e",
+        "assets/templates/CLAUDE.md.template": "982e9b7cb20f93e8f45d3339287b9220b2a2ea0c2ab2dbe83f43aa0cc655cd4b"
+      },
+      "investment-research-analyst": {
+        "assets/product/ROLE.md": "76be61420a6f339dad725e3df6e6c61682ba71e7f86a51331fc506f023c84353",
+        "assets/templates/CLAUDE.md.template": "982e9b7cb20f93e8f45d3339287b9220b2a2ea0c2ab2dbe83f43aa0cc655cd4b"
+      },
+      "marketing-strategist": {
+        "assets/product/ROLE.md": "3ed58252479325b0b3b76043df1c85379923b5886e1b7f3af2f76b678b233888",
+        "assets/templates/CLAUDE.md.template": "6a161f39ec2f3df385480102a3746818b8afc643d3937620799c99f7e8bd79e0"
+      },
+      "performance-marketer": {
+        "assets/product/ROLE.md": "5f76d8ce27437e4d5eab2f4fd7298127afe609222c9429f3da3221381a75e666",
+        "assets/templates/CLAUDE.md.template": "6a161f39ec2f3df385480102a3746818b8afc643d3937620799c99f7e8bd79e0"
+      },
+      "premium": {
+        "assets/product/ROLE.md": "50cfb76fe2f44a34db451a98e29a8399a16901c8b9c10e2b6fc8e2c9931de778",
+        "assets/roles/creative-producer/ROLE.md": "91516b5083d3c6ccd7b95588dc1a2b237f9a253340a1f81e6141d677476b4b65",
+        "assets/roles/data-bi-analyst/ROLE.md": "1f0416711926fa12dddc7226b3d3c86a21a60483c5b128789840bf2b68f1af53",
+        "assets/roles/executive-assistant/ROLE.md": "522bb3d2d75bc1df50225b00f7c891b7b86e057d33d4d2ba6d90241042a07134",
+        "assets/roles/fpa-cfo-assistant/ROLE.md": "10e8eef70cf819eddfa32f1e6dda4e0e7ddb99feccf2310e7a1e0684a916b39e",
+        "assets/roles/investment-research-analyst/ROLE.md": "76be61420a6f339dad725e3df6e6c61682ba71e7f86a51331fc506f023c84353",
+        "assets/roles/marketing-strategist/ROLE.md": "3ed58252479325b0b3b76043df1c85379923b5886e1b7f3af2f76b678b233888",
+        "assets/roles/performance-marketer/ROLE.md": "5f76d8ce27437e4d5eab2f4fd7298127afe609222c9429f3da3221381a75e666",
+        "assets/roles/project-operations-manager/ROLE.md": "130fc45b3db5a8dc381d47743504bc647f21e16bfe4f191299fe35a6200b7a7e",
+        "assets/roles/sales-sdr/ROLE.md": "b310368a6eb2d5092382b74ffb464f4d95941e2bec6b306fc09b0a1e365979cc",
+        "assets/roles/smm-manager/ROLE.md": "45ad011bbb6ecf93f151e29067998611ec8b774e7e99e16a74a9ef4224f16bbb",
+        "assets/templates/CLAUDE.md.template": "9c75b27169eb40142ef3b636a78a2dfab9d37a5c619ec98b808b7d0549ab9f3a"
+      },
+      "project-operations-manager": {
+        "assets/product/ROLE.md": "130fc45b3db5a8dc381d47743504bc647f21e16bfe4f191299fe35a6200b7a7e",
+        "assets/templates/CLAUDE.md.template": "97f472dd27497e9a1a555ee9dbb5821638bd729aa89b764e24e7bb5189206783"
+      },
+      "sales-sdr": {
+        "assets/product/ROLE.md": "b310368a6eb2d5092382b74ffb464f4d95941e2bec6b306fc09b0a1e365979cc",
+        "assets/templates/CLAUDE.md.template": "982e9b7cb20f93e8f45d3339287b9220b2a2ea0c2ab2dbe83f43aa0cc655cd4b"
+      },
+      "smm-manager": {
+        "assets/product/ROLE.md": "45ad011bbb6ecf93f151e29067998611ec8b774e7e99e16a74a9ef4224f16bbb",
+        "assets/templates/CLAUDE.md.template": "6bf17e3932abf077192a86fb0648713835f218bfc1271384f5f3e4aa9d369904"
+      },
+      "starter": {
+        "assets/product/ROLE.md": "150eca42e84925a1e0a65e0212e34a84601d403f044310fb89cc5bf88f4ab87c",
+        "assets/templates/CLAUDE.md.template": "982e9b7cb20f93e8f45d3339287b9220b2a2ea0c2ab2dbe83f43aa0cc655cd4b"
+      }
+    },
+    "17b2b6e27fd512cece894b25e42b236f8d24cd3b": {
+      "creative-producer": {
+        "assets/product/ROLE.md": "91516b5083d3c6ccd7b95588dc1a2b237f9a253340a1f81e6141d677476b4b65",
+        "assets/templates/CLAUDE.md.template": "f80450e45f77ea00887715f692dc28009706ea0a57fdb0e37bf451b48e11b26c"
+      },
+      "data-bi-analyst": {
+        "assets/product/ROLE.md": "1f0416711926fa12dddc7226b3d3c86a21a60483c5b128789840bf2b68f1af53",
+        "assets/templates/CLAUDE.md.template": "90ed7d8f7a2e45ed90a5ced70bb3029862d379b2426621c6c0ae0387bd01c421"
+      },
+      "executive-assistant": {
+        "assets/product/ROLE.md": "522bb3d2d75bc1df50225b00f7c891b7b86e057d33d4d2ba6d90241042a07134",
+        "assets/templates/CLAUDE.md.template": "90ed7d8f7a2e45ed90a5ced70bb3029862d379b2426621c6c0ae0387bd01c421"
+      },
+      "fpa-cfo-assistant": {
+        "assets/product/ROLE.md": "10e8eef70cf819eddfa32f1e6dda4e0e7ddb99feccf2310e7a1e0684a916b39e",
+        "assets/templates/CLAUDE.md.template": "90ed7d8f7a2e45ed90a5ced70bb3029862d379b2426621c6c0ae0387bd01c421"
+      },
+      "investment-research-analyst": {
+        "assets/product/ROLE.md": "76be61420a6f339dad725e3df6e6c61682ba71e7f86a51331fc506f023c84353",
+        "assets/templates/CLAUDE.md.template": "90ed7d8f7a2e45ed90a5ced70bb3029862d379b2426621c6c0ae0387bd01c421"
+      },
+      "marketing-strategist": {
+        "assets/product/ROLE.md": "3ed58252479325b0b3b76043df1c85379923b5886e1b7f3af2f76b678b233888",
+        "assets/templates/CLAUDE.md.template": "d95349b0eb22fd3f62919893d1650a7d36333c31bcbe95af8acc42a23110e742"
+      },
+      "performance-marketer": {
+        "assets/product/ROLE.md": "5f76d8ce27437e4d5eab2f4fd7298127afe609222c9429f3da3221381a75e666",
+        "assets/templates/CLAUDE.md.template": "d95349b0eb22fd3f62919893d1650a7d36333c31bcbe95af8acc42a23110e742"
+      },
+      "premium": {
+        "assets/product/ROLE.md": "50cfb76fe2f44a34db451a98e29a8399a16901c8b9c10e2b6fc8e2c9931de778",
+        "assets/roles/creative-producer/ROLE.md": "91516b5083d3c6ccd7b95588dc1a2b237f9a253340a1f81e6141d677476b4b65",
+        "assets/roles/data-bi-analyst/ROLE.md": "1f0416711926fa12dddc7226b3d3c86a21a60483c5b128789840bf2b68f1af53",
+        "assets/roles/executive-assistant/ROLE.md": "522bb3d2d75bc1df50225b00f7c891b7b86e057d33d4d2ba6d90241042a07134",
+        "assets/roles/fpa-cfo-assistant/ROLE.md": "10e8eef70cf819eddfa32f1e6dda4e0e7ddb99feccf2310e7a1e0684a916b39e",
+        "assets/roles/investment-research-analyst/ROLE.md": "76be61420a6f339dad725e3df6e6c61682ba71e7f86a51331fc506f023c84353",
+        "assets/roles/marketing-strategist/ROLE.md": "3ed58252479325b0b3b76043df1c85379923b5886e1b7f3af2f76b678b233888",
+        "assets/roles/performance-marketer/ROLE.md": "5f76d8ce27437e4d5eab2f4fd7298127afe609222c9429f3da3221381a75e666",
+        "assets/roles/project-operations-manager/ROLE.md": "130fc45b3db5a8dc381d47743504bc647f21e16bfe4f191299fe35a6200b7a7e",
+        "assets/roles/sales-sdr/ROLE.md": "b310368a6eb2d5092382b74ffb464f4d95941e2bec6b306fc09b0a1e365979cc",
+        "assets/roles/smm-manager/ROLE.md": "45ad011bbb6ecf93f151e29067998611ec8b774e7e99e16a74a9ef4224f16bbb",
+        "assets/templates/CLAUDE.md.template": "1707f66655ebecfef5cd4dd157b5eeb3d401f54440d639ada1d75d0d6e97ee8b"
+      },
+      "project-operations-manager": {
+        "assets/product/ROLE.md": "130fc45b3db5a8dc381d47743504bc647f21e16bfe4f191299fe35a6200b7a7e",
+        "assets/templates/CLAUDE.md.template": "6af1902dbd3dd5600cb9753c9e51458ce58a3456cb8a6af1fe41afb311e9fcfe"
+      },
+      "sales-sdr": {
+        "assets/product/ROLE.md": "b310368a6eb2d5092382b74ffb464f4d95941e2bec6b306fc09b0a1e365979cc",
+        "assets/templates/CLAUDE.md.template": "90ed7d8f7a2e45ed90a5ced70bb3029862d379b2426621c6c0ae0387bd01c421"
+      },
+      "smm-manager": {
+        "assets/product/ROLE.md": "45ad011bbb6ecf93f151e29067998611ec8b774e7e99e16a74a9ef4224f16bbb",
+        "assets/templates/CLAUDE.md.template": "f80450e45f77ea00887715f692dc28009706ea0a57fdb0e37bf451b48e11b26c"
+      },
+      "starter": {
+        "assets/product/ROLE.md": "150eca42e84925a1e0a65e0212e34a84601d403f044310fb89cc5bf88f4ab87c",
+        "assets/templates/CLAUDE.md.template": "90ed7d8f7a2e45ed90a5ced70bb3029862d379b2426621c6c0ae0387bd01c421"
+      }
+    },
+    "bdf5de7af86e6fe6e979f1aef2ef6feb1b34f4e8": {
+      "creative-producer": {
+        "assets/product/ROLE.md": "91516b5083d3c6ccd7b95588dc1a2b237f9a253340a1f81e6141d677476b4b65",
+        "assets/templates/CLAUDE.md.template": "f80450e45f77ea00887715f692dc28009706ea0a57fdb0e37bf451b48e11b26c"
+      },
+      "data-bi-analyst": {
+        "assets/product/ROLE.md": "1f0416711926fa12dddc7226b3d3c86a21a60483c5b128789840bf2b68f1af53",
+        "assets/templates/CLAUDE.md.template": "90ed7d8f7a2e45ed90a5ced70bb3029862d379b2426621c6c0ae0387bd01c421"
+      },
+      "executive-assistant": {
+        "assets/product/ROLE.md": "522bb3d2d75bc1df50225b00f7c891b7b86e057d33d4d2ba6d90241042a07134",
+        "assets/templates/CLAUDE.md.template": "90ed7d8f7a2e45ed90a5ced70bb3029862d379b2426621c6c0ae0387bd01c421"
+      },
+      "fpa-cfo-assistant": {
+        "assets/product/ROLE.md": "10e8eef70cf819eddfa32f1e6dda4e0e7ddb99feccf2310e7a1e0684a916b39e",
+        "assets/templates/CLAUDE.md.template": "90ed7d8f7a2e45ed90a5ced70bb3029862d379b2426621c6c0ae0387bd01c421"
+      },
+      "investment-research-analyst": {
+        "assets/product/ROLE.md": "76be61420a6f339dad725e3df6e6c61682ba71e7f86a51331fc506f023c84353",
+        "assets/templates/CLAUDE.md.template": "90ed7d8f7a2e45ed90a5ced70bb3029862d379b2426621c6c0ae0387bd01c421"
+      },
+      "marketing-strategist": {
+        "assets/product/ROLE.md": "3ed58252479325b0b3b76043df1c85379923b5886e1b7f3af2f76b678b233888",
+        "assets/templates/CLAUDE.md.template": "d95349b0eb22fd3f62919893d1650a7d36333c31bcbe95af8acc42a23110e742"
+      },
+      "performance-marketer": {
+        "assets/product/ROLE.md": "5f76d8ce27437e4d5eab2f4fd7298127afe609222c9429f3da3221381a75e666",
+        "assets/templates/CLAUDE.md.template": "d95349b0eb22fd3f62919893d1650a7d36333c31bcbe95af8acc42a23110e742"
+      },
+      "premium": {
+        "assets/product/ROLE.md": "50cfb76fe2f44a34db451a98e29a8399a16901c8b9c10e2b6fc8e2c9931de778",
+        "assets/roles/creative-producer/ROLE.md": "91516b5083d3c6ccd7b95588dc1a2b237f9a253340a1f81e6141d677476b4b65",
+        "assets/roles/data-bi-analyst/ROLE.md": "1f0416711926fa12dddc7226b3d3c86a21a60483c5b128789840bf2b68f1af53",
+        "assets/roles/executive-assistant/ROLE.md": "522bb3d2d75bc1df50225b00f7c891b7b86e057d33d4d2ba6d90241042a07134",
+        "assets/roles/fpa-cfo-assistant/ROLE.md": "10e8eef70cf819eddfa32f1e6dda4e0e7ddb99feccf2310e7a1e0684a916b39e",
+        "assets/roles/investment-research-analyst/ROLE.md": "76be61420a6f339dad725e3df6e6c61682ba71e7f86a51331fc506f023c84353",
+        "assets/roles/marketing-strategist/ROLE.md": "3ed58252479325b0b3b76043df1c85379923b5886e1b7f3af2f76b678b233888",
+        "assets/roles/performance-marketer/ROLE.md": "5f76d8ce27437e4d5eab2f4fd7298127afe609222c9429f3da3221381a75e666",
+        "assets/roles/project-operations-manager/ROLE.md": "130fc45b3db5a8dc381d47743504bc647f21e16bfe4f191299fe35a6200b7a7e",
+        "assets/roles/sales-sdr/ROLE.md": "b310368a6eb2d5092382b74ffb464f4d95941e2bec6b306fc09b0a1e365979cc",
+        "assets/roles/smm-manager/ROLE.md": "45ad011bbb6ecf93f151e29067998611ec8b774e7e99e16a74a9ef4224f16bbb",
+        "assets/templates/CLAUDE.md.template": "1707f66655ebecfef5cd4dd157b5eeb3d401f54440d639ada1d75d0d6e97ee8b"
+      },
+      "project-operations-manager": {
+        "assets/product/ROLE.md": "130fc45b3db5a8dc381d47743504bc647f21e16bfe4f191299fe35a6200b7a7e",
+        "assets/templates/CLAUDE.md.template": "6af1902dbd3dd5600cb9753c9e51458ce58a3456cb8a6af1fe41afb311e9fcfe"
+      },
+      "sales-sdr": {
+        "assets/product/ROLE.md": "b310368a6eb2d5092382b74ffb464f4d95941e2bec6b306fc09b0a1e365979cc",
+        "assets/templates/CLAUDE.md.template": "90ed7d8f7a2e45ed90a5ced70bb3029862d379b2426621c6c0ae0387bd01c421"
+      },
+      "smm-manager": {
+        "assets/product/ROLE.md": "45ad011bbb6ecf93f151e29067998611ec8b774e7e99e16a74a9ef4224f16bbb",
+        "assets/templates/CLAUDE.md.template": "f80450e45f77ea00887715f692dc28009706ea0a57fdb0e37bf451b48e11b26c"
+      },
+      "starter": {
+        "assets/product/ROLE.md": "150eca42e84925a1e0a65e0212e34a84601d403f044310fb89cc5bf88f4ab87c",
+        "assets/templates/CLAUDE.md.template": "90ed7d8f7a2e45ed90a5ced70bb3029862d379b2426621c6c0ae0387bd01c421"
+      }
+    },
+    "f76f6dbccf8d53d86ab7d28d657e0b470936deac": {
+      "creative-producer": {
+        "assets/product/ROLE.md": "91516b5083d3c6ccd7b95588dc1a2b237f9a253340a1f81e6141d677476b4b65",
+        "assets/templates/CLAUDE.md.template": "f80450e45f77ea00887715f692dc28009706ea0a57fdb0e37bf451b48e11b26c"
+      },
+      "data-bi-analyst": {
+        "assets/product/ROLE.md": "1f0416711926fa12dddc7226b3d3c86a21a60483c5b128789840bf2b68f1af53",
+        "assets/templates/CLAUDE.md.template": "90ed7d8f7a2e45ed90a5ced70bb3029862d379b2426621c6c0ae0387bd01c421"
+      },
+      "executive-assistant": {
+        "assets/product/ROLE.md": "522bb3d2d75bc1df50225b00f7c891b7b86e057d33d4d2ba6d90241042a07134",
+        "assets/templates/CLAUDE.md.template": "90ed7d8f7a2e45ed90a5ced70bb3029862d379b2426621c6c0ae0387bd01c421"
+      },
+      "fpa-cfo-assistant": {
+        "assets/product/ROLE.md": "10e8eef70cf819eddfa32f1e6dda4e0e7ddb99feccf2310e7a1e0684a916b39e",
+        "assets/templates/CLAUDE.md.template": "90ed7d8f7a2e45ed90a5ced70bb3029862d379b2426621c6c0ae0387bd01c421"
+      },
+      "investment-research-analyst": {
+        "assets/product/ROLE.md": "76be61420a6f339dad725e3df6e6c61682ba71e7f86a51331fc506f023c84353",
+        "assets/templates/CLAUDE.md.template": "90ed7d8f7a2e45ed90a5ced70bb3029862d379b2426621c6c0ae0387bd01c421"
+      },
+      "marketing-strategist": {
+        "assets/product/ROLE.md": "3ed58252479325b0b3b76043df1c85379923b5886e1b7f3af2f76b678b233888",
+        "assets/templates/CLAUDE.md.template": "d95349b0eb22fd3f62919893d1650a7d36333c31bcbe95af8acc42a23110e742"
+      },
+      "performance-marketer": {
+        "assets/product/ROLE.md": "5f76d8ce27437e4d5eab2f4fd7298127afe609222c9429f3da3221381a75e666",
+        "assets/templates/CLAUDE.md.template": "d95349b0eb22fd3f62919893d1650a7d36333c31bcbe95af8acc42a23110e742"
+      },
+      "premium": {
+        "assets/product/ROLE.md": "50cfb76fe2f44a34db451a98e29a8399a16901c8b9c10e2b6fc8e2c9931de778",
+        "assets/roles/creative-producer/ROLE.md": "91516b5083d3c6ccd7b95588dc1a2b237f9a253340a1f81e6141d677476b4b65",
+        "assets/roles/data-bi-analyst/ROLE.md": "1f0416711926fa12dddc7226b3d3c86a21a60483c5b128789840bf2b68f1af53",
+        "assets/roles/executive-assistant/ROLE.md": "522bb3d2d75bc1df50225b00f7c891b7b86e057d33d4d2ba6d90241042a07134",
+        "assets/roles/fpa-cfo-assistant/ROLE.md": "10e8eef70cf819eddfa32f1e6dda4e0e7ddb99feccf2310e7a1e0684a916b39e",
+        "assets/roles/investment-research-analyst/ROLE.md": "76be61420a6f339dad725e3df6e6c61682ba71e7f86a51331fc506f023c84353",
+        "assets/roles/marketing-strategist/ROLE.md": "3ed58252479325b0b3b76043df1c85379923b5886e1b7f3af2f76b678b233888",
+        "assets/roles/performance-marketer/ROLE.md": "5f76d8ce27437e4d5eab2f4fd7298127afe609222c9429f3da3221381a75e666",
+        "assets/roles/project-operations-manager/ROLE.md": "130fc45b3db5a8dc381d47743504bc647f21e16bfe4f191299fe35a6200b7a7e",
+        "assets/roles/sales-sdr/ROLE.md": "b310368a6eb2d5092382b74ffb464f4d95941e2bec6b306fc09b0a1e365979cc",
+        "assets/roles/smm-manager/ROLE.md": "45ad011bbb6ecf93f151e29067998611ec8b774e7e99e16a74a9ef4224f16bbb",
+        "assets/templates/CLAUDE.md.template": "1707f66655ebecfef5cd4dd157b5eeb3d401f54440d639ada1d75d0d6e97ee8b"
+      },
+      "project-operations-manager": {
+        "assets/product/ROLE.md": "130fc45b3db5a8dc381d47743504bc647f21e16bfe4f191299fe35a6200b7a7e",
+        "assets/templates/CLAUDE.md.template": "6af1902dbd3dd5600cb9753c9e51458ce58a3456cb8a6af1fe41afb311e9fcfe"
+      },
+      "sales-sdr": {
+        "assets/product/ROLE.md": "b310368a6eb2d5092382b74ffb464f4d95941e2bec6b306fc09b0a1e365979cc",
+        "assets/templates/CLAUDE.md.template": "90ed7d8f7a2e45ed90a5ced70bb3029862d379b2426621c6c0ae0387bd01c421"
+      },
+      "smm-manager": {
+        "assets/product/ROLE.md": "45ad011bbb6ecf93f151e29067998611ec8b774e7e99e16a74a9ef4224f16bbb",
+        "assets/templates/CLAUDE.md.template": "f80450e45f77ea00887715f692dc28009706ea0a57fdb0e37bf451b48e11b26c"
+      },
+      "starter": {
+        "assets/product/ROLE.md": "150eca42e84925a1e0a65e0212e34a84601d403f044310fb89cc5bf88f4ab87c",
+        "assets/templates/CLAUDE.md.template": "90ed7d8f7a2e45ed90a5ced70bb3029862d379b2426621c6c0ae0387bd01c421"
+      }
+    },
+    "54c59b7191e2b1303f025534f6be62b605d91962": {
+      "creative-producer": {
+        "assets/product/ROLE.md": "91516b5083d3c6ccd7b95588dc1a2b237f9a253340a1f81e6141d677476b4b65",
+        "assets/templates/CLAUDE.md.template": "f80450e45f77ea00887715f692dc28009706ea0a57fdb0e37bf451b48e11b26c"
+      },
+      "data-bi-analyst": {
+        "assets/product/ROLE.md": "1f0416711926fa12dddc7226b3d3c86a21a60483c5b128789840bf2b68f1af53",
+        "assets/templates/CLAUDE.md.template": "90ed7d8f7a2e45ed90a5ced70bb3029862d379b2426621c6c0ae0387bd01c421"
+      },
+      "executive-assistant": {
+        "assets/product/ROLE.md": "522bb3d2d75bc1df50225b00f7c891b7b86e057d33d4d2ba6d90241042a07134",
+        "assets/templates/CLAUDE.md.template": "90ed7d8f7a2e45ed90a5ced70bb3029862d379b2426621c6c0ae0387bd01c421"
+      },
+      "fpa-cfo-assistant": {
+        "assets/product/ROLE.md": "10e8eef70cf819eddfa32f1e6dda4e0e7ddb99feccf2310e7a1e0684a916b39e",
+        "assets/templates/CLAUDE.md.template": "90ed7d8f7a2e45ed90a5ced70bb3029862d379b2426621c6c0ae0387bd01c421"
+      },
+      "investment-research-analyst": {
+        "assets/product/ROLE.md": "76be61420a6f339dad725e3df6e6c61682ba71e7f86a51331fc506f023c84353",
+        "assets/templates/CLAUDE.md.template": "90ed7d8f7a2e45ed90a5ced70bb3029862d379b2426621c6c0ae0387bd01c421"
+      },
+      "marketing-strategist": {
+        "assets/product/ROLE.md": "3ed58252479325b0b3b76043df1c85379923b5886e1b7f3af2f76b678b233888",
+        "assets/templates/CLAUDE.md.template": "d95349b0eb22fd3f62919893d1650a7d36333c31bcbe95af8acc42a23110e742"
+      },
+      "performance-marketer": {
+        "assets/product/ROLE.md": "5f76d8ce27437e4d5eab2f4fd7298127afe609222c9429f3da3221381a75e666",
+        "assets/templates/CLAUDE.md.template": "d95349b0eb22fd3f62919893d1650a7d36333c31bcbe95af8acc42a23110e742"
+      },
+      "premium": {
+        "assets/product/ROLE.md": "50cfb76fe2f44a34db451a98e29a8399a16901c8b9c10e2b6fc8e2c9931de778",
+        "assets/roles/creative-producer/ROLE.md": "91516b5083d3c6ccd7b95588dc1a2b237f9a253340a1f81e6141d677476b4b65",
+        "assets/roles/data-bi-analyst/ROLE.md": "1f0416711926fa12dddc7226b3d3c86a21a60483c5b128789840bf2b68f1af53",
+        "assets/roles/executive-assistant/ROLE.md": "522bb3d2d75bc1df50225b00f7c891b7b86e057d33d4d2ba6d90241042a07134",
+        "assets/roles/fpa-cfo-assistant/ROLE.md": "10e8eef70cf819eddfa32f1e6dda4e0e7ddb99feccf2310e7a1e0684a916b39e",
+        "assets/roles/investment-research-analyst/ROLE.md": "76be61420a6f339dad725e3df6e6c61682ba71e7f86a51331fc506f023c84353",
+        "assets/roles/marketing-strategist/ROLE.md": "3ed58252479325b0b3b76043df1c85379923b5886e1b7f3af2f76b678b233888",
+        "assets/roles/performance-marketer/ROLE.md": "5f76d8ce27437e4d5eab2f4fd7298127afe609222c9429f3da3221381a75e666",
+        "assets/roles/project-operations-manager/ROLE.md": "130fc45b3db5a8dc381d47743504bc647f21e16bfe4f191299fe35a6200b7a7e",
+        "assets/roles/sales-sdr/ROLE.md": "b310368a6eb2d5092382b74ffb464f4d95941e2bec6b306fc09b0a1e365979cc",
+        "assets/roles/smm-manager/ROLE.md": "45ad011bbb6ecf93f151e29067998611ec8b774e7e99e16a74a9ef4224f16bbb",
+        "assets/templates/CLAUDE.md.template": "1707f66655ebecfef5cd4dd157b5eeb3d401f54440d639ada1d75d0d6e97ee8b"
+      },
+      "project-operations-manager": {
+        "assets/product/ROLE.md": "130fc45b3db5a8dc381d47743504bc647f21e16bfe4f191299fe35a6200b7a7e",
+        "assets/templates/CLAUDE.md.template": "6af1902dbd3dd5600cb9753c9e51458ce58a3456cb8a6af1fe41afb311e9fcfe"
+      },
+      "sales-sdr": {
+        "assets/product/ROLE.md": "b310368a6eb2d5092382b74ffb464f4d95941e2bec6b306fc09b0a1e365979cc",
+        "assets/templates/CLAUDE.md.template": "90ed7d8f7a2e45ed90a5ced70bb3029862d379b2426621c6c0ae0387bd01c421"
+      },
+      "smm-manager": {
+        "assets/product/ROLE.md": "45ad011bbb6ecf93f151e29067998611ec8b774e7e99e16a74a9ef4224f16bbb",
+        "assets/templates/CLAUDE.md.template": "f80450e45f77ea00887715f692dc28009706ea0a57fdb0e37bf451b48e11b26c"
+      },
+      "starter": {
+        "assets/product/ROLE.md": "150eca42e84925a1e0a65e0212e34a84601d403f044310fb89cc5bf88f4ab87c",
+        "assets/templates/CLAUDE.md.template": "90ed7d8f7a2e45ed90a5ced70bb3029862d379b2426621c6c0ae0387bd01c421"
+      }
+    },
+    "12047fa166368b7a28c33db75a527ae95a1d534b": {
+      "creative-producer": {
+        "assets/product/ROLE.md": "91516b5083d3c6ccd7b95588dc1a2b237f9a253340a1f81e6141d677476b4b65",
+        "assets/templates/CLAUDE.md.template": "3a7e02cbafd48127c340d76ee0333403ffd41b2bda5361be668dcf3877e3cd4e"
+      },
+      "data-bi-analyst": {
+        "assets/product/ROLE.md": "1f0416711926fa12dddc7226b3d3c86a21a60483c5b128789840bf2b68f1af53",
+        "assets/templates/CLAUDE.md.template": "e4831680b9cf14af16b15db0a4d47c9ce165881562eff5058c25e595bd071d35"
+      },
+      "executive-assistant": {
+        "assets/product/ROLE.md": "522bb3d2d75bc1df50225b00f7c891b7b86e057d33d4d2ba6d90241042a07134",
+        "assets/templates/CLAUDE.md.template": "e4831680b9cf14af16b15db0a4d47c9ce165881562eff5058c25e595bd071d35"
+      },
+      "fpa-cfo-assistant": {
+        "assets/product/ROLE.md": "10e8eef70cf819eddfa32f1e6dda4e0e7ddb99feccf2310e7a1e0684a916b39e",
+        "assets/templates/CLAUDE.md.template": "e4831680b9cf14af16b15db0a4d47c9ce165881562eff5058c25e595bd071d35"
+      },
+      "investment-research-analyst": {
+        "assets/product/ROLE.md": "76be61420a6f339dad725e3df6e6c61682ba71e7f86a51331fc506f023c84353",
+        "assets/templates/CLAUDE.md.template": "e4831680b9cf14af16b15db0a4d47c9ce165881562eff5058c25e595bd071d35"
+      },
+      "marketing-strategist": {
+        "assets/product/ROLE.md": "3ed58252479325b0b3b76043df1c85379923b5886e1b7f3af2f76b678b233888",
+        "assets/templates/CLAUDE.md.template": "9d812e91957f150d80d413f6274a8cc24c8ec3aa0a7bbf7510ba3ce5a9f679eb"
+      },
+      "performance-marketer": {
+        "assets/product/ROLE.md": "5f76d8ce27437e4d5eab2f4fd7298127afe609222c9429f3da3221381a75e666",
+        "assets/templates/CLAUDE.md.template": "9d812e91957f150d80d413f6274a8cc24c8ec3aa0a7bbf7510ba3ce5a9f679eb"
+      },
+      "premium": {
+        "assets/product/ROLE.md": "50cfb76fe2f44a34db451a98e29a8399a16901c8b9c10e2b6fc8e2c9931de778",
+        "assets/roles/creative-producer/ROLE.md": "91516b5083d3c6ccd7b95588dc1a2b237f9a253340a1f81e6141d677476b4b65",
+        "assets/roles/data-bi-analyst/ROLE.md": "1f0416711926fa12dddc7226b3d3c86a21a60483c5b128789840bf2b68f1af53",
+        "assets/roles/executive-assistant/ROLE.md": "522bb3d2d75bc1df50225b00f7c891b7b86e057d33d4d2ba6d90241042a07134",
+        "assets/roles/fpa-cfo-assistant/ROLE.md": "10e8eef70cf819eddfa32f1e6dda4e0e7ddb99feccf2310e7a1e0684a916b39e",
+        "assets/roles/investment-research-analyst/ROLE.md": "76be61420a6f339dad725e3df6e6c61682ba71e7f86a51331fc506f023c84353",
+        "assets/roles/marketing-strategist/ROLE.md": "3ed58252479325b0b3b76043df1c85379923b5886e1b7f3af2f76b678b233888",
+        "assets/roles/performance-marketer/ROLE.md": "5f76d8ce27437e4d5eab2f4fd7298127afe609222c9429f3da3221381a75e666",
+        "assets/roles/project-operations-manager/ROLE.md": "130fc45b3db5a8dc381d47743504bc647f21e16bfe4f191299fe35a6200b7a7e",
+        "assets/roles/sales-sdr/ROLE.md": "b310368a6eb2d5092382b74ffb464f4d95941e2bec6b306fc09b0a1e365979cc",
+        "assets/roles/smm-manager/ROLE.md": "45ad011bbb6ecf93f151e29067998611ec8b774e7e99e16a74a9ef4224f16bbb",
+        "assets/templates/CLAUDE.md.template": "33d6760078ce67467e2e44929086354d235c16a15f4f8d67dae0420d1da7f279"
+      },
+      "project-operations-manager": {
+        "assets/product/ROLE.md": "130fc45b3db5a8dc381d47743504bc647f21e16bfe4f191299fe35a6200b7a7e",
+        "assets/templates/CLAUDE.md.template": "ed727576c58a0236363243e7a3eadcbf8fb9775708bf2436b3b95d2669755f2a"
+      },
+      "sales-sdr": {
+        "assets/product/ROLE.md": "b310368a6eb2d5092382b74ffb464f4d95941e2bec6b306fc09b0a1e365979cc",
+        "assets/templates/CLAUDE.md.template": "e4831680b9cf14af16b15db0a4d47c9ce165881562eff5058c25e595bd071d35"
+      },
+      "smm-manager": {
+        "assets/product/ROLE.md": "45ad011bbb6ecf93f151e29067998611ec8b774e7e99e16a74a9ef4224f16bbb",
+        "assets/templates/CLAUDE.md.template": "3a7e02cbafd48127c340d76ee0333403ffd41b2bda5361be668dcf3877e3cd4e"
+      },
+      "starter": {
+        "assets/product/ROLE.md": "150eca42e84925a1e0a65e0212e34a84601d403f044310fb89cc5bf88f4ab87c",
+        "assets/templates/CLAUDE.md.template": "e4831680b9cf14af16b15db0a4d47c9ce165881562eff5058c25e595bd071d35"
+      }
+    },
+    "4cf9282f659d0e107061ff98007e15a177c28e91": {
+      "creative-producer": {
+        "assets/product/ROLE.md": "91516b5083d3c6ccd7b95588dc1a2b237f9a253340a1f81e6141d677476b4b65",
+        "assets/templates/CLAUDE.md.template": "f80450e45f77ea00887715f692dc28009706ea0a57fdb0e37bf451b48e11b26c"
+      },
+      "data-bi-analyst": {
+        "assets/product/ROLE.md": "1f0416711926fa12dddc7226b3d3c86a21a60483c5b128789840bf2b68f1af53",
+        "assets/templates/CLAUDE.md.template": "90ed7d8f7a2e45ed90a5ced70bb3029862d379b2426621c6c0ae0387bd01c421"
+      },
+      "executive-assistant": {
+        "assets/product/ROLE.md": "522bb3d2d75bc1df50225b00f7c891b7b86e057d33d4d2ba6d90241042a07134",
+        "assets/templates/CLAUDE.md.template": "90ed7d8f7a2e45ed90a5ced70bb3029862d379b2426621c6c0ae0387bd01c421"
+      },
+      "fpa-cfo-assistant": {
+        "assets/product/ROLE.md": "10e8eef70cf819eddfa32f1e6dda4e0e7ddb99feccf2310e7a1e0684a916b39e",
+        "assets/templates/CLAUDE.md.template": "90ed7d8f7a2e45ed90a5ced70bb3029862d379b2426621c6c0ae0387bd01c421"
+      },
+      "investment-research-analyst": {
+        "assets/product/ROLE.md": "76be61420a6f339dad725e3df6e6c61682ba71e7f86a51331fc506f023c84353",
+        "assets/templates/CLAUDE.md.template": "90ed7d8f7a2e45ed90a5ced70bb3029862d379b2426621c6c0ae0387bd01c421"
+      },
+      "marketing-strategist": {
+        "assets/product/ROLE.md": "3ed58252479325b0b3b76043df1c85379923b5886e1b7f3af2f76b678b233888",
+        "assets/templates/CLAUDE.md.template": "d95349b0eb22fd3f62919893d1650a7d36333c31bcbe95af8acc42a23110e742"
+      },
+      "performance-marketer": {
+        "assets/product/ROLE.md": "5f76d8ce27437e4d5eab2f4fd7298127afe609222c9429f3da3221381a75e666",
+        "assets/templates/CLAUDE.md.template": "d95349b0eb22fd3f62919893d1650a7d36333c31bcbe95af8acc42a23110e742"
+      },
+      "premium": {
+        "assets/product/ROLE.md": "50cfb76fe2f44a34db451a98e29a8399a16901c8b9c10e2b6fc8e2c9931de778",
+        "assets/roles/creative-producer/ROLE.md": "91516b5083d3c6ccd7b95588dc1a2b237f9a253340a1f81e6141d677476b4b65",
+        "assets/roles/data-bi-analyst/ROLE.md": "1f0416711926fa12dddc7226b3d3c86a21a60483c5b128789840bf2b68f1af53",
+        "assets/roles/executive-assistant/ROLE.md": "522bb3d2d75bc1df50225b00f7c891b7b86e057d33d4d2ba6d90241042a07134",
+        "assets/roles/fpa-cfo-assistant/ROLE.md": "10e8eef70cf819eddfa32f1e6dda4e0e7ddb99feccf2310e7a1e0684a916b39e",
+        "assets/roles/investment-research-analyst/ROLE.md": "76be61420a6f339dad725e3df6e6c61682ba71e7f86a51331fc506f023c84353",
+        "assets/roles/marketing-strategist/ROLE.md": "3ed58252479325b0b3b76043df1c85379923b5886e1b7f3af2f76b678b233888",
+        "assets/roles/performance-marketer/ROLE.md": "5f76d8ce27437e4d5eab2f4fd7298127afe609222c9429f3da3221381a75e666",
+        "assets/roles/project-operations-manager/ROLE.md": "130fc45b3db5a8dc381d47743504bc647f21e16bfe4f191299fe35a6200b7a7e",
+        "assets/roles/sales-sdr/ROLE.md": "b310368a6eb2d5092382b74ffb464f4d95941e2bec6b306fc09b0a1e365979cc",
+        "assets/roles/smm-manager/ROLE.md": "45ad011bbb6ecf93f151e29067998611ec8b774e7e99e16a74a9ef4224f16bbb",
+        "assets/templates/CLAUDE.md.template": "1707f66655ebecfef5cd4dd157b5eeb3d401f54440d639ada1d75d0d6e97ee8b"
+      },
+      "project-operations-manager": {
+        "assets/product/ROLE.md": "130fc45b3db5a8dc381d47743504bc647f21e16bfe4f191299fe35a6200b7a7e",
+        "assets/templates/CLAUDE.md.template": "6af1902dbd3dd5600cb9753c9e51458ce58a3456cb8a6af1fe41afb311e9fcfe"
+      },
+      "sales-sdr": {
+        "assets/product/ROLE.md": "b310368a6eb2d5092382b74ffb464f4d95941e2bec6b306fc09b0a1e365979cc",
+        "assets/templates/CLAUDE.md.template": "90ed7d8f7a2e45ed90a5ced70bb3029862d379b2426621c6c0ae0387bd01c421"
+      },
+      "smm-manager": {
+        "assets/product/ROLE.md": "45ad011bbb6ecf93f151e29067998611ec8b774e7e99e16a74a9ef4224f16bbb",
+        "assets/templates/CLAUDE.md.template": "f80450e45f77ea00887715f692dc28009706ea0a57fdb0e37bf451b48e11b26c"
+      },
+      "starter": {
+        "assets/product/ROLE.md": "150eca42e84925a1e0a65e0212e34a84601d403f044310fb89cc5bf88f4ab87c",
+        "assets/templates/CLAUDE.md.template": "90ed7d8f7a2e45ed90a5ced70bb3029862d379b2426621c6c0ae0387bd01c421"
+      }
+    },
+    "4da752c3b354c86785fbf08541d5ddc6dfb264d6": {
+      "creative-producer": {
+        "assets/product/ROLE.md": "91516b5083d3c6ccd7b95588dc1a2b237f9a253340a1f81e6141d677476b4b65",
+        "assets/templates/CLAUDE.md.template": "f80450e45f77ea00887715f692dc28009706ea0a57fdb0e37bf451b48e11b26c"
+      },
+      "data-bi-analyst": {
+        "assets/product/ROLE.md": "1f0416711926fa12dddc7226b3d3c86a21a60483c5b128789840bf2b68f1af53",
+        "assets/templates/CLAUDE.md.template": "90ed7d8f7a2e45ed90a5ced70bb3029862d379b2426621c6c0ae0387bd01c421"
+      },
+      "executive-assistant": {
+        "assets/product/ROLE.md": "522bb3d2d75bc1df50225b00f7c891b7b86e057d33d4d2ba6d90241042a07134",
+        "assets/templates/CLAUDE.md.template": "90ed7d8f7a2e45ed90a5ced70bb3029862d379b2426621c6c0ae0387bd01c421"
+      },
+      "fpa-cfo-assistant": {
+        "assets/product/ROLE.md": "10e8eef70cf819eddfa32f1e6dda4e0e7ddb99feccf2310e7a1e0684a916b39e",
+        "assets/templates/CLAUDE.md.template": "90ed7d8f7a2e45ed90a5ced70bb3029862d379b2426621c6c0ae0387bd01c421"
+      },
+      "investment-research-analyst": {
+        "assets/product/ROLE.md": "76be61420a6f339dad725e3df6e6c61682ba71e7f86a51331fc506f023c84353",
+        "assets/templates/CLAUDE.md.template": "90ed7d8f7a2e45ed90a5ced70bb3029862d379b2426621c6c0ae0387bd01c421"
+      },
+      "marketing-strategist": {
+        "assets/product/ROLE.md": "3ed58252479325b0b3b76043df1c85379923b5886e1b7f3af2f76b678b233888",
+        "assets/templates/CLAUDE.md.template": "d95349b0eb22fd3f62919893d1650a7d36333c31bcbe95af8acc42a23110e742"
+      },
+      "performance-marketer": {
+        "assets/product/ROLE.md": "5f76d8ce27437e4d5eab2f4fd7298127afe609222c9429f3da3221381a75e666",
+        "assets/templates/CLAUDE.md.template": "d95349b0eb22fd3f62919893d1650a7d36333c31bcbe95af8acc42a23110e742"
+      },
+      "premium": {
+        "assets/product/ROLE.md": "50cfb76fe2f44a34db451a98e29a8399a16901c8b9c10e2b6fc8e2c9931de778",
+        "assets/roles/creative-producer/ROLE.md": "91516b5083d3c6ccd7b95588dc1a2b237f9a253340a1f81e6141d677476b4b65",
+        "assets/roles/data-bi-analyst/ROLE.md": "1f0416711926fa12dddc7226b3d3c86a21a60483c5b128789840bf2b68f1af53",
+        "assets/roles/executive-assistant/ROLE.md": "522bb3d2d75bc1df50225b00f7c891b7b86e057d33d4d2ba6d90241042a07134",
+        "assets/roles/fpa-cfo-assistant/ROLE.md": "10e8eef70cf819eddfa32f1e6dda4e0e7ddb99feccf2310e7a1e0684a916b39e",
+        "assets/roles/investment-research-analyst/ROLE.md": "76be61420a6f339dad725e3df6e6c61682ba71e7f86a51331fc506f023c84353",
+        "assets/roles/marketing-strategist/ROLE.md": "3ed58252479325b0b3b76043df1c85379923b5886e1b7f3af2f76b678b233888",
+        "assets/roles/performance-marketer/ROLE.md": "5f76d8ce27437e4d5eab2f4fd7298127afe609222c9429f3da3221381a75e666",
+        "assets/roles/project-operations-manager/ROLE.md": "130fc45b3db5a8dc381d47743504bc647f21e16bfe4f191299fe35a6200b7a7e",
+        "assets/roles/sales-sdr/ROLE.md": "b310368a6eb2d5092382b74ffb464f4d95941e2bec6b306fc09b0a1e365979cc",
+        "assets/roles/smm-manager/ROLE.md": "45ad011bbb6ecf93f151e29067998611ec8b774e7e99e16a74a9ef4224f16bbb",
+        "assets/templates/CLAUDE.md.template": "1707f66655ebecfef5cd4dd157b5eeb3d401f54440d639ada1d75d0d6e97ee8b"
+      },
+      "project-operations-manager": {
+        "assets/product/ROLE.md": "130fc45b3db5a8dc381d47743504bc647f21e16bfe4f191299fe35a6200b7a7e",
+        "assets/templates/CLAUDE.md.template": "6af1902dbd3dd5600cb9753c9e51458ce58a3456cb8a6af1fe41afb311e9fcfe"
+      },
+      "sales-sdr": {
+        "assets/product/ROLE.md": "b310368a6eb2d5092382b74ffb464f4d95941e2bec6b306fc09b0a1e365979cc",
+        "assets/templates/CLAUDE.md.template": "90ed7d8f7a2e45ed90a5ced70bb3029862d379b2426621c6c0ae0387bd01c421"
+      },
+      "smm-manager": {
+        "assets/product/ROLE.md": "45ad011bbb6ecf93f151e29067998611ec8b774e7e99e16a74a9ef4224f16bbb",
+        "assets/templates/CLAUDE.md.template": "f80450e45f77ea00887715f692dc28009706ea0a57fdb0e37bf451b48e11b26c"
+      },
+      "starter": {
+        "assets/product/ROLE.md": "150eca42e84925a1e0a65e0212e34a84601d403f044310fb89cc5bf88f4ab87c",
+        "assets/templates/CLAUDE.md.template": "90ed7d8f7a2e45ed90a5ced70bb3029862d379b2426621c6c0ae0387bd01c421"
+      }
+    },
+    "64ad5ed5e246667c6ed27954a41ec9cd3e306df9": {
+      "creative-producer": {
+        "assets/product/ROLE.md": "91516b5083d3c6ccd7b95588dc1a2b237f9a253340a1f81e6141d677476b4b65",
+        "assets/templates/CLAUDE.md.template": "3a7e02cbafd48127c340d76ee0333403ffd41b2bda5361be668dcf3877e3cd4e"
+      },
+      "data-bi-analyst": {
+        "assets/product/ROLE.md": "1f0416711926fa12dddc7226b3d3c86a21a60483c5b128789840bf2b68f1af53",
+        "assets/templates/CLAUDE.md.template": "e4831680b9cf14af16b15db0a4d47c9ce165881562eff5058c25e595bd071d35"
+      },
+      "executive-assistant": {
+        "assets/product/ROLE.md": "522bb3d2d75bc1df50225b00f7c891b7b86e057d33d4d2ba6d90241042a07134",
+        "assets/templates/CLAUDE.md.template": "e4831680b9cf14af16b15db0a4d47c9ce165881562eff5058c25e595bd071d35"
+      },
+      "fpa-cfo-assistant": {
+        "assets/product/ROLE.md": "10e8eef70cf819eddfa32f1e6dda4e0e7ddb99feccf2310e7a1e0684a916b39e",
+        "assets/templates/CLAUDE.md.template": "e4831680b9cf14af16b15db0a4d47c9ce165881562eff5058c25e595bd071d35"
+      },
+      "investment-research-analyst": {
+        "assets/product/ROLE.md": "76be61420a6f339dad725e3df6e6c61682ba71e7f86a51331fc506f023c84353",
+        "assets/templates/CLAUDE.md.template": "e4831680b9cf14af16b15db0a4d47c9ce165881562eff5058c25e595bd071d35"
+      },
+      "marketing-strategist": {
+        "assets/product/ROLE.md": "3ed58252479325b0b3b76043df1c85379923b5886e1b7f3af2f76b678b233888",
+        "assets/templates/CLAUDE.md.template": "9d812e91957f150d80d413f6274a8cc24c8ec3aa0a7bbf7510ba3ce5a9f679eb"
+      },
+      "performance-marketer": {
+        "assets/product/ROLE.md": "5f76d8ce27437e4d5eab2f4fd7298127afe609222c9429f3da3221381a75e666",
+        "assets/templates/CLAUDE.md.template": "9d812e91957f150d80d413f6274a8cc24c8ec3aa0a7bbf7510ba3ce5a9f679eb"
+      },
+      "premium": {
+        "assets/product/ROLE.md": "50cfb76fe2f44a34db451a98e29a8399a16901c8b9c10e2b6fc8e2c9931de778",
+        "assets/roles/creative-producer/ROLE.md": "91516b5083d3c6ccd7b95588dc1a2b237f9a253340a1f81e6141d677476b4b65",
+        "assets/roles/data-bi-analyst/ROLE.md": "1f0416711926fa12dddc7226b3d3c86a21a60483c5b128789840bf2b68f1af53",
+        "assets/roles/executive-assistant/ROLE.md": "522bb3d2d75bc1df50225b00f7c891b7b86e057d33d4d2ba6d90241042a07134",
+        "assets/roles/fpa-cfo-assistant/ROLE.md": "10e8eef70cf819eddfa32f1e6dda4e0e7ddb99feccf2310e7a1e0684a916b39e",
+        "assets/roles/investment-research-analyst/ROLE.md": "76be61420a6f339dad725e3df6e6c61682ba71e7f86a51331fc506f023c84353",
+        "assets/roles/marketing-strategist/ROLE.md": "3ed58252479325b0b3b76043df1c85379923b5886e1b7f3af2f76b678b233888",
+        "assets/roles/performance-marketer/ROLE.md": "5f76d8ce27437e4d5eab2f4fd7298127afe609222c9429f3da3221381a75e666",
+        "assets/roles/project-operations-manager/ROLE.md": "130fc45b3db5a8dc381d47743504bc647f21e16bfe4f191299fe35a6200b7a7e",
+        "assets/roles/sales-sdr/ROLE.md": "b310368a6eb2d5092382b74ffb464f4d95941e2bec6b306fc09b0a1e365979cc",
+        "assets/roles/smm-manager/ROLE.md": "45ad011bbb6ecf93f151e29067998611ec8b774e7e99e16a74a9ef4224f16bbb",
+        "assets/templates/CLAUDE.md.template": "33d6760078ce67467e2e44929086354d235c16a15f4f8d67dae0420d1da7f279"
+      },
+      "project-operations-manager": {
+        "assets/product/ROLE.md": "130fc45b3db5a8dc381d47743504bc647f21e16bfe4f191299fe35a6200b7a7e",
+        "assets/templates/CLAUDE.md.template": "ed727576c58a0236363243e7a3eadcbf8fb9775708bf2436b3b95d2669755f2a"
+      },
+      "sales-sdr": {
+        "assets/product/ROLE.md": "b310368a6eb2d5092382b74ffb464f4d95941e2bec6b306fc09b0a1e365979cc",
+        "assets/templates/CLAUDE.md.template": "e4831680b9cf14af16b15db0a4d47c9ce165881562eff5058c25e595bd071d35"
+      },
+      "smm-manager": {
+        "assets/product/ROLE.md": "45ad011bbb6ecf93f151e29067998611ec8b774e7e99e16a74a9ef4224f16bbb",
+        "assets/templates/CLAUDE.md.template": "3a7e02cbafd48127c340d76ee0333403ffd41b2bda5361be668dcf3877e3cd4e"
+      },
+      "starter": {
+        "assets/product/ROLE.md": "150eca42e84925a1e0a65e0212e34a84601d403f044310fb89cc5bf88f4ab87c",
+        "assets/templates/CLAUDE.md.template": "e4831680b9cf14af16b15db0a4d47c9ce165881562eff5058c25e595bd071d35"
+      }
+    },
+    "937691f7f3000c0c38ec71dbf8189e48fe2e3242": {
+      "creative-producer": {
+        "assets/product/ROLE.md": "91516b5083d3c6ccd7b95588dc1a2b237f9a253340a1f81e6141d677476b4b65",
+        "assets/templates/CLAUDE.md.template": "f80450e45f77ea00887715f692dc28009706ea0a57fdb0e37bf451b48e11b26c"
+      },
+      "data-bi-analyst": {
+        "assets/product/ROLE.md": "1f0416711926fa12dddc7226b3d3c86a21a60483c5b128789840bf2b68f1af53",
+        "assets/templates/CLAUDE.md.template": "90ed7d8f7a2e45ed90a5ced70bb3029862d379b2426621c6c0ae0387bd01c421"
+      },
+      "executive-assistant": {
+        "assets/product/ROLE.md": "522bb3d2d75bc1df50225b00f7c891b7b86e057d33d4d2ba6d90241042a07134",
+        "assets/templates/CLAUDE.md.template": "90ed7d8f7a2e45ed90a5ced70bb3029862d379b2426621c6c0ae0387bd01c421"
+      },
+      "fpa-cfo-assistant": {
+        "assets/product/ROLE.md": "10e8eef70cf819eddfa32f1e6dda4e0e7ddb99feccf2310e7a1e0684a916b39e",
+        "assets/templates/CLAUDE.md.template": "90ed7d8f7a2e45ed90a5ced70bb3029862d379b2426621c6c0ae0387bd01c421"
+      },
+      "investment-research-analyst": {
+        "assets/product/ROLE.md": "76be61420a6f339dad725e3df6e6c61682ba71e7f86a51331fc506f023c84353",
+        "assets/templates/CLAUDE.md.template": "90ed7d8f7a2e45ed90a5ced70bb3029862d379b2426621c6c0ae0387bd01c421"
+      },
+      "marketing-strategist": {
+        "assets/product/ROLE.md": "3ed58252479325b0b3b76043df1c85379923b5886e1b7f3af2f76b678b233888",
+        "assets/templates/CLAUDE.md.template": "d95349b0eb22fd3f62919893d1650a7d36333c31bcbe95af8acc42a23110e742"
+      },
+      "performance-marketer": {
+        "assets/product/ROLE.md": "5f76d8ce27437e4d5eab2f4fd7298127afe609222c9429f3da3221381a75e666",
+        "assets/templates/CLAUDE.md.template": "d95349b0eb22fd3f62919893d1650a7d36333c31bcbe95af8acc42a23110e742"
+      },
+      "premium": {
+        "assets/product/ROLE.md": "50cfb76fe2f44a34db451a98e29a8399a16901c8b9c10e2b6fc8e2c9931de778",
+        "assets/roles/creative-producer/ROLE.md": "91516b5083d3c6ccd7b95588dc1a2b237f9a253340a1f81e6141d677476b4b65",
+        "assets/roles/data-bi-analyst/ROLE.md": "1f0416711926fa12dddc7226b3d3c86a21a60483c5b128789840bf2b68f1af53",
+        "assets/roles/executive-assistant/ROLE.md": "522bb3d2d75bc1df50225b00f7c891b7b86e057d33d4d2ba6d90241042a07134",
+        "assets/roles/fpa-cfo-assistant/ROLE.md": "10e8eef70cf819eddfa32f1e6dda4e0e7ddb99feccf2310e7a1e0684a916b39e",
+        "assets/roles/investment-research-analyst/ROLE.md": "76be61420a6f339dad725e3df6e6c61682ba71e7f86a51331fc506f023c84353",
+        "assets/roles/marketing-strategist/ROLE.md": "3ed58252479325b0b3b76043df1c85379923b5886e1b7f3af2f76b678b233888",
+        "assets/roles/performance-marketer/ROLE.md": "5f76d8ce27437e4d5eab2f4fd7298127afe609222c9429f3da3221381a75e666",
+        "assets/roles/project-operations-manager/ROLE.md": "130fc45b3db5a8dc381d47743504bc647f21e16bfe4f191299fe35a6200b7a7e",
+        "assets/roles/sales-sdr/ROLE.md": "b310368a6eb2d5092382b74ffb464f4d95941e2bec6b306fc09b0a1e365979cc",
+        "assets/roles/smm-manager/ROLE.md": "45ad011bbb6ecf93f151e29067998611ec8b774e7e99e16a74a9ef4224f16bbb",
+        "assets/templates/CLAUDE.md.template": "1707f66655ebecfef5cd4dd157b5eeb3d401f54440d639ada1d75d0d6e97ee8b"
+      },
+      "project-operations-manager": {
+        "assets/product/ROLE.md": "130fc45b3db5a8dc381d47743504bc647f21e16bfe4f191299fe35a6200b7a7e",
+        "assets/templates/CLAUDE.md.template": "6af1902dbd3dd5600cb9753c9e51458ce58a3456cb8a6af1fe41afb311e9fcfe"
+      },
+      "sales-sdr": {
+        "assets/product/ROLE.md": "b310368a6eb2d5092382b74ffb464f4d95941e2bec6b306fc09b0a1e365979cc",
+        "assets/templates/CLAUDE.md.template": "90ed7d8f7a2e45ed90a5ced70bb3029862d379b2426621c6c0ae0387bd01c421"
+      },
+      "smm-manager": {
+        "assets/product/ROLE.md": "45ad011bbb6ecf93f151e29067998611ec8b774e7e99e16a74a9ef4224f16bbb",
+        "assets/templates/CLAUDE.md.template": "f80450e45f77ea00887715f692dc28009706ea0a57fdb0e37bf451b48e11b26c"
+      },
+      "starter": {
+        "assets/product/ROLE.md": "150eca42e84925a1e0a65e0212e34a84601d403f044310fb89cc5bf88f4ab87c",
+        "assets/templates/CLAUDE.md.template": "90ed7d8f7a2e45ed90a5ced70bb3029862d379b2426621c6c0ae0387bd01c421"
+      }
+    },
+    "074a96b4ced5bbb80bf3122ac2061e9993791c42": {
+      "creative-producer": {
+        "assets/product/ROLE.md": "91516b5083d3c6ccd7b95588dc1a2b237f9a253340a1f81e6141d677476b4b65",
+        "assets/templates/CLAUDE.md.template": "3a7e02cbafd48127c340d76ee0333403ffd41b2bda5361be668dcf3877e3cd4e"
+      },
+      "data-bi-analyst": {
+        "assets/product/ROLE.md": "1f0416711926fa12dddc7226b3d3c86a21a60483c5b128789840bf2b68f1af53",
+        "assets/templates/CLAUDE.md.template": "e4831680b9cf14af16b15db0a4d47c9ce165881562eff5058c25e595bd071d35"
+      },
+      "executive-assistant": {
+        "assets/product/ROLE.md": "522bb3d2d75bc1df50225b00f7c891b7b86e057d33d4d2ba6d90241042a07134",
+        "assets/templates/CLAUDE.md.template": "e4831680b9cf14af16b15db0a4d47c9ce165881562eff5058c25e595bd071d35"
+      },
+      "fpa-cfo-assistant": {
+        "assets/product/ROLE.md": "10e8eef70cf819eddfa32f1e6dda4e0e7ddb99feccf2310e7a1e0684a916b39e",
+        "assets/templates/CLAUDE.md.template": "e4831680b9cf14af16b15db0a4d47c9ce165881562eff5058c25e595bd071d35"
+      },
+      "investment-research-analyst": {
+        "assets/product/ROLE.md": "76be61420a6f339dad725e3df6e6c61682ba71e7f86a51331fc506f023c84353",
+        "assets/templates/CLAUDE.md.template": "e4831680b9cf14af16b15db0a4d47c9ce165881562eff5058c25e595bd071d35"
+      },
+      "marketing-strategist": {
+        "assets/product/ROLE.md": "3ed58252479325b0b3b76043df1c85379923b5886e1b7f3af2f76b678b233888",
+        "assets/templates/CLAUDE.md.template": "9d812e91957f150d80d413f6274a8cc24c8ec3aa0a7bbf7510ba3ce5a9f679eb"
+      },
+      "performance-marketer": {
+        "assets/product/ROLE.md": "5f76d8ce27437e4d5eab2f4fd7298127afe609222c9429f3da3221381a75e666",
+        "assets/templates/CLAUDE.md.template": "9d812e91957f150d80d413f6274a8cc24c8ec3aa0a7bbf7510ba3ce5a9f679eb"
+      },
+      "premium": {
+        "assets/product/ROLE.md": "50cfb76fe2f44a34db451a98e29a8399a16901c8b9c10e2b6fc8e2c9931de778",
+        "assets/roles/creative-producer/ROLE.md": "91516b5083d3c6ccd7b95588dc1a2b237f9a253340a1f81e6141d677476b4b65",
+        "assets/roles/data-bi-analyst/ROLE.md": "1f0416711926fa12dddc7226b3d3c86a21a60483c5b128789840bf2b68f1af53",
+        "assets/roles/executive-assistant/ROLE.md": "522bb3d2d75bc1df50225b00f7c891b7b86e057d33d4d2ba6d90241042a07134",
+        "assets/roles/fpa-cfo-assistant/ROLE.md": "10e8eef70cf819eddfa32f1e6dda4e0e7ddb99feccf2310e7a1e0684a916b39e",
+        "assets/roles/investment-research-analyst/ROLE.md": "76be61420a6f339dad725e3df6e6c61682ba71e7f86a51331fc506f023c84353",
+        "assets/roles/marketing-strategist/ROLE.md": "3ed58252479325b0b3b76043df1c85379923b5886e1b7f3af2f76b678b233888",
+        "assets/roles/performance-marketer/ROLE.md": "5f76d8ce27437e4d5eab2f4fd7298127afe609222c9429f3da3221381a75e666",
+        "assets/roles/project-operations-manager/ROLE.md": "130fc45b3db5a8dc381d47743504bc647f21e16bfe4f191299fe35a6200b7a7e",
+        "assets/roles/sales-sdr/ROLE.md": "b310368a6eb2d5092382b74ffb464f4d95941e2bec6b306fc09b0a1e365979cc",
+        "assets/roles/smm-manager/ROLE.md": "45ad011bbb6ecf93f151e29067998611ec8b774e7e99e16a74a9ef4224f16bbb",
+        "assets/templates/CLAUDE.md.template": "33d6760078ce67467e2e44929086354d235c16a15f4f8d67dae0420d1da7f279"
+      },
+      "project-operations-manager": {
+        "assets/product/ROLE.md": "130fc45b3db5a8dc381d47743504bc647f21e16bfe4f191299fe35a6200b7a7e",
+        "assets/templates/CLAUDE.md.template": "ed727576c58a0236363243e7a3eadcbf8fb9775708bf2436b3b95d2669755f2a"
+      },
+      "sales-sdr": {
+        "assets/product/ROLE.md": "b310368a6eb2d5092382b74ffb464f4d95941e2bec6b306fc09b0a1e365979cc",
+        "assets/templates/CLAUDE.md.template": "e4831680b9cf14af16b15db0a4d47c9ce165881562eff5058c25e595bd071d35"
+      },
+      "smm-manager": {
+        "assets/product/ROLE.md": "45ad011bbb6ecf93f151e29067998611ec8b774e7e99e16a74a9ef4224f16bbb",
+        "assets/templates/CLAUDE.md.template": "3a7e02cbafd48127c340d76ee0333403ffd41b2bda5361be668dcf3877e3cd4e"
+      },
+      "starter": {
+        "assets/product/ROLE.md": "150eca42e84925a1e0a65e0212e34a84601d403f044310fb89cc5bf88f4ab87c",
+        "assets/templates/CLAUDE.md.template": "e4831680b9cf14af16b15db0a4d47c9ce165881562eff5058c25e595bd071d35"
+      }
+    },
+    "23b78d03e2b97012bd37a33d521033dbfb5280e3": {
+      "creative-producer": {
+        "assets/product/ROLE.md": "91516b5083d3c6ccd7b95588dc1a2b237f9a253340a1f81e6141d677476b4b65",
+        "assets/templates/CLAUDE.md.template": "8c6126e1a77b84bf05578e53ec431fb767a26f04179a4647e06d6e58258df95e"
+      },
+      "data-bi-analyst": {
+        "assets/product/ROLE.md": "1f0416711926fa12dddc7226b3d3c86a21a60483c5b128789840bf2b68f1af53",
+        "assets/templates/CLAUDE.md.template": "8718947976a4fb3b649eb94559eea8205c3ba2f6301c1b234688ee4e20bdc949"
+      },
+      "executive-assistant": {
+        "assets/product/ROLE.md": "522bb3d2d75bc1df50225b00f7c891b7b86e057d33d4d2ba6d90241042a07134",
+        "assets/templates/CLAUDE.md.template": "8718947976a4fb3b649eb94559eea8205c3ba2f6301c1b234688ee4e20bdc949"
+      },
+      "fpa-cfo-assistant": {
+        "assets/product/ROLE.md": "10e8eef70cf819eddfa32f1e6dda4e0e7ddb99feccf2310e7a1e0684a916b39e",
+        "assets/templates/CLAUDE.md.template": "8718947976a4fb3b649eb94559eea8205c3ba2f6301c1b234688ee4e20bdc949"
+      },
+      "investment-research-analyst": {
+        "assets/product/ROLE.md": "76be61420a6f339dad725e3df6e6c61682ba71e7f86a51331fc506f023c84353",
+        "assets/templates/CLAUDE.md.template": "8718947976a4fb3b649eb94559eea8205c3ba2f6301c1b234688ee4e20bdc949"
+      },
+      "marketing-strategist": {
+        "assets/product/ROLE.md": "3ed58252479325b0b3b76043df1c85379923b5886e1b7f3af2f76b678b233888",
+        "assets/templates/CLAUDE.md.template": "b4b1cc60916fc44cdbca133efe7fecf42c3d0c0259955db3cd15a40c5ce8faf2"
+      },
+      "performance-marketer": {
+        "assets/product/ROLE.md": "5f76d8ce27437e4d5eab2f4fd7298127afe609222c9429f3da3221381a75e666",
+        "assets/templates/CLAUDE.md.template": "b4b1cc60916fc44cdbca133efe7fecf42c3d0c0259955db3cd15a40c5ce8faf2"
+      },
+      "premium": {
+        "assets/product/ROLE.md": "50cfb76fe2f44a34db451a98e29a8399a16901c8b9c10e2b6fc8e2c9931de778",
+        "assets/roles/creative-producer/ROLE.md": "91516b5083d3c6ccd7b95588dc1a2b237f9a253340a1f81e6141d677476b4b65",
+        "assets/roles/data-bi-analyst/ROLE.md": "1f0416711926fa12dddc7226b3d3c86a21a60483c5b128789840bf2b68f1af53",
+        "assets/roles/executive-assistant/ROLE.md": "522bb3d2d75bc1df50225b00f7c891b7b86e057d33d4d2ba6d90241042a07134",
+        "assets/roles/fpa-cfo-assistant/ROLE.md": "10e8eef70cf819eddfa32f1e6dda4e0e7ddb99feccf2310e7a1e0684a916b39e",
+        "assets/roles/investment-research-analyst/ROLE.md": "76be61420a6f339dad725e3df6e6c61682ba71e7f86a51331fc506f023c84353",
+        "assets/roles/marketing-strategist/ROLE.md": "3ed58252479325b0b3b76043df1c85379923b5886e1b7f3af2f76b678b233888",
+        "assets/roles/performance-marketer/ROLE.md": "5f76d8ce27437e4d5eab2f4fd7298127afe609222c9429f3da3221381a75e666",
+        "assets/roles/project-operations-manager/ROLE.md": "130fc45b3db5a8dc381d47743504bc647f21e16bfe4f191299fe35a6200b7a7e",
+        "assets/roles/sales-sdr/ROLE.md": "b310368a6eb2d5092382b74ffb464f4d95941e2bec6b306fc09b0a1e365979cc",
+        "assets/roles/smm-manager/ROLE.md": "45ad011bbb6ecf93f151e29067998611ec8b774e7e99e16a74a9ef4224f16bbb",
+        "assets/templates/CLAUDE.md.template": "d7d337736f1b6a1865f907bca0ff832d66ed223921b56a86e48659797202c9e3"
+      },
+      "project-operations-manager": {
+        "assets/product/ROLE.md": "130fc45b3db5a8dc381d47743504bc647f21e16bfe4f191299fe35a6200b7a7e",
+        "assets/templates/CLAUDE.md.template": "50cb7c81492cff456c1af1044bbc811182314bf4afb5c0e34307dcfa8045f578"
+      },
+      "sales-sdr": {
+        "assets/product/ROLE.md": "b310368a6eb2d5092382b74ffb464f4d95941e2bec6b306fc09b0a1e365979cc",
+        "assets/templates/CLAUDE.md.template": "8718947976a4fb3b649eb94559eea8205c3ba2f6301c1b234688ee4e20bdc949"
+      },
+      "smm-manager": {
+        "assets/product/ROLE.md": "45ad011bbb6ecf93f151e29067998611ec8b774e7e99e16a74a9ef4224f16bbb",
+        "assets/templates/CLAUDE.md.template": "8c6126e1a77b84bf05578e53ec431fb767a26f04179a4647e06d6e58258df95e"
+      },
+      "starter": {
+        "assets/product/ROLE.md": "150eca42e84925a1e0a65e0212e34a84601d403f044310fb89cc5bf88f4ab87c",
+        "assets/templates/CLAUDE.md.template": "8718947976a4fb3b649eb94559eea8205c3ba2f6301c1b234688ee4e20bdc949"
+      }
+    },
+    "4abd5b2e07214f4a5dfceb6df25305b2f056cfd0": {
+      "creative-producer": {
+        "assets/product/ROLE.md": "91516b5083d3c6ccd7b95588dc1a2b237f9a253340a1f81e6141d677476b4b65",
+        "assets/templates/CLAUDE.md.template": "3a7e02cbafd48127c340d76ee0333403ffd41b2bda5361be668dcf3877e3cd4e"
+      },
+      "data-bi-analyst": {
+        "assets/product/ROLE.md": "1f0416711926fa12dddc7226b3d3c86a21a60483c5b128789840bf2b68f1af53",
+        "assets/templates/CLAUDE.md.template": "e4831680b9cf14af16b15db0a4d47c9ce165881562eff5058c25e595bd071d35"
+      },
+      "executive-assistant": {
+        "assets/product/ROLE.md": "522bb3d2d75bc1df50225b00f7c891b7b86e057d33d4d2ba6d90241042a07134",
+        "assets/templates/CLAUDE.md.template": "e4831680b9cf14af16b15db0a4d47c9ce165881562eff5058c25e595bd071d35"
+      },
+      "fpa-cfo-assistant": {
+        "assets/product/ROLE.md": "10e8eef70cf819eddfa32f1e6dda4e0e7ddb99feccf2310e7a1e0684a916b39e",
+        "assets/templates/CLAUDE.md.template": "e4831680b9cf14af16b15db0a4d47c9ce165881562eff5058c25e595bd071d35"
+      },
+      "investment-research-analyst": {
+        "assets/product/ROLE.md": "76be61420a6f339dad725e3df6e6c61682ba71e7f86a51331fc506f023c84353",
+        "assets/templates/CLAUDE.md.template": "e4831680b9cf14af16b15db0a4d47c9ce165881562eff5058c25e595bd071d35"
+      },
+      "marketing-strategist": {
+        "assets/product/ROLE.md": "3ed58252479325b0b3b76043df1c85379923b5886e1b7f3af2f76b678b233888",
+        "assets/templates/CLAUDE.md.template": "9d812e91957f150d80d413f6274a8cc24c8ec3aa0a7bbf7510ba3ce5a9f679eb"
+      },
+      "performance-marketer": {
+        "assets/product/ROLE.md": "5f76d8ce27437e4d5eab2f4fd7298127afe609222c9429f3da3221381a75e666",
+        "assets/templates/CLAUDE.md.template": "9d812e91957f150d80d413f6274a8cc24c8ec3aa0a7bbf7510ba3ce5a9f679eb"
+      },
+      "premium": {
+        "assets/product/ROLE.md": "50cfb76fe2f44a34db451a98e29a8399a16901c8b9c10e2b6fc8e2c9931de778",
+        "assets/roles/creative-producer/ROLE.md": "91516b5083d3c6ccd7b95588dc1a2b237f9a253340a1f81e6141d677476b4b65",
+        "assets/roles/data-bi-analyst/ROLE.md": "1f0416711926fa12dddc7226b3d3c86a21a60483c5b128789840bf2b68f1af53",
+        "assets/roles/executive-assistant/ROLE.md": "522bb3d2d75bc1df50225b00f7c891b7b86e057d33d4d2ba6d90241042a07134",
+        "assets/roles/fpa-cfo-assistant/ROLE.md": "10e8eef70cf819eddfa32f1e6dda4e0e7ddb99feccf2310e7a1e0684a916b39e",
+        "assets/roles/investment-research-analyst/ROLE.md": "76be61420a6f339dad725e3df6e6c61682ba71e7f86a51331fc506f023c84353",
+        "assets/roles/marketing-strategist/ROLE.md": "3ed58252479325b0b3b76043df1c85379923b5886e1b7f3af2f76b678b233888",
+        "assets/roles/performance-marketer/ROLE.md": "5f76d8ce27437e4d5eab2f4fd7298127afe609222c9429f3da3221381a75e666",
+        "assets/roles/project-operations-manager/ROLE.md": "130fc45b3db5a8dc381d47743504bc647f21e16bfe4f191299fe35a6200b7a7e",
+        "assets/roles/sales-sdr/ROLE.md": "b310368a6eb2d5092382b74ffb464f4d95941e2bec6b306fc09b0a1e365979cc",
+        "assets/roles/smm-manager/ROLE.md": "45ad011bbb6ecf93f151e29067998611ec8b774e7e99e16a74a9ef4224f16bbb",
+        "assets/templates/CLAUDE.md.template": "33d6760078ce67467e2e44929086354d235c16a15f4f8d67dae0420d1da7f279"
+      },
+      "project-operations-manager": {
+        "assets/product/ROLE.md": "130fc45b3db5a8dc381d47743504bc647f21e16bfe4f191299fe35a6200b7a7e",
+        "assets/templates/CLAUDE.md.template": "ed727576c58a0236363243e7a3eadcbf8fb9775708bf2436b3b95d2669755f2a"
+      },
+      "sales-sdr": {
+        "assets/product/ROLE.md": "b310368a6eb2d5092382b74ffb464f4d95941e2bec6b306fc09b0a1e365979cc",
+        "assets/templates/CLAUDE.md.template": "e4831680b9cf14af16b15db0a4d47c9ce165881562eff5058c25e595bd071d35"
+      },
+      "smm-manager": {
+        "assets/product/ROLE.md": "45ad011bbb6ecf93f151e29067998611ec8b774e7e99e16a74a9ef4224f16bbb",
+        "assets/templates/CLAUDE.md.template": "3a7e02cbafd48127c340d76ee0333403ffd41b2bda5361be668dcf3877e3cd4e"
+      },
+      "starter": {
+        "assets/product/ROLE.md": "150eca42e84925a1e0a65e0212e34a84601d403f044310fb89cc5bf88f4ab87c",
+        "assets/templates/CLAUDE.md.template": "e4831680b9cf14af16b15db0a4d47c9ce165881562eff5058c25e595bd071d35"
+      }
+    },
+    "fbe9016f409f87e841255713ce059fa28d786658": {
+      "creative-producer": {
+        "assets/product/ROLE.md": "91516b5083d3c6ccd7b95588dc1a2b237f9a253340a1f81e6141d677476b4b65",
+        "assets/templates/CLAUDE.md.template": "3a7e02cbafd48127c340d76ee0333403ffd41b2bda5361be668dcf3877e3cd4e"
+      },
+      "data-bi-analyst": {
+        "assets/product/ROLE.md": "1f0416711926fa12dddc7226b3d3c86a21a60483c5b128789840bf2b68f1af53",
+        "assets/templates/CLAUDE.md.template": "e4831680b9cf14af16b15db0a4d47c9ce165881562eff5058c25e595bd071d35"
+      },
+      "executive-assistant": {
+        "assets/product/ROLE.md": "522bb3d2d75bc1df50225b00f7c891b7b86e057d33d4d2ba6d90241042a07134",
+        "assets/templates/CLAUDE.md.template": "e4831680b9cf14af16b15db0a4d47c9ce165881562eff5058c25e595bd071d35"
+      },
+      "fpa-cfo-assistant": {
+        "assets/product/ROLE.md": "10e8eef70cf819eddfa32f1e6dda4e0e7ddb99feccf2310e7a1e0684a916b39e",
+        "assets/templates/CLAUDE.md.template": "e4831680b9cf14af16b15db0a4d47c9ce165881562eff5058c25e595bd071d35"
+      },
+      "investment-research-analyst": {
+        "assets/product/ROLE.md": "76be61420a6f339dad725e3df6e6c61682ba71e7f86a51331fc506f023c84353",
+        "assets/templates/CLAUDE.md.template": "e4831680b9cf14af16b15db0a4d47c9ce165881562eff5058c25e595bd071d35"
+      },
+      "marketing-strategist": {
+        "assets/product/ROLE.md": "3ed58252479325b0b3b76043df1c85379923b5886e1b7f3af2f76b678b233888",
+        "assets/templates/CLAUDE.md.template": "9d812e91957f150d80d413f6274a8cc24c8ec3aa0a7bbf7510ba3ce5a9f679eb"
+      },
+      "performance-marketer": {
+        "assets/product/ROLE.md": "5f76d8ce27437e4d5eab2f4fd7298127afe609222c9429f3da3221381a75e666",
+        "assets/templates/CLAUDE.md.template": "9d812e91957f150d80d413f6274a8cc24c8ec3aa0a7bbf7510ba3ce5a9f679eb"
+      },
+      "premium": {
+        "assets/product/ROLE.md": "50cfb76fe2f44a34db451a98e29a8399a16901c8b9c10e2b6fc8e2c9931de778",
+        "assets/roles/creative-producer/ROLE.md": "91516b5083d3c6ccd7b95588dc1a2b237f9a253340a1f81e6141d677476b4b65",
+        "assets/roles/data-bi-analyst/ROLE.md": "1f0416711926fa12dddc7226b3d3c86a21a60483c5b128789840bf2b68f1af53",
+        "assets/roles/executive-assistant/ROLE.md": "522bb3d2d75bc1df50225b00f7c891b7b86e057d33d4d2ba6d90241042a07134",
+        "assets/roles/fpa-cfo-assistant/ROLE.md": "10e8eef70cf819eddfa32f1e6dda4e0e7ddb99feccf2310e7a1e0684a916b39e",
+        "assets/roles/investment-research-analyst/ROLE.md": "76be61420a6f339dad725e3df6e6c61682ba71e7f86a51331fc506f023c84353",
+        "assets/roles/marketing-strategist/ROLE.md": "3ed58252479325b0b3b76043df1c85379923b5886e1b7f3af2f76b678b233888",
+        "assets/roles/performance-marketer/ROLE.md": "5f76d8ce27437e4d5eab2f4fd7298127afe609222c9429f3da3221381a75e666",
+        "assets/roles/project-operations-manager/ROLE.md": "130fc45b3db5a8dc381d47743504bc647f21e16bfe4f191299fe35a6200b7a7e",
+        "assets/roles/sales-sdr/ROLE.md": "b310368a6eb2d5092382b74ffb464f4d95941e2bec6b306fc09b0a1e365979cc",
+        "assets/roles/smm-manager/ROLE.md": "45ad011bbb6ecf93f151e29067998611ec8b774e7e99e16a74a9ef4224f16bbb",
+        "assets/templates/CLAUDE.md.template": "33d6760078ce67467e2e44929086354d235c16a15f4f8d67dae0420d1da7f279"
+      },
+      "project-operations-manager": {
+        "assets/product/ROLE.md": "130fc45b3db5a8dc381d47743504bc647f21e16bfe4f191299fe35a6200b7a7e",
+        "assets/templates/CLAUDE.md.template": "ed727576c58a0236363243e7a3eadcbf8fb9775708bf2436b3b95d2669755f2a"
+      },
+      "sales-sdr": {
+        "assets/product/ROLE.md": "b310368a6eb2d5092382b74ffb464f4d95941e2bec6b306fc09b0a1e365979cc",
+        "assets/templates/CLAUDE.md.template": "e4831680b9cf14af16b15db0a4d47c9ce165881562eff5058c25e595bd071d35"
+      },
+      "smm-manager": {
+        "assets/product/ROLE.md": "45ad011bbb6ecf93f151e29067998611ec8b774e7e99e16a74a9ef4224f16bbb",
+        "assets/templates/CLAUDE.md.template": "3a7e02cbafd48127c340d76ee0333403ffd41b2bda5361be668dcf3877e3cd4e"
+      },
+      "starter": {
+        "assets/product/ROLE.md": "150eca42e84925a1e0a65e0212e34a84601d403f044310fb89cc5bf88f4ab87c",
+        "assets/templates/CLAUDE.md.template": "e4831680b9cf14af16b15db0a4d47c9ce165881562eff5058c25e595bd071d35"
+      }
+    },
+    "0be9250daccbf1b8bf88f082fc2f73e6d6d25788": {
+      "creative-producer": {
+        "assets/product/ROLE.md": "91516b5083d3c6ccd7b95588dc1a2b237f9a253340a1f81e6141d677476b4b65",
+        "assets/templates/CLAUDE.md.template": "273d924d50d3a4693d9e366c0289d6263c43f315c49a20db7d23d39b1b9a53bc"
+      },
+      "data-bi-analyst": {
+        "assets/product/ROLE.md": "1f0416711926fa12dddc7226b3d3c86a21a60483c5b128789840bf2b68f1af53",
+        "assets/templates/CLAUDE.md.template": "ef0d2111dc4f85f7eb57ac5497b7e32b878050dcaa1ca445dc609a21dc3c80e8"
+      },
+      "executive-assistant": {
+        "assets/product/ROLE.md": "522bb3d2d75bc1df50225b00f7c891b7b86e057d33d4d2ba6d90241042a07134",
+        "assets/templates/CLAUDE.md.template": "ef0d2111dc4f85f7eb57ac5497b7e32b878050dcaa1ca445dc609a21dc3c80e8"
+      },
+      "fpa-cfo-assistant": {
+        "assets/product/ROLE.md": "10e8eef70cf819eddfa32f1e6dda4e0e7ddb99feccf2310e7a1e0684a916b39e",
+        "assets/templates/CLAUDE.md.template": "ef0d2111dc4f85f7eb57ac5497b7e32b878050dcaa1ca445dc609a21dc3c80e8"
+      },
+      "investment-research-analyst": {
+        "assets/product/ROLE.md": "76be61420a6f339dad725e3df6e6c61682ba71e7f86a51331fc506f023c84353",
+        "assets/templates/CLAUDE.md.template": "ef0d2111dc4f85f7eb57ac5497b7e32b878050dcaa1ca445dc609a21dc3c80e8"
+      },
+      "marketing-strategist": {
+        "assets/product/ROLE.md": "3ed58252479325b0b3b76043df1c85379923b5886e1b7f3af2f76b678b233888",
+        "assets/templates/CLAUDE.md.template": "4df18bab800d1546db589aff6f933cbf4704dfdaa578b74443b08586a785fb50"
+      },
+      "performance-marketer": {
+        "assets/product/ROLE.md": "5f76d8ce27437e4d5eab2f4fd7298127afe609222c9429f3da3221381a75e666",
+        "assets/templates/CLAUDE.md.template": "4df18bab800d1546db589aff6f933cbf4704dfdaa578b74443b08586a785fb50"
+      },
+      "premium": {
+        "assets/product/ROLE.md": "50cfb76fe2f44a34db451a98e29a8399a16901c8b9c10e2b6fc8e2c9931de778",
+        "assets/roles/creative-producer/ROLE.md": "91516b5083d3c6ccd7b95588dc1a2b237f9a253340a1f81e6141d677476b4b65",
+        "assets/roles/data-bi-analyst/ROLE.md": "1f0416711926fa12dddc7226b3d3c86a21a60483c5b128789840bf2b68f1af53",
+        "assets/roles/executive-assistant/ROLE.md": "522bb3d2d75bc1df50225b00f7c891b7b86e057d33d4d2ba6d90241042a07134",
+        "assets/roles/fpa-cfo-assistant/ROLE.md": "10e8eef70cf819eddfa32f1e6dda4e0e7ddb99feccf2310e7a1e0684a916b39e",
+        "assets/roles/investment-research-analyst/ROLE.md": "76be61420a6f339dad725e3df6e6c61682ba71e7f86a51331fc506f023c84353",
+        "assets/roles/marketing-strategist/ROLE.md": "3ed58252479325b0b3b76043df1c85379923b5886e1b7f3af2f76b678b233888",
+        "assets/roles/performance-marketer/ROLE.md": "5f76d8ce27437e4d5eab2f4fd7298127afe609222c9429f3da3221381a75e666",
+        "assets/roles/project-operations-manager/ROLE.md": "130fc45b3db5a8dc381d47743504bc647f21e16bfe4f191299fe35a6200b7a7e",
+        "assets/roles/sales-sdr/ROLE.md": "b310368a6eb2d5092382b74ffb464f4d95941e2bec6b306fc09b0a1e365979cc",
+        "assets/roles/smm-manager/ROLE.md": "45ad011bbb6ecf93f151e29067998611ec8b774e7e99e16a74a9ef4224f16bbb",
+        "assets/templates/CLAUDE.md.template": "2528693214b23b1bf6a8778886950245de2289798add72070624e1e18c0e5981"
+      },
+      "project-operations-manager": {
+        "assets/product/ROLE.md": "130fc45b3db5a8dc381d47743504bc647f21e16bfe4f191299fe35a6200b7a7e",
+        "assets/templates/CLAUDE.md.template": "88bd34becefcbf0a327bdbe8c3188f300474a3009eabcca2a6bf66c1c5e3f4bc"
+      },
+      "sales-sdr": {
+        "assets/product/ROLE.md": "b310368a6eb2d5092382b74ffb464f4d95941e2bec6b306fc09b0a1e365979cc",
+        "assets/templates/CLAUDE.md.template": "ef0d2111dc4f85f7eb57ac5497b7e32b878050dcaa1ca445dc609a21dc3c80e8"
+      },
+      "smm-manager": {
+        "assets/product/ROLE.md": "45ad011bbb6ecf93f151e29067998611ec8b774e7e99e16a74a9ef4224f16bbb",
+        "assets/templates/CLAUDE.md.template": "273d924d50d3a4693d9e366c0289d6263c43f315c49a20db7d23d39b1b9a53bc"
+      },
+      "starter": {
+        "assets/product/ROLE.md": "150eca42e84925a1e0a65e0212e34a84601d403f044310fb89cc5bf88f4ab87c",
+        "assets/templates/CLAUDE.md.template": "ef0d2111dc4f85f7eb57ac5497b7e32b878050dcaa1ca445dc609a21dc3c80e8"
+      }
+    },
+    "782db45f006bf01329a92626436c3e25ce6c777b": {
+      "creative-producer": {
+        "assets/product/ROLE.md": "91516b5083d3c6ccd7b95588dc1a2b237f9a253340a1f81e6141d677476b4b65",
+        "assets/templates/CLAUDE.md.template": "d7f0c0e910f4c5fd652789ea2dd8bb4821cfc62f8b0003213ba2e3f67783ffbc"
+      },
+      "data-bi-analyst": {
+        "assets/product/ROLE.md": "1f0416711926fa12dddc7226b3d3c86a21a60483c5b128789840bf2b68f1af53",
+        "assets/templates/CLAUDE.md.template": "96f4faab775a4c76f80fe4f9a72240c7f31b4184faaaef4b947542414e939873"
+      },
+      "executive-assistant": {
+        "assets/product/ROLE.md": "522bb3d2d75bc1df50225b00f7c891b7b86e057d33d4d2ba6d90241042a07134",
+        "assets/templates/CLAUDE.md.template": "96f4faab775a4c76f80fe4f9a72240c7f31b4184faaaef4b947542414e939873"
+      },
+      "fpa-cfo-assistant": {
+        "assets/product/ROLE.md": "10e8eef70cf819eddfa32f1e6dda4e0e7ddb99feccf2310e7a1e0684a916b39e",
+        "assets/templates/CLAUDE.md.template": "96f4faab775a4c76f80fe4f9a72240c7f31b4184faaaef4b947542414e939873"
+      },
+      "investment-research-analyst": {
+        "assets/product/ROLE.md": "76be61420a6f339dad725e3df6e6c61682ba71e7f86a51331fc506f023c84353",
+        "assets/templates/CLAUDE.md.template": "96f4faab775a4c76f80fe4f9a72240c7f31b4184faaaef4b947542414e939873"
+      },
+      "marketing-strategist": {
+        "assets/product/ROLE.md": "3ed58252479325b0b3b76043df1c85379923b5886e1b7f3af2f76b678b233888",
+        "assets/templates/CLAUDE.md.template": "b0d3fa6a271411845ee7d0da09a6db883c3b2e6eebb38f2c722bb07857003ac2"
+      },
+      "performance-marketer": {
+        "assets/product/ROLE.md": "5f76d8ce27437e4d5eab2f4fd7298127afe609222c9429f3da3221381a75e666",
+        "assets/templates/CLAUDE.md.template": "b0d3fa6a271411845ee7d0da09a6db883c3b2e6eebb38f2c722bb07857003ac2"
+      },
+      "premium": {
+        "assets/product/ROLE.md": "50cfb76fe2f44a34db451a98e29a8399a16901c8b9c10e2b6fc8e2c9931de778",
+        "assets/roles/creative-producer/ROLE.md": "91516b5083d3c6ccd7b95588dc1a2b237f9a253340a1f81e6141d677476b4b65",
+        "assets/roles/data-bi-analyst/ROLE.md": "1f0416711926fa12dddc7226b3d3c86a21a60483c5b128789840bf2b68f1af53",
+        "assets/roles/executive-assistant/ROLE.md": "522bb3d2d75bc1df50225b00f7c891b7b86e057d33d4d2ba6d90241042a07134",
+        "assets/roles/fpa-cfo-assistant/ROLE.md": "10e8eef70cf819eddfa32f1e6dda4e0e7ddb99feccf2310e7a1e0684a916b39e",
+        "assets/roles/investment-research-analyst/ROLE.md": "76be61420a6f339dad725e3df6e6c61682ba71e7f86a51331fc506f023c84353",
+        "assets/roles/marketing-strategist/ROLE.md": "3ed58252479325b0b3b76043df1c85379923b5886e1b7f3af2f76b678b233888",
+        "assets/roles/performance-marketer/ROLE.md": "5f76d8ce27437e4d5eab2f4fd7298127afe609222c9429f3da3221381a75e666",
+        "assets/roles/project-operations-manager/ROLE.md": "130fc45b3db5a8dc381d47743504bc647f21e16bfe4f191299fe35a6200b7a7e",
+        "assets/roles/sales-sdr/ROLE.md": "b310368a6eb2d5092382b74ffb464f4d95941e2bec6b306fc09b0a1e365979cc",
+        "assets/roles/smm-manager/ROLE.md": "45ad011bbb6ecf93f151e29067998611ec8b774e7e99e16a74a9ef4224f16bbb",
+        "assets/templates/CLAUDE.md.template": "3fd1f10a94958a930a7e7303a0c53644b193d807c48434e1ff735f369cacb4fb"
+      },
+      "project-operations-manager": {
+        "assets/product/ROLE.md": "130fc45b3db5a8dc381d47743504bc647f21e16bfe4f191299fe35a6200b7a7e",
+        "assets/templates/CLAUDE.md.template": "6ddd5f8f946261bd143edeb75d3bda50bd64b50faec9d2cefec4132f9e167803"
+      },
+      "sales-sdr": {
+        "assets/product/ROLE.md": "b310368a6eb2d5092382b74ffb464f4d95941e2bec6b306fc09b0a1e365979cc",
+        "assets/templates/CLAUDE.md.template": "96f4faab775a4c76f80fe4f9a72240c7f31b4184faaaef4b947542414e939873"
+      },
+      "smm-manager": {
+        "assets/product/ROLE.md": "45ad011bbb6ecf93f151e29067998611ec8b774e7e99e16a74a9ef4224f16bbb",
+        "assets/templates/CLAUDE.md.template": "d7f0c0e910f4c5fd652789ea2dd8bb4821cfc62f8b0003213ba2e3f67783ffbc"
+      },
+      "starter": {
+        "assets/product/ROLE.md": "150eca42e84925a1e0a65e0212e34a84601d403f044310fb89cc5bf88f4ab87c",
+        "assets/templates/CLAUDE.md.template": "96f4faab775a4c76f80fe4f9a72240c7f31b4184faaaef4b947542414e939873"
+      }
+    },
+    "d279ed561df8feca49ce5c2e675ab1ba28ff2ca1": {
+      "creative-producer": {
+        "assets/product/ROLE.md": "91516b5083d3c6ccd7b95588dc1a2b237f9a253340a1f81e6141d677476b4b65",
+        "assets/templates/CLAUDE.md.template": "273d924d50d3a4693d9e366c0289d6263c43f315c49a20db7d23d39b1b9a53bc"
+      },
+      "data-bi-analyst": {
+        "assets/product/ROLE.md": "1f0416711926fa12dddc7226b3d3c86a21a60483c5b128789840bf2b68f1af53",
+        "assets/templates/CLAUDE.md.template": "ef0d2111dc4f85f7eb57ac5497b7e32b878050dcaa1ca445dc609a21dc3c80e8"
+      },
+      "executive-assistant": {
+        "assets/product/ROLE.md": "522bb3d2d75bc1df50225b00f7c891b7b86e057d33d4d2ba6d90241042a07134",
+        "assets/templates/CLAUDE.md.template": "ef0d2111dc4f85f7eb57ac5497b7e32b878050dcaa1ca445dc609a21dc3c80e8"
+      },
+      "fpa-cfo-assistant": {
+        "assets/product/ROLE.md": "10e8eef70cf819eddfa32f1e6dda4e0e7ddb99feccf2310e7a1e0684a916b39e",
+        "assets/templates/CLAUDE.md.template": "ef0d2111dc4f85f7eb57ac5497b7e32b878050dcaa1ca445dc609a21dc3c80e8"
+      },
+      "investment-research-analyst": {
+        "assets/product/ROLE.md": "76be61420a6f339dad725e3df6e6c61682ba71e7f86a51331fc506f023c84353",
+        "assets/templates/CLAUDE.md.template": "ef0d2111dc4f85f7eb57ac5497b7e32b878050dcaa1ca445dc609a21dc3c80e8"
+      },
+      "marketing-strategist": {
+        "assets/product/ROLE.md": "3ed58252479325b0b3b76043df1c85379923b5886e1b7f3af2f76b678b233888",
+        "assets/templates/CLAUDE.md.template": "4df18bab800d1546db589aff6f933cbf4704dfdaa578b74443b08586a785fb50"
+      },
+      "performance-marketer": {
+        "assets/product/ROLE.md": "5f76d8ce27437e4d5eab2f4fd7298127afe609222c9429f3da3221381a75e666",
+        "assets/templates/CLAUDE.md.template": "4df18bab800d1546db589aff6f933cbf4704dfdaa578b74443b08586a785fb50"
+      },
+      "premium": {
+        "assets/product/ROLE.md": "50cfb76fe2f44a34db451a98e29a8399a16901c8b9c10e2b6fc8e2c9931de778",
+        "assets/roles/creative-producer/ROLE.md": "91516b5083d3c6ccd7b95588dc1a2b237f9a253340a1f81e6141d677476b4b65",
+        "assets/roles/data-bi-analyst/ROLE.md": "1f0416711926fa12dddc7226b3d3c86a21a60483c5b128789840bf2b68f1af53",
+        "assets/roles/executive-assistant/ROLE.md": "522bb3d2d75bc1df50225b00f7c891b7b86e057d33d4d2ba6d90241042a07134",
+        "assets/roles/fpa-cfo-assistant/ROLE.md": "10e8eef70cf819eddfa32f1e6dda4e0e7ddb99feccf2310e7a1e0684a916b39e",
+        "assets/roles/investment-research-analyst/ROLE.md": "76be61420a6f339dad725e3df6e6c61682ba71e7f86a51331fc506f023c84353",
+        "assets/roles/marketing-strategist/ROLE.md": "3ed58252479325b0b3b76043df1c85379923b5886e1b7f3af2f76b678b233888",
+        "assets/roles/performance-marketer/ROLE.md": "5f76d8ce27437e4d5eab2f4fd7298127afe609222c9429f3da3221381a75e666",
+        "assets/roles/project-operations-manager/ROLE.md": "130fc45b3db5a8dc381d47743504bc647f21e16bfe4f191299fe35a6200b7a7e",
+        "assets/roles/sales-sdr/ROLE.md": "b310368a6eb2d5092382b74ffb464f4d95941e2bec6b306fc09b0a1e365979cc",
+        "assets/roles/smm-manager/ROLE.md": "45ad011bbb6ecf93f151e29067998611ec8b774e7e99e16a74a9ef4224f16bbb",
+        "assets/templates/CLAUDE.md.template": "2528693214b23b1bf6a8778886950245de2289798add72070624e1e18c0e5981"
+      },
+      "project-operations-manager": {
+        "assets/product/ROLE.md": "130fc45b3db5a8dc381d47743504bc647f21e16bfe4f191299fe35a6200b7a7e",
+        "assets/templates/CLAUDE.md.template": "88bd34becefcbf0a327bdbe8c3188f300474a3009eabcca2a6bf66c1c5e3f4bc"
+      },
+      "sales-sdr": {
+        "assets/product/ROLE.md": "b310368a6eb2d5092382b74ffb464f4d95941e2bec6b306fc09b0a1e365979cc",
+        "assets/templates/CLAUDE.md.template": "ef0d2111dc4f85f7eb57ac5497b7e32b878050dcaa1ca445dc609a21dc3c80e8"
+      },
+      "smm-manager": {
+        "assets/product/ROLE.md": "45ad011bbb6ecf93f151e29067998611ec8b774e7e99e16a74a9ef4224f16bbb",
+        "assets/templates/CLAUDE.md.template": "273d924d50d3a4693d9e366c0289d6263c43f315c49a20db7d23d39b1b9a53bc"
+      },
+      "starter": {
+        "assets/product/ROLE.md": "150eca42e84925a1e0a65e0212e34a84601d403f044310fb89cc5bf88f4ab87c",
+        "assets/templates/CLAUDE.md.template": "ef0d2111dc4f85f7eb57ac5497b7e32b878050dcaa1ca445dc609a21dc3c80e8"
+      }
+    },
+    "72167a7b740c48629c3e7bcb1e3414de88caaaae": {
+      "creative-producer": {
+        "assets/product/ROLE.md": "91516b5083d3c6ccd7b95588dc1a2b237f9a253340a1f81e6141d677476b4b65",
+        "assets/templates/CLAUDE.md.template": "273d924d50d3a4693d9e366c0289d6263c43f315c49a20db7d23d39b1b9a53bc"
+      },
+      "data-bi-analyst": {
+        "assets/product/ROLE.md": "1f0416711926fa12dddc7226b3d3c86a21a60483c5b128789840bf2b68f1af53",
+        "assets/templates/CLAUDE.md.template": "ef0d2111dc4f85f7eb57ac5497b7e32b878050dcaa1ca445dc609a21dc3c80e8"
+      },
+      "executive-assistant": {
+        "assets/product/ROLE.md": "522bb3d2d75bc1df50225b00f7c891b7b86e057d33d4d2ba6d90241042a07134",
+        "assets/templates/CLAUDE.md.template": "ef0d2111dc4f85f7eb57ac5497b7e32b878050dcaa1ca445dc609a21dc3c80e8"
+      },
+      "fpa-cfo-assistant": {
+        "assets/product/ROLE.md": "10e8eef70cf819eddfa32f1e6dda4e0e7ddb99feccf2310e7a1e0684a916b39e",
+        "assets/templates/CLAUDE.md.template": "ef0d2111dc4f85f7eb57ac5497b7e32b878050dcaa1ca445dc609a21dc3c80e8"
+      },
+      "investment-research-analyst": {
+        "assets/product/ROLE.md": "76be61420a6f339dad725e3df6e6c61682ba71e7f86a51331fc506f023c84353",
+        "assets/templates/CLAUDE.md.template": "ef0d2111dc4f85f7eb57ac5497b7e32b878050dcaa1ca445dc609a21dc3c80e8"
+      },
+      "marketing-strategist": {
+        "assets/product/ROLE.md": "3ed58252479325b0b3b76043df1c85379923b5886e1b7f3af2f76b678b233888",
+        "assets/templates/CLAUDE.md.template": "4df18bab800d1546db589aff6f933cbf4704dfdaa578b74443b08586a785fb50"
+      },
+      "performance-marketer": {
+        "assets/product/ROLE.md": "5f76d8ce27437e4d5eab2f4fd7298127afe609222c9429f3da3221381a75e666",
+        "assets/templates/CLAUDE.md.template": "4df18bab800d1546db589aff6f933cbf4704dfdaa578b74443b08586a785fb50"
+      },
+      "premium": {
+        "assets/product/ROLE.md": "50cfb76fe2f44a34db451a98e29a8399a16901c8b9c10e2b6fc8e2c9931de778",
+        "assets/roles/creative-producer/ROLE.md": "91516b5083d3c6ccd7b95588dc1a2b237f9a253340a1f81e6141d677476b4b65",
+        "assets/roles/data-bi-analyst/ROLE.md": "1f0416711926fa12dddc7226b3d3c86a21a60483c5b128789840bf2b68f1af53",
+        "assets/roles/executive-assistant/ROLE.md": "522bb3d2d75bc1df50225b00f7c891b7b86e057d33d4d2ba6d90241042a07134",
+        "assets/roles/fpa-cfo-assistant/ROLE.md": "10e8eef70cf819eddfa32f1e6dda4e0e7ddb99feccf2310e7a1e0684a916b39e",
+        "assets/roles/investment-research-analyst/ROLE.md": "76be61420a6f339dad725e3df6e6c61682ba71e7f86a51331fc506f023c84353",
+        "assets/roles/marketing-strategist/ROLE.md": "3ed58252479325b0b3b76043df1c85379923b5886e1b7f3af2f76b678b233888",
+        "assets/roles/performance-marketer/ROLE.md": "5f76d8ce27437e4d5eab2f4fd7298127afe609222c9429f3da3221381a75e666",
+        "assets/roles/project-operations-manager/ROLE.md": "130fc45b3db5a8dc381d47743504bc647f21e16bfe4f191299fe35a6200b7a7e",
+        "assets/roles/sales-sdr/ROLE.md": "b310368a6eb2d5092382b74ffb464f4d95941e2bec6b306fc09b0a1e365979cc",
+        "assets/roles/smm-manager/ROLE.md": "45ad011bbb6ecf93f151e29067998611ec8b774e7e99e16a74a9ef4224f16bbb",
+        "assets/templates/CLAUDE.md.template": "2528693214b23b1bf6a8778886950245de2289798add72070624e1e18c0e5981"
+      },
+      "project-operations-manager": {
+        "assets/product/ROLE.md": "130fc45b3db5a8dc381d47743504bc647f21e16bfe4f191299fe35a6200b7a7e",
+        "assets/templates/CLAUDE.md.template": "88bd34becefcbf0a327bdbe8c3188f300474a3009eabcca2a6bf66c1c5e3f4bc"
+      },
+      "sales-sdr": {
+        "assets/product/ROLE.md": "b310368a6eb2d5092382b74ffb464f4d95941e2bec6b306fc09b0a1e365979cc",
+        "assets/templates/CLAUDE.md.template": "ef0d2111dc4f85f7eb57ac5497b7e32b878050dcaa1ca445dc609a21dc3c80e8"
+      },
+      "smm-manager": {
+        "assets/product/ROLE.md": "45ad011bbb6ecf93f151e29067998611ec8b774e7e99e16a74a9ef4224f16bbb",
+        "assets/templates/CLAUDE.md.template": "273d924d50d3a4693d9e366c0289d6263c43f315c49a20db7d23d39b1b9a53bc"
+      },
+      "starter": {
+        "assets/product/ROLE.md": "150eca42e84925a1e0a65e0212e34a84601d403f044310fb89cc5bf88f4ab87c",
+        "assets/templates/CLAUDE.md.template": "ef0d2111dc4f85f7eb57ac5497b7e32b878050dcaa1ca445dc609a21dc3c80e8"
+      }
+    },
+    "77eec4e165c65c45e4536d86448459cbc9957f86": {
+      "creative-producer": {
+        "assets/product/ROLE.md": "91516b5083d3c6ccd7b95588dc1a2b237f9a253340a1f81e6141d677476b4b65",
+        "assets/templates/CLAUDE.md.template": "273d924d50d3a4693d9e366c0289d6263c43f315c49a20db7d23d39b1b9a53bc"
+      },
+      "data-bi-analyst": {
+        "assets/product/ROLE.md": "1f0416711926fa12dddc7226b3d3c86a21a60483c5b128789840bf2b68f1af53",
+        "assets/templates/CLAUDE.md.template": "ef0d2111dc4f85f7eb57ac5497b7e32b878050dcaa1ca445dc609a21dc3c80e8"
+      },
+      "executive-assistant": {
+        "assets/product/ROLE.md": "522bb3d2d75bc1df50225b00f7c891b7b86e057d33d4d2ba6d90241042a07134",
+        "assets/templates/CLAUDE.md.template": "ef0d2111dc4f85f7eb57ac5497b7e32b878050dcaa1ca445dc609a21dc3c80e8"
+      },
+      "fpa-cfo-assistant": {
+        "assets/product/ROLE.md": "10e8eef70cf819eddfa32f1e6dda4e0e7ddb99feccf2310e7a1e0684a916b39e",
+        "assets/templates/CLAUDE.md.template": "ef0d2111dc4f85f7eb57ac5497b7e32b878050dcaa1ca445dc609a21dc3c80e8"
+      },
+      "investment-research-analyst": {
+        "assets/product/ROLE.md": "76be61420a6f339dad725e3df6e6c61682ba71e7f86a51331fc506f023c84353",
+        "assets/templates/CLAUDE.md.template": "ef0d2111dc4f85f7eb57ac5497b7e32b878050dcaa1ca445dc609a21dc3c80e8"
+      },
+      "marketing-strategist": {
+        "assets/product/ROLE.md": "3ed58252479325b0b3b76043df1c85379923b5886e1b7f3af2f76b678b233888",
+        "assets/templates/CLAUDE.md.template": "4df18bab800d1546db589aff6f933cbf4704dfdaa578b74443b08586a785fb50"
+      },
+      "performance-marketer": {
+        "assets/product/ROLE.md": "5f76d8ce27437e4d5eab2f4fd7298127afe609222c9429f3da3221381a75e666",
+        "assets/templates/CLAUDE.md.template": "4df18bab800d1546db589aff6f933cbf4704dfdaa578b74443b08586a785fb50"
+      },
+      "premium": {
+        "assets/product/ROLE.md": "50cfb76fe2f44a34db451a98e29a8399a16901c8b9c10e2b6fc8e2c9931de778",
+        "assets/roles/creative-producer/ROLE.md": "91516b5083d3c6ccd7b95588dc1a2b237f9a253340a1f81e6141d677476b4b65",
+        "assets/roles/data-bi-analyst/ROLE.md": "1f0416711926fa12dddc7226b3d3c86a21a60483c5b128789840bf2b68f1af53",
+        "assets/roles/executive-assistant/ROLE.md": "522bb3d2d75bc1df50225b00f7c891b7b86e057d33d4d2ba6d90241042a07134",
+        "assets/roles/fpa-cfo-assistant/ROLE.md": "10e8eef70cf819eddfa32f1e6dda4e0e7ddb99feccf2310e7a1e0684a916b39e",
+        "assets/roles/investment-research-analyst/ROLE.md": "76be61420a6f339dad725e3df6e6c61682ba71e7f86a51331fc506f023c84353",
+        "assets/roles/marketing-strategist/ROLE.md": "3ed58252479325b0b3b76043df1c85379923b5886e1b7f3af2f76b678b233888",
+        "assets/roles/performance-marketer/ROLE.md": "5f76d8ce27437e4d5eab2f4fd7298127afe609222c9429f3da3221381a75e666",
+        "assets/roles/project-operations-manager/ROLE.md": "130fc45b3db5a8dc381d47743504bc647f21e16bfe4f191299fe35a6200b7a7e",
+        "assets/roles/sales-sdr/ROLE.md": "b310368a6eb2d5092382b74ffb464f4d95941e2bec6b306fc09b0a1e365979cc",
+        "assets/roles/smm-manager/ROLE.md": "45ad011bbb6ecf93f151e29067998611ec8b774e7e99e16a74a9ef4224f16bbb",
+        "assets/templates/CLAUDE.md.template": "2528693214b23b1bf6a8778886950245de2289798add72070624e1e18c0e5981"
+      },
+      "project-operations-manager": {
+        "assets/product/ROLE.md": "130fc45b3db5a8dc381d47743504bc647f21e16bfe4f191299fe35a6200b7a7e",
+        "assets/templates/CLAUDE.md.template": "88bd34becefcbf0a327bdbe8c3188f300474a3009eabcca2a6bf66c1c5e3f4bc"
+      },
+      "sales-sdr": {
+        "assets/product/ROLE.md": "b310368a6eb2d5092382b74ffb464f4d95941e2bec6b306fc09b0a1e365979cc",
+        "assets/templates/CLAUDE.md.template": "ef0d2111dc4f85f7eb57ac5497b7e32b878050dcaa1ca445dc609a21dc3c80e8"
+      },
+      "smm-manager": {
+        "assets/product/ROLE.md": "45ad011bbb6ecf93f151e29067998611ec8b774e7e99e16a74a9ef4224f16bbb",
+        "assets/templates/CLAUDE.md.template": "273d924d50d3a4693d9e366c0289d6263c43f315c49a20db7d23d39b1b9a53bc"
+      },
+      "starter": {
+        "assets/product/ROLE.md": "150eca42e84925a1e0a65e0212e34a84601d403f044310fb89cc5bf88f4ab87c",
+        "assets/templates/CLAUDE.md.template": "ef0d2111dc4f85f7eb57ac5497b7e32b878050dcaa1ca445dc609a21dc3c80e8"
+      }
+    },
+    "da164ee196ea34107bd3569a430f599f4bdae3ac": {
+      "creative-producer": {
+        "assets/product/ROLE.md": "91516b5083d3c6ccd7b95588dc1a2b237f9a253340a1f81e6141d677476b4b65",
+        "assets/templates/CLAUDE.md.template": "273d924d50d3a4693d9e366c0289d6263c43f315c49a20db7d23d39b1b9a53bc"
+      },
+      "data-bi-analyst": {
+        "assets/product/ROLE.md": "1f0416711926fa12dddc7226b3d3c86a21a60483c5b128789840bf2b68f1af53",
+        "assets/templates/CLAUDE.md.template": "ef0d2111dc4f85f7eb57ac5497b7e32b878050dcaa1ca445dc609a21dc3c80e8"
+      },
+      "executive-assistant": {
+        "assets/product/ROLE.md": "522bb3d2d75bc1df50225b00f7c891b7b86e057d33d4d2ba6d90241042a07134",
+        "assets/templates/CLAUDE.md.template": "ef0d2111dc4f85f7eb57ac5497b7e32b878050dcaa1ca445dc609a21dc3c80e8"
+      },
+      "fpa-cfo-assistant": {
+        "assets/product/ROLE.md": "10e8eef70cf819eddfa32f1e6dda4e0e7ddb99feccf2310e7a1e0684a916b39e",
+        "assets/templates/CLAUDE.md.template": "ef0d2111dc4f85f7eb57ac5497b7e32b878050dcaa1ca445dc609a21dc3c80e8"
+      },
+      "investment-research-analyst": {
+        "assets/product/ROLE.md": "76be61420a6f339dad725e3df6e6c61682ba71e7f86a51331fc506f023c84353",
+        "assets/templates/CLAUDE.md.template": "ef0d2111dc4f85f7eb57ac5497b7e32b878050dcaa1ca445dc609a21dc3c80e8"
+      },
+      "marketing-strategist": {
+        "assets/product/ROLE.md": "3ed58252479325b0b3b76043df1c85379923b5886e1b7f3af2f76b678b233888",
+        "assets/templates/CLAUDE.md.template": "4df18bab800d1546db589aff6f933cbf4704dfdaa578b74443b08586a785fb50"
+      },
+      "performance-marketer": {
+        "assets/product/ROLE.md": "5f76d8ce27437e4d5eab2f4fd7298127afe609222c9429f3da3221381a75e666",
+        "assets/templates/CLAUDE.md.template": "4df18bab800d1546db589aff6f933cbf4704dfdaa578b74443b08586a785fb50"
+      },
+      "premium": {
+        "assets/product/ROLE.md": "50cfb76fe2f44a34db451a98e29a8399a16901c8b9c10e2b6fc8e2c9931de778",
+        "assets/roles/creative-producer/ROLE.md": "91516b5083d3c6ccd7b95588dc1a2b237f9a253340a1f81e6141d677476b4b65",
+        "assets/roles/data-bi-analyst/ROLE.md": "1f0416711926fa12dddc7226b3d3c86a21a60483c5b128789840bf2b68f1af53",
+        "assets/roles/executive-assistant/ROLE.md": "522bb3d2d75bc1df50225b00f7c891b7b86e057d33d4d2ba6d90241042a07134",
+        "assets/roles/fpa-cfo-assistant/ROLE.md": "10e8eef70cf819eddfa32f1e6dda4e0e7ddb99feccf2310e7a1e0684a916b39e",
+        "assets/roles/investment-research-analyst/ROLE.md": "76be61420a6f339dad725e3df6e6c61682ba71e7f86a51331fc506f023c84353",
+        "assets/roles/marketing-strategist/ROLE.md": "3ed58252479325b0b3b76043df1c85379923b5886e1b7f3af2f76b678b233888",
+        "assets/roles/performance-marketer/ROLE.md": "5f76d8ce27437e4d5eab2f4fd7298127afe609222c9429f3da3221381a75e666",
+        "assets/roles/project-operations-manager/ROLE.md": "130fc45b3db5a8dc381d47743504bc647f21e16bfe4f191299fe35a6200b7a7e",
+        "assets/roles/sales-sdr/ROLE.md": "b310368a6eb2d5092382b74ffb464f4d95941e2bec6b306fc09b0a1e365979cc",
+        "assets/roles/smm-manager/ROLE.md": "45ad011bbb6ecf93f151e29067998611ec8b774e7e99e16a74a9ef4224f16bbb",
+        "assets/templates/CLAUDE.md.template": "2528693214b23b1bf6a8778886950245de2289798add72070624e1e18c0e5981"
+      },
+      "project-operations-manager": {
+        "assets/product/ROLE.md": "130fc45b3db5a8dc381d47743504bc647f21e16bfe4f191299fe35a6200b7a7e",
+        "assets/templates/CLAUDE.md.template": "88bd34becefcbf0a327bdbe8c3188f300474a3009eabcca2a6bf66c1c5e3f4bc"
+      },
+      "sales-sdr": {
+        "assets/product/ROLE.md": "b310368a6eb2d5092382b74ffb464f4d95941e2bec6b306fc09b0a1e365979cc",
+        "assets/templates/CLAUDE.md.template": "ef0d2111dc4f85f7eb57ac5497b7e32b878050dcaa1ca445dc609a21dc3c80e8"
+      },
+      "smm-manager": {
+        "assets/product/ROLE.md": "45ad011bbb6ecf93f151e29067998611ec8b774e7e99e16a74a9ef4224f16bbb",
+        "assets/templates/CLAUDE.md.template": "273d924d50d3a4693d9e366c0289d6263c43f315c49a20db7d23d39b1b9a53bc"
+      },
+      "starter": {
+        "assets/product/ROLE.md": "150eca42e84925a1e0a65e0212e34a84601d403f044310fb89cc5bf88f4ab87c",
+        "assets/templates/CLAUDE.md.template": "ef0d2111dc4f85f7eb57ac5497b7e32b878050dcaa1ca445dc609a21dc3c80e8"
+      }
+    },
+    "e85de62f44dd3087051c76692063090279b879c4": {
+      "creative-producer": {
+        "assets/product/ROLE.md": "91516b5083d3c6ccd7b95588dc1a2b237f9a253340a1f81e6141d677476b4b65",
+        "assets/templates/CLAUDE.md.template": "273d924d50d3a4693d9e366c0289d6263c43f315c49a20db7d23d39b1b9a53bc"
+      },
+      "data-bi-analyst": {
+        "assets/product/ROLE.md": "1f0416711926fa12dddc7226b3d3c86a21a60483c5b128789840bf2b68f1af53",
+        "assets/templates/CLAUDE.md.template": "ef0d2111dc4f85f7eb57ac5497b7e32b878050dcaa1ca445dc609a21dc3c80e8"
+      },
+      "executive-assistant": {
+        "assets/product/ROLE.md": "522bb3d2d75bc1df50225b00f7c891b7b86e057d33d4d2ba6d90241042a07134",
+        "assets/templates/CLAUDE.md.template": "ef0d2111dc4f85f7eb57ac5497b7e32b878050dcaa1ca445dc609a21dc3c80e8"
+      },
+      "fpa-cfo-assistant": {
+        "assets/product/ROLE.md": "10e8eef70cf819eddfa32f1e6dda4e0e7ddb99feccf2310e7a1e0684a916b39e",
+        "assets/templates/CLAUDE.md.template": "ef0d2111dc4f85f7eb57ac5497b7e32b878050dcaa1ca445dc609a21dc3c80e8"
+      },
+      "investment-research-analyst": {
+        "assets/product/ROLE.md": "76be61420a6f339dad725e3df6e6c61682ba71e7f86a51331fc506f023c84353",
+        "assets/templates/CLAUDE.md.template": "ef0d2111dc4f85f7eb57ac5497b7e32b878050dcaa1ca445dc609a21dc3c80e8"
+      },
+      "marketing-strategist": {
+        "assets/product/ROLE.md": "3ed58252479325b0b3b76043df1c85379923b5886e1b7f3af2f76b678b233888",
+        "assets/templates/CLAUDE.md.template": "4df18bab800d1546db589aff6f933cbf4704dfdaa578b74443b08586a785fb50"
+      },
+      "performance-marketer": {
+        "assets/product/ROLE.md": "5f76d8ce27437e4d5eab2f4fd7298127afe609222c9429f3da3221381a75e666",
+        "assets/templates/CLAUDE.md.template": "4df18bab800d1546db589aff6f933cbf4704dfdaa578b74443b08586a785fb50"
+      },
+      "premium": {
+        "assets/product/ROLE.md": "50cfb76fe2f44a34db451a98e29a8399a16901c8b9c10e2b6fc8e2c9931de778",
+        "assets/roles/creative-producer/ROLE.md": "91516b5083d3c6ccd7b95588dc1a2b237f9a253340a1f81e6141d677476b4b65",
+        "assets/roles/data-bi-analyst/ROLE.md": "1f0416711926fa12dddc7226b3d3c86a21a60483c5b128789840bf2b68f1af53",
+        "assets/roles/executive-assistant/ROLE.md": "522bb3d2d75bc1df50225b00f7c891b7b86e057d33d4d2ba6d90241042a07134",
+        "assets/roles/fpa-cfo-assistant/ROLE.md": "10e8eef70cf819eddfa32f1e6dda4e0e7ddb99feccf2310e7a1e0684a916b39e",
+        "assets/roles/investment-research-analyst/ROLE.md": "76be61420a6f339dad725e3df6e6c61682ba71e7f86a51331fc506f023c84353",
+        "assets/roles/marketing-strategist/ROLE.md": "3ed58252479325b0b3b76043df1c85379923b5886e1b7f3af2f76b678b233888",
+        "assets/roles/performance-marketer/ROLE.md": "5f76d8ce27437e4d5eab2f4fd7298127afe609222c9429f3da3221381a75e666",
+        "assets/roles/project-operations-manager/ROLE.md": "130fc45b3db5a8dc381d47743504bc647f21e16bfe4f191299fe35a6200b7a7e",
+        "assets/roles/sales-sdr/ROLE.md": "b310368a6eb2d5092382b74ffb464f4d95941e2bec6b306fc09b0a1e365979cc",
+        "assets/roles/smm-manager/ROLE.md": "45ad011bbb6ecf93f151e29067998611ec8b774e7e99e16a74a9ef4224f16bbb",
+        "assets/templates/CLAUDE.md.template": "2528693214b23b1bf6a8778886950245de2289798add72070624e1e18c0e5981"
+      },
+      "project-operations-manager": {
+        "assets/product/ROLE.md": "130fc45b3db5a8dc381d47743504bc647f21e16bfe4f191299fe35a6200b7a7e",
+        "assets/templates/CLAUDE.md.template": "88bd34becefcbf0a327bdbe8c3188f300474a3009eabcca2a6bf66c1c5e3f4bc"
+      },
+      "sales-sdr": {
+        "assets/product/ROLE.md": "b310368a6eb2d5092382b74ffb464f4d95941e2bec6b306fc09b0a1e365979cc",
+        "assets/templates/CLAUDE.md.template": "ef0d2111dc4f85f7eb57ac5497b7e32b878050dcaa1ca445dc609a21dc3c80e8"
+      },
+      "smm-manager": {
+        "assets/product/ROLE.md": "45ad011bbb6ecf93f151e29067998611ec8b774e7e99e16a74a9ef4224f16bbb",
+        "assets/templates/CLAUDE.md.template": "273d924d50d3a4693d9e366c0289d6263c43f315c49a20db7d23d39b1b9a53bc"
+      },
+      "starter": {
+        "assets/product/ROLE.md": "150eca42e84925a1e0a65e0212e34a84601d403f044310fb89cc5bf88f4ab87c",
+        "assets/templates/CLAUDE.md.template": "ef0d2111dc4f85f7eb57ac5497b7e32b878050dcaa1ca445dc609a21dc3c80e8"
+      }
+    },
+    "1a506af77ba1440b43f11849c70c647456be4f3d": {
+      "creative-producer": {
+        "assets/product/ROLE.md": "91516b5083d3c6ccd7b95588dc1a2b237f9a253340a1f81e6141d677476b4b65",
+        "assets/templates/CLAUDE.md.template": "273d924d50d3a4693d9e366c0289d6263c43f315c49a20db7d23d39b1b9a53bc"
+      },
+      "data-bi-analyst": {
+        "assets/product/ROLE.md": "1f0416711926fa12dddc7226b3d3c86a21a60483c5b128789840bf2b68f1af53",
+        "assets/templates/CLAUDE.md.template": "ef0d2111dc4f85f7eb57ac5497b7e32b878050dcaa1ca445dc609a21dc3c80e8"
+      },
+      "executive-assistant": {
+        "assets/product/ROLE.md": "522bb3d2d75bc1df50225b00f7c891b7b86e057d33d4d2ba6d90241042a07134",
+        "assets/templates/CLAUDE.md.template": "ef0d2111dc4f85f7eb57ac5497b7e32b878050dcaa1ca445dc609a21dc3c80e8"
+      },
+      "fpa-cfo-assistant": {
+        "assets/product/ROLE.md": "10e8eef70cf819eddfa32f1e6dda4e0e7ddb99feccf2310e7a1e0684a916b39e",
+        "assets/templates/CLAUDE.md.template": "ef0d2111dc4f85f7eb57ac5497b7e32b878050dcaa1ca445dc609a21dc3c80e8"
+      },
+      "investment-research-analyst": {
+        "assets/product/ROLE.md": "76be61420a6f339dad725e3df6e6c61682ba71e7f86a51331fc506f023c84353",
+        "assets/templates/CLAUDE.md.template": "ef0d2111dc4f85f7eb57ac5497b7e32b878050dcaa1ca445dc609a21dc3c80e8"
+      },
+      "marketing-strategist": {
+        "assets/product/ROLE.md": "3ed58252479325b0b3b76043df1c85379923b5886e1b7f3af2f76b678b233888",
+        "assets/templates/CLAUDE.md.template": "4df18bab800d1546db589aff6f933cbf4704dfdaa578b74443b08586a785fb50"
+      },
+      "performance-marketer": {
+        "assets/product/ROLE.md": "5f76d8ce27437e4d5eab2f4fd7298127afe609222c9429f3da3221381a75e666",
+        "assets/templates/CLAUDE.md.template": "4df18bab800d1546db589aff6f933cbf4704dfdaa578b74443b08586a785fb50"
+      },
+      "premium": {
+        "assets/product/ROLE.md": "50cfb76fe2f44a34db451a98e29a8399a16901c8b9c10e2b6fc8e2c9931de778",
+        "assets/roles/creative-producer/ROLE.md": "91516b5083d3c6ccd7b95588dc1a2b237f9a253340a1f81e6141d677476b4b65",
+        "assets/roles/data-bi-analyst/ROLE.md": "1f0416711926fa12dddc7226b3d3c86a21a60483c5b128789840bf2b68f1af53",
+        "assets/roles/executive-assistant/ROLE.md": "522bb3d2d75bc1df50225b00f7c891b7b86e057d33d4d2ba6d90241042a07134",
+        "assets/roles/fpa-cfo-assistant/ROLE.md": "10e8eef70cf819eddfa32f1e6dda4e0e7ddb99feccf2310e7a1e0684a916b39e",
+        "assets/roles/investment-research-analyst/ROLE.md": "76be61420a6f339dad725e3df6e6c61682ba71e7f86a51331fc506f023c84353",
+        "assets/roles/marketing-strategist/ROLE.md": "3ed58252479325b0b3b76043df1c85379923b5886e1b7f3af2f76b678b233888",
+        "assets/roles/performance-marketer/ROLE.md": "5f76d8ce27437e4d5eab2f4fd7298127afe609222c9429f3da3221381a75e666",
+        "assets/roles/project-operations-manager/ROLE.md": "130fc45b3db5a8dc381d47743504bc647f21e16bfe4f191299fe35a6200b7a7e",
+        "assets/roles/sales-sdr/ROLE.md": "b310368a6eb2d5092382b74ffb464f4d95941e2bec6b306fc09b0a1e365979cc",
+        "assets/roles/smm-manager/ROLE.md": "45ad011bbb6ecf93f151e29067998611ec8b774e7e99e16a74a9ef4224f16bbb",
+        "assets/templates/CLAUDE.md.template": "2528693214b23b1bf6a8778886950245de2289798add72070624e1e18c0e5981"
+      },
+      "project-operations-manager": {
+        "assets/product/ROLE.md": "130fc45b3db5a8dc381d47743504bc647f21e16bfe4f191299fe35a6200b7a7e",
+        "assets/templates/CLAUDE.md.template": "88bd34becefcbf0a327bdbe8c3188f300474a3009eabcca2a6bf66c1c5e3f4bc"
+      },
+      "sales-sdr": {
+        "assets/product/ROLE.md": "b310368a6eb2d5092382b74ffb464f4d95941e2bec6b306fc09b0a1e365979cc",
+        "assets/templates/CLAUDE.md.template": "ef0d2111dc4f85f7eb57ac5497b7e32b878050dcaa1ca445dc609a21dc3c80e8"
+      },
+      "smm-manager": {
+        "assets/product/ROLE.md": "45ad011bbb6ecf93f151e29067998611ec8b774e7e99e16a74a9ef4224f16bbb",
+        "assets/templates/CLAUDE.md.template": "273d924d50d3a4693d9e366c0289d6263c43f315c49a20db7d23d39b1b9a53bc"
+      },
+      "starter": {
+        "assets/product/ROLE.md": "150eca42e84925a1e0a65e0212e34a84601d403f044310fb89cc5bf88f4ab87c",
+        "assets/templates/CLAUDE.md.template": "ef0d2111dc4f85f7eb57ac5497b7e32b878050dcaa1ca445dc609a21dc3c80e8"
+      }
+    },
+    "4477ab50e42576912d65a76685010723f15cbae1": {
+      "creative-producer": {
+        "assets/product/ROLE.md": "91516b5083d3c6ccd7b95588dc1a2b237f9a253340a1f81e6141d677476b4b65",
+        "assets/templates/CLAUDE.md.template": "aeb09a9de73c74943b912d004d7111c3e563d7dcfb981dc8bb03c7d7b0f49250"
+      },
+      "data-bi-analyst": {
+        "assets/product/ROLE.md": "1f0416711926fa12dddc7226b3d3c86a21a60483c5b128789840bf2b68f1af53",
+        "assets/templates/CLAUDE.md.template": "b44dc5b0d04afc33a7dba0454a96730e25e878fcd5788bba40ebb185b76c1e02"
+      },
+      "executive-assistant": {
+        "assets/product/ROLE.md": "522bb3d2d75bc1df50225b00f7c891b7b86e057d33d4d2ba6d90241042a07134",
+        "assets/templates/CLAUDE.md.template": "b44dc5b0d04afc33a7dba0454a96730e25e878fcd5788bba40ebb185b76c1e02"
+      },
+      "fpa-cfo-assistant": {
+        "assets/product/ROLE.md": "10e8eef70cf819eddfa32f1e6dda4e0e7ddb99feccf2310e7a1e0684a916b39e",
+        "assets/templates/CLAUDE.md.template": "b44dc5b0d04afc33a7dba0454a96730e25e878fcd5788bba40ebb185b76c1e02"
+      },
+      "investment-research-analyst": {
+        "assets/product/ROLE.md": "76be61420a6f339dad725e3df6e6c61682ba71e7f86a51331fc506f023c84353",
+        "assets/templates/CLAUDE.md.template": "b44dc5b0d04afc33a7dba0454a96730e25e878fcd5788bba40ebb185b76c1e02"
+      },
+      "marketing-strategist": {
+        "assets/product/ROLE.md": "3ed58252479325b0b3b76043df1c85379923b5886e1b7f3af2f76b678b233888",
+        "assets/templates/CLAUDE.md.template": "a699cd44f52745ed2ac7d5cc81f01c0b605d0d5b87a427ab52eceb729ed83895"
+      },
+      "performance-marketer": {
+        "assets/product/ROLE.md": "5f76d8ce27437e4d5eab2f4fd7298127afe609222c9429f3da3221381a75e666",
+        "assets/templates/CLAUDE.md.template": "a699cd44f52745ed2ac7d5cc81f01c0b605d0d5b87a427ab52eceb729ed83895"
+      },
+      "premium": {
+        "assets/product/ROLE.md": "50cfb76fe2f44a34db451a98e29a8399a16901c8b9c10e2b6fc8e2c9931de778",
+        "assets/roles/creative-producer/ROLE.md": "91516b5083d3c6ccd7b95588dc1a2b237f9a253340a1f81e6141d677476b4b65",
+        "assets/roles/data-bi-analyst/ROLE.md": "1f0416711926fa12dddc7226b3d3c86a21a60483c5b128789840bf2b68f1af53",
+        "assets/roles/executive-assistant/ROLE.md": "522bb3d2d75bc1df50225b00f7c891b7b86e057d33d4d2ba6d90241042a07134",
+        "assets/roles/fpa-cfo-assistant/ROLE.md": "10e8eef70cf819eddfa32f1e6dda4e0e7ddb99feccf2310e7a1e0684a916b39e",
+        "assets/roles/investment-research-analyst/ROLE.md": "76be61420a6f339dad725e3df6e6c61682ba71e7f86a51331fc506f023c84353",
+        "assets/roles/marketing-strategist/ROLE.md": "3ed58252479325b0b3b76043df1c85379923b5886e1b7f3af2f76b678b233888",
+        "assets/roles/performance-marketer/ROLE.md": "5f76d8ce27437e4d5eab2f4fd7298127afe609222c9429f3da3221381a75e666",
+        "assets/roles/project-operations-manager/ROLE.md": "130fc45b3db5a8dc381d47743504bc647f21e16bfe4f191299fe35a6200b7a7e",
+        "assets/roles/sales-sdr/ROLE.md": "b310368a6eb2d5092382b74ffb464f4d95941e2bec6b306fc09b0a1e365979cc",
+        "assets/roles/smm-manager/ROLE.md": "45ad011bbb6ecf93f151e29067998611ec8b774e7e99e16a74a9ef4224f16bbb",
+        "assets/templates/CLAUDE.md.template": "24019c64c670ab2d0d1b7d1b48a5f6c190d8f21f2071fc310c3dbbdc8e037b60"
+      },
+      "project-operations-manager": {
+        "assets/product/ROLE.md": "130fc45b3db5a8dc381d47743504bc647f21e16bfe4f191299fe35a6200b7a7e",
+        "assets/templates/CLAUDE.md.template": "7a43beca50d9c0a1ca017a1e22ca3a9259e06309b17eeea1a797b6e789b06c13"
+      },
+      "sales-sdr": {
+        "assets/product/ROLE.md": "b310368a6eb2d5092382b74ffb464f4d95941e2bec6b306fc09b0a1e365979cc",
+        "assets/templates/CLAUDE.md.template": "b44dc5b0d04afc33a7dba0454a96730e25e878fcd5788bba40ebb185b76c1e02"
+      },
+      "smm-manager": {
+        "assets/product/ROLE.md": "45ad011bbb6ecf93f151e29067998611ec8b774e7e99e16a74a9ef4224f16bbb",
+        "assets/templates/CLAUDE.md.template": "aeb09a9de73c74943b912d004d7111c3e563d7dcfb981dc8bb03c7d7b0f49250"
+      },
+      "starter": {
+        "assets/product/ROLE.md": "150eca42e84925a1e0a65e0212e34a84601d403f044310fb89cc5bf88f4ab87c",
+        "assets/templates/CLAUDE.md.template": "b44dc5b0d04afc33a7dba0454a96730e25e878fcd5788bba40ebb185b76c1e02"
+      }
+    },
+    "4d220dad8827b8e17e4b48fd3f409c4ec0aed340": {
+      "creative-producer": {
+        "assets/product/ROLE.md": "91516b5083d3c6ccd7b95588dc1a2b237f9a253340a1f81e6141d677476b4b65",
+        "assets/templates/CLAUDE.md.template": "aeb09a9de73c74943b912d004d7111c3e563d7dcfb981dc8bb03c7d7b0f49250"
+      },
+      "data-bi-analyst": {
+        "assets/product/ROLE.md": "1f0416711926fa12dddc7226b3d3c86a21a60483c5b128789840bf2b68f1af53",
+        "assets/templates/CLAUDE.md.template": "b44dc5b0d04afc33a7dba0454a96730e25e878fcd5788bba40ebb185b76c1e02"
+      },
+      "executive-assistant": {
+        "assets/product/ROLE.md": "522bb3d2d75bc1df50225b00f7c891b7b86e057d33d4d2ba6d90241042a07134",
+        "assets/templates/CLAUDE.md.template": "b44dc5b0d04afc33a7dba0454a96730e25e878fcd5788bba40ebb185b76c1e02"
+      },
+      "fpa-cfo-assistant": {
+        "assets/product/ROLE.md": "10e8eef70cf819eddfa32f1e6dda4e0e7ddb99feccf2310e7a1e0684a916b39e",
+        "assets/templates/CLAUDE.md.template": "b44dc5b0d04afc33a7dba0454a96730e25e878fcd5788bba40ebb185b76c1e02"
+      },
+      "investment-research-analyst": {
+        "assets/product/ROLE.md": "76be61420a6f339dad725e3df6e6c61682ba71e7f86a51331fc506f023c84353",
+        "assets/templates/CLAUDE.md.template": "b44dc5b0d04afc33a7dba0454a96730e25e878fcd5788bba40ebb185b76c1e02"
+      },
+      "marketing-strategist": {
+        "assets/product/ROLE.md": "3ed58252479325b0b3b76043df1c85379923b5886e1b7f3af2f76b678b233888",
+        "assets/templates/CLAUDE.md.template": "a699cd44f52745ed2ac7d5cc81f01c0b605d0d5b87a427ab52eceb729ed83895"
+      },
+      "performance-marketer": {
+        "assets/product/ROLE.md": "5f76d8ce27437e4d5eab2f4fd7298127afe609222c9429f3da3221381a75e666",
+        "assets/templates/CLAUDE.md.template": "a699cd44f52745ed2ac7d5cc81f01c0b605d0d5b87a427ab52eceb729ed83895"
+      },
+      "premium": {
+        "assets/product/ROLE.md": "50cfb76fe2f44a34db451a98e29a8399a16901c8b9c10e2b6fc8e2c9931de778",
+        "assets/roles/creative-producer/ROLE.md": "91516b5083d3c6ccd7b95588dc1a2b237f9a253340a1f81e6141d677476b4b65",
+        "assets/roles/data-bi-analyst/ROLE.md": "1f0416711926fa12dddc7226b3d3c86a21a60483c5b128789840bf2b68f1af53",
+        "assets/roles/executive-assistant/ROLE.md": "522bb3d2d75bc1df50225b00f7c891b7b86e057d33d4d2ba6d90241042a07134",
+        "assets/roles/fpa-cfo-assistant/ROLE.md": "10e8eef70cf819eddfa32f1e6dda4e0e7ddb99feccf2310e7a1e0684a916b39e",
+        "assets/roles/investment-research-analyst/ROLE.md": "76be61420a6f339dad725e3df6e6c61682ba71e7f86a51331fc506f023c84353",
+        "assets/roles/marketing-strategist/ROLE.md": "3ed58252479325b0b3b76043df1c85379923b5886e1b7f3af2f76b678b233888",
+        "assets/roles/performance-marketer/ROLE.md": "5f76d8ce27437e4d5eab2f4fd7298127afe609222c9429f3da3221381a75e666",
+        "assets/roles/project-operations-manager/ROLE.md": "130fc45b3db5a8dc381d47743504bc647f21e16bfe4f191299fe35a6200b7a7e",
+        "assets/roles/sales-sdr/ROLE.md": "b310368a6eb2d5092382b74ffb464f4d95941e2bec6b306fc09b0a1e365979cc",
+        "assets/roles/smm-manager/ROLE.md": "45ad011bbb6ecf93f151e29067998611ec8b774e7e99e16a74a9ef4224f16bbb",
+        "assets/templates/CLAUDE.md.template": "24019c64c670ab2d0d1b7d1b48a5f6c190d8f21f2071fc310c3dbbdc8e037b60"
+      },
+      "project-operations-manager": {
+        "assets/product/ROLE.md": "130fc45b3db5a8dc381d47743504bc647f21e16bfe4f191299fe35a6200b7a7e",
+        "assets/templates/CLAUDE.md.template": "7a43beca50d9c0a1ca017a1e22ca3a9259e06309b17eeea1a797b6e789b06c13"
+      },
+      "sales-sdr": {
+        "assets/product/ROLE.md": "b310368a6eb2d5092382b74ffb464f4d95941e2bec6b306fc09b0a1e365979cc",
+        "assets/templates/CLAUDE.md.template": "b44dc5b0d04afc33a7dba0454a96730e25e878fcd5788bba40ebb185b76c1e02"
+      },
+      "smm-manager": {
+        "assets/product/ROLE.md": "45ad011bbb6ecf93f151e29067998611ec8b774e7e99e16a74a9ef4224f16bbb",
+        "assets/templates/CLAUDE.md.template": "aeb09a9de73c74943b912d004d7111c3e563d7dcfb981dc8bb03c7d7b0f49250"
+      },
+      "starter": {
+        "assets/product/ROLE.md": "150eca42e84925a1e0a65e0212e34a84601d403f044310fb89cc5bf88f4ab87c",
+        "assets/templates/CLAUDE.md.template": "b44dc5b0d04afc33a7dba0454a96730e25e878fcd5788bba40ebb185b76c1e02"
+      }
+    },
+    "6d9cf0a14e2c750e6aac85f89ead6ebf62e6cc1d": {
+      "creative-producer": {
+        "assets/product/ROLE.md": "91516b5083d3c6ccd7b95588dc1a2b237f9a253340a1f81e6141d677476b4b65",
+        "assets/templates/CLAUDE.md.template": "aeb09a9de73c74943b912d004d7111c3e563d7dcfb981dc8bb03c7d7b0f49250"
+      },
+      "data-bi-analyst": {
+        "assets/product/ROLE.md": "1f0416711926fa12dddc7226b3d3c86a21a60483c5b128789840bf2b68f1af53",
+        "assets/templates/CLAUDE.md.template": "b44dc5b0d04afc33a7dba0454a96730e25e878fcd5788bba40ebb185b76c1e02"
+      },
+      "executive-assistant": {
+        "assets/product/ROLE.md": "522bb3d2d75bc1df50225b00f7c891b7b86e057d33d4d2ba6d90241042a07134",
+        "assets/templates/CLAUDE.md.template": "b44dc5b0d04afc33a7dba0454a96730e25e878fcd5788bba40ebb185b76c1e02"
+      },
+      "fpa-cfo-assistant": {
+        "assets/product/ROLE.md": "10e8eef70cf819eddfa32f1e6dda4e0e7ddb99feccf2310e7a1e0684a916b39e",
+        "assets/templates/CLAUDE.md.template": "b44dc5b0d04afc33a7dba0454a96730e25e878fcd5788bba40ebb185b76c1e02"
+      },
+      "investment-research-analyst": {
+        "assets/product/ROLE.md": "76be61420a6f339dad725e3df6e6c61682ba71e7f86a51331fc506f023c84353",
+        "assets/templates/CLAUDE.md.template": "b44dc5b0d04afc33a7dba0454a96730e25e878fcd5788bba40ebb185b76c1e02"
+      },
+      "marketing-strategist": {
+        "assets/product/ROLE.md": "3ed58252479325b0b3b76043df1c85379923b5886e1b7f3af2f76b678b233888",
+        "assets/templates/CLAUDE.md.template": "a699cd44f52745ed2ac7d5cc81f01c0b605d0d5b87a427ab52eceb729ed83895"
+      },
+      "performance-marketer": {
+        "assets/product/ROLE.md": "5f76d8ce27437e4d5eab2f4fd7298127afe609222c9429f3da3221381a75e666",
+        "assets/templates/CLAUDE.md.template": "a699cd44f52745ed2ac7d5cc81f01c0b605d0d5b87a427ab52eceb729ed83895"
+      },
+      "premium": {
+        "assets/product/ROLE.md": "50cfb76fe2f44a34db451a98e29a8399a16901c8b9c10e2b6fc8e2c9931de778",
+        "assets/roles/creative-producer/ROLE.md": "91516b5083d3c6ccd7b95588dc1a2b237f9a253340a1f81e6141d677476b4b65",
+        "assets/roles/data-bi-analyst/ROLE.md": "1f0416711926fa12dddc7226b3d3c86a21a60483c5b128789840bf2b68f1af53",
+        "assets/roles/executive-assistant/ROLE.md": "522bb3d2d75bc1df50225b00f7c891b7b86e057d33d4d2ba6d90241042a07134",
+        "assets/roles/fpa-cfo-assistant/ROLE.md": "10e8eef70cf819eddfa32f1e6dda4e0e7ddb99feccf2310e7a1e0684a916b39e",
+        "assets/roles/investment-research-analyst/ROLE.md": "76be61420a6f339dad725e3df6e6c61682ba71e7f86a51331fc506f023c84353",
+        "assets/roles/marketing-strategist/ROLE.md": "3ed58252479325b0b3b76043df1c85379923b5886e1b7f3af2f76b678b233888",
+        "assets/roles/performance-marketer/ROLE.md": "5f76d8ce27437e4d5eab2f4fd7298127afe609222c9429f3da3221381a75e666",
+        "assets/roles/project-operations-manager/ROLE.md": "130fc45b3db5a8dc381d47743504bc647f21e16bfe4f191299fe35a6200b7a7e",
+        "assets/roles/sales-sdr/ROLE.md": "b310368a6eb2d5092382b74ffb464f4d95941e2bec6b306fc09b0a1e365979cc",
+        "assets/roles/smm-manager/ROLE.md": "45ad011bbb6ecf93f151e29067998611ec8b774e7e99e16a74a9ef4224f16bbb",
+        "assets/templates/CLAUDE.md.template": "24019c64c670ab2d0d1b7d1b48a5f6c190d8f21f2071fc310c3dbbdc8e037b60"
+      },
+      "project-operations-manager": {
+        "assets/product/ROLE.md": "130fc45b3db5a8dc381d47743504bc647f21e16bfe4f191299fe35a6200b7a7e",
+        "assets/templates/CLAUDE.md.template": "7a43beca50d9c0a1ca017a1e22ca3a9259e06309b17eeea1a797b6e789b06c13"
+      },
+      "sales-sdr": {
+        "assets/product/ROLE.md": "b310368a6eb2d5092382b74ffb464f4d95941e2bec6b306fc09b0a1e365979cc",
+        "assets/templates/CLAUDE.md.template": "b44dc5b0d04afc33a7dba0454a96730e25e878fcd5788bba40ebb185b76c1e02"
+      },
+      "smm-manager": {
+        "assets/product/ROLE.md": "45ad011bbb6ecf93f151e29067998611ec8b774e7e99e16a74a9ef4224f16bbb",
+        "assets/templates/CLAUDE.md.template": "aeb09a9de73c74943b912d004d7111c3e563d7dcfb981dc8bb03c7d7b0f49250"
+      },
+      "starter": {
+        "assets/product/ROLE.md": "150eca42e84925a1e0a65e0212e34a84601d403f044310fb89cc5bf88f4ab87c",
+        "assets/templates/CLAUDE.md.template": "b44dc5b0d04afc33a7dba0454a96730e25e878fcd5788bba40ebb185b76c1e02"
+      }
+    },
+    "82adaaf0c9c2345d7510ffff603001f7f87250a5": {
+      "creative-producer": {
+        "assets/product/ROLE.md": "91516b5083d3c6ccd7b95588dc1a2b237f9a253340a1f81e6141d677476b4b65",
+        "assets/templates/CLAUDE.md.template": "aeb09a9de73c74943b912d004d7111c3e563d7dcfb981dc8bb03c7d7b0f49250"
+      },
+      "data-bi-analyst": {
+        "assets/product/ROLE.md": "1f0416711926fa12dddc7226b3d3c86a21a60483c5b128789840bf2b68f1af53",
+        "assets/templates/CLAUDE.md.template": "b44dc5b0d04afc33a7dba0454a96730e25e878fcd5788bba40ebb185b76c1e02"
+      },
+      "executive-assistant": {
+        "assets/product/ROLE.md": "522bb3d2d75bc1df50225b00f7c891b7b86e057d33d4d2ba6d90241042a07134",
+        "assets/templates/CLAUDE.md.template": "b44dc5b0d04afc33a7dba0454a96730e25e878fcd5788bba40ebb185b76c1e02"
+      },
+      "fpa-cfo-assistant": {
+        "assets/product/ROLE.md": "10e8eef70cf819eddfa32f1e6dda4e0e7ddb99feccf2310e7a1e0684a916b39e",
+        "assets/templates/CLAUDE.md.template": "b44dc5b0d04afc33a7dba0454a96730e25e878fcd5788bba40ebb185b76c1e02"
+      },
+      "investment-research-analyst": {
+        "assets/product/ROLE.md": "76be61420a6f339dad725e3df6e6c61682ba71e7f86a51331fc506f023c84353",
+        "assets/templates/CLAUDE.md.template": "b44dc5b0d04afc33a7dba0454a96730e25e878fcd5788bba40ebb185b76c1e02"
+      },
+      "marketing-strategist": {
+        "assets/product/ROLE.md": "3ed58252479325b0b3b76043df1c85379923b5886e1b7f3af2f76b678b233888",
+        "assets/templates/CLAUDE.md.template": "a699cd44f52745ed2ac7d5cc81f01c0b605d0d5b87a427ab52eceb729ed83895"
+      },
+      "performance-marketer": {
+        "assets/product/ROLE.md": "5f76d8ce27437e4d5eab2f4fd7298127afe609222c9429f3da3221381a75e666",
+        "assets/templates/CLAUDE.md.template": "a699cd44f52745ed2ac7d5cc81f01c0b605d0d5b87a427ab52eceb729ed83895"
+      },
+      "premium": {
+        "assets/product/ROLE.md": "50cfb76fe2f44a34db451a98e29a8399a16901c8b9c10e2b6fc8e2c9931de778",
+        "assets/roles/creative-producer/ROLE.md": "91516b5083d3c6ccd7b95588dc1a2b237f9a253340a1f81e6141d677476b4b65",
+        "assets/roles/data-bi-analyst/ROLE.md": "1f0416711926fa12dddc7226b3d3c86a21a60483c5b128789840bf2b68f1af53",
+        "assets/roles/executive-assistant/ROLE.md": "522bb3d2d75bc1df50225b00f7c891b7b86e057d33d4d2ba6d90241042a07134",
+        "assets/roles/fpa-cfo-assistant/ROLE.md": "10e8eef70cf819eddfa32f1e6dda4e0e7ddb99feccf2310e7a1e0684a916b39e",
+        "assets/roles/investment-research-analyst/ROLE.md": "76be61420a6f339dad725e3df6e6c61682ba71e7f86a51331fc506f023c84353",
+        "assets/roles/marketing-strategist/ROLE.md": "3ed58252479325b0b3b76043df1c85379923b5886e1b7f3af2f76b678b233888",
+        "assets/roles/performance-marketer/ROLE.md": "5f76d8ce27437e4d5eab2f4fd7298127afe609222c9429f3da3221381a75e666",
+        "assets/roles/project-operations-manager/ROLE.md": "130fc45b3db5a8dc381d47743504bc647f21e16bfe4f191299fe35a6200b7a7e",
+        "assets/roles/sales-sdr/ROLE.md": "b310368a6eb2d5092382b74ffb464f4d95941e2bec6b306fc09b0a1e365979cc",
+        "assets/roles/smm-manager/ROLE.md": "45ad011bbb6ecf93f151e29067998611ec8b774e7e99e16a74a9ef4224f16bbb",
+        "assets/templates/CLAUDE.md.template": "24019c64c670ab2d0d1b7d1b48a5f6c190d8f21f2071fc310c3dbbdc8e037b60"
+      },
+      "project-operations-manager": {
+        "assets/product/ROLE.md": "130fc45b3db5a8dc381d47743504bc647f21e16bfe4f191299fe35a6200b7a7e",
+        "assets/templates/CLAUDE.md.template": "7a43beca50d9c0a1ca017a1e22ca3a9259e06309b17eeea1a797b6e789b06c13"
+      },
+      "sales-sdr": {
+        "assets/product/ROLE.md": "b310368a6eb2d5092382b74ffb464f4d95941e2bec6b306fc09b0a1e365979cc",
+        "assets/templates/CLAUDE.md.template": "b44dc5b0d04afc33a7dba0454a96730e25e878fcd5788bba40ebb185b76c1e02"
+      },
+      "smm-manager": {
+        "assets/product/ROLE.md": "45ad011bbb6ecf93f151e29067998611ec8b774e7e99e16a74a9ef4224f16bbb",
+        "assets/templates/CLAUDE.md.template": "aeb09a9de73c74943b912d004d7111c3e563d7dcfb981dc8bb03c7d7b0f49250"
+      },
+      "starter": {
+        "assets/product/ROLE.md": "150eca42e84925a1e0a65e0212e34a84601d403f044310fb89cc5bf88f4ab87c",
+        "assets/templates/CLAUDE.md.template": "b44dc5b0d04afc33a7dba0454a96730e25e878fcd5788bba40ebb185b76c1e02"
+      }
+    },
+    "f25b62439b7780397c05a76c89f9ae7832403abb": {
+      "creative-producer": {
+        "assets/product/ROLE.md": "91516b5083d3c6ccd7b95588dc1a2b237f9a253340a1f81e6141d677476b4b65",
+        "assets/templates/CLAUDE.md.template": "aeb09a9de73c74943b912d004d7111c3e563d7dcfb981dc8bb03c7d7b0f49250"
+      },
+      "data-bi-analyst": {
+        "assets/product/ROLE.md": "1f0416711926fa12dddc7226b3d3c86a21a60483c5b128789840bf2b68f1af53",
+        "assets/templates/CLAUDE.md.template": "b44dc5b0d04afc33a7dba0454a96730e25e878fcd5788bba40ebb185b76c1e02"
+      },
+      "executive-assistant": {
+        "assets/product/ROLE.md": "522bb3d2d75bc1df50225b00f7c891b7b86e057d33d4d2ba6d90241042a07134",
+        "assets/templates/CLAUDE.md.template": "b44dc5b0d04afc33a7dba0454a96730e25e878fcd5788bba40ebb185b76c1e02"
+      },
+      "fpa-cfo-assistant": {
+        "assets/product/ROLE.md": "10e8eef70cf819eddfa32f1e6dda4e0e7ddb99feccf2310e7a1e0684a916b39e",
+        "assets/templates/CLAUDE.md.template": "b44dc5b0d04afc33a7dba0454a96730e25e878fcd5788bba40ebb185b76c1e02"
+      },
+      "investment-research-analyst": {
+        "assets/product/ROLE.md": "76be61420a6f339dad725e3df6e6c61682ba71e7f86a51331fc506f023c84353",
+        "assets/templates/CLAUDE.md.template": "b44dc5b0d04afc33a7dba0454a96730e25e878fcd5788bba40ebb185b76c1e02"
+      },
+      "marketing-strategist": {
+        "assets/product/ROLE.md": "3ed58252479325b0b3b76043df1c85379923b5886e1b7f3af2f76b678b233888",
+        "assets/templates/CLAUDE.md.template": "a699cd44f52745ed2ac7d5cc81f01c0b605d0d5b87a427ab52eceb729ed83895"
+      },
+      "performance-marketer": {
+        "assets/product/ROLE.md": "5f76d8ce27437e4d5eab2f4fd7298127afe609222c9429f3da3221381a75e666",
+        "assets/templates/CLAUDE.md.template": "a699cd44f52745ed2ac7d5cc81f01c0b605d0d5b87a427ab52eceb729ed83895"
+      },
+      "premium": {
+        "assets/product/ROLE.md": "50cfb76fe2f44a34db451a98e29a8399a16901c8b9c10e2b6fc8e2c9931de778",
+        "assets/roles/creative-producer/ROLE.md": "91516b5083d3c6ccd7b95588dc1a2b237f9a253340a1f81e6141d677476b4b65",
+        "assets/roles/data-bi-analyst/ROLE.md": "1f0416711926fa12dddc7226b3d3c86a21a60483c5b128789840bf2b68f1af53",
+        "assets/roles/executive-assistant/ROLE.md": "522bb3d2d75bc1df50225b00f7c891b7b86e057d33d4d2ba6d90241042a07134",
+        "assets/roles/fpa-cfo-assistant/ROLE.md": "10e8eef70cf819eddfa32f1e6dda4e0e7ddb99feccf2310e7a1e0684a916b39e",
+        "assets/roles/investment-research-analyst/ROLE.md": "76be61420a6f339dad725e3df6e6c61682ba71e7f86a51331fc506f023c84353",
+        "assets/roles/marketing-strategist/ROLE.md": "3ed58252479325b0b3b76043df1c85379923b5886e1b7f3af2f76b678b233888",
+        "assets/roles/performance-marketer/ROLE.md": "5f76d8ce27437e4d5eab2f4fd7298127afe609222c9429f3da3221381a75e666",
+        "assets/roles/project-operations-manager/ROLE.md": "130fc45b3db5a8dc381d47743504bc647f21e16bfe4f191299fe35a6200b7a7e",
+        "assets/roles/sales-sdr/ROLE.md": "b310368a6eb2d5092382b74ffb464f4d95941e2bec6b306fc09b0a1e365979cc",
+        "assets/roles/smm-manager/ROLE.md": "45ad011bbb6ecf93f151e29067998611ec8b774e7e99e16a74a9ef4224f16bbb",
+        "assets/templates/CLAUDE.md.template": "24019c64c670ab2d0d1b7d1b48a5f6c190d8f21f2071fc310c3dbbdc8e037b60"
+      },
+      "project-operations-manager": {
+        "assets/product/ROLE.md": "130fc45b3db5a8dc381d47743504bc647f21e16bfe4f191299fe35a6200b7a7e",
+        "assets/templates/CLAUDE.md.template": "7a43beca50d9c0a1ca017a1e22ca3a9259e06309b17eeea1a797b6e789b06c13"
+      },
+      "sales-sdr": {
+        "assets/product/ROLE.md": "b310368a6eb2d5092382b74ffb464f4d95941e2bec6b306fc09b0a1e365979cc",
+        "assets/templates/CLAUDE.md.template": "b44dc5b0d04afc33a7dba0454a96730e25e878fcd5788bba40ebb185b76c1e02"
+      },
+      "smm-manager": {
+        "assets/product/ROLE.md": "45ad011bbb6ecf93f151e29067998611ec8b774e7e99e16a74a9ef4224f16bbb",
+        "assets/templates/CLAUDE.md.template": "aeb09a9de73c74943b912d004d7111c3e563d7dcfb981dc8bb03c7d7b0f49250"
+      },
+      "starter": {
+        "assets/product/ROLE.md": "150eca42e84925a1e0a65e0212e34a84601d403f044310fb89cc5bf88f4ab87c",
+        "assets/templates/CLAUDE.md.template": "b44dc5b0d04afc33a7dba0454a96730e25e878fcd5788bba40ebb185b76c1e02"
+      }
+    },
+    "0d54f16ae520a04663344f13e0c5d812ec08d52a": {
+      "creative-producer": {
+        "assets/product/ROLE.md": "91516b5083d3c6ccd7b95588dc1a2b237f9a253340a1f81e6141d677476b4b65",
+        "assets/templates/CLAUDE.md.template": "aeb09a9de73c74943b912d004d7111c3e563d7dcfb981dc8bb03c7d7b0f49250"
+      },
+      "data-bi-analyst": {
+        "assets/product/ROLE.md": "1f0416711926fa12dddc7226b3d3c86a21a60483c5b128789840bf2b68f1af53",
+        "assets/templates/CLAUDE.md.template": "b44dc5b0d04afc33a7dba0454a96730e25e878fcd5788bba40ebb185b76c1e02"
+      },
+      "executive-assistant": {
+        "assets/product/ROLE.md": "522bb3d2d75bc1df50225b00f7c891b7b86e057d33d4d2ba6d90241042a07134",
+        "assets/templates/CLAUDE.md.template": "b44dc5b0d04afc33a7dba0454a96730e25e878fcd5788bba40ebb185b76c1e02"
+      },
+      "fpa-cfo-assistant": {
+        "assets/product/ROLE.md": "10e8eef70cf819eddfa32f1e6dda4e0e7ddb99feccf2310e7a1e0684a916b39e",
+        "assets/templates/CLAUDE.md.template": "b44dc5b0d04afc33a7dba0454a96730e25e878fcd5788bba40ebb185b76c1e02"
+      },
+      "investment-research-analyst": {
+        "assets/product/ROLE.md": "76be61420a6f339dad725e3df6e6c61682ba71e7f86a51331fc506f023c84353",
+        "assets/templates/CLAUDE.md.template": "b44dc5b0d04afc33a7dba0454a96730e25e878fcd5788bba40ebb185b76c1e02"
+      },
+      "marketing-strategist": {
+        "assets/product/ROLE.md": "3ed58252479325b0b3b76043df1c85379923b5886e1b7f3af2f76b678b233888",
+        "assets/templates/CLAUDE.md.template": "a699cd44f52745ed2ac7d5cc81f01c0b605d0d5b87a427ab52eceb729ed83895"
+      },
+      "performance-marketer": {
+        "assets/product/ROLE.md": "5f76d8ce27437e4d5eab2f4fd7298127afe609222c9429f3da3221381a75e666",
+        "assets/templates/CLAUDE.md.template": "a699cd44f52745ed2ac7d5cc81f01c0b605d0d5b87a427ab52eceb729ed83895"
+      },
+      "premium": {
+        "assets/product/ROLE.md": "50cfb76fe2f44a34db451a98e29a8399a16901c8b9c10e2b6fc8e2c9931de778",
+        "assets/roles/creative-producer/ROLE.md": "91516b5083d3c6ccd7b95588dc1a2b237f9a253340a1f81e6141d677476b4b65",
+        "assets/roles/data-bi-analyst/ROLE.md": "1f0416711926fa12dddc7226b3d3c86a21a60483c5b128789840bf2b68f1af53",
+        "assets/roles/executive-assistant/ROLE.md": "522bb3d2d75bc1df50225b00f7c891b7b86e057d33d4d2ba6d90241042a07134",
+        "assets/roles/fpa-cfo-assistant/ROLE.md": "10e8eef70cf819eddfa32f1e6dda4e0e7ddb99feccf2310e7a1e0684a916b39e",
+        "assets/roles/investment-research-analyst/ROLE.md": "76be61420a6f339dad725e3df6e6c61682ba71e7f86a51331fc506f023c84353",
+        "assets/roles/marketing-strategist/ROLE.md": "3ed58252479325b0b3b76043df1c85379923b5886e1b7f3af2f76b678b233888",
+        "assets/roles/performance-marketer/ROLE.md": "5f76d8ce27437e4d5eab2f4fd7298127afe609222c9429f3da3221381a75e666",
+        "assets/roles/project-operations-manager/ROLE.md": "130fc45b3db5a8dc381d47743504bc647f21e16bfe4f191299fe35a6200b7a7e",
+        "assets/roles/sales-sdr/ROLE.md": "b310368a6eb2d5092382b74ffb464f4d95941e2bec6b306fc09b0a1e365979cc",
+        "assets/roles/smm-manager/ROLE.md": "45ad011bbb6ecf93f151e29067998611ec8b774e7e99e16a74a9ef4224f16bbb",
+        "assets/templates/CLAUDE.md.template": "24019c64c670ab2d0d1b7d1b48a5f6c190d8f21f2071fc310c3dbbdc8e037b60"
+      },
+      "project-operations-manager": {
+        "assets/product/ROLE.md": "130fc45b3db5a8dc381d47743504bc647f21e16bfe4f191299fe35a6200b7a7e",
+        "assets/templates/CLAUDE.md.template": "7a43beca50d9c0a1ca017a1e22ca3a9259e06309b17eeea1a797b6e789b06c13"
+      },
+      "sales-sdr": {
+        "assets/product/ROLE.md": "b310368a6eb2d5092382b74ffb464f4d95941e2bec6b306fc09b0a1e365979cc",
+        "assets/templates/CLAUDE.md.template": "b44dc5b0d04afc33a7dba0454a96730e25e878fcd5788bba40ebb185b76c1e02"
+      },
+      "smm-manager": {
+        "assets/product/ROLE.md": "45ad011bbb6ecf93f151e29067998611ec8b774e7e99e16a74a9ef4224f16bbb",
+        "assets/templates/CLAUDE.md.template": "aeb09a9de73c74943b912d004d7111c3e563d7dcfb981dc8bb03c7d7b0f49250"
+      },
+      "starter": {
+        "assets/product/ROLE.md": "150eca42e84925a1e0a65e0212e34a84601d403f044310fb89cc5bf88f4ab87c",
+        "assets/templates/CLAUDE.md.template": "b44dc5b0d04afc33a7dba0454a96730e25e878fcd5788bba40ebb185b76c1e02"
+      }
+    },
+    "bc4c61246d042b87287eec2c483801b60645d37e": {
+      "creative-producer": {
+        "assets/product/ROLE.md": "91516b5083d3c6ccd7b95588dc1a2b237f9a253340a1f81e6141d677476b4b65",
+        "assets/templates/CLAUDE.md.template": "aeb09a9de73c74943b912d004d7111c3e563d7dcfb981dc8bb03c7d7b0f49250"
+      },
+      "data-bi-analyst": {
+        "assets/product/ROLE.md": "1f0416711926fa12dddc7226b3d3c86a21a60483c5b128789840bf2b68f1af53",
+        "assets/templates/CLAUDE.md.template": "b44dc5b0d04afc33a7dba0454a96730e25e878fcd5788bba40ebb185b76c1e02"
+      },
+      "executive-assistant": {
+        "assets/product/ROLE.md": "522bb3d2d75bc1df50225b00f7c891b7b86e057d33d4d2ba6d90241042a07134",
+        "assets/templates/CLAUDE.md.template": "b44dc5b0d04afc33a7dba0454a96730e25e878fcd5788bba40ebb185b76c1e02"
+      },
+      "fpa-cfo-assistant": {
+        "assets/product/ROLE.md": "10e8eef70cf819eddfa32f1e6dda4e0e7ddb99feccf2310e7a1e0684a916b39e",
+        "assets/templates/CLAUDE.md.template": "b44dc5b0d04afc33a7dba0454a96730e25e878fcd5788bba40ebb185b76c1e02"
+      },
+      "investment-research-analyst": {
+        "assets/product/ROLE.md": "76be61420a6f339dad725e3df6e6c61682ba71e7f86a51331fc506f023c84353",
+        "assets/templates/CLAUDE.md.template": "b44dc5b0d04afc33a7dba0454a96730e25e878fcd5788bba40ebb185b76c1e02"
+      },
+      "marketing-strategist": {
+        "assets/product/ROLE.md": "3ed58252479325b0b3b76043df1c85379923b5886e1b7f3af2f76b678b233888",
+        "assets/templates/CLAUDE.md.template": "a699cd44f52745ed2ac7d5cc81f01c0b605d0d5b87a427ab52eceb729ed83895"
+      },
+      "performance-marketer": {
+        "assets/product/ROLE.md": "5f76d8ce27437e4d5eab2f4fd7298127afe609222c9429f3da3221381a75e666",
+        "assets/templates/CLAUDE.md.template": "a699cd44f52745ed2ac7d5cc81f01c0b605d0d5b87a427ab52eceb729ed83895"
+      },
+      "premium": {
+        "assets/product/ROLE.md": "50cfb76fe2f44a34db451a98e29a8399a16901c8b9c10e2b6fc8e2c9931de778",
+        "assets/roles/creative-producer/ROLE.md": "91516b5083d3c6ccd7b95588dc1a2b237f9a253340a1f81e6141d677476b4b65",
+        "assets/roles/data-bi-analyst/ROLE.md": "1f0416711926fa12dddc7226b3d3c86a21a60483c5b128789840bf2b68f1af53",
+        "assets/roles/executive-assistant/ROLE.md": "522bb3d2d75bc1df50225b00f7c891b7b86e057d33d4d2ba6d90241042a07134",
+        "assets/roles/fpa-cfo-assistant/ROLE.md": "10e8eef70cf819eddfa32f1e6dda4e0e7ddb99feccf2310e7a1e0684a916b39e",
+        "assets/roles/investment-research-analyst/ROLE.md": "76be61420a6f339dad725e3df6e6c61682ba71e7f86a51331fc506f023c84353",
+        "assets/roles/marketing-strategist/ROLE.md": "3ed58252479325b0b3b76043df1c85379923b5886e1b7f3af2f76b678b233888",
+        "assets/roles/performance-marketer/ROLE.md": "5f76d8ce27437e4d5eab2f4fd7298127afe609222c9429f3da3221381a75e666",
+        "assets/roles/project-operations-manager/ROLE.md": "130fc45b3db5a8dc381d47743504bc647f21e16bfe4f191299fe35a6200b7a7e",
+        "assets/roles/sales-sdr/ROLE.md": "b310368a6eb2d5092382b74ffb464f4d95941e2bec6b306fc09b0a1e365979cc",
+        "assets/roles/smm-manager/ROLE.md": "45ad011bbb6ecf93f151e29067998611ec8b774e7e99e16a74a9ef4224f16bbb",
+        "assets/templates/CLAUDE.md.template": "24019c64c670ab2d0d1b7d1b48a5f6c190d8f21f2071fc310c3dbbdc8e037b60"
+      },
+      "project-operations-manager": {
+        "assets/product/ROLE.md": "130fc45b3db5a8dc381d47743504bc647f21e16bfe4f191299fe35a6200b7a7e",
+        "assets/templates/CLAUDE.md.template": "7a43beca50d9c0a1ca017a1e22ca3a9259e06309b17eeea1a797b6e789b06c13"
+      },
+      "sales-sdr": {
+        "assets/product/ROLE.md": "b310368a6eb2d5092382b74ffb464f4d95941e2bec6b306fc09b0a1e365979cc",
+        "assets/templates/CLAUDE.md.template": "b44dc5b0d04afc33a7dba0454a96730e25e878fcd5788bba40ebb185b76c1e02"
+      },
+      "smm-manager": {
+        "assets/product/ROLE.md": "45ad011bbb6ecf93f151e29067998611ec8b774e7e99e16a74a9ef4224f16bbb",
+        "assets/templates/CLAUDE.md.template": "aeb09a9de73c74943b912d004d7111c3e563d7dcfb981dc8bb03c7d7b0f49250"
+      },
+      "starter": {
+        "assets/product/ROLE.md": "150eca42e84925a1e0a65e0212e34a84601d403f044310fb89cc5bf88f4ab87c",
+        "assets/templates/CLAUDE.md.template": "b44dc5b0d04afc33a7dba0454a96730e25e878fcd5788bba40ebb185b76c1e02"
+      }
+    },
+    "099f2f489c1ddb7d415ad00d6f9860e61cc4cf00": {
+      "creative-producer": {
+        "assets/product/ROLE.md": "91516b5083d3c6ccd7b95588dc1a2b237f9a253340a1f81e6141d677476b4b65",
+        "assets/templates/CLAUDE.md.template": "c33724cee3512197418693b0f3b23f7b037d45d48543d9a7e7302bb176e9cf44"
+      },
+      "data-bi-analyst": {
+        "assets/product/ROLE.md": "1f0416711926fa12dddc7226b3d3c86a21a60483c5b128789840bf2b68f1af53",
+        "assets/templates/CLAUDE.md.template": "dda1512e0ef51400a3cc4364aec67cb89325547c0ce71bc20c9d0a3ffd36bc1d"
+      },
+      "executive-assistant": {
+        "assets/product/ROLE.md": "522bb3d2d75bc1df50225b00f7c891b7b86e057d33d4d2ba6d90241042a07134",
+        "assets/templates/CLAUDE.md.template": "dda1512e0ef51400a3cc4364aec67cb89325547c0ce71bc20c9d0a3ffd36bc1d"
+      },
+      "fpa-cfo-assistant": {
+        "assets/product/ROLE.md": "10e8eef70cf819eddfa32f1e6dda4e0e7ddb99feccf2310e7a1e0684a916b39e",
+        "assets/templates/CLAUDE.md.template": "dda1512e0ef51400a3cc4364aec67cb89325547c0ce71bc20c9d0a3ffd36bc1d"
+      },
+      "investment-research-analyst": {
+        "assets/product/ROLE.md": "76be61420a6f339dad725e3df6e6c61682ba71e7f86a51331fc506f023c84353",
+        "assets/templates/CLAUDE.md.template": "dda1512e0ef51400a3cc4364aec67cb89325547c0ce71bc20c9d0a3ffd36bc1d"
+      },
+      "marketing-strategist": {
+        "assets/product/ROLE.md": "3ed58252479325b0b3b76043df1c85379923b5886e1b7f3af2f76b678b233888",
+        "assets/templates/CLAUDE.md.template": "32b2b1bc246923baf520eba63ab1d3237d099f30b4e34f46d554768a5efa8442"
+      },
+      "performance-marketer": {
+        "assets/product/ROLE.md": "5f76d8ce27437e4d5eab2f4fd7298127afe609222c9429f3da3221381a75e666",
+        "assets/templates/CLAUDE.md.template": "32b2b1bc246923baf520eba63ab1d3237d099f30b4e34f46d554768a5efa8442"
+      },
+      "premium": {
+        "assets/product/ROLE.md": "50cfb76fe2f44a34db451a98e29a8399a16901c8b9c10e2b6fc8e2c9931de778",
+        "assets/roles/creative-producer/ROLE.md": "91516b5083d3c6ccd7b95588dc1a2b237f9a253340a1f81e6141d677476b4b65",
+        "assets/roles/data-bi-analyst/ROLE.md": "1f0416711926fa12dddc7226b3d3c86a21a60483c5b128789840bf2b68f1af53",
+        "assets/roles/executive-assistant/ROLE.md": "522bb3d2d75bc1df50225b00f7c891b7b86e057d33d4d2ba6d90241042a07134",
+        "assets/roles/fpa-cfo-assistant/ROLE.md": "10e8eef70cf819eddfa32f1e6dda4e0e7ddb99feccf2310e7a1e0684a916b39e",
+        "assets/roles/investment-research-analyst/ROLE.md": "76be61420a6f339dad725e3df6e6c61682ba71e7f86a51331fc506f023c84353",
+        "assets/roles/marketing-strategist/ROLE.md": "3ed58252479325b0b3b76043df1c85379923b5886e1b7f3af2f76b678b233888",
+        "assets/roles/performance-marketer/ROLE.md": "5f76d8ce27437e4d5eab2f4fd7298127afe609222c9429f3da3221381a75e666",
+        "assets/roles/project-operations-manager/ROLE.md": "130fc45b3db5a8dc381d47743504bc647f21e16bfe4f191299fe35a6200b7a7e",
+        "assets/roles/sales-sdr/ROLE.md": "b310368a6eb2d5092382b74ffb464f4d95941e2bec6b306fc09b0a1e365979cc",
+        "assets/roles/smm-manager/ROLE.md": "45ad011bbb6ecf93f151e29067998611ec8b774e7e99e16a74a9ef4224f16bbb",
+        "assets/templates/CLAUDE.md.template": "06dd7587049485e35a4e7042c6db65f36605d95353821d4c3418806cdbab8835"
+      },
+      "project-operations-manager": {
+        "assets/product/ROLE.md": "130fc45b3db5a8dc381d47743504bc647f21e16bfe4f191299fe35a6200b7a7e",
+        "assets/templates/CLAUDE.md.template": "139eae05097f7bff871b48ca39965f45ce99eeeb8763b749379f6eb7c4923693"
+      },
+      "sales-sdr": {
+        "assets/product/ROLE.md": "b310368a6eb2d5092382b74ffb464f4d95941e2bec6b306fc09b0a1e365979cc",
+        "assets/templates/CLAUDE.md.template": "dda1512e0ef51400a3cc4364aec67cb89325547c0ce71bc20c9d0a3ffd36bc1d"
+      },
+      "smm-manager": {
+        "assets/product/ROLE.md": "45ad011bbb6ecf93f151e29067998611ec8b774e7e99e16a74a9ef4224f16bbb",
+        "assets/templates/CLAUDE.md.template": "c33724cee3512197418693b0f3b23f7b037d45d48543d9a7e7302bb176e9cf44"
+      },
+      "starter": {
+        "assets/product/ROLE.md": "150eca42e84925a1e0a65e0212e34a84601d403f044310fb89cc5bf88f4ab87c",
+        "assets/templates/CLAUDE.md.template": "dda1512e0ef51400a3cc4364aec67cb89325547c0ce71bc20c9d0a3ffd36bc1d"
+      }
+    },
+    "1fa5eed0031efd1cc85ca382968fd14f4b4e75c9": {
+      "creative-producer": {
+        "assets/product/ROLE.md": "91516b5083d3c6ccd7b95588dc1a2b237f9a253340a1f81e6141d677476b4b65",
+        "assets/templates/CLAUDE.md.template": "c33724cee3512197418693b0f3b23f7b037d45d48543d9a7e7302bb176e9cf44"
+      },
+      "data-bi-analyst": {
+        "assets/product/ROLE.md": "1f0416711926fa12dddc7226b3d3c86a21a60483c5b128789840bf2b68f1af53",
+        "assets/templates/CLAUDE.md.template": "dda1512e0ef51400a3cc4364aec67cb89325547c0ce71bc20c9d0a3ffd36bc1d"
+      },
+      "executive-assistant": {
+        "assets/product/ROLE.md": "522bb3d2d75bc1df50225b00f7c891b7b86e057d33d4d2ba6d90241042a07134",
+        "assets/templates/CLAUDE.md.template": "dda1512e0ef51400a3cc4364aec67cb89325547c0ce71bc20c9d0a3ffd36bc1d"
+      },
+      "fpa-cfo-assistant": {
+        "assets/product/ROLE.md": "10e8eef70cf819eddfa32f1e6dda4e0e7ddb99feccf2310e7a1e0684a916b39e",
+        "assets/templates/CLAUDE.md.template": "dda1512e0ef51400a3cc4364aec67cb89325547c0ce71bc20c9d0a3ffd36bc1d"
+      },
+      "investment-research-analyst": {
+        "assets/product/ROLE.md": "76be61420a6f339dad725e3df6e6c61682ba71e7f86a51331fc506f023c84353",
+        "assets/templates/CLAUDE.md.template": "dda1512e0ef51400a3cc4364aec67cb89325547c0ce71bc20c9d0a3ffd36bc1d"
+      },
+      "marketing-strategist": {
+        "assets/product/ROLE.md": "3ed58252479325b0b3b76043df1c85379923b5886e1b7f3af2f76b678b233888",
+        "assets/templates/CLAUDE.md.template": "32b2b1bc246923baf520eba63ab1d3237d099f30b4e34f46d554768a5efa8442"
+      },
+      "performance-marketer": {
+        "assets/product/ROLE.md": "5f76d8ce27437e4d5eab2f4fd7298127afe609222c9429f3da3221381a75e666",
+        "assets/templates/CLAUDE.md.template": "32b2b1bc246923baf520eba63ab1d3237d099f30b4e34f46d554768a5efa8442"
+      },
+      "premium": {
+        "assets/product/ROLE.md": "50cfb76fe2f44a34db451a98e29a8399a16901c8b9c10e2b6fc8e2c9931de778",
+        "assets/roles/creative-producer/ROLE.md": "91516b5083d3c6ccd7b95588dc1a2b237f9a253340a1f81e6141d677476b4b65",
+        "assets/roles/data-bi-analyst/ROLE.md": "1f0416711926fa12dddc7226b3d3c86a21a60483c5b128789840bf2b68f1af53",
+        "assets/roles/executive-assistant/ROLE.md": "522bb3d2d75bc1df50225b00f7c891b7b86e057d33d4d2ba6d90241042a07134",
+        "assets/roles/fpa-cfo-assistant/ROLE.md": "10e8eef70cf819eddfa32f1e6dda4e0e7ddb99feccf2310e7a1e0684a916b39e",
+        "assets/roles/investment-research-analyst/ROLE.md": "76be61420a6f339dad725e3df6e6c61682ba71e7f86a51331fc506f023c84353",
+        "assets/roles/marketing-strategist/ROLE.md": "3ed58252479325b0b3b76043df1c85379923b5886e1b7f3af2f76b678b233888",
+        "assets/roles/performance-marketer/ROLE.md": "5f76d8ce27437e4d5eab2f4fd7298127afe609222c9429f3da3221381a75e666",
+        "assets/roles/project-operations-manager/ROLE.md": "130fc45b3db5a8dc381d47743504bc647f21e16bfe4f191299fe35a6200b7a7e",
+        "assets/roles/sales-sdr/ROLE.md": "b310368a6eb2d5092382b74ffb464f4d95941e2bec6b306fc09b0a1e365979cc",
+        "assets/roles/smm-manager/ROLE.md": "45ad011bbb6ecf93f151e29067998611ec8b774e7e99e16a74a9ef4224f16bbb",
+        "assets/templates/CLAUDE.md.template": "06dd7587049485e35a4e7042c6db65f36605d95353821d4c3418806cdbab8835"
+      },
+      "project-operations-manager": {
+        "assets/product/ROLE.md": "130fc45b3db5a8dc381d47743504bc647f21e16bfe4f191299fe35a6200b7a7e",
+        "assets/templates/CLAUDE.md.template": "139eae05097f7bff871b48ca39965f45ce99eeeb8763b749379f6eb7c4923693"
+      },
+      "sales-sdr": {
+        "assets/product/ROLE.md": "b310368a6eb2d5092382b74ffb464f4d95941e2bec6b306fc09b0a1e365979cc",
+        "assets/templates/CLAUDE.md.template": "dda1512e0ef51400a3cc4364aec67cb89325547c0ce71bc20c9d0a3ffd36bc1d"
+      },
+      "smm-manager": {
+        "assets/product/ROLE.md": "45ad011bbb6ecf93f151e29067998611ec8b774e7e99e16a74a9ef4224f16bbb",
+        "assets/templates/CLAUDE.md.template": "c33724cee3512197418693b0f3b23f7b037d45d48543d9a7e7302bb176e9cf44"
+      },
+      "starter": {
+        "assets/product/ROLE.md": "150eca42e84925a1e0a65e0212e34a84601d403f044310fb89cc5bf88f4ab87c",
+        "assets/templates/CLAUDE.md.template": "dda1512e0ef51400a3cc4364aec67cb89325547c0ce71bc20c9d0a3ffd36bc1d"
+      }
+    },
+    "bc72fb4002e9470b93d05d634c857e42d093d945": {
+      "creative-producer": {
+        "assets/product/ROLE.md": "91516b5083d3c6ccd7b95588dc1a2b237f9a253340a1f81e6141d677476b4b65",
+        "assets/templates/CLAUDE.md.template": "c33724cee3512197418693b0f3b23f7b037d45d48543d9a7e7302bb176e9cf44"
+      },
+      "data-bi-analyst": {
+        "assets/product/ROLE.md": "1f0416711926fa12dddc7226b3d3c86a21a60483c5b128789840bf2b68f1af53",
+        "assets/templates/CLAUDE.md.template": "dda1512e0ef51400a3cc4364aec67cb89325547c0ce71bc20c9d0a3ffd36bc1d"
+      },
+      "executive-assistant": {
+        "assets/product/ROLE.md": "522bb3d2d75bc1df50225b00f7c891b7b86e057d33d4d2ba6d90241042a07134",
+        "assets/templates/CLAUDE.md.template": "dda1512e0ef51400a3cc4364aec67cb89325547c0ce71bc20c9d0a3ffd36bc1d"
+      },
+      "fpa-cfo-assistant": {
+        "assets/product/ROLE.md": "10e8eef70cf819eddfa32f1e6dda4e0e7ddb99feccf2310e7a1e0684a916b39e",
+        "assets/templates/CLAUDE.md.template": "dda1512e0ef51400a3cc4364aec67cb89325547c0ce71bc20c9d0a3ffd36bc1d"
+      },
+      "investment-research-analyst": {
+        "assets/product/ROLE.md": "76be61420a6f339dad725e3df6e6c61682ba71e7f86a51331fc506f023c84353",
+        "assets/templates/CLAUDE.md.template": "dda1512e0ef51400a3cc4364aec67cb89325547c0ce71bc20c9d0a3ffd36bc1d"
+      },
+      "marketing-strategist": {
+        "assets/product/ROLE.md": "3ed58252479325b0b3b76043df1c85379923b5886e1b7f3af2f76b678b233888",
+        "assets/templates/CLAUDE.md.template": "32b2b1bc246923baf520eba63ab1d3237d099f30b4e34f46d554768a5efa8442"
+      },
+      "performance-marketer": {
+        "assets/product/ROLE.md": "5f76d8ce27437e4d5eab2f4fd7298127afe609222c9429f3da3221381a75e666",
+        "assets/templates/CLAUDE.md.template": "32b2b1bc246923baf520eba63ab1d3237d099f30b4e34f46d554768a5efa8442"
+      },
+      "premium": {
+        "assets/product/ROLE.md": "50cfb76fe2f44a34db451a98e29a8399a16901c8b9c10e2b6fc8e2c9931de778",
+        "assets/roles/creative-producer/ROLE.md": "91516b5083d3c6ccd7b95588dc1a2b237f9a253340a1f81e6141d677476b4b65",
+        "assets/roles/data-bi-analyst/ROLE.md": "1f0416711926fa12dddc7226b3d3c86a21a60483c5b128789840bf2b68f1af53",
+        "assets/roles/executive-assistant/ROLE.md": "522bb3d2d75bc1df50225b00f7c891b7b86e057d33d4d2ba6d90241042a07134",
+        "assets/roles/fpa-cfo-assistant/ROLE.md": "10e8eef70cf819eddfa32f1e6dda4e0e7ddb99feccf2310e7a1e0684a916b39e",
+        "assets/roles/investment-research-analyst/ROLE.md": "76be61420a6f339dad725e3df6e6c61682ba71e7f86a51331fc506f023c84353",
+        "assets/roles/marketing-strategist/ROLE.md": "3ed58252479325b0b3b76043df1c85379923b5886e1b7f3af2f76b678b233888",
+        "assets/roles/performance-marketer/ROLE.md": "5f76d8ce27437e4d5eab2f4fd7298127afe609222c9429f3da3221381a75e666",
+        "assets/roles/project-operations-manager/ROLE.md": "130fc45b3db5a8dc381d47743504bc647f21e16bfe4f191299fe35a6200b7a7e",
+        "assets/roles/sales-sdr/ROLE.md": "b310368a6eb2d5092382b74ffb464f4d95941e2bec6b306fc09b0a1e365979cc",
+        "assets/roles/smm-manager/ROLE.md": "45ad011bbb6ecf93f151e29067998611ec8b774e7e99e16a74a9ef4224f16bbb",
+        "assets/templates/CLAUDE.md.template": "06dd7587049485e35a4e7042c6db65f36605d95353821d4c3418806cdbab8835"
+      },
+      "project-operations-manager": {
+        "assets/product/ROLE.md": "130fc45b3db5a8dc381d47743504bc647f21e16bfe4f191299fe35a6200b7a7e",
+        "assets/templates/CLAUDE.md.template": "139eae05097f7bff871b48ca39965f45ce99eeeb8763b749379f6eb7c4923693"
+      },
+      "sales-sdr": {
+        "assets/product/ROLE.md": "b310368a6eb2d5092382b74ffb464f4d95941e2bec6b306fc09b0a1e365979cc",
+        "assets/templates/CLAUDE.md.template": "dda1512e0ef51400a3cc4364aec67cb89325547c0ce71bc20c9d0a3ffd36bc1d"
+      },
+      "smm-manager": {
+        "assets/product/ROLE.md": "45ad011bbb6ecf93f151e29067998611ec8b774e7e99e16a74a9ef4224f16bbb",
+        "assets/templates/CLAUDE.md.template": "c33724cee3512197418693b0f3b23f7b037d45d48543d9a7e7302bb176e9cf44"
+      },
+      "starter": {
+        "assets/product/ROLE.md": "150eca42e84925a1e0a65e0212e34a84601d403f044310fb89cc5bf88f4ab87c",
+        "assets/templates/CLAUDE.md.template": "dda1512e0ef51400a3cc4364aec67cb89325547c0ce71bc20c9d0a3ffd36bc1d"
+      }
+    },
+    "4e4592616fd347e32415c729dd4a7181effab1f7": {
+      "creative-producer": {
+        "assets/product/ROLE.md": "91516b5083d3c6ccd7b95588dc1a2b237f9a253340a1f81e6141d677476b4b65",
+        "assets/templates/CLAUDE.md.template": "85828af4b5a50664502187a51a1b31d4519dd598612b0471a36854c949a21031"
+      },
+      "data-bi-analyst": {
+        "assets/product/ROLE.md": "1f0416711926fa12dddc7226b3d3c86a21a60483c5b128789840bf2b68f1af53",
+        "assets/templates/CLAUDE.md.template": "675aff126590855e8d2c80b6c4f8a8f37f7ea24844d6df1d5fd9fdaf039f74b8"
+      },
+      "executive-assistant": {
+        "assets/product/ROLE.md": "522bb3d2d75bc1df50225b00f7c891b7b86e057d33d4d2ba6d90241042a07134",
+        "assets/templates/CLAUDE.md.template": "675aff126590855e8d2c80b6c4f8a8f37f7ea24844d6df1d5fd9fdaf039f74b8"
+      },
+      "fpa-cfo-assistant": {
+        "assets/product/ROLE.md": "10e8eef70cf819eddfa32f1e6dda4e0e7ddb99feccf2310e7a1e0684a916b39e",
+        "assets/templates/CLAUDE.md.template": "675aff126590855e8d2c80b6c4f8a8f37f7ea24844d6df1d5fd9fdaf039f74b8"
+      },
+      "investment-research-analyst": {
+        "assets/product/ROLE.md": "76be61420a6f339dad725e3df6e6c61682ba71e7f86a51331fc506f023c84353",
+        "assets/templates/CLAUDE.md.template": "675aff126590855e8d2c80b6c4f8a8f37f7ea24844d6df1d5fd9fdaf039f74b8"
+      },
+      "marketing-strategist": {
+        "assets/product/ROLE.md": "3ed58252479325b0b3b76043df1c85379923b5886e1b7f3af2f76b678b233888",
+        "assets/templates/CLAUDE.md.template": "f36c1cbae7f2107e06110fce0cda26bb5fee0260965e59bf136a4ae504aa6d21"
+      },
+      "performance-marketer": {
+        "assets/product/ROLE.md": "5f76d8ce27437e4d5eab2f4fd7298127afe609222c9429f3da3221381a75e666",
+        "assets/templates/CLAUDE.md.template": "f36c1cbae7f2107e06110fce0cda26bb5fee0260965e59bf136a4ae504aa6d21"
+      },
+      "premium": {
+        "assets/product/ROLE.md": "50cfb76fe2f44a34db451a98e29a8399a16901c8b9c10e2b6fc8e2c9931de778",
+        "assets/roles/creative-producer/ROLE.md": "91516b5083d3c6ccd7b95588dc1a2b237f9a253340a1f81e6141d677476b4b65",
+        "assets/roles/data-bi-analyst/ROLE.md": "1f0416711926fa12dddc7226b3d3c86a21a60483c5b128789840bf2b68f1af53",
+        "assets/roles/executive-assistant/ROLE.md": "522bb3d2d75bc1df50225b00f7c891b7b86e057d33d4d2ba6d90241042a07134",
+        "assets/roles/fpa-cfo-assistant/ROLE.md": "10e8eef70cf819eddfa32f1e6dda4e0e7ddb99feccf2310e7a1e0684a916b39e",
+        "assets/roles/investment-research-analyst/ROLE.md": "76be61420a6f339dad725e3df6e6c61682ba71e7f86a51331fc506f023c84353",
+        "assets/roles/marketing-strategist/ROLE.md": "3ed58252479325b0b3b76043df1c85379923b5886e1b7f3af2f76b678b233888",
+        "assets/roles/performance-marketer/ROLE.md": "5f76d8ce27437e4d5eab2f4fd7298127afe609222c9429f3da3221381a75e666",
+        "assets/roles/project-operations-manager/ROLE.md": "130fc45b3db5a8dc381d47743504bc647f21e16bfe4f191299fe35a6200b7a7e",
+        "assets/roles/sales-sdr/ROLE.md": "b310368a6eb2d5092382b74ffb464f4d95941e2bec6b306fc09b0a1e365979cc",
+        "assets/roles/smm-manager/ROLE.md": "45ad011bbb6ecf93f151e29067998611ec8b774e7e99e16a74a9ef4224f16bbb",
+        "assets/templates/CLAUDE.md.template": "b57a0c6ed47b4cec75b802a3a29fc98a11fa0d08d296995205fa697f1d9fbf66"
+      },
+      "project-operations-manager": {
+        "assets/product/ROLE.md": "130fc45b3db5a8dc381d47743504bc647f21e16bfe4f191299fe35a6200b7a7e",
+        "assets/templates/CLAUDE.md.template": "d59fa18adaa018d5fc879d47caf43b275f0078743edd6c50ff0e23ad7b3a67a8"
+      },
+      "sales-sdr": {
+        "assets/product/ROLE.md": "b310368a6eb2d5092382b74ffb464f4d95941e2bec6b306fc09b0a1e365979cc",
+        "assets/templates/CLAUDE.md.template": "675aff126590855e8d2c80b6c4f8a8f37f7ea24844d6df1d5fd9fdaf039f74b8"
+      },
+      "smm-manager": {
+        "assets/product/ROLE.md": "45ad011bbb6ecf93f151e29067998611ec8b774e7e99e16a74a9ef4224f16bbb",
+        "assets/templates/CLAUDE.md.template": "85828af4b5a50664502187a51a1b31d4519dd598612b0471a36854c949a21031"
+      },
+      "starter": {
+        "assets/product/ROLE.md": "150eca42e84925a1e0a65e0212e34a84601d403f044310fb89cc5bf88f4ab87c",
+        "assets/templates/CLAUDE.md.template": "675aff126590855e8d2c80b6c4f8a8f37f7ea24844d6df1d5fd9fdaf039f74b8"
+      }
+    },
+    "f0758027af58cb9625f373b829d0e47e94abffd8": {
+      "creative-producer": {
+        "assets/product/ROLE.md": "91516b5083d3c6ccd7b95588dc1a2b237f9a253340a1f81e6141d677476b4b65",
+        "assets/templates/CLAUDE.md.template": "85828af4b5a50664502187a51a1b31d4519dd598612b0471a36854c949a21031"
+      },
+      "data-bi-analyst": {
+        "assets/product/ROLE.md": "1f0416711926fa12dddc7226b3d3c86a21a60483c5b128789840bf2b68f1af53",
+        "assets/templates/CLAUDE.md.template": "675aff126590855e8d2c80b6c4f8a8f37f7ea24844d6df1d5fd9fdaf039f74b8"
+      },
+      "executive-assistant": {
+        "assets/product/ROLE.md": "522bb3d2d75bc1df50225b00f7c891b7b86e057d33d4d2ba6d90241042a07134",
+        "assets/templates/CLAUDE.md.template": "675aff126590855e8d2c80b6c4f8a8f37f7ea24844d6df1d5fd9fdaf039f74b8"
+      },
+      "fpa-cfo-assistant": {
+        "assets/product/ROLE.md": "10e8eef70cf819eddfa32f1e6dda4e0e7ddb99feccf2310e7a1e0684a916b39e",
+        "assets/templates/CLAUDE.md.template": "675aff126590855e8d2c80b6c4f8a8f37f7ea24844d6df1d5fd9fdaf039f74b8"
+      },
+      "investment-research-analyst": {
+        "assets/product/ROLE.md": "76be61420a6f339dad725e3df6e6c61682ba71e7f86a51331fc506f023c84353",
+        "assets/templates/CLAUDE.md.template": "675aff126590855e8d2c80b6c4f8a8f37f7ea24844d6df1d5fd9fdaf039f74b8"
+      },
+      "marketing-strategist": {
+        "assets/product/ROLE.md": "3ed58252479325b0b3b76043df1c85379923b5886e1b7f3af2f76b678b233888",
+        "assets/templates/CLAUDE.md.template": "f36c1cbae7f2107e06110fce0cda26bb5fee0260965e59bf136a4ae504aa6d21"
+      },
+      "performance-marketer": {
+        "assets/product/ROLE.md": "5f76d8ce27437e4d5eab2f4fd7298127afe609222c9429f3da3221381a75e666",
+        "assets/templates/CLAUDE.md.template": "f36c1cbae7f2107e06110fce0cda26bb5fee0260965e59bf136a4ae504aa6d21"
+      },
+      "premium": {
+        "assets/product/ROLE.md": "50cfb76fe2f44a34db451a98e29a8399a16901c8b9c10e2b6fc8e2c9931de778",
+        "assets/roles/creative-producer/ROLE.md": "91516b5083d3c6ccd7b95588dc1a2b237f9a253340a1f81e6141d677476b4b65",
+        "assets/roles/data-bi-analyst/ROLE.md": "1f0416711926fa12dddc7226b3d3c86a21a60483c5b128789840bf2b68f1af53",
+        "assets/roles/executive-assistant/ROLE.md": "522bb3d2d75bc1df50225b00f7c891b7b86e057d33d4d2ba6d90241042a07134",
+        "assets/roles/fpa-cfo-assistant/ROLE.md": "10e8eef70cf819eddfa32f1e6dda4e0e7ddb99feccf2310e7a1e0684a916b39e",
+        "assets/roles/investment-research-analyst/ROLE.md": "76be61420a6f339dad725e3df6e6c61682ba71e7f86a51331fc506f023c84353",
+        "assets/roles/marketing-strategist/ROLE.md": "3ed58252479325b0b3b76043df1c85379923b5886e1b7f3af2f76b678b233888",
+        "assets/roles/performance-marketer/ROLE.md": "5f76d8ce27437e4d5eab2f4fd7298127afe609222c9429f3da3221381a75e666",
+        "assets/roles/project-operations-manager/ROLE.md": "130fc45b3db5a8dc381d47743504bc647f21e16bfe4f191299fe35a6200b7a7e",
+        "assets/roles/sales-sdr/ROLE.md": "b310368a6eb2d5092382b74ffb464f4d95941e2bec6b306fc09b0a1e365979cc",
+        "assets/roles/smm-manager/ROLE.md": "45ad011bbb6ecf93f151e29067998611ec8b774e7e99e16a74a9ef4224f16bbb",
+        "assets/templates/CLAUDE.md.template": "b57a0c6ed47b4cec75b802a3a29fc98a11fa0d08d296995205fa697f1d9fbf66"
+      },
+      "project-operations-manager": {
+        "assets/product/ROLE.md": "130fc45b3db5a8dc381d47743504bc647f21e16bfe4f191299fe35a6200b7a7e",
+        "assets/templates/CLAUDE.md.template": "d59fa18adaa018d5fc879d47caf43b275f0078743edd6c50ff0e23ad7b3a67a8"
+      },
+      "sales-sdr": {
+        "assets/product/ROLE.md": "b310368a6eb2d5092382b74ffb464f4d95941e2bec6b306fc09b0a1e365979cc",
+        "assets/templates/CLAUDE.md.template": "675aff126590855e8d2c80b6c4f8a8f37f7ea24844d6df1d5fd9fdaf039f74b8"
+      },
+      "smm-manager": {
+        "assets/product/ROLE.md": "45ad011bbb6ecf93f151e29067998611ec8b774e7e99e16a74a9ef4224f16bbb",
+        "assets/templates/CLAUDE.md.template": "85828af4b5a50664502187a51a1b31d4519dd598612b0471a36854c949a21031"
+      },
+      "starter": {
+        "assets/product/ROLE.md": "150eca42e84925a1e0a65e0212e34a84601d403f044310fb89cc5bf88f4ab87c",
+        "assets/templates/CLAUDE.md.template": "675aff126590855e8d2c80b6c4f8a8f37f7ea24844d6df1d5fd9fdaf039f74b8"
+      }
+    },
+    "09b90a60fcee66f670462f1a68a60b7b092c7441": {
+      "creative-producer": {
+        "assets/product/ROLE.md": "91516b5083d3c6ccd7b95588dc1a2b237f9a253340a1f81e6141d677476b4b65",
+        "assets/templates/CLAUDE.md.template": "6fd752566ce59e127d75df51aebda7cd258f1d900c74bafedef2866d357db5bb"
+      },
+      "data-bi-analyst": {
+        "assets/product/ROLE.md": "1f0416711926fa12dddc7226b3d3c86a21a60483c5b128789840bf2b68f1af53",
+        "assets/templates/CLAUDE.md.template": "20e7358d93fae241eb2397a6fb74eb9df72ad5001fd4e64a843e46918d6a4fb2"
+      },
+      "executive-assistant": {
+        "assets/product/ROLE.md": "522bb3d2d75bc1df50225b00f7c891b7b86e057d33d4d2ba6d90241042a07134",
+        "assets/templates/CLAUDE.md.template": "20e7358d93fae241eb2397a6fb74eb9df72ad5001fd4e64a843e46918d6a4fb2"
+      },
+      "fpa-cfo-assistant": {
+        "assets/product/ROLE.md": "10e8eef70cf819eddfa32f1e6dda4e0e7ddb99feccf2310e7a1e0684a916b39e",
+        "assets/templates/CLAUDE.md.template": "20e7358d93fae241eb2397a6fb74eb9df72ad5001fd4e64a843e46918d6a4fb2"
+      },
+      "investment-research-analyst": {
+        "assets/product/ROLE.md": "76be61420a6f339dad725e3df6e6c61682ba71e7f86a51331fc506f023c84353",
+        "assets/templates/CLAUDE.md.template": "20e7358d93fae241eb2397a6fb74eb9df72ad5001fd4e64a843e46918d6a4fb2"
+      },
+      "marketing-strategist": {
+        "assets/product/ROLE.md": "3ed58252479325b0b3b76043df1c85379923b5886e1b7f3af2f76b678b233888",
+        "assets/templates/CLAUDE.md.template": "beb5a58a870feabb6643030a9691f73e4bcad39caa8f125920beef85479e2e17"
+      },
+      "performance-marketer": {
+        "assets/product/ROLE.md": "5f76d8ce27437e4d5eab2f4fd7298127afe609222c9429f3da3221381a75e666",
+        "assets/templates/CLAUDE.md.template": "beb5a58a870feabb6643030a9691f73e4bcad39caa8f125920beef85479e2e17"
+      },
+      "premium": {
+        "assets/product/ROLE.md": "50cfb76fe2f44a34db451a98e29a8399a16901c8b9c10e2b6fc8e2c9931de778",
+        "assets/roles/creative-producer/ROLE.md": "91516b5083d3c6ccd7b95588dc1a2b237f9a253340a1f81e6141d677476b4b65",
+        "assets/roles/data-bi-analyst/ROLE.md": "1f0416711926fa12dddc7226b3d3c86a21a60483c5b128789840bf2b68f1af53",
+        "assets/roles/executive-assistant/ROLE.md": "522bb3d2d75bc1df50225b00f7c891b7b86e057d33d4d2ba6d90241042a07134",
+        "assets/roles/fpa-cfo-assistant/ROLE.md": "10e8eef70cf819eddfa32f1e6dda4e0e7ddb99feccf2310e7a1e0684a916b39e",
+        "assets/roles/investment-research-analyst/ROLE.md": "76be61420a6f339dad725e3df6e6c61682ba71e7f86a51331fc506f023c84353",
+        "assets/roles/marketing-strategist/ROLE.md": "3ed58252479325b0b3b76043df1c85379923b5886e1b7f3af2f76b678b233888",
+        "assets/roles/performance-marketer/ROLE.md": "5f76d8ce27437e4d5eab2f4fd7298127afe609222c9429f3da3221381a75e666",
+        "assets/roles/project-operations-manager/ROLE.md": "130fc45b3db5a8dc381d47743504bc647f21e16bfe4f191299fe35a6200b7a7e",
+        "assets/roles/sales-sdr/ROLE.md": "b310368a6eb2d5092382b74ffb464f4d95941e2bec6b306fc09b0a1e365979cc",
+        "assets/roles/smm-manager/ROLE.md": "45ad011bbb6ecf93f151e29067998611ec8b774e7e99e16a74a9ef4224f16bbb",
+        "assets/templates/CLAUDE.md.template": "a196c84d766322ab63733976ace5a6655cfe379c30eb197c3852683372c99b97"
+      },
+      "project-operations-manager": {
+        "assets/product/ROLE.md": "130fc45b3db5a8dc381d47743504bc647f21e16bfe4f191299fe35a6200b7a7e",
+        "assets/templates/CLAUDE.md.template": "d7e5745113086f037d52703e0288e288a378279bbda0a94887055129b8fd1e0d"
+      },
+      "sales-sdr": {
+        "assets/product/ROLE.md": "b310368a6eb2d5092382b74ffb464f4d95941e2bec6b306fc09b0a1e365979cc",
+        "assets/templates/CLAUDE.md.template": "20e7358d93fae241eb2397a6fb74eb9df72ad5001fd4e64a843e46918d6a4fb2"
+      },
+      "smm-manager": {
+        "assets/product/ROLE.md": "45ad011bbb6ecf93f151e29067998611ec8b774e7e99e16a74a9ef4224f16bbb",
+        "assets/templates/CLAUDE.md.template": "6fd752566ce59e127d75df51aebda7cd258f1d900c74bafedef2866d357db5bb"
+      },
+      "starter": {
+        "assets/product/ROLE.md": "150eca42e84925a1e0a65e0212e34a84601d403f044310fb89cc5bf88f4ab87c",
+        "assets/templates/CLAUDE.md.template": "20e7358d93fae241eb2397a6fb74eb9df72ad5001fd4e64a843e46918d6a4fb2"
+      }
+    },
+    "1abdf0eabb8279fafc5dc30c7be1f7014ada5978": {
+      "creative-producer": {
+        "assets/product/ROLE.md": "91516b5083d3c6ccd7b95588dc1a2b237f9a253340a1f81e6141d677476b4b65",
+        "assets/templates/CLAUDE.md.template": "6fd752566ce59e127d75df51aebda7cd258f1d900c74bafedef2866d357db5bb"
+      },
+      "data-bi-analyst": {
+        "assets/product/ROLE.md": "1f0416711926fa12dddc7226b3d3c86a21a60483c5b128789840bf2b68f1af53",
+        "assets/templates/CLAUDE.md.template": "20e7358d93fae241eb2397a6fb74eb9df72ad5001fd4e64a843e46918d6a4fb2"
+      },
+      "executive-assistant": {
+        "assets/product/ROLE.md": "522bb3d2d75bc1df50225b00f7c891b7b86e057d33d4d2ba6d90241042a07134",
+        "assets/templates/CLAUDE.md.template": "20e7358d93fae241eb2397a6fb74eb9df72ad5001fd4e64a843e46918d6a4fb2"
+      },
+      "fpa-cfo-assistant": {
+        "assets/product/ROLE.md": "10e8eef70cf819eddfa32f1e6dda4e0e7ddb99feccf2310e7a1e0684a916b39e",
+        "assets/templates/CLAUDE.md.template": "20e7358d93fae241eb2397a6fb74eb9df72ad5001fd4e64a843e46918d6a4fb2"
+      },
+      "investment-research-analyst": {
+        "assets/product/ROLE.md": "76be61420a6f339dad725e3df6e6c61682ba71e7f86a51331fc506f023c84353",
+        "assets/templates/CLAUDE.md.template": "20e7358d93fae241eb2397a6fb74eb9df72ad5001fd4e64a843e46918d6a4fb2"
+      },
+      "marketing-strategist": {
+        "assets/product/ROLE.md": "3ed58252479325b0b3b76043df1c85379923b5886e1b7f3af2f76b678b233888",
+        "assets/templates/CLAUDE.md.template": "beb5a58a870feabb6643030a9691f73e4bcad39caa8f125920beef85479e2e17"
+      },
+      "performance-marketer": {
+        "assets/product/ROLE.md": "5f76d8ce27437e4d5eab2f4fd7298127afe609222c9429f3da3221381a75e666",
+        "assets/templates/CLAUDE.md.template": "beb5a58a870feabb6643030a9691f73e4bcad39caa8f125920beef85479e2e17"
+      },
+      "premium": {
+        "assets/product/ROLE.md": "50cfb76fe2f44a34db451a98e29a8399a16901c8b9c10e2b6fc8e2c9931de778",
+        "assets/roles/creative-producer/ROLE.md": "91516b5083d3c6ccd7b95588dc1a2b237f9a253340a1f81e6141d677476b4b65",
+        "assets/roles/data-bi-analyst/ROLE.md": "1f0416711926fa12dddc7226b3d3c86a21a60483c5b128789840bf2b68f1af53",
+        "assets/roles/executive-assistant/ROLE.md": "522bb3d2d75bc1df50225b00f7c891b7b86e057d33d4d2ba6d90241042a07134",
+        "assets/roles/fpa-cfo-assistant/ROLE.md": "10e8eef70cf819eddfa32f1e6dda4e0e7ddb99feccf2310e7a1e0684a916b39e",
+        "assets/roles/investment-research-analyst/ROLE.md": "76be61420a6f339dad725e3df6e6c61682ba71e7f86a51331fc506f023c84353",
+        "assets/roles/marketing-strategist/ROLE.md": "3ed58252479325b0b3b76043df1c85379923b5886e1b7f3af2f76b678b233888",
+        "assets/roles/performance-marketer/ROLE.md": "5f76d8ce27437e4d5eab2f4fd7298127afe609222c9429f3da3221381a75e666",
+        "assets/roles/project-operations-manager/ROLE.md": "130fc45b3db5a8dc381d47743504bc647f21e16bfe4f191299fe35a6200b7a7e",
+        "assets/roles/sales-sdr/ROLE.md": "b310368a6eb2d5092382b74ffb464f4d95941e2bec6b306fc09b0a1e365979cc",
+        "assets/roles/smm-manager/ROLE.md": "45ad011bbb6ecf93f151e29067998611ec8b774e7e99e16a74a9ef4224f16bbb",
+        "assets/templates/CLAUDE.md.template": "a196c84d766322ab63733976ace5a6655cfe379c30eb197c3852683372c99b97"
+      },
+      "project-operations-manager": {
+        "assets/product/ROLE.md": "130fc45b3db5a8dc381d47743504bc647f21e16bfe4f191299fe35a6200b7a7e",
+        "assets/templates/CLAUDE.md.template": "d7e5745113086f037d52703e0288e288a378279bbda0a94887055129b8fd1e0d"
+      },
+      "sales-sdr": {
+        "assets/product/ROLE.md": "b310368a6eb2d5092382b74ffb464f4d95941e2bec6b306fc09b0a1e365979cc",
+        "assets/templates/CLAUDE.md.template": "20e7358d93fae241eb2397a6fb74eb9df72ad5001fd4e64a843e46918d6a4fb2"
+      },
+      "smm-manager": {
+        "assets/product/ROLE.md": "45ad011bbb6ecf93f151e29067998611ec8b774e7e99e16a74a9ef4224f16bbb",
+        "assets/templates/CLAUDE.md.template": "6fd752566ce59e127d75df51aebda7cd258f1d900c74bafedef2866d357db5bb"
+      },
+      "starter": {
+        "assets/product/ROLE.md": "150eca42e84925a1e0a65e0212e34a84601d403f044310fb89cc5bf88f4ab87c",
+        "assets/templates/CLAUDE.md.template": "20e7358d93fae241eb2397a6fb74eb9df72ad5001fd4e64a843e46918d6a4fb2"
+      }
+    },
+    "24aa21785302ef8aa3acacbf61268c3d90de4fe7": {
+      "creative-producer": {
+        "assets/product/ROLE.md": "91516b5083d3c6ccd7b95588dc1a2b237f9a253340a1f81e6141d677476b4b65",
+        "assets/templates/CLAUDE.md.template": "85828af4b5a50664502187a51a1b31d4519dd598612b0471a36854c949a21031"
+      },
+      "data-bi-analyst": {
+        "assets/product/ROLE.md": "1f0416711926fa12dddc7226b3d3c86a21a60483c5b128789840bf2b68f1af53",
+        "assets/templates/CLAUDE.md.template": "675aff126590855e8d2c80b6c4f8a8f37f7ea24844d6df1d5fd9fdaf039f74b8"
+      },
+      "executive-assistant": {
+        "assets/product/ROLE.md": "522bb3d2d75bc1df50225b00f7c891b7b86e057d33d4d2ba6d90241042a07134",
+        "assets/templates/CLAUDE.md.template": "675aff126590855e8d2c80b6c4f8a8f37f7ea24844d6df1d5fd9fdaf039f74b8"
+      },
+      "fpa-cfo-assistant": {
+        "assets/product/ROLE.md": "10e8eef70cf819eddfa32f1e6dda4e0e7ddb99feccf2310e7a1e0684a916b39e",
+        "assets/templates/CLAUDE.md.template": "675aff126590855e8d2c80b6c4f8a8f37f7ea24844d6df1d5fd9fdaf039f74b8"
+      },
+      "investment-research-analyst": {
+        "assets/product/ROLE.md": "76be61420a6f339dad725e3df6e6c61682ba71e7f86a51331fc506f023c84353",
+        "assets/templates/CLAUDE.md.template": "675aff126590855e8d2c80b6c4f8a8f37f7ea24844d6df1d5fd9fdaf039f74b8"
+      },
+      "marketing-strategist": {
+        "assets/product/ROLE.md": "3ed58252479325b0b3b76043df1c85379923b5886e1b7f3af2f76b678b233888",
+        "assets/templates/CLAUDE.md.template": "f36c1cbae7f2107e06110fce0cda26bb5fee0260965e59bf136a4ae504aa6d21"
+      },
+      "performance-marketer": {
+        "assets/product/ROLE.md": "5f76d8ce27437e4d5eab2f4fd7298127afe609222c9429f3da3221381a75e666",
+        "assets/templates/CLAUDE.md.template": "f36c1cbae7f2107e06110fce0cda26bb5fee0260965e59bf136a4ae504aa6d21"
+      },
+      "premium": {
+        "assets/product/ROLE.md": "50cfb76fe2f44a34db451a98e29a8399a16901c8b9c10e2b6fc8e2c9931de778",
+        "assets/roles/creative-producer/ROLE.md": "91516b5083d3c6ccd7b95588dc1a2b237f9a253340a1f81e6141d677476b4b65",
+        "assets/roles/data-bi-analyst/ROLE.md": "1f0416711926fa12dddc7226b3d3c86a21a60483c5b128789840bf2b68f1af53",
+        "assets/roles/executive-assistant/ROLE.md": "522bb3d2d75bc1df50225b00f7c891b7b86e057d33d4d2ba6d90241042a07134",
+        "assets/roles/fpa-cfo-assistant/ROLE.md": "10e8eef70cf819eddfa32f1e6dda4e0e7ddb99feccf2310e7a1e0684a916b39e",
+        "assets/roles/investment-research-analyst/ROLE.md": "76be61420a6f339dad725e3df6e6c61682ba71e7f86a51331fc506f023c84353",
+        "assets/roles/marketing-strategist/ROLE.md": "3ed58252479325b0b3b76043df1c85379923b5886e1b7f3af2f76b678b233888",
+        "assets/roles/performance-marketer/ROLE.md": "5f76d8ce27437e4d5eab2f4fd7298127afe609222c9429f3da3221381a75e666",
+        "assets/roles/project-operations-manager/ROLE.md": "130fc45b3db5a8dc381d47743504bc647f21e16bfe4f191299fe35a6200b7a7e",
+        "assets/roles/sales-sdr/ROLE.md": "b310368a6eb2d5092382b74ffb464f4d95941e2bec6b306fc09b0a1e365979cc",
+        "assets/roles/smm-manager/ROLE.md": "45ad011bbb6ecf93f151e29067998611ec8b774e7e99e16a74a9ef4224f16bbb",
+        "assets/templates/CLAUDE.md.template": "d5079a0e4fe89717016b071e2f6154154ba63dcbcc63d050eed5ec740b172655"
+      },
+      "project-operations-manager": {
+        "assets/product/ROLE.md": "130fc45b3db5a8dc381d47743504bc647f21e16bfe4f191299fe35a6200b7a7e",
+        "assets/templates/CLAUDE.md.template": "91e76011bf8ce827706ee8a3e342cdb473309da50242175677ddbc3e9bc80d34"
+      },
+      "sales-sdr": {
+        "assets/product/ROLE.md": "b310368a6eb2d5092382b74ffb464f4d95941e2bec6b306fc09b0a1e365979cc",
+        "assets/templates/CLAUDE.md.template": "675aff126590855e8d2c80b6c4f8a8f37f7ea24844d6df1d5fd9fdaf039f74b8"
+      },
+      "smm-manager": {
+        "assets/product/ROLE.md": "45ad011bbb6ecf93f151e29067998611ec8b774e7e99e16a74a9ef4224f16bbb",
+        "assets/templates/CLAUDE.md.template": "85828af4b5a50664502187a51a1b31d4519dd598612b0471a36854c949a21031"
+      },
+      "starter": {
+        "assets/product/ROLE.md": "150eca42e84925a1e0a65e0212e34a84601d403f044310fb89cc5bf88f4ab87c",
+        "assets/templates/CLAUDE.md.template": "675aff126590855e8d2c80b6c4f8a8f37f7ea24844d6df1d5fd9fdaf039f74b8"
+      }
+    },
+    "467fdbc782698aacece21baef4bf71a73b9af523": {
+      "creative-producer": {
+        "assets/product/ROLE.md": "91516b5083d3c6ccd7b95588dc1a2b237f9a253340a1f81e6141d677476b4b65",
+        "assets/templates/CLAUDE.md.template": "6fd752566ce59e127d75df51aebda7cd258f1d900c74bafedef2866d357db5bb"
+      },
+      "data-bi-analyst": {
+        "assets/product/ROLE.md": "1f0416711926fa12dddc7226b3d3c86a21a60483c5b128789840bf2b68f1af53",
+        "assets/templates/CLAUDE.md.template": "20e7358d93fae241eb2397a6fb74eb9df72ad5001fd4e64a843e46918d6a4fb2"
+      },
+      "executive-assistant": {
+        "assets/product/ROLE.md": "522bb3d2d75bc1df50225b00f7c891b7b86e057d33d4d2ba6d90241042a07134",
+        "assets/templates/CLAUDE.md.template": "20e7358d93fae241eb2397a6fb74eb9df72ad5001fd4e64a843e46918d6a4fb2"
+      },
+      "fpa-cfo-assistant": {
+        "assets/product/ROLE.md": "10e8eef70cf819eddfa32f1e6dda4e0e7ddb99feccf2310e7a1e0684a916b39e",
+        "assets/templates/CLAUDE.md.template": "20e7358d93fae241eb2397a6fb74eb9df72ad5001fd4e64a843e46918d6a4fb2"
+      },
+      "investment-research-analyst": {
+        "assets/product/ROLE.md": "76be61420a6f339dad725e3df6e6c61682ba71e7f86a51331fc506f023c84353",
+        "assets/templates/CLAUDE.md.template": "20e7358d93fae241eb2397a6fb74eb9df72ad5001fd4e64a843e46918d6a4fb2"
+      },
+      "marketing-strategist": {
+        "assets/product/ROLE.md": "3ed58252479325b0b3b76043df1c85379923b5886e1b7f3af2f76b678b233888",
+        "assets/templates/CLAUDE.md.template": "beb5a58a870feabb6643030a9691f73e4bcad39caa8f125920beef85479e2e17"
+      },
+      "performance-marketer": {
+        "assets/product/ROLE.md": "5f76d8ce27437e4d5eab2f4fd7298127afe609222c9429f3da3221381a75e666",
+        "assets/templates/CLAUDE.md.template": "beb5a58a870feabb6643030a9691f73e4bcad39caa8f125920beef85479e2e17"
+      },
+      "premium": {
+        "assets/product/ROLE.md": "50cfb76fe2f44a34db451a98e29a8399a16901c8b9c10e2b6fc8e2c9931de778",
+        "assets/roles/creative-producer/ROLE.md": "91516b5083d3c6ccd7b95588dc1a2b237f9a253340a1f81e6141d677476b4b65",
+        "assets/roles/data-bi-analyst/ROLE.md": "1f0416711926fa12dddc7226b3d3c86a21a60483c5b128789840bf2b68f1af53",
+        "assets/roles/executive-assistant/ROLE.md": "522bb3d2d75bc1df50225b00f7c891b7b86e057d33d4d2ba6d90241042a07134",
+        "assets/roles/fpa-cfo-assistant/ROLE.md": "10e8eef70cf819eddfa32f1e6dda4e0e7ddb99feccf2310e7a1e0684a916b39e",
+        "assets/roles/investment-research-analyst/ROLE.md": "76be61420a6f339dad725e3df6e6c61682ba71e7f86a51331fc506f023c84353",
+        "assets/roles/marketing-strategist/ROLE.md": "3ed58252479325b0b3b76043df1c85379923b5886e1b7f3af2f76b678b233888",
+        "assets/roles/performance-marketer/ROLE.md": "5f76d8ce27437e4d5eab2f4fd7298127afe609222c9429f3da3221381a75e666",
+        "assets/roles/project-operations-manager/ROLE.md": "130fc45b3db5a8dc381d47743504bc647f21e16bfe4f191299fe35a6200b7a7e",
+        "assets/roles/sales-sdr/ROLE.md": "b310368a6eb2d5092382b74ffb464f4d95941e2bec6b306fc09b0a1e365979cc",
+        "assets/roles/smm-manager/ROLE.md": "45ad011bbb6ecf93f151e29067998611ec8b774e7e99e16a74a9ef4224f16bbb",
+        "assets/templates/CLAUDE.md.template": "a196c84d766322ab63733976ace5a6655cfe379c30eb197c3852683372c99b97"
+      },
+      "project-operations-manager": {
+        "assets/product/ROLE.md": "130fc45b3db5a8dc381d47743504bc647f21e16bfe4f191299fe35a6200b7a7e",
+        "assets/templates/CLAUDE.md.template": "d7e5745113086f037d52703e0288e288a378279bbda0a94887055129b8fd1e0d"
+      },
+      "sales-sdr": {
+        "assets/product/ROLE.md": "b310368a6eb2d5092382b74ffb464f4d95941e2bec6b306fc09b0a1e365979cc",
+        "assets/templates/CLAUDE.md.template": "20e7358d93fae241eb2397a6fb74eb9df72ad5001fd4e64a843e46918d6a4fb2"
+      },
+      "smm-manager": {
+        "assets/product/ROLE.md": "45ad011bbb6ecf93f151e29067998611ec8b774e7e99e16a74a9ef4224f16bbb",
+        "assets/templates/CLAUDE.md.template": "6fd752566ce59e127d75df51aebda7cd258f1d900c74bafedef2866d357db5bb"
+      },
+      "starter": {
+        "assets/product/ROLE.md": "150eca42e84925a1e0a65e0212e34a84601d403f044310fb89cc5bf88f4ab87c",
+        "assets/templates/CLAUDE.md.template": "20e7358d93fae241eb2397a6fb74eb9df72ad5001fd4e64a843e46918d6a4fb2"
+      }
+    },
+    "46bd4fef8112f5798a8bbee646888fbe9e2a2e1d": {
+      "creative-producer": {
+        "assets/product/ROLE.md": "91516b5083d3c6ccd7b95588dc1a2b237f9a253340a1f81e6141d677476b4b65",
+        "assets/templates/CLAUDE.md.template": "feda6f10f418cb9b3e929e1208cb1b542e1b1a37a94c67af0de8562aa6b269b9"
+      },
+      "data-bi-analyst": {
+        "assets/product/ROLE.md": "1f0416711926fa12dddc7226b3d3c86a21a60483c5b128789840bf2b68f1af53",
+        "assets/templates/CLAUDE.md.template": "49e0af454f0fb1efa2db51de0f9fba8b10aa178f75d1f478c256e8882cfae616"
+      },
+      "executive-assistant": {
+        "assets/product/ROLE.md": "522bb3d2d75bc1df50225b00f7c891b7b86e057d33d4d2ba6d90241042a07134",
+        "assets/templates/CLAUDE.md.template": "49e0af454f0fb1efa2db51de0f9fba8b10aa178f75d1f478c256e8882cfae616"
+      },
+      "fpa-cfo-assistant": {
+        "assets/product/ROLE.md": "10e8eef70cf819eddfa32f1e6dda4e0e7ddb99feccf2310e7a1e0684a916b39e",
+        "assets/templates/CLAUDE.md.template": "49e0af454f0fb1efa2db51de0f9fba8b10aa178f75d1f478c256e8882cfae616"
+      },
+      "investment-research-analyst": {
+        "assets/product/ROLE.md": "76be61420a6f339dad725e3df6e6c61682ba71e7f86a51331fc506f023c84353",
+        "assets/templates/CLAUDE.md.template": "49e0af454f0fb1efa2db51de0f9fba8b10aa178f75d1f478c256e8882cfae616"
+      },
+      "marketing-strategist": {
+        "assets/product/ROLE.md": "3ed58252479325b0b3b76043df1c85379923b5886e1b7f3af2f76b678b233888",
+        "assets/templates/CLAUDE.md.template": "e92a81f5ef4634b820e69858943d68d524352c0534747c983bd2f999e8c31663"
+      },
+      "performance-marketer": {
+        "assets/product/ROLE.md": "5f76d8ce27437e4d5eab2f4fd7298127afe609222c9429f3da3221381a75e666",
+        "assets/templates/CLAUDE.md.template": "e92a81f5ef4634b820e69858943d68d524352c0534747c983bd2f999e8c31663"
+      },
+      "premium": {
+        "assets/product/ROLE.md": "50cfb76fe2f44a34db451a98e29a8399a16901c8b9c10e2b6fc8e2c9931de778",
+        "assets/roles/creative-producer/ROLE.md": "91516b5083d3c6ccd7b95588dc1a2b237f9a253340a1f81e6141d677476b4b65",
+        "assets/roles/data-bi-analyst/ROLE.md": "1f0416711926fa12dddc7226b3d3c86a21a60483c5b128789840bf2b68f1af53",
+        "assets/roles/executive-assistant/ROLE.md": "522bb3d2d75bc1df50225b00f7c891b7b86e057d33d4d2ba6d90241042a07134",
+        "assets/roles/fpa-cfo-assistant/ROLE.md": "10e8eef70cf819eddfa32f1e6dda4e0e7ddb99feccf2310e7a1e0684a916b39e",
+        "assets/roles/investment-research-analyst/ROLE.md": "76be61420a6f339dad725e3df6e6c61682ba71e7f86a51331fc506f023c84353",
+        "assets/roles/marketing-strategist/ROLE.md": "3ed58252479325b0b3b76043df1c85379923b5886e1b7f3af2f76b678b233888",
+        "assets/roles/performance-marketer/ROLE.md": "5f76d8ce27437e4d5eab2f4fd7298127afe609222c9429f3da3221381a75e666",
+        "assets/roles/project-operations-manager/ROLE.md": "130fc45b3db5a8dc381d47743504bc647f21e16bfe4f191299fe35a6200b7a7e",
+        "assets/roles/sales-sdr/ROLE.md": "b310368a6eb2d5092382b74ffb464f4d95941e2bec6b306fc09b0a1e365979cc",
+        "assets/roles/smm-manager/ROLE.md": "45ad011bbb6ecf93f151e29067998611ec8b774e7e99e16a74a9ef4224f16bbb",
+        "assets/templates/CLAUDE.md.template": "b48fe609e8e3827c0567f886a24fb623fda368bb4527969f7e7f94c2cddbe73d"
+      },
+      "project-operations-manager": {
+        "assets/product/ROLE.md": "130fc45b3db5a8dc381d47743504bc647f21e16bfe4f191299fe35a6200b7a7e",
+        "assets/templates/CLAUDE.md.template": "15dbc570f4ac15b6e5cdad0f2266fb9f4fc81287f7e377bfd7cb9f718e61e3f2"
+      },
+      "sales-sdr": {
+        "assets/product/ROLE.md": "b310368a6eb2d5092382b74ffb464f4d95941e2bec6b306fc09b0a1e365979cc",
+        "assets/templates/CLAUDE.md.template": "49e0af454f0fb1efa2db51de0f9fba8b10aa178f75d1f478c256e8882cfae616"
+      },
+      "smm-manager": {
+        "assets/product/ROLE.md": "45ad011bbb6ecf93f151e29067998611ec8b774e7e99e16a74a9ef4224f16bbb",
+        "assets/templates/CLAUDE.md.template": "feda6f10f418cb9b3e929e1208cb1b542e1b1a37a94c67af0de8562aa6b269b9"
+      },
+      "starter": {
+        "assets/product/ROLE.md": "150eca42e84925a1e0a65e0212e34a84601d403f044310fb89cc5bf88f4ab87c",
+        "assets/templates/CLAUDE.md.template": "49e0af454f0fb1efa2db51de0f9fba8b10aa178f75d1f478c256e8882cfae616"
+      }
+    },
+    "82dc54db28f00208bc925be781a9b44af91712b4": {
+      "creative-producer": {
+        "assets/product/ROLE.md": "91516b5083d3c6ccd7b95588dc1a2b237f9a253340a1f81e6141d677476b4b65",
+        "assets/templates/CLAUDE.md.template": "feda6f10f418cb9b3e929e1208cb1b542e1b1a37a94c67af0de8562aa6b269b9"
+      },
+      "data-bi-analyst": {
+        "assets/product/ROLE.md": "1f0416711926fa12dddc7226b3d3c86a21a60483c5b128789840bf2b68f1af53",
+        "assets/templates/CLAUDE.md.template": "49e0af454f0fb1efa2db51de0f9fba8b10aa178f75d1f478c256e8882cfae616"
+      },
+      "executive-assistant": {
+        "assets/product/ROLE.md": "522bb3d2d75bc1df50225b00f7c891b7b86e057d33d4d2ba6d90241042a07134",
+        "assets/templates/CLAUDE.md.template": "49e0af454f0fb1efa2db51de0f9fba8b10aa178f75d1f478c256e8882cfae616"
+      },
+      "fpa-cfo-assistant": {
+        "assets/product/ROLE.md": "10e8eef70cf819eddfa32f1e6dda4e0e7ddb99feccf2310e7a1e0684a916b39e",
+        "assets/templates/CLAUDE.md.template": "49e0af454f0fb1efa2db51de0f9fba8b10aa178f75d1f478c256e8882cfae616"
+      },
+      "investment-research-analyst": {
+        "assets/product/ROLE.md": "76be61420a6f339dad725e3df6e6c61682ba71e7f86a51331fc506f023c84353",
+        "assets/templates/CLAUDE.md.template": "49e0af454f0fb1efa2db51de0f9fba8b10aa178f75d1f478c256e8882cfae616"
+      },
+      "marketing-strategist": {
+        "assets/product/ROLE.md": "3ed58252479325b0b3b76043df1c85379923b5886e1b7f3af2f76b678b233888",
+        "assets/templates/CLAUDE.md.template": "e92a81f5ef4634b820e69858943d68d524352c0534747c983bd2f999e8c31663"
+      },
+      "performance-marketer": {
+        "assets/product/ROLE.md": "5f76d8ce27437e4d5eab2f4fd7298127afe609222c9429f3da3221381a75e666",
+        "assets/templates/CLAUDE.md.template": "e92a81f5ef4634b820e69858943d68d524352c0534747c983bd2f999e8c31663"
+      },
+      "premium": {
+        "assets/product/ROLE.md": "50cfb76fe2f44a34db451a98e29a8399a16901c8b9c10e2b6fc8e2c9931de778",
+        "assets/roles/creative-producer/ROLE.md": "91516b5083d3c6ccd7b95588dc1a2b237f9a253340a1f81e6141d677476b4b65",
+        "assets/roles/data-bi-analyst/ROLE.md": "1f0416711926fa12dddc7226b3d3c86a21a60483c5b128789840bf2b68f1af53",
+        "assets/roles/executive-assistant/ROLE.md": "522bb3d2d75bc1df50225b00f7c891b7b86e057d33d4d2ba6d90241042a07134",
+        "assets/roles/fpa-cfo-assistant/ROLE.md": "10e8eef70cf819eddfa32f1e6dda4e0e7ddb99feccf2310e7a1e0684a916b39e",
+        "assets/roles/investment-research-analyst/ROLE.md": "76be61420a6f339dad725e3df6e6c61682ba71e7f86a51331fc506f023c84353",
+        "assets/roles/marketing-strategist/ROLE.md": "3ed58252479325b0b3b76043df1c85379923b5886e1b7f3af2f76b678b233888",
+        "assets/roles/performance-marketer/ROLE.md": "5f76d8ce27437e4d5eab2f4fd7298127afe609222c9429f3da3221381a75e666",
+        "assets/roles/project-operations-manager/ROLE.md": "130fc45b3db5a8dc381d47743504bc647f21e16bfe4f191299fe35a6200b7a7e",
+        "assets/roles/sales-sdr/ROLE.md": "b310368a6eb2d5092382b74ffb464f4d95941e2bec6b306fc09b0a1e365979cc",
+        "assets/roles/smm-manager/ROLE.md": "45ad011bbb6ecf93f151e29067998611ec8b774e7e99e16a74a9ef4224f16bbb",
+        "assets/templates/CLAUDE.md.template": "b48fe609e8e3827c0567f886a24fb623fda368bb4527969f7e7f94c2cddbe73d"
+      },
+      "project-operations-manager": {
+        "assets/product/ROLE.md": "130fc45b3db5a8dc381d47743504bc647f21e16bfe4f191299fe35a6200b7a7e",
+        "assets/templates/CLAUDE.md.template": "15dbc570f4ac15b6e5cdad0f2266fb9f4fc81287f7e377bfd7cb9f718e61e3f2"
+      },
+      "sales-sdr": {
+        "assets/product/ROLE.md": "b310368a6eb2d5092382b74ffb464f4d95941e2bec6b306fc09b0a1e365979cc",
+        "assets/templates/CLAUDE.md.template": "49e0af454f0fb1efa2db51de0f9fba8b10aa178f75d1f478c256e8882cfae616"
+      },
+      "smm-manager": {
+        "assets/product/ROLE.md": "45ad011bbb6ecf93f151e29067998611ec8b774e7e99e16a74a9ef4224f16bbb",
+        "assets/templates/CLAUDE.md.template": "feda6f10f418cb9b3e929e1208cb1b542e1b1a37a94c67af0de8562aa6b269b9"
+      },
+      "starter": {
+        "assets/product/ROLE.md": "150eca42e84925a1e0a65e0212e34a84601d403f044310fb89cc5bf88f4ab87c",
+        "assets/templates/CLAUDE.md.template": "49e0af454f0fb1efa2db51de0f9fba8b10aa178f75d1f478c256e8882cfae616"
+      }
+    },
+    "8dfeb4eb2ab2e70171a7ce6e72ccbfe136768557": {
+      "creative-producer": {
+        "assets/product/ROLE.md": "91516b5083d3c6ccd7b95588dc1a2b237f9a253340a1f81e6141d677476b4b65",
+        "assets/templates/CLAUDE.md.template": "feda6f10f418cb9b3e929e1208cb1b542e1b1a37a94c67af0de8562aa6b269b9"
+      },
+      "data-bi-analyst": {
+        "assets/product/ROLE.md": "1f0416711926fa12dddc7226b3d3c86a21a60483c5b128789840bf2b68f1af53",
+        "assets/templates/CLAUDE.md.template": "49e0af454f0fb1efa2db51de0f9fba8b10aa178f75d1f478c256e8882cfae616"
+      },
+      "executive-assistant": {
+        "assets/product/ROLE.md": "522bb3d2d75bc1df50225b00f7c891b7b86e057d33d4d2ba6d90241042a07134",
+        "assets/templates/CLAUDE.md.template": "49e0af454f0fb1efa2db51de0f9fba8b10aa178f75d1f478c256e8882cfae616"
+      },
+      "fpa-cfo-assistant": {
+        "assets/product/ROLE.md": "10e8eef70cf819eddfa32f1e6dda4e0e7ddb99feccf2310e7a1e0684a916b39e",
+        "assets/templates/CLAUDE.md.template": "49e0af454f0fb1efa2db51de0f9fba8b10aa178f75d1f478c256e8882cfae616"
+      },
+      "investment-research-analyst": {
+        "assets/product/ROLE.md": "76be61420a6f339dad725e3df6e6c61682ba71e7f86a51331fc506f023c84353",
+        "assets/templates/CLAUDE.md.template": "49e0af454f0fb1efa2db51de0f9fba8b10aa178f75d1f478c256e8882cfae616"
+      },
+      "marketing-strategist": {
+        "assets/product/ROLE.md": "3ed58252479325b0b3b76043df1c85379923b5886e1b7f3af2f76b678b233888",
+        "assets/templates/CLAUDE.md.template": "e92a81f5ef4634b820e69858943d68d524352c0534747c983bd2f999e8c31663"
+      },
+      "performance-marketer": {
+        "assets/product/ROLE.md": "5f76d8ce27437e4d5eab2f4fd7298127afe609222c9429f3da3221381a75e666",
+        "assets/templates/CLAUDE.md.template": "e92a81f5ef4634b820e69858943d68d524352c0534747c983bd2f999e8c31663"
+      },
+      "premium": {
+        "assets/product/ROLE.md": "50cfb76fe2f44a34db451a98e29a8399a16901c8b9c10e2b6fc8e2c9931de778",
+        "assets/roles/creative-producer/ROLE.md": "91516b5083d3c6ccd7b95588dc1a2b237f9a253340a1f81e6141d677476b4b65",
+        "assets/roles/data-bi-analyst/ROLE.md": "1f0416711926fa12dddc7226b3d3c86a21a60483c5b128789840bf2b68f1af53",
+        "assets/roles/executive-assistant/ROLE.md": "522bb3d2d75bc1df50225b00f7c891b7b86e057d33d4d2ba6d90241042a07134",
+        "assets/roles/fpa-cfo-assistant/ROLE.md": "10e8eef70cf819eddfa32f1e6dda4e0e7ddb99feccf2310e7a1e0684a916b39e",
+        "assets/roles/investment-research-analyst/ROLE.md": "76be61420a6f339dad725e3df6e6c61682ba71e7f86a51331fc506f023c84353",
+        "assets/roles/marketing-strategist/ROLE.md": "3ed58252479325b0b3b76043df1c85379923b5886e1b7f3af2f76b678b233888",
+        "assets/roles/performance-marketer/ROLE.md": "5f76d8ce27437e4d5eab2f4fd7298127afe609222c9429f3da3221381a75e666",
+        "assets/roles/project-operations-manager/ROLE.md": "130fc45b3db5a8dc381d47743504bc647f21e16bfe4f191299fe35a6200b7a7e",
+        "assets/roles/sales-sdr/ROLE.md": "b310368a6eb2d5092382b74ffb464f4d95941e2bec6b306fc09b0a1e365979cc",
+        "assets/roles/smm-manager/ROLE.md": "45ad011bbb6ecf93f151e29067998611ec8b774e7e99e16a74a9ef4224f16bbb",
+        "assets/templates/CLAUDE.md.template": "b48fe609e8e3827c0567f886a24fb623fda368bb4527969f7e7f94c2cddbe73d"
+      },
+      "project-operations-manager": {
+        "assets/product/ROLE.md": "130fc45b3db5a8dc381d47743504bc647f21e16bfe4f191299fe35a6200b7a7e",
+        "assets/templates/CLAUDE.md.template": "15dbc570f4ac15b6e5cdad0f2266fb9f4fc81287f7e377bfd7cb9f718e61e3f2"
+      },
+      "sales-sdr": {
+        "assets/product/ROLE.md": "b310368a6eb2d5092382b74ffb464f4d95941e2bec6b306fc09b0a1e365979cc",
+        "assets/templates/CLAUDE.md.template": "49e0af454f0fb1efa2db51de0f9fba8b10aa178f75d1f478c256e8882cfae616"
+      },
+      "smm-manager": {
+        "assets/product/ROLE.md": "45ad011bbb6ecf93f151e29067998611ec8b774e7e99e16a74a9ef4224f16bbb",
+        "assets/templates/CLAUDE.md.template": "feda6f10f418cb9b3e929e1208cb1b542e1b1a37a94c67af0de8562aa6b269b9"
+      },
+      "starter": {
+        "assets/product/ROLE.md": "150eca42e84925a1e0a65e0212e34a84601d403f044310fb89cc5bf88f4ab87c",
+        "assets/templates/CLAUDE.md.template": "49e0af454f0fb1efa2db51de0f9fba8b10aa178f75d1f478c256e8882cfae616"
+      }
     }
   },
   "schema": "novsky-legacy-persona-hashes/v1"

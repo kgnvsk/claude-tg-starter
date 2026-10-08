@@ -1,8 +1,8 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-10-08.5fe5f57b6271`
+- Реліз: `2026-10-08.1d016e42b046`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `5fe5f57b6271b7b677ad1a1091e761b80216b365`
+- Ревізія вихідного комплекту: `1d016e42b046d1c4bd1c1bbf5c8c406eff89107d`
 - Дата релізу: `2026-10-08`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
@@ -19,8 +19,7 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    Seed disabled skills where they lie; complete an existing skills baseline
-    Seed the skills baseline of an agent older than baselines before the window
+    fix(persona): pin the role kits of the store releases 08.09–21.09
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не
