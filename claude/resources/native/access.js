@@ -2,6 +2,8 @@
 // modules/telegram-corporate/capability-store.ts
 import { Database } from "bun:sqlite";
 import { createHash as createHash2, randomUUID } from "crypto";
+import { readFileSync } from "fs";
+import { userInfo } from "os";
 
 // modules/telegram-corporate/resource-control.ts
 import { isIP } from "net";
@@ -599,6 +601,18 @@ function readQueuedGroupAction(db, jobId) {
 }
 
 // modules/telegram-corporate/capability-store.ts
+var MANAGERS_ABOVE_DIR = "/etc/novsky/managers";
+var AGENT_ID = /^[A-Za-z0-9_.:-]{1,128}$/;
+var APPROVER = /^[1-9]\d{0,19}$/;
+function managersAboveFromFile() {
+  try {
+    const value = JSON.parse(readFileSync(`${MANAGERS_ABOVE_DIR}/${userInfo().username}.json`, "utf8"));
+    const ids = value.managersAbove;
+    return Array.isArray(ids) && ids.every((id) => typeof id === "string" && AGENT_ID.test(id)) ? ids : null;
+  } catch {
+    return null;
+  }
+}
 var SECRET_KEY = /token|secret|password|credential|authorization|cookie|api.?key|private.?key/i;
 var RESOURCE_ID2 = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 var SCHEMA = `
@@ -618,6 +632,15 @@ CREATE TABLE IF NOT EXISTS corporate_policies (
   version INTEGER NOT NULL CHECK(version >= 1),
   grants_json TEXT NOT NULL,
   updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS corporate_policy_pins (
+  subject TEXT NOT NULL,
+  resource_key TEXT NOT NULL,
+  pinned_by TEXT NOT NULL,
+  confirmed_by TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY(subject, resource_key)
 );
 
 CREATE TABLE IF NOT EXISTS corporate_policy_previews (
@@ -731,17 +754,19 @@ class CapabilityStore {
   primaryOwnerId;
   catalog;
   isSuperadmin;
+  managersAbove;
   constructor(path, options) {
     this.primaryOwnerId = options.primaryOwnerId;
     this.catalog = options.catalog ?? CAPABILITY_CATALOG;
     this.isSuperadmin = options.isSuperadmin ?? (() => false);
+    this.managersAbove = options.managersAbove ?? managersAboveFromFile;
     this.db = new Database(path, { create: true });
     this.db.run("PRAGMA journal_mode=WAL");
     this.db.run("PRAGMA busy_timeout=5000");
     this.db.exec(SCHEMA);
     this.db.transaction(() => {
       const columns = new Set(this.db.query("PRAGMA table_info(corporate_policy_previews)").all().map((c) => c.name));
-      for (const name of ["resource_versions_json", "agent_request_id", "agent_request_json", "agent_message_json", "conversation_json"]) {
+      for (const name of ["resource_versions_json", "agent_request_id", "agent_request_json", "agent_message_json", "conversation_json", "branch_json"]) {
         if (!columns.has(name))
           this.db.exec(`ALTER TABLE corporate_policy_previews ADD COLUMN ${name} TEXT`);
       }
@@ -997,6 +1022,9 @@ class CapabilityStore {
       throw new Error("owner private resource");
     const protectedGrants = input.requestedBy === this.primaryOwnerId ? [] : this.resolve(input.subject).grants.filter((grant) => grant.resourceId != null && !visibleResources.has(grant.resourceId));
     const proposedGrants = sortedUniqueGrants([...requested, ...protectedGrants]);
+    const pinned = this.pinnedBy(input.subject, this.changedKeys(this.ownGrants(input.subject), proposedGrants));
+    if (pinned)
+      throw new Error(`branch_pinned:${pinned}: a manager agent above set this access; change it there`);
     this.validateGrants(input.subject, proposedGrants, !!input.conversation || this.resolve(input.subject).chatAuthorized === true);
     const baseVersion = this.resolve(input.subject).version;
     const token = randomUUID();
@@ -1018,6 +1046,177 @@ class CapabilityStore {
       proposedVersion: baseVersion + 1,
       proposedGrants,
       expiresAt: input.expiresAt
+    };
+  }
+  branchPins(subject) {
+    const above = this.managersAbove();
+    const pins = this.db.query(`SELECT resource_key AS resourceKey,pinned_by AS pinnedBy,confirmed_by AS confirmedBy,created_at AS createdAt
+      FROM corporate_policy_pins WHERE subject=? ORDER BY resource_key`).all(subject);
+    return above == null ? pins : pins.filter((pin) => above.includes(pin.pinnedBy));
+  }
+  ownGrants(subject) {
+    const row = this.policyRow(subject);
+    return row == null ? [] : this.activeGrants(row);
+  }
+  changedKeys(before, after) {
+    const keyed = (grants) => {
+      const map = new Map;
+      for (const grant of sortedUniqueGrants(grants)) {
+        const key = grant.resourceId ?? "*";
+        map.set(key, [...map.get(key) ?? [], `${grant.capabilityId}${grant.trusted ? "+trusted" : ""}`]);
+      }
+      return map;
+    };
+    const left = keyed(before), right = keyed(after);
+    return new Set([...left.keys(), ...right.keys()].filter((key) => (left.get(key) ?? []).join() !== (right.get(key) ?? []).join()));
+  }
+  pinnedBy(subject, keys, allowed = new Set) {
+    return this.branchPins(subject).find((pin) => keys.has(pin.resourceKey) && !allowed.has(pin.pinnedBy))?.pinnedBy ?? null;
+  }
+  dropLapsedPins(subject, now) {
+    const read = this.managersAbove();
+    if (read == null)
+      return;
+    const above = new Set(read);
+    const lapsed = this.db.query("SELECT resource_key AS resourceKey,pinned_by AS pinnedBy FROM corporate_policy_pins WHERE subject=?").all(subject).filter((pin) => !above.has(pin.pinnedBy));
+    for (const pin of lapsed) {
+      this.db.query("DELETE FROM corporate_policy_pins WHERE subject=? AND resource_key=? AND pinned_by=?").run(subject, pin.resourceKey, pin.pinnedBy);
+      this.audit(subject, pin.pinnedBy, "branch_pin_lapsed", pin, now);
+    }
+  }
+  branchCaller(managerId) {
+    const above = this.managersAbove() ?? [];
+    const index = above.indexOf(managerId);
+    if (!AGENT_ID.test(managerId) || index < 0)
+      throw new Error("the manager agent is not above this agent");
+    return new Set(above.slice(0, index + 1));
+  }
+  branchPreview(subject, grants, change, expiresAt, now) {
+    if (!isValidSubject(subject))
+      throw new Error("invalid policy subject");
+    if (!Number.isSafeInteger(expiresAt) || expiresAt <= now)
+      throw new Error("policy preview expiry must be in the future");
+    if (change.approvers.length < 1 || !change.approvers.every((id) => APPROVER.test(id)))
+      throw new Error("a branch change needs its approvers");
+    const baseVersion = this.resolve(subject).version;
+    const token = randomUUID();
+    this.db.transaction(() => {
+      this.db.query(`INSERT INTO corporate_policy_previews(token,subject,base_version,grants_json,requested_by,expires_at,state,created_at,resource_versions_json,branch_json)
+         VALUES(?,?,?,?,?,?,'pending',?,?,?)`).run(token, subject, baseVersion, safeJson(grants), `agent:${change.managerId}`, expiresAt, now, this.resourceVersions(grants), safeJson(change));
+      this.audit(subject, `agent:${change.managerId}`, `branch_${change.kind === "set" ? "policy" : "release"}_previewed`, {
+        tokenHash: token.slice(0, 8),
+        managerId: change.managerId,
+        resourceKeys: change.resourceKeys,
+        grants
+      }, now);
+    })();
+    return { token, subject, baseVersion, proposedVersion: baseVersion + 1, proposedGrants: grants, expiresAt };
+  }
+  createBranchPolicyPreview(input, now) {
+    const allowed = this.branchCaller(input.managerId);
+    const keys = new Set(input.resourceKeys);
+    if (keys.size < 1 || [...keys].some((key) => key !== "*" && !RESOURCE_ID2.test(key)))
+      throw new Error("invalid resource keys");
+    if (input.grants.some((grant) => !keys.has(grant.resourceId ?? "*")))
+      throw new Error("a grant is outside the changed resources");
+    const higher = this.pinnedBy(input.subject, keys, allowed);
+    if (higher)
+      throw new Error(`branch_pinned:${higher}: a manager agent above set this access; only it can change it`);
+    const current = this.ownGrants(input.subject);
+    const grants = sortedUniqueGrants([...current.filter((grant) => !keys.has(grant.resourceId ?? "*")), ...input.grants]);
+    this.validateGrants(input.subject, grants, this.resolve(input.subject).chatAuthorized === true);
+    return this.branchPreview(input.subject, grants, { kind: "set", managerId: input.managerId, approvers: [...new Set(input.approvers)], resourceKeys: [...keys] }, input.expiresAt, now);
+  }
+  createBranchReleasePreview(input, now) {
+    const allowed = this.branchCaller(input.managerId);
+    const keys = new Set(input.resourceKeys);
+    const higher = this.pinnedBy(input.subject, keys, allowed);
+    if (higher)
+      throw new Error(`branch_pinned:${higher}: a manager agent above set this access; only it can release it`);
+    return this.branchPreview(input.subject, this.ownGrants(input.subject), { kind: "release", managerId: input.managerId, approvers: [...new Set(input.approvers)], resourceKeys: [...keys] }, input.expiresAt, now);
+  }
+  approveBranchPreview(token, actorUserId, now) {
+    return this.db.transaction(() => {
+      const row = this.preview(token);
+      const change = row?.branchJson ? JSON.parse(row.branchJson) : null;
+      if (row == null || change == null)
+        return { ok: false, reason: "missing" };
+      if (!change.approvers.includes(actorUserId))
+        return { ok: false, reason: "actor" };
+      if (row.state !== "pending")
+        return { ok: false, reason: "used" };
+      if (now > row.expiresAt) {
+        this.resolvePreview(token, "expired", now);
+        return { ok: false, reason: "expired" };
+      }
+      let allowed;
+      try {
+        allowed = this.branchCaller(change.managerId);
+      } catch {
+        this.resolvePreview(token, "stale", now);
+        return { ok: false, reason: "stale" };
+      }
+      const keys = new Set(change.resourceKeys);
+      if (this.resolve(row.subject).version !== row.baseVersion || this.pinnedBy(row.subject, keys, allowed) || row.resourceVersionsJson !== this.resourceVersions(JSON.parse(row.grantsJson))) {
+        this.resolvePreview(token, "stale", now);
+        return { ok: false, reason: "stale" };
+      }
+      let version = row.baseVersion;
+      if (change.kind === "set") {
+        const chatAuthorized = this.resolve(row.subject).chatAuthorized === true;
+        version = row.baseVersion + 1;
+        const written = row.baseVersion === 0 ? this.db.query(`INSERT INTO corporate_policies(subject,version,grants_json,updated_at,chat_authorized) VALUES(?,?,?,?,?)`).run(row.subject, version, row.grantsJson, now, chatAuthorized ? 1 : 0) : this.db.query(`UPDATE corporate_policies SET version=?,grants_json=?,updated_at=? WHERE subject=? AND version=?`).run(version, row.grantsJson, now, row.subject, row.baseVersion);
+        if (written.changes !== 1) {
+          this.resolvePreview(token, "stale", now);
+          return { ok: false, reason: "stale" };
+        }
+        for (const key of keys) {
+          this.db.query(`INSERT INTO corporate_policy_pins(subject,resource_key,pinned_by,confirmed_by,created_at) VALUES(?,?,?,?,?)
+            ON CONFLICT(subject,resource_key) DO UPDATE SET pinned_by=excluded.pinned_by,confirmed_by=excluded.confirmed_by,created_at=excluded.created_at`).run(row.subject, key, change.managerId, actorUserId, now);
+        }
+      } else {
+        for (const key of keys) {
+          this.db.query("DELETE FROM corporate_policy_pins WHERE subject=? AND resource_key=?").run(row.subject, key);
+        }
+      }
+      this.resolvePreview(token, "approved", now);
+      this.audit(row.subject, actorUserId, change.kind === "set" ? "branch_policy_approved" : "branch_pins_released", {
+        managerId: change.managerId,
+        resourceKeys: change.resourceKeys,
+        baseVersion: row.baseVersion,
+        version,
+        grants: JSON.parse(row.grantsJson)
+      }, now);
+      return { ok: true, version };
+    })();
+  }
+  cancelBranchPreview(token, actorUserId, now) {
+    return this.db.transaction(() => {
+      const row = this.preview(token);
+      const change = row?.branchJson ? JSON.parse(row.branchJson) : null;
+      if (row == null || change == null)
+        return { ok: false, reason: "missing" };
+      if (!change.approvers.includes(actorUserId))
+        return { ok: false, reason: "actor" };
+      if (row.state !== "pending")
+        return { ok: false, reason: "used" };
+      this.resolvePreview(token, "cancelled", now);
+      this.audit(row.subject, actorUserId, "branch_change_cancelled", { managerId: change.managerId, resourceKeys: change.resourceKeys }, now);
+      return { ok: true };
+    })();
+  }
+  isBranchPreview(token) {
+    return !!this.preview(token)?.branchJson;
+  }
+  branchSummary() {
+    const subjects = this.db.query("SELECT subject FROM corporate_policies UNION SELECT subject FROM corporate_policy_pins ORDER BY subject").all().map((row) => row.subject);
+    return {
+      resources: this.listResources().map(({ id, label, connector, capabilityIds }) => ({ id, label, connector, capabilityIds })),
+      policies: subjects.map((subject) => ({
+        subject,
+        grants: this.ownGrants(subject),
+        pins: this.branchPins(subject).map(({ resourceKey, pinnedBy }) => ({ resourceKey, pinnedBy }))
+      }))
     };
   }
   bindPolicyMessage(token, message) {
@@ -1066,6 +1265,10 @@ class CapabilityStore {
         this.resolvePreview(token, "stale", now);
         return { ok: false, reason: "stale" };
       }
+      if (this.pinnedBy(row.subject, this.changedKeys(this.ownGrants(row.subject), grants))) {
+        this.resolvePreview(token, "stale", now);
+        return { ok: false, reason: "stale" };
+      }
       const chatAuthorized = !!row.conversationJson || this.resolve(row.subject).chatAuthorized === true;
       this.validateGrants(row.subject, grants, chatAuthorized);
       const version = row.baseVersion + 1;
@@ -1086,6 +1289,7 @@ class CapabilityStore {
         version,
         grants
       }, now);
+      this.dropLapsedPins(row.subject, now);
       return { ok: true, version };
     })();
   }
@@ -1575,7 +1779,8 @@ class CapabilityStore {
     return this.db.query(`SELECT token,subject,base_version AS baseVersion,grants_json AS grantsJson,
               requested_by AS requestedBy,expires_at AS expiresAt,state,
               resource_versions_json AS resourceVersionsJson,agent_request_id AS agentRequestId,
-              agent_request_json AS agentRequestJson,agent_message_json AS agentMessageJson,conversation_json AS conversationJson
+              agent_request_json AS agentRequestJson,agent_message_json AS agentMessageJson,conversation_json AS conversationJson,
+              branch_json AS branchJson
        FROM corporate_policy_previews WHERE token=?`).get(token);
   }
   action(token) {
@@ -1608,6 +1813,52 @@ class CapabilityStore {
        ) VALUES(?,?,?,?,?)`).run(subject, actorUserId, eventType, safeJson(metadata), now);
   }
 }
+// modules/telegram-corporate/agent-access.ts
+import { homedir } from "os";
+import { dirname, join } from "path";
+
+// modules/telegram-corporate/branch-access.ts
+import { Database as Database2 } from "bun:sqlite";
+import { execFile, execFileSync } from "child_process";
+import { promisify } from "util";
+var run = promisify(execFile);
+var USER_ID = /^[1-9]\d{0,19}$/;
+var TTL_MS = 10 * 60000;
+function accessPreviewState(dbPath, token) {
+  try {
+    const db = new Database2(dbPath, { readonly: true });
+    try {
+      return db.query("SELECT state FROM access_branch_previews WHERE token=?").get(token)?.state ?? null;
+    } finally {
+      db.close();
+    }
+  } catch {
+    return null;
+  }
+}
+function branchDecision(options, token, decision, context) {
+  const inAccessFile = accessPreviewState(options.dbPath, token) != null;
+  if (!inAccessFile && !options.store.isBranchPreview(token))
+    return null;
+  if (context.chatType !== "private" || context.chatId !== context.userId || !USER_ID.test(context.userId))
+    return { ok: false, reason: "actor" };
+  if (!inAccessFile) {
+    return decision === "approve" ? options.store.approveBranchPreview(token, context.userId, Date.now()) : { ...options.store.cancelBranchPreview(token, context.userId, Date.now()), state: "cancelled" };
+  }
+  try {
+    execFileSync(options.script, ["branch-confirm", options.accessPath, options.ownerChatId, context.userId, token, decision], { timeout: 15000, maxBuffer: 4096, stdio: "pipe" });
+    return decision === "approve" ? { ok: true } : { ok: true, state: "cancelled" };
+  } catch (error) {
+    const stderr = String(error?.stderr ?? "");
+    if (/^BRANCH_ACTOR:/m.test(stderr))
+      return { ok: false, reason: "actor" };
+    if (!/^ACCESS_STALE:/m.test(stderr))
+      return { ok: false, reason: "uncertain" };
+    const state = accessPreviewState(options.dbPath, token);
+    return { ok: false, reason: state === "stale" ? "stale" : state === "pending" ? "expired" : "used" };
+  }
+}
+
 // modules/telegram-corporate/resource-sheets.ts
 var SHEET_KEY = /^sheet\.([A-Za-z0-9_-]{10,256})$/;
 function allowedSheets(resource) {
@@ -1625,6 +1876,15 @@ function allowedSheets(resource) {
 // modules/telegram-corporate/agent-access.ts
 function agentAccessDecision(dbPath, owner, token, decision, context) {
   const store = new CapabilityStore(dbPath, { primaryOwnerId: owner });
+  const branch = branchDecision({
+    store,
+    dbPath,
+    ownerChatId: owner,
+    accessPath: join(dirname(dbPath), "access.json"),
+    script: join(homedir(), "bin/access-update")
+  }, token, decision, context);
+  if (branch)
+    return branch;
   if (!store.isAgentAccessPreview(token))
     return null;
   if (context.chatType !== "private" || context.chatId !== owner || context.userId !== owner)
@@ -1691,8 +1951,8 @@ async function agentAccess(input, options) {
   return { state: "ready", allowed: true, data: response.data, resource: resource.id };
 }
 // modules/telegram-corporate/adapters/google.ts
-import { join as join4 } from "path";
-import { Database as Database3 } from "bun:sqlite";
+import { join as join5 } from "path";
+import { Database as Database4 } from "bun:sqlite";
 
 // modules/telegram-corporate/adapters/command.ts
 var OUTPUT_LIMIT = 256 * 1024;
@@ -1912,10 +2172,10 @@ class DriveFolderIndex {
 }
 
 // modules/telegram-corporate/adapters/slides.ts
-import { Database as Database2 } from "bun:sqlite";
+import { Database as Database3 } from "bun:sqlite";
 import { mkdtemp, rm, writeFile } from "fs/promises";
 import { tmpdir } from "os";
-import { join } from "path";
+import { join as join2 } from "path";
 
 // modules/telegram-corporate/adapters/public-image-url.ts
 function publicImageUrl(value) {
@@ -1965,7 +2225,7 @@ class SlidesAdapter {
     this.createdSlideIds = options.createdSlideIds ?? ((resourceId) => {
       let db;
       try {
-        db = new Database2(join(this.home, ".claude/channels/telegram/messages.db"), { readonly: true });
+        db = new Database3(join2(this.home, ".claude/channels/telegram/messages.db"), { readonly: true });
         return createdGoogleSlideIds(db, resourceId);
       } catch {
         return [];
@@ -2043,7 +2303,7 @@ class SlidesAdapter {
   command(account, command, args, readonly = false) {
     return {
       argv: [
-        join(this.home, "bin", "gog"),
+        join2(this.home, "bin", "gog"),
         "--no-input",
         "--json",
         ...readonly ? ["--readonly"] : [],
@@ -2103,8 +2363,8 @@ class SlidesAdapter {
     let directory;
     let launched = false;
     try {
-      directory = await mkdtemp(join(tmpdir(), "corporate-slides-"));
-      const input = join(directory, "deck.md");
+      directory = await mkdtemp(join2(tmpdir(), "corporate-slides-"));
+      const input = join2(directory, "deck.md");
       await writeFile(input, markdown, { mode: 384, flag: "wx" });
       if (signal.aborted)
         return { ok: false, code: "unavailable" };
@@ -2167,7 +2427,7 @@ class SlidesAdapter {
 }
 
 // modules/telegram-corporate/adapters/docs-write.ts
-import { join as join2 } from "path";
+import { join as join3 } from "path";
 function uncertainAppend() {
   return {
     ok: false,
@@ -2216,7 +2476,7 @@ class DocsWriteAdapter {
     try {
       const result = await this.run({
         argv: [
-          join2(this.home, "bin", "gog"),
+          join3(this.home, "bin", "gog"),
           "--no-input",
           "--json",
           "--enable-commands-exact=docs.write",
@@ -2276,7 +2536,7 @@ class DocsWriteAdapter {
     try {
       const result = await this.run({
         argv: [
-          join2(this.home, "bin", "gog"),
+          join3(this.home, "bin", "gog"),
           "--no-input",
           "--json",
           "--enable-commands-exact=docs.insert-image",
@@ -2460,7 +2720,7 @@ function validSheetsBatch(requests) {
 // modules/telegram-corporate/adapters/drive-files.ts
 import { randomUUID as randomUUID2 } from "crypto";
 import { closeSync, constants, fstatSync, lstatSync, mkdtempSync, openSync, readSync, realpathSync, rmSync } from "fs";
-import { dirname, join as join3 } from "path";
+import { dirname as dirname2, join as join4 } from "path";
 import { tmpdir as tmpdir2 } from "os";
 var MAX_FILE_BYTES = 12 * 1024 * 1024;
 var MAX_PAGE_SIZE = 10;
@@ -2551,9 +2811,9 @@ class DriveFilesAdapter {
     if (typeof account !== "string" || !account.includes("@") || /[\r\n\0]/.test(account))
       return invalid("\u041D\u0435 \u043D\u0430\u043B\u0430\u0448\u0442\u043E\u0432\u0430\u043D\u0438\u0439 Google-\u0430\u043A\u0430\u0443\u043D\u0442 \u0440\u0435\u0441\u0443\u0440\u0441\u0443.");
     const args = request.arguments;
-    const run = (method, params) => this.options.run({
+    const run2 = (method, params) => this.options.run({
       argv: [
-        join3(this.options.home, "bin/gog"),
+        join4(this.options.home, "bin/gog"),
         "--no-input",
         "--json",
         "--readonly",
@@ -2578,7 +2838,7 @@ class DriveFilesAdapter {
       if (membership !== "inside")
         return invalid("\u0422\u0435\u043A\u0430 \u043D\u0435 \u0432\u0445\u043E\u0434\u0438\u0442\u044C \u0434\u043E \u0434\u043E\u0437\u0432\u043E\u043B\u0435\u043D\u043E\u0433\u043E \u0440\u0435\u0441\u0443\u0440\u0441\u0443 \u0430\u0431\u043E \u0457\u0457 \u043D\u0430\u043B\u0435\u0436\u043D\u0456\u0441\u0442\u044C \u043D\u0435 \u043F\u0456\u0434\u0442\u0432\u0435\u0440\u0434\u0436\u0435\u043D\u0430.");
       const pageSize = Math.min(Number(args.max ?? MAX_PAGE_SIZE), MAX_PAGE_SIZE);
-      const response = await run("files.list", {
+      const response = await run2("files.list", {
         q: `'${args.folderId}' in parents and trashed = false`,
         pageSize,
         ...args.cursor ? { pageToken: args.cursor } : {},
@@ -2609,11 +2869,11 @@ class DriveFilesAdapter {
     const workspace = request.verified.workspace;
     let identity;
     try {
-      const root = this.options.workspaceRoot ?? join3(this.options.home, "corporate-workspaces");
-      if (typeof workspace !== "string" || dirname(workspace) !== root || !/^[a-f0-9]{64}$/.test(workspace.slice(root.length + 1)))
+      const root = this.options.workspaceRoot ?? join4(this.options.home, "corporate-workspaces");
+      if (typeof workspace !== "string" || dirname2(workspace) !== root || !/^[a-f0-9]{64}$/.test(workspace.slice(root.length + 1)))
         throw new Error("invalid workspace");
       const before = lstatSync(workspace, { bigint: true });
-      if (before.isSymbolicLink() || !before.isDirectory() || realpathSync(workspace) !== join3(realpathSync(root), workspace.slice(root.length + 1)))
+      if (before.isSymbolicLink() || !before.isDirectory() || realpathSync(workspace) !== join4(realpathSync(root), workspace.slice(root.length + 1)))
         throw new Error("invalid workspace");
       const fd = openSync(workspace, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
       try {
@@ -2630,7 +2890,7 @@ class DriveFilesAdapter {
     const denial = await this.options.authorizeFile(request, account, signal);
     if (denial)
       return invalid(denial);
-    const metadata = await run("files.get", { fileId: args.fileId, fields: "id,name,mimeType,size,trashed", supportsAllDrives: true });
+    const metadata = await run2("files.get", { fileId: args.fileId, fields: "id,name,mimeType,size,trashed", supportsAllDrives: true });
     if (metadata.exitCode !== 0 || metadata.stdoutTruncated || signal.aborted)
       return { ok: false, code: "unavailable" };
     let file;
@@ -2646,15 +2906,15 @@ class DriveFilesAdapter {
       return invalid("\u0424\u0430\u0439\u043B \u0437\u0430\u0432\u0435\u043B\u0438\u043A\u0438\u0439 \u0430\u0431\u043E \u0439\u043E\u0433\u043E \u0440\u043E\u0437\u043C\u0456\u0440 \u043D\u0435 \u043F\u0456\u0434\u0442\u0432\u0435\u0440\u0434\u0436\u0435\u043D\u043E (\u043C\u0430\u043A\u0441\u0438\u043C\u0443\u043C 12 \u041C\u0411).");
     if (file.mimeType.startsWith("application/vnd.google-apps.") && !format2)
       return invalid("\u0426\u0435\u0439 \u0442\u0438\u043F Google-\u0444\u0430\u0439\u043B\u0430 \u043D\u0435 \u043F\u0456\u0434\u0442\u0440\u0438\u043C\u0443\u0454 \u0437\u0430\u0432\u0430\u043D\u0442\u0430\u0436\u0435\u043D\u043D\u044F; \u0441\u043A\u043E\u0440\u0438\u0441\u0442\u0430\u0439\u0441\u044F \u0432\u0456\u0434\u043F\u043E\u0432\u0456\u0434\u043D\u0438\u043C \u043A\u043E\u043D\u0435\u043A\u0442\u043E\u0440\u043E\u043C.");
-    const temp = mkdtempSync(join3(tmpdir2(), "corporate-drive-"));
-    const download = join3(temp, format2 ? `download.${format2}` : "download");
+    const temp = mkdtempSync(join4(tmpdir2(), "corporate-drive-"));
+    const download = join4(temp, format2 ? `download.${format2}` : "download");
     try {
       const response = await this.options.run({
         argv: [
           "/usr/bin/prlimit",
           `--fsize=${MAX_FILE_BYTES}:${MAX_FILE_BYTES}`,
           "--",
-          join3(this.options.home, "bin/gog"),
+          join4(this.options.home, "bin/gog"),
           "--no-input",
           "--json",
           "--readonly",
@@ -2681,7 +2941,7 @@ class DriveFilesAdapter {
           code: "unavailable",
           message: "\u0424\u0430\u0439\u043B HEIF \u043E\u0442\u0440\u0438\u043C\u0430\u043D\u043E, \u0430\u043B\u0435 \u043A\u043E\u043D\u0432\u0435\u0440\u0442\u0435\u0440 HEIF\u2192JPEG \u043D\u0435\u0434\u043E\u0441\u0442\u0443\u043F\u043D\u0438\u0439 \u0430\u0431\u043E \u043D\u0435 \u0437\u043C\u0456\u0433 \u0431\u0435\u0437\u043F\u0435\u0447\u043D\u043E \u043E\u0431\u0440\u043E\u0431\u0438\u0442\u0438 \u0444\u043E\u0442\u043E. \u0426\u0435 \u043D\u0435 \u043F\u043E\u043C\u0438\u043B\u043A\u0430 \u0434\u043E\u0441\u0442\u0443\u043F\u0443 \u0434\u043E Google; \u043F\u043E\u0442\u0440\u0456\u0431\u043D\u0430 \u043F\u0435\u0440\u0435\u0432\u0456\u0440\u043A\u0430 \u043A\u043E\u043D\u0432\u0435\u0440\u0442\u0435\u0440\u0430 \u043D\u0430 \u0441\u0435\u0440\u0432\u0435\u0440\u0456."
         });
-        const converted = join3(temp, "converted.jpg");
+        const converted = join4(temp, "converted.jpg");
         const conversion = await this.options.run({
           argv: [
             "/usr/bin/prlimit",
@@ -2689,7 +2949,7 @@ class DriveFilesAdapter {
             "--as=536870912:536870912",
             "--cpu=20:20",
             "--",
-            join3(this.options.home, "bin/heic-to-jpg"),
+            join4(this.options.home, "bin/heic-to-jpg"),
             download,
             converted
           ],
@@ -2709,7 +2969,7 @@ class DriveFilesAdapter {
         source = converted;
       }
       const name = `drive-${randomUUID2()}.${heif ? "jpg" : format2 ?? EXTENSIONS[file.mimeType] ?? "bin"}`;
-      const target = join3(workspace, name);
+      const target = join4(workspace, name);
       const publication = await runBoundedCommand({
         argv: ["python3", "-c", PUBLISH_FILE, workspace, identity.device, identity.inode, source, name, String(MAX_FILE_BYTES)],
         cwd: this.options.home,
@@ -2837,7 +3097,7 @@ class GoogleAdapter {
     this.createdSheetIds = options.createdSheetIds ?? ((resourceId) => {
       let db;
       try {
-        db = new Database3(join4(this.home, ".claude/channels/telegram/messages.db"), { readonly: true });
+        db = new Database4(join5(this.home, ".claude/channels/telegram/messages.db"), { readonly: true });
         return createdGoogleSheetIds(db, resourceId);
       } catch {
         return [];
@@ -2851,7 +3111,7 @@ class GoogleAdapter {
       }
       let db;
       try {
-        db = new Database3(join4(this.home, ".claude/channels/telegram/messages.db"), { readonly: true });
+        db = new Database4(join5(this.home, ".claude/channels/telegram/messages.db"), { readonly: true });
         return createdGoogleSheetFiles(db, resourceId);
       } catch {
         return [];
@@ -2862,7 +3122,7 @@ class GoogleAdapter {
     this.createdDocumentFiles = (resourceId) => {
       let db;
       try {
-        db = new Database3(join4(this.home, ".claude/channels/telegram/messages.db"), { readonly: true });
+        db = new Database4(join5(this.home, ".claude/channels/telegram/messages.db"), { readonly: true });
         return createdGoogleDocFiles(db, resourceId);
       } catch {
         return [];
@@ -2938,7 +3198,7 @@ class GoogleAdapter {
         const spreadsheetId = request.arguments.spreadsheetId;
         const probe = await this.run({
           argv: [
-            join4(this.home, "bin", "gog"),
+            join5(this.home, "bin", "gog"),
             "--no-input",
             "--json",
             "--readonly",
@@ -2978,7 +3238,7 @@ class GoogleAdapter {
     const stdin = isSheetBatch ? JSON.stringify({ requests: request.arguments.requests, includeSpreadsheetInResponse: false }) : request.capability === "google.docs.write" && (request.operation === "replace" || request.operation === "append") && typeof request.arguments.content === "string" ? request.arguments.content : undefined;
     const command = {
       argv: [
-        join4(this.home, "bin", "gog"),
+        join5(this.home, "bin", "gog"),
         "--no-input",
         "--json",
         ...isSheetBatch ? ["--enable-commands-exact=api.call,api.sheets.spreadsheets.batchupdate"] : isSheetLayout ? ["--readonly", "--enable-commands-exact=api.call,api.sheets.spreadsheets.get"] : isSheetMetadata ? ["--readonly", "--enable-commands-exact=sheets.metadata"] : isSheetReadFormat ? ["--readonly", "--enable-commands-exact=sheets.read-format"] : [`--enable-commands=${service}`],
@@ -3037,7 +3297,7 @@ class GoogleAdapter {
             const share = await this.run({
               ...command,
               argv: [
-                join4(this.home, "bin", "gog"),
+                join5(this.home, "bin", "gog"),
                 "--no-input",
                 "--json",
                 "--enable-commands-exact=drive.share",
@@ -3262,7 +3522,7 @@ class GoogleAdapter {
       return "unknown";
     const result = await this.run({
       argv: [
-        join4(this.home, "bin", "gog"),
+        join5(this.home, "bin", "gog"),
         "--no-input",
         "--enable-commands=docs,docs.cat",
         "docs",
@@ -3296,7 +3556,7 @@ class GoogleAdapter {
     }
     let db;
     try {
-      db = new Database3(join4(this.home, ".claude/channels/telegram/messages.db"), { readonly: true });
+      db = new Database4(join5(this.home, ".claude/channels/telegram/messages.db"), { readonly: true });
       for (const file of createdGoogleSlideFiles(db, resource.id)) {
         if (!files.has(file.id))
           files.set(file.id, file);

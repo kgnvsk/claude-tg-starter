@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import pwd
 import re
 import sqlite3
 import sys
@@ -22,6 +23,11 @@ CARRIER_MAX_AGE_S = 15 * 60
 LOCK_WAIT_SECONDS = 5.0
 TEAM_PREVIEW_TTL_MS = 10 * 60_000
 PREVIEW_RETENTION_MS = 7 * 24 * 60 * 60_000
+# Owner, 08.10.2026: a manager agent changes who may talk to the agents below it and nothing below can undo it.
+MANAGERS_ABOVE_DIR = Path("/etc/novsky/managers")
+AGENT_ID = re.compile(r"[A-Za-z0-9_.:-]{1,128}")
+APPROVER = re.compile(r"[1-9]\d{0,19}")
+BRANCH_SUBJECT = re.compile(r"team:[1-9]\d{0,19}|group:-\d{1,20}\.admission")
 
 
 def acquire_access_lock(lock_fd: int) -> None:
@@ -130,7 +136,7 @@ def team_fingerprint(data: dict) -> str:
 
 
 def cleanup_access_previews(db: sqlite3.Connection, table: str, now: int) -> None:
-    if table not in {"access_team_previews", "access_settings_previews"}:
+    if table not in {"access_team_previews", "access_settings_previews", "access_branch_previews"}:
         raise ValueError("unknown access preview table")
     # A claimed approval may need reconciliation after a crash, so retain it.
     # Pending approvals are removed only after expiry; terminal receipts remain
@@ -176,7 +182,7 @@ def record_admin_decision(db: sqlite3.Connection, *, kind: str, token: str, owne
 def close_stale_preview(path: Path, table: str, kind: str, token: str, owner: str,
                         actor: str, subject: str, change_json: str) -> None:
     """A stale base hash failed before access.json was written; close its claim."""
-    if table not in {"access_team_previews", "access_settings_previews"}:
+    if table not in {"access_team_previews", "access_settings_previews", "access_branch_previews"}:
         raise ValueError("unknown access preview table")
     with closing(sqlite3.connect(path.with_name("messages.db"), timeout=5)) as db, db:
         updated = db.execute(f"UPDATE {table} SET state='stale' WHERE token=? AND state='claimed'",
@@ -192,9 +198,42 @@ def settings_subject(change: dict) -> str:
             else f"agent.{change['setting']}")
 
 
+def managers_above() -> list[str] | None:
+    """The agents above this one on its server, nearest first; Novsky writes them as root at each team sync.
+    None when the file cannot be read or validated: only a valid read proves a manager has left."""
+    try:
+        ids = json.loads((MANAGERS_ABOVE_DIR / f"{pwd.getpwuid(os.geteuid()).pw_name}.json")
+                         .read_text(encoding="utf-8"))["managersAbove"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    return ids if isinstance(ids, list) and all(isinstance(item, str) and AGENT_ID.fullmatch(item) for item in ids) else None
+
+
+def refuse_pinned(data: dict, subject: str | None, stale: bool = False, allowed: list[str] | None = None) -> None:
+    """An entry a manager above changed stays as it set it; only that manager or one above it (allowed)
+    changes it again. A pin of a manager no longer above lapses and leaves with the change being written."""
+    pins = data.get("branchPins")
+    manager = pins.get(subject) if isinstance(pins, dict) and subject else None
+    if manager is None:
+        return
+    above = managers_above()
+    if above is not None and manager not in above:
+        del pins[subject]
+    elif manager not in (allowed or []):
+        raise SystemExit(f"{'ACCESS_STALE: ' if stale else ''}BRANCH_PINNED:{manager}: "
+                         f"цей доступ встановив керівний агент {manager}; змінити його може лише він або агент над ним")
+
+
+def settings_pin_subject(change: object) -> str | None:
+    """Who may talk to the agent in a group: its admission mode and list share one pin."""
+    if isinstance(change, dict) and change.get("scope") == "group" and change.get("setting") in {"admissionMode", "allowFrom"}:
+        return f"group:{change.get('groupId')}.admission"
+    return None
+
+
 def confirmation_status(path: Path, table: str, owner: str, actor: str, token: str) -> str:
     """Read back a terminal receipt if the confirm process response was lost."""
-    if table not in {"access_team_previews", "access_settings_previews"}:
+    if table not in {"access_team_previews", "access_settings_previews", "access_branch_previews"}:
         raise ValueError("unknown confirmation table")
     db_path = path.with_name("messages.db")
     if db_path.is_symlink() or not db_path.is_file():
@@ -267,6 +306,7 @@ def team_preview(path: Path, owner: str, actor: str, message_id: str, target: st
     corroborate_requester(path, actor, message_id, target, private_only=True)
     snapshot = json.loads(locked_inspect(path, lambda data: json.dumps(data)))
     proposed = json.loads(json.dumps(snapshot))
+    refuse_pinned(proposed, f"team:{target}")
     summary = change_team_role(proposed, owner, actor, target, role)
     token = str(uuid.uuid4())
     expires_at = int(time.time() * 1000) + TEAM_PREVIEW_TTL_MS
@@ -322,6 +362,7 @@ def team_confirm(path: Path, owner: str, actor: str, token: str, decision: str) 
     def apply(data: dict) -> str:
         if team_fingerprint(data) != base_hash:
             raise SystemExit("ACCESS_STALE: Склад доступу змінився; створіть нове підтвердження")
+        refuse_pinned(data, f"team:{target}", stale=True)
         return change_team_role(data, owner, actor, target, role)
     try:
         result = locked_update(path, apply)
@@ -419,6 +460,7 @@ def settings_preview(path: Path, owner: str, actor: str, message_id: str, change
     corroborate_requester(path, actor, message_id, "settings", private_only=True)
     snapshot = json.loads(locked_inspect(path, lambda data: json.dumps(data)))
     proposed = json.loads(json.dumps(snapshot))
+    refuse_pinned(proposed, settings_pin_subject(change))
     summary = apply_settings(proposed, owner, actor, change)
     token = str(uuid.uuid4())
     expires_at = int(time.time() * 1000) + TEAM_PREVIEW_TTL_MS
@@ -476,6 +518,7 @@ def settings_confirm(path: Path, owner: str, actor: str, token: str, decision: s
     def apply(data: dict) -> str:
         if team_fingerprint(data) != row[3]:
             raise SystemExit("ACCESS_STALE: Settings changed; create a new confirmation")
+        refuse_pinned(data, settings_pin_subject(json.loads(row[2])), stale=True)
         return apply_settings(data, owner, actor, json.loads(row[2]))
     try:
         result = locked_update(path, apply)
@@ -491,6 +534,116 @@ def settings_confirm(path: Path, owner: str, actor: str, token: str, decision: s
                               subject=settings_subject(change),
                               decision="approve", event="applied", change_json=row[2])
     return result
+
+
+def branch_previews_table(db: sqlite3.Connection) -> None:
+    db.execute("""CREATE TABLE IF NOT EXISTS access_branch_previews (
+        token TEXT PRIMARY KEY, owner TEXT NOT NULL, manager TEXT NOT NULL, approvers_json TEXT NOT NULL,
+        subject TEXT NOT NULL, change_json TEXT NOT NULL, base_hash TEXT NOT NULL, post_hash TEXT NOT NULL,
+        expires_at INTEGER NOT NULL, state TEXT NOT NULL, actor TEXT)""")
+
+
+def apply_branch(data: dict, owner: str, manager: str, change: object, stale: bool = False) -> tuple[str, str]:
+    """A manager above changes who may talk to this agent, as this agent's owner would, and pins the entry."""
+    above = managers_above()
+    if above is None or manager not in above:
+        raise SystemExit(f"{'ACCESS_STALE: ' if stale else ''}BRANCH_NOT_ABOVE: керівний агент не стоїть над цим агентом")
+    require_business_administrator(data, owner, owner)
+    kind = change.get("kind") if isinstance(change, dict) else None
+    if kind == "team" and set(change) == {"kind", "target", "role"} and all(isinstance(change[key], str) for key in ("target", "role")):
+        subject, summary = f"team:{change['target']}", change_team_role(data, owner, owner, change["target"], change["role"])
+    elif kind == "settings" and set(change) == {"kind", "change"} and settings_pin_subject(change["change"]):
+        subject, summary = settings_pin_subject(change["change"]), apply_settings(data, owner, owner, change["change"])
+    elif kind == "release" and set(change) == {"kind", "subject"} and isinstance(change["subject"], str) \
+            and BRANCH_SUBJECT.fullmatch(change["subject"]):
+        subject = change["subject"]
+        summary = "Повернути агенту рішення: " + subject.replace("team:", "людина ").replace("group:", "хто пише в групі ").removesuffix(".admission")
+    else:
+        raise SystemExit("Invalid branch change")
+    refuse_pinned(data, subject, stale, above[: above.index(manager) + 1])
+    pins = data.setdefault("branchPins", {})
+    if not isinstance(pins, dict):
+        raise SystemExit("Поле branchPins має бути JSON-об’єктом")
+    if kind == "release":
+        pins.pop(subject, None)
+    else:
+        pins[subject] = manager
+    return subject, summary
+
+
+def branch_preview(path: Path, owner: str, manager: str, approvers_csv: str, change_json: str) -> str:
+    """The broker prepares a manager's change; one tap of a listed approver applies it (owner, 08.10.2026)."""
+    approvers = unique(approvers_csv.split(","))
+    if not AGENT_ID.fullmatch(manager) or not approvers or len(change_json) > 8192 \
+            or not all(APPROVER.fullmatch(value) for value in approvers):
+        raise SystemExit("Invalid branch request")
+    try:
+        change = json.loads(change_json)
+    except ValueError:
+        raise SystemExit("Invalid branch request") from None
+    snapshot = json.loads(locked_inspect(path, lambda data: json.dumps(data)))
+    proposed = json.loads(json.dumps(snapshot))
+    subject, summary = apply_branch(proposed, owner, manager, change)
+    token = str(uuid.uuid4())
+    expires_at = int(time.time() * 1000) + TEAM_PREVIEW_TTL_MS
+    with closing(sqlite3.connect(path.with_name("messages.db"), timeout=5)) as db, db:
+        branch_previews_table(db)
+        cleanup_access_previews(db, "access_branch_previews", expires_at - TEAM_PREVIEW_TTL_MS)
+        db.execute("INSERT INTO access_branch_previews VALUES (?,?,?,?,?,?,?,?,?,'pending',NULL)",
+                   (token, owner, manager, json.dumps(approvers), subject, json.dumps(change, ensure_ascii=False),
+                    team_fingerprint(snapshot), team_fingerprint(proposed), expires_at))
+        record_admin_decision(db, kind="branch", token=token, owner=owner, actor=f"agent:{manager}",
+                              subject=subject, event="previewed", change_json=json.dumps(
+                                  {"manager": manager, "approvers": approvers, "change": change}, ensure_ascii=False))
+    return json.dumps({"token": token, "expiresAt": expires_at, "summary": summary}, ensure_ascii=False)
+
+
+def branch_confirm(path: Path, owner: str, actor: str, token: str, decision: str) -> str:
+    if decision not in {"approve", "cancel"}:
+        raise SystemExit("Неправильне підтвердження")
+    now = int(time.time() * 1000)
+    with closing(sqlite3.connect(path.with_name("messages.db"), timeout=5)) as db, db:
+        db.execute("BEGIN IMMEDIATE")
+        access_admin_audit(db)
+        branch_previews_table(db)
+        row = db.execute("SELECT owner,manager,approvers_json,subject,change_json,base_hash,post_hash,expires_at,state,actor "
+                         "FROM access_branch_previews WHERE token=?", (token,)).fetchone()
+        if row is None or row[0] != owner:
+            raise SystemExit("ACCESS_STALE: Розпорядження відсутнє, прострочене або вже використане")
+        if actor not in json.loads(row[2]):
+            raise SystemExit("BRANCH_ACTOR: підтвердити може лише власник або суперадміністратор керівного агента")
+        if row[8] == "claimed" and decision == "approve" and row[9] == actor:
+            pass  # Reconcile after releasing the SQLite write lock.
+        elif row[8] != "pending" or row[7] <= now:
+            raise SystemExit("ACCESS_STALE: Розпорядження відсутнє, прострочене або вже використане")
+        else:
+            db.execute("UPDATE access_branch_previews SET state=?, actor=? WHERE token=? AND state='pending'",
+                       ("claimed" if decision == "approve" else "cancelled", actor, token))
+            record_admin_decision(db, kind="branch", token=token, owner=owner, actor=actor, subject=row[3],
+                                  decision=decision, event="claimed" if decision == "approve" else "cancelled")
+    _, manager, _, subject, change_json, base_hash, post_hash, _, state, _ = row
+    if state == "claimed":
+        current = json.loads(locked_inspect(path, lambda data: json.dumps(data)))
+        if team_fingerprint(current) != post_hash:
+            raise SystemExit("Стан розпорядження невизначений; перевірте поточний список доступу")
+    elif decision == "cancel":
+        return "Скасовано"
+    else:
+        def apply(data: dict) -> str:
+            if team_fingerprint(data) != base_hash:
+                raise SystemExit("ACCESS_STALE: Склад доступу змінився; потрібне нове розпорядження")
+            return apply_branch(data, owner, manager, json.loads(change_json), stale=True)[1]
+        try:
+            locked_update(path, apply)
+        except SystemExit as error:
+            if str(error).startswith("ACCESS_STALE:"):
+                close_stale_preview(path, "access_branch_previews", "branch", token, owner, actor, subject, change_json)
+            raise
+    with closing(sqlite3.connect(path.with_name("messages.db"), timeout=5)) as db, db:
+        db.execute("UPDATE access_branch_previews SET state='applied' WHERE token=? AND state='claimed'", (token,))
+        record_admin_decision(db, kind="branch", token=token, owner=owner, actor=actor, subject=subject,
+                              decision="approve", event="applied")
+    return "Розпорядження керівного агента застосовано"
 
 
 def preserve_admins(data: dict, owner: str, additional_csv: str) -> str:
@@ -582,6 +735,7 @@ def record_access_event(event: dict) -> None:
 def allow_chat(data: dict, requester: str, chat_id: str, name: str) -> str:
     if requester not in unique(data.get("admins", [])):
         raise SystemExit("Дію відхилено: користувач не є адміністратором")
+    refuse_pinned(data, f"team:{chat_id}")
     allowed = unique(data.get("allowFrom", []))
     if chat_id in allowed:
         return f"Чат {chat_id} уже в списку дозволених (усього: {len(allowed)})"
@@ -595,6 +749,7 @@ def revoke_chat(data: dict, requester: str, chat_id: str) -> str:
     admins = unique(data.get("admins", []))
     if requester not in admins:
         raise SystemExit("Дію відхилено: користувач не є адміністратором")
+    refuse_pinned(data, f"team:{chat_id}")
     # admins ⊆ allowFrom is an invariant preserve-admins checks on every update;
     # stripping an admin from the allowlist is a separate owner decision.
     if chat_id in admins:
@@ -708,6 +863,9 @@ def main(argv: list[str]) -> int:
             f"       {command_name} settings-preview <path> <owner> <actor> <message_id> <json>\n"
             f"       {command_name} settings-confirm <path> <owner> <actor> <token> <approve|cancel>\n"
             f"       {command_name} settings-status <path> <owner> <actor> <token>\n"
+            f"       {command_name} branch-preview <path> <owner> <manager_agent> <approvers_csv> <json>\n"
+            f"       {command_name} branch-confirm <path> <owner> <actor> <token> <approve|cancel>\n"
+            f"       {command_name} branch-status <path> <owner> <actor> <token>\n"
             f"       {command_name} allow <path> <requester> <message_id> <chat_id> [name]\n"
             f"       {command_name} revoke <path> <requester> <message_id> <chat_id>\n"
             f"       {command_name} {observation_command} <path> <requester> <on|off|status> <group>\n"
@@ -739,6 +897,12 @@ def main(argv: list[str]) -> int:
         message = settings_confirm(path, argv[3], argv[4], argv[5], argv[6])
     elif command == "settings-status" and len(argv) == 6:
         message = confirmation_status(path, "access_settings_previews", argv[3], argv[4], argv[5])
+    elif command == "branch-preview" and len(argv) == 7:
+        message = branch_preview(path, argv[3], argv[4], argv[5], argv[6])
+    elif command == "branch-confirm" and len(argv) == 7:
+        message = branch_confirm(path, argv[3], argv[4], argv[5], argv[6])
+    elif command == "branch-status" and len(argv) == 6:
+        message = confirmation_status(path, "access_branch_previews", argv[3], argv[4], argv[5])
     elif command == "preserve-admins" and len(argv) in (4, 5):
         message = locked_inspect(
             path, lambda data: preserve_admins(data, argv[3], argv[4] if len(argv) == 5 else "")

@@ -1,9 +1,9 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-10-08.75e83b57ae1b`
+- Реліз: `2026-10-09.2b411fa683e6`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `75e83b57ae1b2d31eafce588dadc69e1aacf4520`
-- Дата релізу: `2026-10-08`
+- Ревізія вихідного комплекту: `2b411fa683e677f3fc00575d75e37f67a8c92478`
+- Дата релізу: `2026-10-09`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
 
@@ -19,13 +19,12 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    google: keep the YouTube grammar out of this release (codex/integrations.py is readiness-pinned)
-    icloud-mail: refuse control characters in a folder id before connecting
-    google-workspace: keep the skill description under skill-doctor's 200 characters
-    icloud-mail: register the skill in the core pack, managed skills and Premium runtime
-    icloud-mail: the owner's iCloud Mail, read-only
-    telegram: a group of only the owner and the agent is the owner's own chat
-    google: YouTube (read) in the connection, and an unticked permission names its cure
+    fix(corporate): an unreadable hierarchy holds every branch pin
+    fix(corporate): bound the card's name lookups so the broker's helper call stays within its time
+    fix(corporate): the branch card names people as Telegram knows them, not as the order words them
+    feat(corporate): a manager agent above prepares access changes, confirmed by one tap in this bot
+    feat(access): pin who may talk to an agent when a manager agent above changes it
+    feat(corporate): pin access settings changed by a manager agent above
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не
