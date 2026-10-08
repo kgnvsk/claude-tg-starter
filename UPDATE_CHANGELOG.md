@@ -1,8 +1,8 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-10-08.0969047fe7ab`
+- Реліз: `2026-10-08.d775015fb74e`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `0969047fe7ab94841902cb888133a9e70cfa4438`
+- Ревізія вихідного комплекту: `d775015fb74ec0f3ee566393592ae53f7c1d0c57`
 - Дата релізу: `2026-10-08`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
@@ -19,8 +19,8 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    fix(update): let an unstamped legacy kit through the role guide and the runtime seed
-    fix(persona): trust old and unstamped kits by their product's published bytes
+    fix(team-access): the owner makes someone an administrator or super-administrator through the agent
+    fix(corporate): an employee's Google or Meta connect asks for its account and shows the real reason
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не

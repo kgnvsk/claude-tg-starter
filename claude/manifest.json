@@ -7,7 +7,7 @@
     "local-foundation-v1"
   ],
   "source": "codex/starter/product.json",
-  "sourceRevision": "0969047fe7ab94841902cb888133a9e70cfa4438",
+  "sourceRevision": "d775015fb74ec0f3ee566393592ae53f7c1d0c57",
   "sourceDirty": false,
   "features": [
     "browser"
@@ -125,7 +125,7 @@
     "modules/telegram-corporate/chat-policy.ts": "2993c4d5f1cdcffe2063d5b1de0267004278a261b21f1b2cd36db7af2ed035d3",
     "modules/telegram-corporate/codex-profile.ts": "a2b9e91604757878b781a7f0d751c178244a2441b898e82ae6b3cf9c11b40b0e",
     "modules/telegram-corporate/codex-worker.ts": "658255ee754fdca99f1a8f8bc827c6b156dafbf56c08da641717483d119804a9",
-    "modules/telegram-corporate/delegated-integrations.ts": "db0f7dd8929d1e563c82ea80e37b1483a31d1fe8615962ee91da00b541a1abf4",
+    "modules/telegram-corporate/delegated-integrations.ts": "cc0da44a1011503436c0632bc5c589c045bd7db64bc7db7f28739f08f01ee221",
     "modules/telegram-corporate/group-action.ts": "21501bd7028d59fa1977a1e0d5fe7450ba9308a1dd6fecafc38b3edfed2c16b1",
     "modules/telegram-corporate/index.ts": "f229f173ec2cc1f67b343e8dfd767b5e670687e36d456487565d104199316df4",
     "modules/telegram-corporate/integration-readiness.ts": "61b6fbe49e7f5853e2d418ee30a6ba8c3dfdd4a66ee7a2164848ce1b87fd34f9",
@@ -134,7 +134,7 @@
     "modules/telegram-corporate/media.ts": "4f9ed8585eb51a78043d1f81c96f6b6dc56ac173b9ccd4ba5d39121c1739cf48",
     "modules/telegram-corporate/migration-plan.ts": "0be8e6e40dcca8bc418a3a3462c0136808139d5bc2c11838c4f7665a0d7d4bf8",
     "modules/telegram-corporate/native-file-reply.ts": "bbaad3bc89f3ee58d56ba9950ca483628b39b1d339bdb80f75ae9d682417e56a",
-    "modules/telegram-corporate/native-mcp.ts": "c83d5a0a67c445fa305cb74db614407449c7a9c1098b3dc36717be52c374aee6",
+    "modules/telegram-corporate/native-mcp.ts": "32c34fc9e8311b7598d90f32f07795a9948abdd4e70cf297a43a74c477bee5ca",
     "modules/telegram-corporate/native-profile.ts": "960041ce94c3af2e05b8360c358debedc1c627ad549d1b6bc94e3c013079227a",
     "modules/telegram-corporate/native-readiness.ts": "ecff867750a70ca61f242ccddd4d85eefc55bd5383fbeb1e4cde17198ed419d7",
     "modules/telegram-corporate/native-reminder.ts": "4b1ef0da3bf372877a72c223d99a217c9b62aeef15cfb79ce449b469d1d67d9d",
