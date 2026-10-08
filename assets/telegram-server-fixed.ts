@@ -8725,11 +8725,17 @@ async function handleInbound(
   // A pending connection owns only its credential/callback input, never the
   // person's ordinary dialogue. Consume it before any journal or model sees it.
   let sensitiveIntegrationInput = false
-  const ownerShared = String(from.id) === OWNER_CHAT_ID && !ctx.message?.sender_chat
+  const ownerInGroup = String(from.id) === OWNER_CHAT_ID && !ctx.message?.sender_chat
     && (ctx.chat?.type === 'group' || ctx.chat?.type === 'supergroup')
+  const ownerAddressed = ownerInGroup
     && (isMentioned(ctx, access.mentionPatterns)
       || matchesAutoAnswer(ctx, access.groups[chat_id]?.autoAnswerPatterns)
       || (result.action === 'deliver' && result.continues != null))
+  // Owner 08.10.2026: a group of only the owner and this bot is his own chat, so what the bot answers there is
+  // answered with his full access, mentioned or not. Telegram counts the bot too; a failed count keeps the group rules.
+  const ownerAlone = ownerInGroup && !ownerAddressed && result.action === 'deliver'
+    && await bot.api.getChatMemberCount(chat_id).then(count => count === 2, () => false)
+  const ownerShared = ownerAddressed || ownerAlone
   if (ownerShared) {
     // Full tools do not make a public chat a credential intake. Never retain
     // a pasted connection secret, even when the company module is unavailable.
@@ -8951,7 +8957,7 @@ async function handleInbound(
   const continues = result.action === 'deliver' ? result.continues : undefined
   // A file that continues its author's own mention asked the bot as much as the mention did.
   const unaddressed = ctx.chat?.type !== 'private' && !isMentioned(ctx, access.mentionPatterns)
-    && !matchesAutoAnswer(ctx, access.groups[chat_id]?.autoAnswerPatterns) && continues == null
+    && !matchesAutoAnswer(ctx, access.groups[chat_id]?.autoAnswerPatterns) && continues == null && !ownerAlone
 
   // Ack reaction — says "received"; "in work" is the typing indicator, which
   // follows the turn ledger (see syncTypingWithTurnLedger). Fire-and-forget.
@@ -8969,7 +8975,7 @@ async function handleInbound(
   await routeInbound(ctx, text, downloadImage, attachment, deliveryId => takingIn(sender, async () => {
     const imagePath = downloadImage ? await downloadImage() : undefined
     let inboundText = text
-    if (ctx.chat?.type === 'private' && chat_id === OWNER_CHAT_ID && String(from.id) === OWNER_CHAT_ID && (attachment?.kind === 'voice' || attachment?.kind === 'audio')) {
+    if ((ctx.chat?.type === 'private' ? chat_id === OWNER_CHAT_ID : ownerAlone) && String(from.id) === OWNER_CHAT_ID && (attachment?.kind === 'voice' || attachment?.kind === 'audio')) {
       const saved = MSG_DB.query("SELECT text FROM messages WHERE chat_id=? AND direction='in' AND message_id=?").get(chat_id, msgId ?? null) as {text: string} | null
       const transcript = saved?.text && saved.text !== text ? saved.text : await transcribeObservedAttachment(ctx, chat_id, msgId, attachment)
       // A forwarded recording keeps the line naming its author; a transcript read

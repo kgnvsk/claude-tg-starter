@@ -1,8 +1,8 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-10-08.d775015fb74e`
+- Реліз: `2026-10-08.75e83b57ae1b`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `d775015fb74ec0f3ee566393592ae53f7c1d0c57`
+- Ревізія вихідного комплекту: `75e83b57ae1b2d31eafce588dadc69e1aacf4520`
 - Дата релізу: `2026-10-08`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
@@ -19,8 +19,13 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    fix(team-access): the owner makes someone an administrator or super-administrator through the agent
-    fix(corporate): an employee's Google or Meta connect asks for its account and shows the real reason
+    google: keep the YouTube grammar out of this release (codex/integrations.py is readiness-pinned)
+    icloud-mail: refuse control characters in a folder id before connecting
+    google-workspace: keep the skill description under skill-doctor's 200 characters
+    icloud-mail: register the skill in the core pack, managed skills and Premium runtime
+    icloud-mail: the owner's iCloud Mail, read-only
+    telegram: a group of only the owner and the agent is the owner's own chat
+    google: YouTube (read) in the connection, and an unticked permission names its cure
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не

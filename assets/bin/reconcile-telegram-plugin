@@ -28,10 +28,12 @@ UPSTREAM_SERVER_SHA256 = (
 )
 UPSTREAM_PACKAGE_START = "bun install --no-summary 1>&2 && bun server.ts"
 GOLDEN_SERVER_SHA256 = (
-    "169208745de53e95f82af7188032d94296337c7fe2d3b71a43d7d472398a0085"
+    "6bd2ee9dce886f7c4657fcc3ea8e863dcb2ee1616a4af93933c290d731bcd3a4"
 )
 PREVIOUS_GOLDEN_SERVER_SHA256S = frozenset(
     {
+        # The golden before the owner alone with the agent in a group counted as his own chat.
+        "169208745de53e95f82af7188032d94296337c7fe2d3b71a43d7d472398a0085",
         # The golden before owner-confirmed lasting policy in the current chat or topic.
         "09167595ba014d1d9f965b2cc0711d065e5e462d03e695135749e8dcba78bace",
         # The golden before recovering a request whose exact background worker was stopped.

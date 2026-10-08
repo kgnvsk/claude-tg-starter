@@ -144,6 +144,7 @@
     "bin/heic-to-jpg",
     "bin/html-to-pdf",
     "bin/hubspot-crm",
+    "bin/icloud-mail",
     "bin/inbox-secretary",
     "bin/install-plugins",
     "bin/kit-module",

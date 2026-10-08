@@ -7,7 +7,7 @@
     "local-foundation-v1"
   ],
   "source": "codex/starter/product.json",
-  "sourceRevision": "d775015fb74ec0f3ee566393592ae53f7c1d0c57",
+  "sourceRevision": "75e83b57ae1b2d31eafce588dadc69e1aacf4520",
   "sourceDirty": false,
   "features": [
     "browser"
@@ -125,7 +125,7 @@
     "modules/telegram-corporate/chat-policy.ts": "2993c4d5f1cdcffe2063d5b1de0267004278a261b21f1b2cd36db7af2ed035d3",
     "modules/telegram-corporate/codex-profile.ts": "a2b9e91604757878b781a7f0d751c178244a2441b898e82ae6b3cf9c11b40b0e",
     "modules/telegram-corporate/codex-worker.ts": "658255ee754fdca99f1a8f8bc827c6b156dafbf56c08da641717483d119804a9",
-    "modules/telegram-corporate/delegated-integrations.ts": "cc0da44a1011503436c0632bc5c589c045bd7db64bc7db7f28739f08f01ee221",
+    "modules/telegram-corporate/delegated-integrations.ts": "9cd241d382fe53546dd58479a81fa350c8d5bbdddb9a7b086d2b4c9b35e8ee48",
     "modules/telegram-corporate/group-action.ts": "21501bd7028d59fa1977a1e0d5fe7450ba9308a1dd6fecafc38b3edfed2c16b1",
     "modules/telegram-corporate/index.ts": "f229f173ec2cc1f67b343e8dfd767b5e670687e36d456487565d104199316df4",
     "modules/telegram-corporate/integration-readiness.ts": "61b6fbe49e7f5853e2d418ee30a6ba8c3dfdd4a66ee7a2164848ce1b87fd34f9",
