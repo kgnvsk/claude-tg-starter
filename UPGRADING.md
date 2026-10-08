@@ -252,6 +252,36 @@ managed state, прочитай захоплені дані, перевір ло
 не точний rollback. Збій перевірки snapshot — жорстка зупинка: не створюй
 блокування перезапуску, не зупиняй службу й не торкайся живого комплекту.
 
+Для першого оновлення старого агента без збережених хешів персони підготуй
+**окреме, доступне для читання агенту джерело старих публічних шаблонів**.
+Root-only snapshot для відкату залишається приватним; не передавай його в
+`NOVSKY_PREVIOUS_KIT_DIR`. З поточного перевіреного комплекту скопіюй лише
+`RELEASE.json` (архіви, зібрані до 08.08.2026, його не мають — тоді без
+нього), `assets/templates/CLAUDE.md.template` і `assets/product/ROLE.md` у
+новий root-owned каталог поза живим kit. Каталоги мають mode `755`, файли —
+`644`; жодних `.env`, токенів чи приватних даних у цій копії немає. Вкажи його
+абсолютний прямий шлях у `TRUSTED_OLD_PERSONA_SOURCE` і збережи до завершення
+оновлення. Новий комплект звірить кожен шаблон з опублікованими байтами цього
+продукту; змінений шаблон або відредагована жива персона зупиняють оновлення
+для ручного розбору. Виконай від root **до зупинки служби**:
+
+```bash
+TRUSTED_OLD_PERSONA_SOURCE="$(mktemp -d /opt/novsky-prior-persona.XXXXXX)"
+chmod 755 "$TRUSTED_OLD_PERSONA_SOURCE"
+install -d -m 755 "$TRUSTED_OLD_PERSONA_SOURCE/assets/templates" \
+  "$TRUSTED_OLD_PERSONA_SOURCE/assets/product"
+if [ -e /opt/claude-tg-starter/RELEASE.json ]; then
+  install -m 644 /opt/claude-tg-starter/RELEASE.json \
+    "$TRUSTED_OLD_PERSONA_SOURCE/RELEASE.json"
+fi
+install -m 644 /opt/claude-tg-starter/assets/templates/CLAUDE.md.template \
+  "$TRUSTED_OLD_PERSONA_SOURCE/assets/templates/CLAUDE.md.template"
+install -m 644 /opt/claude-tg-starter/assets/product/ROLE.md \
+  "$TRUSTED_OLD_PERSONA_SOURCE/assets/product/ROLE.md"
+```
+
+Після успішного оновлення прибери тільки цю тимчасову копію публічних шаблонів.
+
 ### 4. Безпечно підготуй нову версію, а потім увійди в maintenance
 
 Розпакуй повний архів поза живим шляхом і перевір staged tree до використання.
@@ -260,7 +290,7 @@ managed state, прочитай захоплені дані, перевір ло
 перевірку.
 
 Novsky Starter безкоштовний: ключ покупки не потрібен. Команда
-`bash "$STAGED_KIT/update.sh" --license-preflight` завершується без звернення
+`NOVSKY_PREVIOUS_KIT_DIR="$TRUSTED_OLD_PERSONA_SOURCE" bash "$STAGED_KIT/update.sh" --license-preflight` завершується без звернення
 до сервісу активації й без зміни працюючого агента.
 
 
@@ -357,7 +387,8 @@ preimage — жорстка зупинка. Не утримуй lifecycle lock �
 комплекту у transaction-owned maintenance mode:
 
 ```bash
-CLAUDE_UPDATE_MAINTENANCE=1 bash update.sh
+NOVSKY_PREVIOUS_KIT_DIR="$TRUSTED_OLD_PERSONA_SOURCE" \
+  CLAUDE_UPDATE_MAINTENANCE=1 bash update.sh
 ```
 
 

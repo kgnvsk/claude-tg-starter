@@ -426,7 +426,13 @@ def selected_bin_paths(policy_path: Path) -> list[str]:
     return paths
 
 
-def source_identity(kit: Path) -> tuple[str, str]:
+# A kit built before 08.08.2026 carries neither RELEASE.json nor .git. Only the seed of a
+# trusted old kit accepts it, recording this revision as "unstamped legacy source"; a
+# candidate kit always carries its stamp.
+UNSTAMPED_REVISION = "0" * 40
+
+
+def source_identity(kit: Path, *, allow_unstamped: bool = False) -> tuple[str, str]:
     try:
         runtime = json.loads(
             (kit / "assets/product/runtime.json").read_text(encoding="utf-8")
@@ -453,6 +459,8 @@ def source_identity(kit: Path) -> tuple[str, str]:
         )
         if result.returncode == 0:
             revision = result.stdout.strip()
+    elif allow_unstamped and not os.path.lexists(release_path):
+        revision = UNSTAMPED_REVISION
     if not isinstance(revision, str) or not REVISION.fullmatch(revision):
         raise UpdateError("invalid or missing source revision")
     return product_id, revision
@@ -752,7 +760,7 @@ def seed_baseline(
     validate_baseline_location(home, baseline_path)
     if baseline_path.exists() or baseline_path.is_symlink():
         raise UpdateError("managed runtime baseline already exists")
-    product_id, revision = source_identity(kit)
+    product_id, revision = source_identity(kit, allow_unstamped=True)
     files = {}
     values = render_context(home)
     for relative in selected_bin_paths(policy_path):

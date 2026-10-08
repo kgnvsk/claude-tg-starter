@@ -1,8 +1,8 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-10-08.1d016e42b046`
+- Реліз: `2026-10-08.0969047fe7ab`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `1d016e42b046d1c4bd1c1bbf5c8c406eff89107d`
+- Ревізія вихідного комплекту: `0969047fe7ab94841902cb888133a9e70cfa4438`
 - Дата релізу: `2026-10-08`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
@@ -19,7 +19,8 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    fix(persona): pin the role kits of the store releases 08.09–21.09
+    fix(update): let an unstamped legacy kit through the role guide and the runtime seed
+    fix(persona): trust old and unstamped kits by their product's published bytes
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не

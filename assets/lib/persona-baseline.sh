@@ -49,15 +49,20 @@ try:
     trusted(old_source)
     prior_root = Path(previous_name)
     prior_release = prior_root / "RELEASE.json"
-    trusted(prior_release)
-    release = json.loads(prior_release.read_text(encoding="utf-8"))
     runtime = json.loads(
         (candidate / "assets/product/runtime.json").read_text(encoding="utf-8")
     )
-    if (release.get("schema") != "claude-kit-release/v1"
-            or not re.fullmatch(r"[0-9a-f]{40}", release.get("sourceKitRevision", ""))
-            or release.get("productId") != runtime.get("productId")):
-        raise ValueError("previous kit release identity does not match")
+    if os.path.lexists(prior_release):
+        trusted(prior_release)
+        release = json.loads(prior_release.read_text(encoding="utf-8"))
+        if (release.get("schema") != "claude-kit-release/v1"
+                or not re.fullmatch(r"[0-9a-f]{40}", release.get("sourceKitRevision", ""))
+                or release.get("productId") != runtime.get("productId")):
+            raise ValueError("previous kit release identity does not match")
+    else:
+        # Archives built before 08.08.2026 carry no RELEASE.json: the old kit is
+        # the candidate's product, and only its historical bytes are trusted.
+        release = {"productId": runtime.get("productId")}
     # RELEASE.json identifies the old product, but a locally edited old kit can
     # retain that identity. Accept only bytes pinned from published artifacts.
     catalog_path = candidate / "assets/product/legacy-persona-hashes.json"
@@ -67,7 +72,7 @@ try:
     if catalog.get("schema") != "novsky-legacy-persona-hashes/v1":
         raise ValueError("persona provenance catalog is invalid")
     digest = hashlib.sha256(old_source.read_bytes()).hexdigest()
-    if release["sourceKitRevision"] in catalog["revisions"]:
+    if release.get("sourceKitRevision") in catalog["revisions"]:
         expected = (
             catalog["revisions"][release["sourceKitRevision"]]
             [release["productId"]][relative.as_posix()]
@@ -77,18 +82,21 @@ try:
         if digest != expected:
             raise ValueError("previous persona source differs from its published artifact")
     else:
-        # A premium kit built from a revision no pin names (archives were also
-        # built by hand for buyers outside the store) is trusted only with the
-        # exact bytes of a version this file has had in the kit's history:
-        # premium ships these sources as they are (Святослав, 07.10.2026).
-        history = catalog["premiumHistory"][relative.as_posix()]
-        if (release["productId"] != "premium" or not isinstance(history, list)
+        # A kit built from a revision no pin names, or before kits were stamped,
+        # is trusted only with the exact bytes of a published version of this
+        # product's file: premium ships its sources as they are (Святослав,
+        # 07.10.2026); a role kit's come from a build at each version (store
+        # buyers of July and August, 08.10.2026).
+        product = release["productId"]
+        history = (catalog["premiumHistory"] if product == "premium"
+                   else catalog["roleHistory"].get(product, {})).get(relative.as_posix())
+        if (not isinstance(history, list)
                 or not all(isinstance(item, str) and re.fullmatch(r"[0-9a-f]{64}", item)
                            for item in history)
                 or digest not in history):
             raise ValueError("previous persona source is not a published kit version")
     current_release = candidate / "RELEASE.json"
-    if current_release.is_file():
+    if "sourceKitRevision" in release and current_release.is_file():
         current = json.loads(current_release.read_text(encoding="utf-8"))
         if release["sourceKitRevision"] == current.get("sourceKitRevision"):
             raise ValueError("previous kit has the candidate revision")
