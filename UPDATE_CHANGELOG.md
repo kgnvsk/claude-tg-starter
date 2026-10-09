@@ -1,8 +1,8 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-10-09.2b411fa683e6`
+- Реліз: `2026-10-09.a3ac0b7d9429`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `2b411fa683e677f3fc00575d75e37f67a8c92478`
+- Ревізія вихідного комплекту: `a3ac0b7d942935d25a4322e53c3493ac2ebd8620`
 - Дата релізу: `2026-10-09`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
@@ -19,12 +19,16 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    fix(corporate): an unreadable hierarchy holds every branch pin
-    fix(corporate): bound the card's name lookups so the broker's helper call stays within its time
-    fix(corporate): the branch card names people as Telegram knows them, not as the order words them
-    feat(corporate): a manager agent above prepares access changes, confirmed by one tap in this bot
-    feat(access): pin who may talk to an agent when a manager agent above changes it
-    feat(corporate): pin access settings changed by a manager agent above
+    scheduler: an unreadable look is kept, and an interrupted adoption is rebuilt once
+    scheduler: what a look found is never lost or run without when keeping it fails
+    scheduler: a release interrupted half-way never re-offers, and an unbound run never starts
+    scheduler: a committed result releases exactly the CHECK output it was given, also after a crash
+    scheduler: what a CHECK printed is kept until a run with it finishes
+    telegram: owner rules under Markdown's list indent stay in view; any long text keeps its first lines
+    scheduler: a watch task looks first with a CHECK command and skips the model run when nothing is new
+    telegram: the owner-rules projection keeps numbered and plain rules
+    meet-listen: «record the meeting» is the notetaker's job, and without a Recall key the agent leads the owner to connect it
+    telegram: the owner's rules are in front of the agent on every turn and in every scheduled task
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не

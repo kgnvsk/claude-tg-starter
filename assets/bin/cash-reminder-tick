@@ -37,6 +37,9 @@ PROFILE_FILE="${PROFILE_FILE:-$HOME/.agent-profile.env}"
 LOCK_FILE="${LOCK_FILE:-${REM_DIR}.worker.lock}"
 RUN_DELIVERY_DIR="$REM_DIR/.run-delivery"
 QUIET_RUN_DIR="$REM_DIR/.quiet-runs"
+# What a task's CHECK printed, kept per task until a run with it finishes (CHECK= below).
+CHECK_PENDING_DIR="$REM_DIR/.check-pending"
+CHECK_INLINE_BYTES=100000
 
 mkdir -p "$REM_DIR" "$(dirname "$LOG")"
 
@@ -521,6 +524,12 @@ finally:
 PY
 }
 
+# A new observation is kept in this order — offer count, then its id, then its text — so its text never appears
+# without its id (release_check, run_agent_task). Returns non-zero, keeping the source file, when any step fails.
+keep_observation() {
+  atomic_text "$1/offers" 0 && atomic_text "$1/observed.id" "$(date +%s)-$$-$RANDOM$RANDOM" && mv -f "$2" "$1/observed.txt"
+}
+
 run_agent_task() {
   local file="$1" prompt="$2" out rc destination="чат ${chat}"
   local workdir="${AGENT_TASK_DIR:-$HOME/.atarax/agent-task}"
@@ -542,6 +551,101 @@ run_agent_task() {
   # Without it Пара's topic reports fell into the group's General (22.09.2026).
   local quiet=0
   [ "${quiet_run:-}" = "1" ] && quiet=1
+  # CHECK=<command> (with RUN=1): a look that costs no model run comes first (Арти, 09.10.2026: a group read every
+  # two minutes spent a Pro plan on «nothing new»). Nothing printed, NO_NEW or a silence word: no run this time.
+  # Anything else reaches the task as what the look found. A look that fails or hangs runs the task as before.
+  # check_cmd and check_key are read with the other headers, while the task file is still in the queue.
+  # A look often moves its own «seen» mark, so what it printed goes straight into a file kept for the task until a
+  # run with it finishes (release_check). A killed or limited run, its retry and the next slot get the same text
+  # again, whole, instead of a new look that would show nothing new (Codex #227 R3, 09.10.2026).
+  local pending="" observed="" bare part size offers id held=""
+  case ${check_key:-} in ''|.*|*/*) ;; *)
+    [ -n "${check_cmd:-}" ] && mkdir -p -m 700 "$CHECK_PENDING_DIR/$check_key" &&
+      pending="$CHECK_PENDING_DIR/$check_key" observed="$CHECK_PENDING_DIR/$check_key/observed.txt" ;;
+  esac
+  if [ -n "$pending" ] && [ -s "$observed" ] && [ ! -s "$pending/observed.id" ]; then
+    # An id is always written before its text appears, so text without its id is what an interrupted release left
+    # behind: that observation was handed on, and it is dropped instead of being offered again (Codex #227 R5-P2-1).
+    rm -rf -- "$pending" && mkdir -p -m 700 "$pending" || pending=""
+  fi
+  if [ -n "$pending" ] && [ ! -s "$observed" ]; then
+    # A tick killed after its look printed, or a look that could not be kept, left the look's file behind. Each such file
+    # first moves into staged/ (one rename), the copy to keep is rebuilt from staged/ alone every time (R7-P2-1), and
+    # staged/ goes only once that copy is kept (R6-P1-1); the release of a kept observation removes staged/ with it, so
+    # nothing handled is adopted twice. Until then every file stays and nothing runs.
+    for part in "$pending"/look.*; do
+      [ -f "$part" ] || continue
+      mkdir -p -m 700 "$pending/staged" && mv -f "$part" "$pending/staged/${part##*/}-$$-$RANDOM" || { held=1; break; }
+    done
+    [ ! -e "$observed.new" ] || rm -f "$observed.new" || held=1
+    if [ -z "$held" ] && [ -d "$pending/staged" ]; then
+      for part in "$pending"/staged/look.*; do
+        [ -f "$part" ] || continue
+        bare=$(tr -d '[:space:]*`."' < "$part") || { held=1; break; }
+        if [ -n "$bare" ] && ! printf '%s\n' "$bare" | grep -qxE "NO_NEW|$SILENCE_WORDS"; then
+          cat "$part" >> "$observed.new" || { held=1; break; }
+        fi
+      done
+      if [ -z "$held" ] && { [ ! -s "$observed.new" ] || keep_observation "$pending" "$observed.new"; }; then
+        rm -rf -- "$pending/staged"
+      else
+        held=1
+      fi
+      [ ! -e "$observed.new" ] || rm -f "$observed.new"
+    fi
+  fi
+  if [ -n "$pending" ] && [ -z "$held" ] && [ ! -s "$observed" ]; then
+    part="$pending/look.$$"
+    if (cd "$workdir" && ATARAX_SUPPRESS_TELEGRAM=1 ${limit:+timeout 60} bash -c "$check_cmd" 2>/dev/null) > "$part"; then
+      # A look whose output cannot be read is kept as its file, never taken for silence (R7-P1-1).
+      bare=$(tr -d '[:space:]*`."' < "$part") || held=1
+      if [ -z "$held" ] && { [ -z "$bare" ] || printf '%s\n' "$bare" | grep -qxE "NO_NEW|$SILENCE_WORDS"; }; then
+        rm -f "$part"
+        log_message "check $(basename "$file"): nothing new, no run"
+        [ "$quiet" -eq 1 ] && return 3
+        printf 'NOTHING'
+        return 0
+      fi
+      # What a look found and could not keep stays as its file for the next try; the task never runs without it (R6-P2-1).
+      [ -n "$held" ] || keep_observation "$pending" "$part" || held=1
+    else
+      [ ! -e "$part" ] || rm -f "$part"
+      pending=""
+    fi
+  fi
+  if [ -n "$held" ]; then
+    log_message "check $(basename "$file"): what the look found could not be kept; no run now, kept for the next try"
+    printf '⚠️ Автоматичне завдання «%s» не виконано: %s.' "$task_id" "не вдалося зберегти, що знайшла перевірка; повторю наступного разу"
+    return 4
+  fi
+  if [ -n "$pending" ]; then
+    # The occurrence records which observation it was given before the model starts, so a result committed under it
+    # releases exactly that one, even when the tick dies before releasing it (Codex #227 R4-P2-1). Without that record
+    # (an id not read, or not written) the model does not start: the observation stays and the owner hears why (R5-P2-2).
+    id=$(cat "$pending/observed.id" 2>/dev/null) || id=""
+    if [ -z "$id" ] || [ -z "${check_journal:-}" ] || ! atomic_text "$check_journal/check-id" "$id" ||
+       [ "$(cat "$check_journal/check-id" 2>/dev/null)" != "$id" ]; then
+      log_message "check $(basename "$file"): observation not bound to its occurrence; kept, no run now"
+      printf '⚠️ Автоматичне завдання «%s» не виконано: %s.' "$task_id" "не вдалося зберегти, яку знахідку перевірки отримав запуск; повторю наступного разу"
+      return 4
+    fi
+    offers=$(cat "$pending/offers" 2>/dev/null)
+    is_uint "$offers" && offers=$(decimal_value "$offers") || offers=0
+    atomic_text "$pending/offers" $((offers + 1)) || log_message "check $(basename "$file"): offer count not saved"
+    size=$(wc -c < "$observed")
+    size=$((size))
+    prompt="${prompt}
+
+Перевірку \`${check_cmd}\` уже виконано перед цим запуском; вдруге її не запускай — повторно вона нового не покаже."
+    [ "$offers" -eq 0 ] || prompt="${prompt}
+Цей самий вивід уже передавався запуску, який не завершився, тож частину могло бути зроблено. Спершу перевір, що вже зроблено (відповіді, надіслані файли), і не повторюй зроблене."
+    prompt="${prompt}
+Ось що вона показала:
+$(head -c "$CHECK_INLINE_BYTES" "$observed")"
+    [ "$size" -le "$CHECK_INLINE_BYTES" ] || prompt="${prompt}
+
+[Тут лише початок. Увесь вивід перевірки (${size} байт) збережено у файлі ${observed} — прочитай його повністю: решта теж нова.]"
+  fi
   if [ "$quiet" -eq 1 ]; then
     prompt="Це автоматичне завдання планувальника. Результат доставляй сам через tg-send і tg-send-file туди, куди сказано в завданні, мовою завдання. Текст, який ти повернеш, у чат не піде.
 
@@ -1134,6 +1238,7 @@ deliver_saved_run() {
     log_message "UNCERTAIN scheduled run $(basename "$journal"): missing saved source or result"
     return 1
   }
+  release_check "$journal"
 
   f="$source"
   chat=$(header_value "$source" CHAT)
@@ -1214,7 +1319,7 @@ alert_broken_lock() {
 # Runs a scheduled occurrence under its record and hands the outcome to
 # delivery. LATE, for a retried run, is the line its result opens with.
 run_occurrence() {
-  local journal="$1" file="$2" body="$3" attempt="$4" late="${5:-}" result_temp rc
+  local journal="$1" file="$2" body="$3" attempt="$4" late="${5:-}" result_temp rc check_journal="$1"
   result_temp=$(mktemp "$journal/result.tmp.XXXXXX") || {
     log_message "UNCERTAIN scheduled run $(basename "$journal"): cannot save result"
     return
@@ -1264,11 +1369,23 @@ run_occurrence() {
   deliver_saved_run "$journal"
 }
 
+# A committed result (state ready or finished) has handed on what its CHECK printed: the observation this occurrence
+# was given is released and the next look starts fresh. A newer observation of the same task is never touched. Called
+# wherever a committed result is found, so a tick that died between the commit and this still releases it.
+release_check() {
+  local name id
+  name=$(cat "$1/name" 2>/dev/null) || return 0
+  case $name in ''|.*|*/*) return 0 ;; esac
+  id=$(cat "$1/check-id" 2>/dev/null) || return 0
+  [ -n "$id" ] && [ "$(cat "$CHECK_PENDING_DIR/$name/observed.id" 2>/dev/null)" = "$id" ] || return 0
+  rm -rf -- "${CHECK_PENDING_DIR:?}/$name"
+}
+
 # A run that died runs once more when its task is retry-safe. The recipient's
 # copy opens with one line saying it is late; no notice goes out before it.
 retry_dead_run() {
   local journal="$1" source="$1/source.rem" late
-  local f chat thread_id epoch task_id run_mode=1 quiet_run="" quiet_run_key=""
+  local f chat thread_id epoch task_id run_mode=1 quiet_run="" quiet_run_key="" check_cmd="" check_key=""
   retry_allowed "$journal" || { rm -f "$journal/retry-pending"; return 0; }
   if in_quiet_hours "$source"; then
     : > "$journal/retry-pending"
@@ -1276,6 +1393,8 @@ retry_dead_run() {
     return 0
   fi
   f="$source"
+  check_cmd=$(header_value "$source" CHECK)
+  check_key=$(cat "$journal/name" 2>/dev/null)
   chat=$(header_value "$source" CHAT)
   thread_id=$(header_value "$source" THREAD_ID)
   epoch=$(header_value "$source" EPOCH)
@@ -1332,6 +1451,7 @@ if [ -d "$QUIET_RUN_DIR" ] && [ ! -L "$QUIET_RUN_DIR" ]; then
       atomic_text "$journal/state" uncertain || continue
       log_message "UNCERTAIN quiet scheduled run $(basename "$journal"): agent stopped before completing; never rerun automatically"
     fi
+    [ "$(cat "$journal/state" 2>/dev/null)" = finished ] && release_check "$journal"
     alert_owner_issue "$journal"
   done
 fi
@@ -1354,6 +1474,8 @@ for f in "$REM_DIR"/*.rem; do
   parse=$(header_value "$f" PARSE)
   run_mode=$(header_value "$f" RUN)
   quiet_run=$(header_value "$f" QUIET)
+  check_cmd=$(header_value "$f" CHECK)
+  check_key=$(basename "$f" .rem)
   # Read while the file is still there: a RUN=1 task leaves the queue before it
   # runs, and its failure message still has to name the task.
   task_id=$(header_value "$f" TASK)
@@ -1701,12 +1823,16 @@ for f in "$REM_DIR"/*.rem; do
     fi
     mark_run_started "$journal" 1 ||
       log_message "quiet scheduled run $(basename "$journal"): in-progress record not saved"
+    check_journal="$journal"
     body=$(run_agent_task "$f" "$body")
     quiet_rc=$?
     rm -f "$journal/runner"
     case $quiet_rc in
-      3) atomic_text "$journal/state" finished ||
+      3) if atomic_text "$journal/state" finished; then
+           release_check "$journal"
+         else
            log_message "UNCERTAIN quiet run $(basename "$journal"): could not save completion"
+         fi
          continue ;;
       # The failure notice is for the owner, not the group, with the same pause
       # as every other scheduled failure.

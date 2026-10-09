@@ -21,12 +21,63 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+RULES_CAP = 3500
+RULES_LINE_CAP = 130
+
+
+def owner_rules(path: Path | None = None, cap: int = RULES_CAP) -> str:
+    """The owner's own section of ~/CLAUDE.md, put in front of the model on every turn. Арти, 09.10.2026: 24 rules
+    at the end of ~100 KB of instructions were followed only after the owner reminded. Whole when short; past `cap`,
+    the first words of every rule, so none drops out of view (the full text stays in CLAUDE.md)."""
+    try:
+        lines = (path or Path.home() / "CLAUDE.md").read_text(encoding="utf-8").splitlines()
+        start = next(i for i, line in enumerate(lines) if line.strip() == "# Правила власника")
+    except (OSError, UnicodeError, StopIteration):
+        return ""
+    body = []
+    for line in lines[start + 1:]:
+        # Novsky's installation contacts and any next top-level part are not rules.
+        if line.startswith(("# ", "<!-- novsky-")):
+            break
+        body.append(line.rstrip())
+    text = "\n".join(body).strip()
+    if not text:
+        return ""
+    head = "OWNER RULES (the owner's section of ~/CLAUDE.md, re-read every turn; follow them in this answer"
+    if len(head) + 3 + len(text) <= cap:
+        return head + "):\n" + text
+    head += "; the first words of each rule, the full text is in ~/CLAUDE.md):"
+    out, used = [head], len(head)
+    # Every line that starts a rule: plain text at the margin, or a bullet or number under Markdown's ordinary indent
+    # (Codex #227: «1)» rules and «  - » lists vanished). Anything else that is long keeps its first lines, never nothing.
+    rules = [line.strip() for line in body if line.strip() and not line.lstrip().startswith("#")
+             and (not line[0].isspace() or re.match(r" {1,3}(?:[-*+•]|\d+[.)]) ", line))]
+    rules = rules or [line.strip() for line in body if line.strip()]
+    for k, rule in enumerate(rules):
+        short = rule if len(rule) <= RULES_LINE_CAP else rule[:RULES_LINE_CAP].rsplit(" ", 1)[0] + "…"
+        if used + len(short) + 1 > cap - 40:
+            out.append(f"… +{len(rules) - k} more in ~/CLAUDE.md")
+            break
+        out.append(short)
+        used += len(short) + 1
+    return "\n".join(out)
+
+
 # ATARAX_SUPPRESS_TELEGRAM=1 marks a session that must not touch Telegram
 # (nested claude -p workers, cron sessions). Injecting the owner's private chat
 # there leaks his conversation into non-owner contexts and hands them his
-# chat_id — skip entirely.
+# chat_id — skip entirely. A scheduled task of the agent itself
+# (ATARAX_TASK_DELIVERY=1) still gets the owner's rules, and nothing of his chat.
 if os.environ.get("ATARAX_SUPPRESS_TELEGRAM") == "1":
-    print(json.dumps({"continue": True}))
+    rules = ""
+    if os.environ.get("ATARAX_TASK_DELIVERY") == "1":
+        try:
+            if json.loads(sys.stdin.read() or "{}").get("hook_event_name") == "UserPromptSubmit":
+                rules = owner_rules()
+        except Exception:
+            rules = ""
+    print(json.dumps({"continue": True, "hookSpecificOutput": {
+        "hookEventName": "UserPromptSubmit", "additionalContext": rules}} if rules else {"continue": True}))
     sys.exit(0)
 
 CONFIG_ROOT = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
@@ -1162,6 +1213,9 @@ def main() -> None:
             completed_tasks = open_service_turn(data, prompt if isinstance(prompt, str) else "")
 
     parts = [current_moment()]
+    rules = owner_rules()
+    if rules:
+        parts.append(rules)
     if isinstance(prompt, str):
         recovered = recovery_context(prompt, data)
         if recovered:
