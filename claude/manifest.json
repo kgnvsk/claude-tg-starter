@@ -7,7 +7,7 @@
     "local-foundation-v1"
   ],
   "source": "codex/starter/product.json",
-  "sourceRevision": "9b5bf855a2347f6b37581171b24d0ce733487ae6",
+  "sourceRevision": "2fd10ccb4bbad81206acf1489bf05acfcb78a27f",
   "sourceDirty": false,
   "features": [
     "browser"
@@ -133,11 +133,11 @@
     "modules/telegram-corporate/integration-readiness.ts": "61b6fbe49e7f5853e2d418ee30a6ba8c3dfdd4a66ee7a2164848ce1b87fd34f9",
     "modules/telegram-corporate/live-engines.ts": "8b107f7d7ed6a5bebfe1cb7a34d14c0e5016d101995dbc7a3d10aa6de6fecddd",
     "modules/telegram-corporate/live-session.ts": "c28d31c88f267c4185ff91b01f564455c8ed1f375323ffdd137e896c30e3e8ac",
-    "modules/telegram-corporate/media.ts": "4f9ed8585eb51a78043d1f81c96f6b6dc56ac173b9ccd4ba5d39121c1739cf48",
+    "modules/telegram-corporate/media.ts": "39ac18f208f7d2a12d3080eedb0b23e440b868e1ba4eb959bc8ebdd3cd863a9d",
     "modules/telegram-corporate/migration-plan.ts": "0be8e6e40dcca8bc418a3a3462c0136808139d5bc2c11838c4f7665a0d7d4bf8",
     "modules/telegram-corporate/native-file-reply.ts": "bbaad3bc89f3ee58d56ba9950ca483628b39b1d339bdb80f75ae9d682417e56a",
     "modules/telegram-corporate/native-mcp.ts": "32c34fc9e8311b7598d90f32f07795a9948abdd4e70cf297a43a74c477bee5ca",
-    "modules/telegram-corporate/native-profile.ts": "960041ce94c3af2e05b8360c358debedc1c627ad549d1b6bc94e3c013079227a",
+    "modules/telegram-corporate/native-profile.ts": "aa745a5ca6fa0c81db72b7e127652d5409cb631b05a2a670bd71ce3dbd06b875",
     "modules/telegram-corporate/native-readiness.ts": "ecff867750a70ca61f242ccddd4d85eefc55bd5383fbeb1e4cde17198ed419d7",
     "modules/telegram-corporate/native-reminder.ts": "4b1ef0da3bf372877a72c223d99a217c9b62aeef15cfb79ce449b469d1d67d9d",
     "modules/telegram-corporate/parity.ts": "8b6cb1e3a8c2e26072478f06c9b89802c61f16a629048574945b7f06c3ef63e1",

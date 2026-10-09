@@ -66,7 +66,7 @@ const CORPORATE_ACTIVATED_MARKER = join(
 const CORPORATE_TEMPORARILY_UNAVAILABLE =
   '⚠️ Корпоративний режим тимчасово недоступний. Спробуй трохи пізніше.'
 const CORPORATE_FILE_INSPECTION_DISABLED =
-  '⚠️ Підтримуються фото та зображення JPEG/PNG/GIF/WebP до 3 МБ, голосові й аудіо, а також документи PDF, DOCX, XLSX, PPTX, TXT, MD, CSV і TSV до 20 МБ. Інші файли надішли як текст.'
+  '⚠️ Підтримуються фото та зображення JPEG/PNG/GIF/WebP до 3 МБ, голосові й аудіо, відео MP4/MOV/WEBM, а також документи PDF, DOCX, XLSX, PPTX, TXT, MD, CSV і TSV до 20 МБ. Інші файли надішли як текст.'
 const CORPORATE_VOICE_UNRECOGNIZED = 'Не розчув запис. Надішли голосове ще раз або напиши запит текстом — і я відповім.'
 const CORPORATE_FILE_TOO_LARGE =
   '⚠️ Файл більший за 20 МБ — Telegram не передає такі файли ботам. Надішли коротший запис, частину файлу або текст.'
@@ -8290,6 +8290,21 @@ async function downloadCorporateImageFile(api: Context['api'], attachment: Attac
   )
 }
 
+// A video or a round video opens like a document of its container type (Арти, 09.10.2026: «видео в этот чат не
+// проходят»); the corporate module still checks its container and size before a worker sees it.
+function corporateVideoFile(attachment: AttachmentMeta): AttachmentMeta {
+  const mime = attachment.mime ?? 'video/mp4'
+  const extension = mime === 'video/quicktime' ? 'mov' : mime === 'video/webm' ? 'webm' : 'mp4'
+  const name = attachment.name && /\.(mp4|m4v|mov|webm)$/i.test(attachment.name) ? attachment.name : `video.${extension}`
+  return { ...attachment, name }
+}
+
+async function downloadCorporateVideo(ctx: Context, attachment: AttachmentMeta) {
+  const video = attachment.kind === 'video' ? ctx.message?.video : attachment.kind === 'video_note' ? ctx.message?.video_note : undefined
+  if (!video || attachment.file_id !== video.file_id) throw new Error('current video missing')
+  return downloadCorporateDocumentFile(ctx.api, corporateVideoFile({ ...attachment, size: video.file_size ?? attachment.size }))
+}
+
 async function downloadCorporateDocument(ctx: Context, attachment: AttachmentMeta) {
   // Same trust rule as images: only this update's document, bounded before the
   // download, then validated by the corporate module before a worker sees it.
@@ -8441,15 +8456,16 @@ async function routeInbound(
     recordCorporateIntakeRefusal(ctx, msgId, reason)
     await replyCorporate(message)
   }
-  // A video or a round video is named to the worker like an unopened file and a sticker comes
-  // as its emoji, as in the owner's chat; no refusal for them (parity, 28.09).
-  const namedOnly = attachment != null && ['video', 'video_note', 'sticker'].includes(attachment.kind)
-  if (attachment && !namedOnly && !['voice', 'audio', 'document', 'photo'].includes(attachment.kind)) {
+  // A sticker comes as its emoji, as in the owner's chat; a video or a round video opens like a file (09.10).
+  const namedOnly = attachment != null && attachment.kind === 'sticker'
+  const video = attachment?.kind === 'video' || attachment?.kind === 'video_note'
+  if (attachment && !namedOnly && !['voice', 'audio', 'document', 'photo', 'video', 'video_note'].includes(attachment.kind)) {
     await refuse('unsupported_file', CORPORATE_FILE_INSPECTION_DISABLED)
     return
   }
-  // Telegram hands no bot a file over 20 MB: that is the answer, not "try later".
-  if (!namedOnly && (attachment?.size ?? 0) > 20 * 1024 * 1024) {
+  // Telegram hands no bot a file over 20 MB: that is the answer, not "try later". A video too big to open is named to
+  // the worker with its words instead, as before videos opened (Codex K229-P2-1).
+  if (!namedOnly && !video && (attachment?.size ?? 0) > 20 * 1024 * 1024) {
     await replyCorporate(CORPORATE_FILE_TOO_LARGE)
     return
   }
@@ -8472,7 +8488,8 @@ async function routeInbound(
     let corporateText = text
     let images
     let documents
-    if (downloadImage != null || attachment?.kind === 'document') {
+    const unopened: AttachmentMeta[] = []
+    if (downloadImage != null || attachment?.kind === 'document' || video) {
       // A photo, or a document that is an image, stays an image; a document of
       // a kind the corporate module takes (PDF, Office, plain text) becomes a
       // file in the worker's workspace; anything else is refused before download.
@@ -8481,21 +8498,25 @@ async function routeInbound(
         && (/^image\//.test(incomingDocument?.mime_type ?? attachment.mime ?? '')
           || /\.(jpe?g|png|gif|webp)$/i.test(incomingDocument?.file_name ?? attachment.name ?? ''))
       try {
-        if (attachment?.kind === 'document' && !imageDocument) documents = [await downloadCorporateDocument(ctx, attachment)]
+        if (video) documents = [await downloadCorporateVideo(ctx, attachment)]
+        else if (attachment?.kind === 'document' && !imageDocument) documents = [await downloadCorporateDocument(ctx, attachment)]
         else images = [await downloadCorporateImage(ctx, attachment)]
       } catch {
-        await refuse('file_unavailable', CORPORATE_FILE_INSPECTION_DISABLED)
-        return
+        // A video that does not open keeps its words and is named (Codex K229-P2-1); any other file is refused.
+        if (!video) {
+          await refuse('file_unavailable', CORPORATE_FILE_INSPECTION_DISABLED)
+          return
+        }
+        unopened.push(attachment!)
       }
     }
     // A reply brings the photo or document it answers, before any late binding.
-    const unopened: AttachmentMeta[] = []
-    if (namedOnly && attachment.kind !== 'sticker') unopened.push(attachment)
     const replied = !images && !documents && attachment == null ? repliedAttachment(ctx.message) : undefined
     if (replied) {
       try {
         if (replied.kind === 'photo' || /^image\//.test(replied.mime ?? '')) images = [await downloadCorporateImageFile(ctx.api, replied)]
         else if (replied.kind === 'document') documents = [await downloadCorporateDocumentFile(ctx.api, replied)]
+        else if (replied.kind === 'video' || replied.kind === 'video_note') documents = [await downloadCorporateDocumentFile(ctx.api, corporateVideoFile(replied))]
         else unopened.push(replied)
       } catch (err) {
         process.stderr.write(`telegram channel: replied file skipped: ${err}\n`)
@@ -8505,18 +8526,34 @@ async function routeInbound(
     const lateThreadId = ctx.message?.is_topic_message === true ? ctx.message.message_thread_id : undefined
     const lateSender = ctx.message?.sender_chat ? '' : inboundSenderKey(chat_id, lateThreadId, String(from.id))
     if (!images && !documents && ctx.chat?.type !== 'private') {
-      const bound = []
+      const bound: { data: string }[] = []
+      let boundBytes = 0
+      // A turn takes four files and 20 MB in all (media.ts) and refuses a bigger set whole, so a file past that
+      // is named instead (09.10.2026: late-bound videos now come with the documents).
+      const bind = (document: { data: string }) => {
+        const bytes = Buffer.byteLength(document.data, 'base64')
+        if (bound.length >= 4 || boundBytes + bytes > 20 * 1024 * 1024) throw new Error('turn file limit reached')
+        bound.push(document)
+        boundBytes += bytes
+      }
       // The file a reply answers is not named a second time from the journal.
       const notReplied = (late: AttachmentMeta) => late.file_id !== replied?.file_id
       for (const late of lateBoundDocuments(lateSender)) {
         if (!notReplied(late)) continue
-        try { bound.push(await downloadCorporateDocumentFile(ctx.api, late)) }
+        try { bind(await downloadCorporateDocumentFile(ctx.api, late)) }
         catch (err) {
           process.stderr.write(`telegram channel: late-bound document skipped: ${err}\n`)
           unopened.push(late)
         }
       }
-      unopened.push(...lateBoundVideos(lateSender).filter(notReplied))
+      for (const late of lateBoundVideos(lateSender)) {
+        if (!notReplied(late)) continue
+        try { bind(await downloadCorporateDocumentFile(ctx.api, corporateVideoFile(late))) }
+        catch (err) {
+          process.stderr.write(`telegram channel: late-bound video skipped: ${err}\n`)
+          unopened.push(late)
+        }
+      }
       // A document is the more deliberate upload, so it wins; photos stand in
       // when the conversation left none.
       if (bound.length) documents = bound
@@ -8674,9 +8711,11 @@ async function joinCompanyAlbum(ctx: Context, text: string, attachment: Attachme
     const imageDocument = attachment.kind === 'document'
       && (/^image\//.test(message.document?.mime_type ?? attachment.mime ?? '')
         || /\.(jpe?g|png|gif|webp)$/i.test(message.document?.file_name ?? attachment.name ?? ''))
-    const part = attachment.kind === 'document' && !imageDocument
-      ? { documents: [await downloadCorporateDocument(ctx, attachment)] }
-      : { images: [await downloadCorporateImage(ctx, attachment)] }
+    const part = attachment.kind === 'video' || attachment.kind === 'video_note'
+      ? { documents: [await downloadCorporateVideo(ctx, attachment)] }
+      : attachment.kind === 'document' && !imageDocument
+        ? { documents: [await downloadCorporateDocument(ctx, attachment)] }
+        : { images: [await downloadCorporateImage(ctx, attachment)] }
     return corporate.joinAlbum({ ...where, deliveryId: `${where.chatId}:${message.message_id}`,
       username: ctx.from!.username ?? ctx.from!.first_name ?? where.userId, messageId: message.message_id,
       text, ...part, createdAt: Date.now() }) === true
@@ -8891,10 +8930,10 @@ async function handleInbound(
   // Anonymous admins and channels share one sender id: nothing is journaled,
   // bound or folded for them.
   const sender = ctx.message?.sender_chat ? '' : inboundSenderKey(chat_id, threadId, String(from.id))
-  // A later photo of an album whose caption addressed the bot joins that album's waiting company
+  // A later photo, document or video of an album whose caption addressed the bot joins that album's waiting company
   // request, matched by author, chat, topic and album (joinCompanyAlbum); otherwise it is observed.
   if (result.action === 'observe' && sender && ctx.message?.media_group_id
-    && (attachment?.kind === 'photo' || attachment?.kind === 'document')
+    && (attachment?.kind === 'photo' || attachment?.kind === 'document' || attachment?.kind === 'video')
     && await joinCompanyAlbum(ctx, text, attachment, threadId)) {
     await removeIntegrationInput()
     return

@@ -28,10 +28,14 @@ UPSTREAM_SERVER_SHA256 = (
 )
 UPSTREAM_PACKAGE_START = "bun install --no-summary 1>&2 && bun server.ts"
 GOLDEN_SERVER_SHA256 = (
-    "6bd2ee9dce886f7c4657fcc3ea8e863dcb2ee1616a4af93933c290d731bcd3a4"
+    "5185727608f318ca486cd9782f2a53ad243c20cc30ed5edf8413a144c14201e1"
 )
 PREVIOUS_GOLDEN_SERVER_SHA256S = frozenset(
     {
+        # An earlier head of kit #229, never released: the history test walks every committed receiver.
+        "f3db451f110f1d665d12cb7137cd748cbdd13c8877321d7d7d7feea0efb5006b",
+        # The golden before company chats opened videos and round videos like files.
+        "6bd2ee9dce886f7c4657fcc3ea8e863dcb2ee1616a4af93933c290d731bcd3a4",
         # The golden before the owner alone with the agent in a group counted as his own chat.
         "169208745de53e95f82af7188032d94296337c7fe2d3b71a43d7d472398a0085",
         # The golden before owner-confirmed lasting policy in the current chat or topic.
