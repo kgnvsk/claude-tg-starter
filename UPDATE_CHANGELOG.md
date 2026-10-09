@@ -1,8 +1,8 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-10-09.a3ac0b7d9429`
+- Реліз: `2026-10-09.9b5bf855a234`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `a3ac0b7d942935d25a4322e53c3493ac2ebd8620`
+- Ревізія вихідного комплекту: `9b5bf855a2347f6b37581171b24d0ce733487ae6`
 - Дата релізу: `2026-10-09`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
@@ -19,16 +19,7 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    scheduler: an unreadable look is kept, and an interrupted adoption is rebuilt once
-    scheduler: what a look found is never lost or run without when keeping it fails
-    scheduler: a release interrupted half-way never re-offers, and an unbound run never starts
-    scheduler: a committed result releases exactly the CHECK output it was given, also after a crash
-    scheduler: what a CHECK printed is kept until a run with it finishes
-    telegram: owner rules under Markdown's list indent stay in view; any long text keeps its first lines
-    scheduler: a watch task looks first with a CHECK command and skips the model run when nothing is new
-    telegram: the owner-rules projection keeps numbered and plain rules
-    meet-listen: «record the meeting» is the notetaker's job, and without a Recall key the agent leads the owner to connect it
-    telegram: the owner's rules are in front of the agent on every turn and in every scheduled task
+    Branch helper: tell the owner once of a blocked project task (owner, 09.10) (#228)
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не

@@ -1836,6 +1836,7 @@ function accessPreviewState(dbPath, token) {
     return null;
   }
 }
+var NOTICE_BUSY_MS = 10 * 60000;
 function branchDecision(options, token, decision, context) {
   const inAccessFile = accessPreviewState(options.dbPath, token) != null;
   if (!inAccessFile && !options.store.isBranchPreview(token))

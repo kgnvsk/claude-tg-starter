@@ -7,7 +7,7 @@
     "local-foundation-v1"
   ],
   "source": "codex/starter/product.json",
-  "sourceRevision": "a3ac0b7d942935d25a4322e53c3493ac2ebd8620",
+  "sourceRevision": "9b5bf855a2347f6b37581171b24d0ce733487ae6",
   "sourceDirty": false,
   "features": [
     "browser"
@@ -119,8 +119,8 @@
     "modules/telegram-corporate/adapters/vercel.ts": "ef542da19bd857c78faeb59ac9eac3d0edf7a3202b06763e5bd10548e433de0a",
     "modules/telegram-corporate/agent-access-control.ts": "9d8e94f1a32ea4d6a29642bd8edb08c08bc43dc9d7fac5a5e5eeec321229f2d4",
     "modules/telegram-corporate/agent-access.ts": "d22a4e75761cb1a51764f583f2744601d33a3edda5e13aba98563d35727545cd",
-    "modules/telegram-corporate/branch-access-control.ts": "80a81b0163f4fe9e28e74778e6192852a3b2c62aa0b311f371861ba1a77d9676",
-    "modules/telegram-corporate/branch-access.ts": "69fb3394d317414a0fe755ae4826c910e30ec91fd4460fd3ec800363ca1136b1",
+    "modules/telegram-corporate/branch-access-control.ts": "f99b0a8f9554c7ec356863ffd3ba73017e6f7c428d91e8e3ec58fa9e33c14a06",
+    "modules/telegram-corporate/branch-access.ts": "e4d2b841f9c2a162e363286b7386b47070aebd20a18e91c2b885b9e758ce64e5",
     "modules/telegram-corporate/broker.ts": "017c63c297c4132713b5d463651378001ac949d4ecd37b0c1396e7c508a49537",
     "modules/telegram-corporate/capabilities.ts": "ef61fd4a8ba0359557726af446318f8702a2053f246ae080a045b135fad687b4",
     "modules/telegram-corporate/capability-store.ts": "67fb3840b7cb4a040bb965ac69f91043cedff75e03738e999f23e4b439c900c0",
@@ -213,7 +213,7 @@
     "installer/local.py": "ebdba3706e15a1f1843e66150493a3f51a6866a6c92390b491ec0ecdb06a9ce6",
     "installer/setup.py": "d950735dde0ed1cdd9a96edd5e52b2573ce4691c938c47b4b56a39176af39e8b",
     "plugin-contract.json": "c5ea9ff8efabb69e2ec79e9082f7fbd3ee6b389376a22227702e446a49ba94d3",
-    "resources/native/access.js": "80ae9f9273a2227eba3d31264dfd1e762e171312061609f56806d390fc1980cc",
+    "resources/native/access.js": "8aa2304c78f62816ef49d9bfac729e04da38f37eea16c1330011b6c4549a3c24",
     "workspace/CLAUDE.md": "049410896d264e07ad2ea725cb7d7bc8e4d694c12712f04d6c368fc4907837d3",
     "workspace/NOVSKY.md": "e26d7d9af91e300e970935022b9260793f7175656632b4e6e5ee634ebbb5687c",
     "workspace/OWNER.md": "739b3bb0b79f8abd5facfb14e19372371216402b183c6c7eb3969c0e0e995d33",
