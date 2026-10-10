@@ -28,10 +28,12 @@ UPSTREAM_SERVER_SHA256 = (
 )
 UPSTREAM_PACKAGE_START = "bun install --no-summary 1>&2 && bun server.ts"
 GOLDEN_SERVER_SHA256 = (
-    "7f02ec77f73ed0b18b4b53e0a30790c993845a884491aedc40feb6ec004a4372"
+    "6f1dfe3dde2a4671ebb7ea073b9bdb0e2f4060f835842f7b413b0ae5cba58e3c"
 )
 PREVIOUS_GOLDEN_SERVER_SHA256S = frozenset(
     {
+        # The golden before the owner's group of two answered him without a mention, every progress went through and a pasted /unstick was a command.
+        "7f02ec77f73ed0b18b4b53e0a30790c993845a884491aedc40feb6ec004a4372",
         # A golden of the owner-word branch before its wording fix (Codex K237).
         "448b46d89d1d3a6761ca186db8a92e7d334ada9d22956b01ca6fb9f32ef9d764",
         # The golden before the owner’s own word in his chat applied a rights change at once.

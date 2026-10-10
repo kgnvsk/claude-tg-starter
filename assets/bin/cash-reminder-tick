@@ -1114,6 +1114,131 @@ clock_time() {
   fi
 }
 
+# Арти, 10.10.2026 («одну сводку о падениях вместо раз в сутки»): one alert per task a day left the
+# rest of a day's failures unheard (a limit failed one task every two minutes, the owner heard once),
+# and an occurrence the scheduler never started told nobody. Once a day, from SCHEDULE_DIGEST_HOUR in
+# the owner's timezone, the owner gets one list of both for the past day, when there is anything.
+failure_digest() {
+  local owner stamp="$REM_DIR/.owner-alerts/digest.date" before out day text resp class after retry_at
+  owner=$(owner_chat_id)
+  [ -n "$owner" ] || return 0
+  retry_at=$(cat "$stamp.retry" 2>/dev/null) || retry_at=""
+  if is_uint "$retry_at" && [ "$tick_now" -lt "$(decimal_value "$retry_at")" ]; then return 0; fi
+  before=$(cat "$stamp" 2>/dev/null) || before=""
+  out=$(python3 - "$(dirname "${BASH_SOURCE[0]}")/agent_notice_locale.py" "$HOME" "$REM_DIR" "$PROFILE_FILE" \
+    "${SCHEDULE_DIGEST_HOUR:-9}" "$before" "$tick_now" <<'PY'
+import importlib.util
+import sys
+from datetime import datetime
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+helper, home, rem, profile, hour, done, now = *sys.argv[1:7], int(sys.argv[7])
+done = (done.split() or [""])[0]  # «day sending» counts as that day's: its outcome is unknown
+zone = None
+try:
+    for line in Path(profile).read_text(encoding="utf-8").splitlines():
+        if line.startswith("TIMEZONE="):
+            zone = ZoneInfo(line.split("=", 1)[1].strip().strip("\"'"))
+except Exception:
+    zone = None
+local = datetime.fromtimestamp(now, zone) if zone else datetime.fromtimestamp(now).astimezone()
+today = local.strftime("%Y-%m-%d")
+if not hour.isdigit() or local.hour < int(hour) or done == today:
+    sys.exit(0)
+try:
+    spec = importlib.util.spec_from_file_location("agent_notice_locale", helper)
+    notices = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(notices)
+    say = lambda key, text, **values: notices.notice_text(key, text, home=Path(home)).format(**values)
+except Exception:
+    say = lambda key, text, **values: text.format(**values)
+
+
+def header(path, key):
+    try:
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            if line.startswith(key + "="):
+                return line.split("=", 1)[1].strip()
+    except OSError:
+        pass
+    return ""
+
+
+failed, missed = {}, []
+for journal in [*Path(rem, ".run-delivery").glob("*"), *Path(rem, ".quiet-runs").glob("*")]:
+    try:
+        state = (journal / "state").read_text(encoding="utf-8").strip()
+        changed = (journal / "state").stat().st_mtime
+    except OSError:
+        continue
+    # A run of this very tick ends after its clock was read.
+    if state not in ("agent_failed", "blocked", "uncertain") or not -3600 <= now - changed <= 86400:
+        continue
+    task = header(journal / "source.rem", "TASK")
+    if not task:
+        try:
+            task = (journal / "name").read_text(encoding="utf-8").strip()
+        except OSError:
+            task = journal.name[:12]
+    if state == "agent_failed":
+        try:
+            reason = (journal / "failure.txt").read_text(encoding="utf-8").strip().split(": ", 1)[-1].rstrip(".")
+        except OSError:
+            reason = say("schedule.digest_error", "помилка виконання")
+    elif state == "blocked":
+        reason = say("schedule.digest_refused", "Telegram відхилив результат")
+    else:
+        reason = say("schedule.digest_uncertain", "запуск перервався або доставку не підтверджено")
+    try:
+        unheard = (journal / "owner-alert.state").read_text(encoding="utf-8").strip() == "paused"
+    except OSError:
+        unheard = False
+    failed.setdefault(task, []).append((changed, reason, unheard))
+for source in Path(rem).glob("*.rem"):
+    epoch = header(source, "EPOCH")
+    if epoch.isdigit() and now - int(epoch) > 3600:
+        missed.append((int(epoch), header(source, "TASK") or source.stem))
+lines = []
+for task, runs in sorted(failed.items(), key=lambda item: -max(run[0] for run in item[1])):
+    reason = max(runs)[1]
+    unheard = sum(run[2] for run in runs)
+    lines.append(say("schedule.digest_failed", "• «{task}» — не виконано {count} раз; остання причина: {reason}",
+                     task=task, count=len(runs), reason=reason)
+                 + (say("schedule.digest_unheard", " (без окремого сповіщення: {unheard})", unheard=unheard)
+                    if unheard else ""))
+for epoch, task in sorted(missed):
+    at = datetime.fromtimestamp(epoch, zone) if zone else datetime.fromtimestamp(epoch).astimezone()
+    lines.append(say("schedule.digest_missed", "• «{task}» — мало запуститися {time}, але не запустилося",
+                     task=task, time=at.strftime("%d.%m %H:%M")))
+if lines:
+    print(today)
+    print("\n".join([say("schedule.digest", "📋 Автоматичні завдання за добу — що не спрацювало:"), *lines[:20]]))
+PY
+  ) || return 0
+  [ -n "$out" ] || return 0
+  day=${out%%$'\n'*}
+  text=${out#*$'\n'}
+  # The day is taken before Telegram is called; only a definite «wait» (429) gives it back, after its delay, so an
+  # answer that never came back cannot send the list twice.
+  mkdir -p -m 700 "$REM_DIR/.owner-alerts" && atomic_text "$stamp" "$day sending" || return 0
+  if resp=$(send_text "$owner" "$text" text "" 1); then
+    atomic_text "$stamp" "$day"
+    rm -f "$stamp.retry"
+    return 0
+  fi
+  class=$(printf '%s' "$resp" | run_delivery_response_class)
+  if [ "$class" = retry ]; then
+    after=$(printf '%s' "$resp" | python3 -c 'import json, sys
+try:
+    print(max(1, int(json.load(sys.stdin)["parameters"]["retry_after"])))
+except Exception:
+    print(60)')
+    atomic_text "$stamp" "$before" && atomic_text "$stamp.retry" "$((tick_now + after))"
+  fi
+  log_message "failure digest for $day: send status=$class"
+}
+
 # A scheduled occurrence that ends blocked, uncertain or failed tells the owner,
 # in the owner's own chat. Only topics used to: a daily task cut off mid-run or
 # refused by Telegram stayed in this log, and the client was the one who asked
@@ -2093,4 +2218,5 @@ for f in "$REM_DIR"/*.rem; do
   rmdir "$RUN_DELIVERY_DIR" 2>/dev/null || true
 done
 
+failure_digest
 exit 0

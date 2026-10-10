@@ -355,7 +355,7 @@ def admit(connection, delivery, row, phase, task_id=None):
     work = scope_work(connection, delivery, session, stamp, turn, response) if phase == "final" else []
     if work and not end_unread_worker(connection, delivery, session, stamp, work, generation, now):
         raise OpenWork(f"background work of this request is still open ({', '.join(work)}); nothing "
-                       "was sent. Send TG_DELIVERY_PHASE=progress with its TG_DELIVERY_TASK_ID now and "
+                       "was sent. Send it now with TG_DELIVERY_PHASE=progress, which is delivered at once, and "
                        "the final after its callback, or stop that task first", work, session, stamp)
     # The attempt carries this sender's PID: if it is killed before it can settle the
     # attempt, the receiver's tick finds it gone and settles it instead.
@@ -642,14 +642,14 @@ def parse_thread_id(chat_id, value):
 
 def repeated_acknowledgement(connection, targets):
     """The last receipt of every target of a progress, when each is younger than
-    TG_PROGRESS_REPEAT_WINDOW_MS (ten minutes by default): the receiver's
-    repeatedAcknowledgement(). None otherwise."""
+    TG_PROGRESS_REPEAT_WINDOW_MS: the receiver's repeatedAcknowledgement(). None
+    otherwise, and always when the window is not set (owner, 10.10.2026)."""
     try:
         window = float(os.environ.get("TG_PROGRESS_REPEAT_WINDOW_MS") or "nan")
     except ValueError:
         window = float("nan")
     if not 0 < window < float("inf"):
-        window = 600_000
+        return None
     if not targets or "phase" not in {row[1] for row in connection.execute("PRAGMA table_info(delivery_receipts)")}:
         return None
     now, last = time.time() * 1000, 0

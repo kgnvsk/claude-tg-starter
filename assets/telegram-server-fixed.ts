@@ -2684,7 +2684,7 @@ function armOutboundTransaction(delivery: ResultDelivery, partialReceiptId?: num
       const open = delivery.phase === 'final' && current ? scopeWork(current) : []
       if (open.length && WORKER_GATES && !endUnreadWorker(current!, open, delivery.generations[index]!, now)) {
         throw new OpenWorkRefusal(`Background work of this request is still open (${open.join(', ')}); nothing was sent. `
-          + 'Send a progress reply with its task_id now and the final answer after its callback, or stop that task first',
+          + 'Send this text now as a progress reply, which is delivered at once, and the final answer after its callback, or stop that task first',
           current!, open)
       }
       if (open.length) recordShadow('would_refuse_final', { chat_id: delivery.chat_id, thread_id: delivery.thread_id,
@@ -3069,7 +3069,9 @@ function resultDelivery(chat_id: string, thread_id: string | null, targets: Rece
 // network; shadow records what it would do and sends. After the window a real
 // «still working» update goes through; a final is never held; a progress whose
 // outcome was unknown has no receipt, so its one resend stays as B0-a allows it.
-const PROGRESS_REPEAT_WINDOW_MS = envNumber('TG_PROGRESS_REPEAT_WINDOW_MS', 600_000)
+// Owner 10.10.2026 («почему блокируются ответы бота»): on Арти such refusals held back
+// login codes, questions and every part of a report, so the window is off unless set.
+const PROGRESS_REPEAT_WINDOW_MS = envNumber('TG_PROGRESS_REPEAT_WINDOW_MS', 0)
 
 // The last receipt of every target of a progress, when each is younger than the window.
 function repeatedAcknowledgement(delivery: ResultDelivery): number | null {
@@ -7519,6 +7521,17 @@ bot.on('my_chat_member', async ctx => {
   // chats). The bot speaks in a group when it is mentioned, replied to or asked to introduce itself.
 })
 
+// A command copied from a code block arrives as code, without a bot_command entity, so no
+// bot.command below sees it: Арти 10.10 sent «/unstick … close» twice and the model said «OK».
+bot.use(async (ctx, next) => {
+  const message = ctx.message
+  const command = message?.text != null && !message.forward_origin ? /^\/unstick(?:@\w+)?(?=\s|$)/u.exec(message.text)?.[0] : undefined
+  if (command && !message!.entities?.some(entity => entity.type === 'bot_command' && entity.offset === 0)) {
+    message!.entities = [{ type: 'bot_command', offset: 0, length: command.length }, ...(message!.entities ?? [])]
+  }
+  return next()
+})
+
 bot.command('health', async (ctx, next) => {
   const allowed = corporateCommandGate(ctx)
   if (!allowed) return
@@ -8772,7 +8785,7 @@ async function handleInbound(
   downloadImage: (() => Promise<string | undefined>) | undefined,
   attachment?: AttachmentMeta,
 ): Promise<void> {
-  const result = gate(ctx)
+  let result = gate(ctx)
 
   if (result.action === 'drop') return
 
@@ -8814,8 +8827,10 @@ async function handleInbound(
       || (result.action === 'deliver' && result.continues != null))
   // Owner 08.10.2026: a group of only the owner and this bot is his own chat, so what the bot answers there is
   // answered with his full access, mentioned or not. Telegram counts the bot too; a failed count keeps the group rules.
-  const ownerAlone = ownerInGroup && !ownerAddressed && result.action === 'deliver'
+  const ownerAlone = ownerInGroup && !ownerAddressed && (result.action === 'deliver' || result.action === 'observe')
     && await bot.api.getChatMemberCount(chat_id).then(count => count === 2, () => false)
+  // Owner 10.10.2026: a group of two that waits for a mention still answers him without one (Арти's «Документи»).
+  if (ownerAlone && result.action === 'observe') result = { action: 'deliver', access }
   const ownerShared = ownerAddressed || ownerAlone
   if (ownerShared) {
     // Full tools do not make a public chat a credential intake. Never retain
