@@ -6445,15 +6445,15 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     }, {
       name: 'corporate_resource_preview',
-      description: 'Prepare registration or revocation of an exact work resource for the primary owner in their personal chat. The owner already has authority; no superadmin role or Novsky access is needed. For a Google calendar use the connected account email, calendarId and access=read or read_write. Other supported kinds name their exact file, account, group or origin. Never guess the target or share a personal calendar by default. This only sends Confirm/Cancel to the owner; it neither verifies/connects Google nor grants employee access. After confirmation grant the selected resource with corporate_policy_preview. Do not pause/resume the company in the shell: confirmation performs its own maintenance and queues current company work again.',
+      description: 'Prepare registration or revocation of an exact work resource for the primary owner in their personal chat. The owner already has authority; no superadmin role or Novsky access is needed. For a Google calendar use the connected account email, calendarId and access=read or read_write. Other supported kinds name their exact file, account, group or origin. A Telegram channel is connector=telegram kind=channel with its numeric chatId (resolve @username with Bot API getChat; the bot must be the channel administrator). The owner’s connected Instagram is connector=instagram kind=account with the businessId that ig-social doctor reports and access=read or read_write. Never guess the target or share a personal calendar by default. This only sends Confirm/Cancel to the owner; it neither verifies/connects Google nor grants employee access. After confirmation grant the selected resource with corporate_policy_preview. Do not pause/resume the company in the shell: confirmation performs its own maintenance and queues current company work again.',
       inputSchema: {
         type: 'object', additionalProperties: false,
         properties: {
           action: { type: 'string', enum: ['register', 'revoke'] },
           id: { type: 'string', pattern: '^[a-z0-9][a-z0-9._-]{0,63}$' },
           label: { type: 'string', maxLength: 120 },
-          connector: { type: 'string', enum: ['google', 'meta', 'gads', 'browser', 'memory', 'image', 'telegram'] },
-          kind: { type: 'string', enum: ['sheet', 'doc', 'slide', 'file', 'folder', 'mailbox', 'calendar', 'contacts', 'tasks', 'ad_account', 'customer', 'origin', 'company', 'generator', 'group'] },
+          connector: { type: 'string', enum: ['google', 'meta', 'gads', 'browser', 'memory', 'image', 'telegram', 'instagram'] },
+          kind: { type: 'string', enum: ['sheet', 'doc', 'slide', 'file', 'folder', 'mailbox', 'calendar', 'contacts', 'tasks', 'ad_account', 'customer', 'origin', 'company', 'generator', 'group', 'channel', 'account'] },
           account: { type: 'string', maxLength: 254 },
           spreadsheetId: { type: 'string', pattern: '^[A-Za-z0-9_-]{10,256}$' },
           fileId: { type: 'string', pattern: '^[A-Za-z0-9_-]{10,256}$' },
@@ -6462,6 +6462,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           customerId: { type: 'string', pattern: '^[0-9]{6,12}$' },
           origin: { type: 'string', maxLength: 2048 },
           chatId: { type: 'string', pattern: '^-[0-9]{5,20}$' },
+          businessId: { type: 'string', pattern: '^[0-9]{5,30}$' },
           access: { type: 'string', enum: ['read', 'read_write'] },
         },
         required: ['action', 'id'],

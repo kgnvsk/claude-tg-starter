@@ -1,8 +1,8 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-10-10.4457ad65d39c`
+- Реліз: `2026-10-10.56f00363199f`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `4457ad65d39c06c20537f27062973513e23f494b`
+- Ревізія вихідного комплекту: `56f00363199f7ea3dcc56fcb06a08e760c677044`
 - Дата релізу: `2026-10-10`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
@@ -19,7 +19,8 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    A job killed for memory no longer restarts the whole assistant (#231)
+    Scheduled tasks catch up after a Claude limit; the owner's standing orders get written down (#233)
+    Company rights for Instagram, the company channel and mailbox organizing (#232)
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не

@@ -24,7 +24,7 @@ UINT_RE = re.compile(r"^[0-9]{1,18}$")
 QUIET_RE = re.compile(r"^(?:[01][0-9]|2[0-3]):[0-5][0-9]$")
 PARSE_VALUES = {"text", "markdown", "markdownv2", "html"}
 DELIVERY_STATES = {"running", "ready", "sending", "uncertain", "blocked", "cancelled",
-                   "agent_failed"}
+                   "agent_failed", "limit_wait"}
 DELIVERY_KEY_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -452,6 +452,10 @@ def delivery_status(rem_dir, task, actor=None, chat=None):
         cursor = cursor if cursor and UINT_RE.fullmatch(cursor) else "unknown"
         if state == "cancelled":
             next_step = "retry_cancel"
+        elif state == "limit_wait":
+            # A retry-safe run refused by a Claude limit; the worker runs it once after the reset.
+            retry_at = small_text(journal / "retry-at")
+            next_step = f"worker_retry_at:{retry_at}" if retry_at and UINT_RE.fullmatch(retry_at) else "worker_retry"
         elif state in {"blocked", "uncertain", "invalid"}:
             next_step = "manual_review"
         elif state in {"running", "sending"}:

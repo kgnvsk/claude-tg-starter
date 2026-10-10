@@ -95,6 +95,7 @@ RUSSIAN_NOTICES = {
         "Она только собирает и отправляет данные, поэтому запускаю её ещё раз."
     ),
     "schedule.late": "Напоминание опоздало — вот оно:",
+    "schedule.late_limit": "Запуск в {time} ждал, пока сбросится лимит Claude, — вот результат:",
     "schedule.lock_broken": (
         "⚠️ Планировщик задач стоял с {time}: его замок держал процесс от прерванного запуска. "
         "Замок заменён, ничего не останавливая; задачи снова выполняются."
@@ -212,6 +213,7 @@ POLISH_NOTICES = {
         "Ono tylko zbiera i wysyła dane, więc uruchamiam je jeszcze raz."
     ),
     "schedule.late": "Przypomnienie się spóźniło — oto ono:",
+    "schedule.late_limit": "Uruchomienie o {time} czekało na reset limitu Claude — oto wynik:",
     "schedule.lock_broken": (
         "⚠️ Harmonogram zadań stał od {time}: jego blokadę trzymał proces z przerwanego uruchomienia. "
         "Blokadę wymieniono bez zatrzymywania czegokolwiek; zadania znowu się wykonują."
@@ -326,6 +328,7 @@ ENGLISH_NOTICES = {
         "It only collects and sends data, so I am running it again."
     ),
     "schedule.late": "The reminder is late — here it is:",
+    "schedule.late_limit": "The run due at {time} waited for the Claude limit to reset — here is the result:",
     "schedule.lock_broken": (
         "⚠️ The task scheduler had been stuck since {time}: its lock was held by a process from an interrupted run. "
         "The lock was replaced without stopping anything; tasks are running again."

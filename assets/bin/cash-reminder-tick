@@ -16,6 +16,7 @@
 #            a failure notice goes to the owner's private chat, not into CHAT.
 #   RETRY_SAFE=1 (with RUN=1) → the task only reads and reports, so a run that
 #            died is run once more; its result reaches CHAT with a late line.
+#            A run refused by a Claude limit runs once more after the reset.
 #   TASK=<stable_task_identifier>
 #   REPEAT_SECONDS=<positive_interval>
 #   TIMEZONE=<safe_IANA_timezone>
@@ -427,6 +428,25 @@ for line in out.splitlines():
 PY
 }
 
+# The reset the CLI names, as epoch seconds, or nothing: when a limited retry-safe run may go again.
+limit_reset_epoch() {
+  python3 - "$(dirname "${BASH_SOURCE[0]}")" "${now:-$(date +%s)}" "$1" <<'PY' 2>/dev/null
+import importlib.machinery
+import importlib.util
+import sys
+
+bin_dir, now, out = sys.argv[1:]
+loader = importlib.machinery.SourceFileLoader("claude_limit_recovery", f"{bin_dir}/claude-limit-recovery")
+watcher = importlib.util.module_from_spec(importlib.util.spec_from_loader("claude_limit_recovery", loader))
+loader.exec_module(watcher)
+for line in out.splitlines():
+    reset = watcher.parse_reset(line.strip(), int(now) * 1000)
+    if reset is not None:
+        print(reset.epoch_ms // 1000, end="")
+        break
+PY
+}
+
 # A headless run loads the agent's @-imported persona and rules only when its
 # own folder is approved for external imports; CLI 2.1.280 skips them without
 # asking otherwise. The Telegram launcher approves this folder at each start,
@@ -533,6 +553,9 @@ keep_observation() {
 run_agent_task() {
   local file="$1" prompt="$2" out rc destination="чат ${chat}"
   local workdir="${AGENT_TASK_DIR:-$HOME/.atarax/agent-task}"
+  # A scheduled run sees the live service's PATH, the agent's own wrappers first (Арти, 09.10.2026: under cron's PATH
+  # mail-clean ran the bare gog without the ~/bin wrapper that loads the keyring password, and Gmail went unread).
+  local agent_path="$HOME/.local/bin:$HOME/.bun/bin:$HOME/bin:/usr/local/bin:${PATH:-/usr/bin:/bin}"
   mkdir -p "$workdir"
   # `timeout` is missing on macOS, where the tests also run; the cap is a
   # safety net, not a requirement.
@@ -596,7 +619,7 @@ run_agent_task() {
   fi
   if [ -n "$pending" ] && [ -z "$held" ] && [ ! -s "$observed" ]; then
     part="$pending/look.$$"
-    if (cd "$workdir" && ATARAX_SUPPRESS_TELEGRAM=1 ${limit:+timeout 60} bash -c "$check_cmd" 2>/dev/null) > "$part"; then
+    if (cd "$workdir" && PATH="$agent_path" ATARAX_SUPPRESS_TELEGRAM=1 ${limit:+timeout 60} bash -c "$check_cmd" 2>/dev/null) > "$part"; then
       # A look whose output cannot be read is kept as its file, never taken for silence (R7-P1-1).
       bare=$(tr -d '[:space:]*`."' < "$part") || held=1
       if [ -z "$held" ] && { [ -z "$bare" ] || printf '%s\n' "$bare" | grep -qxE "NO_NEW|$SILENCE_WORDS"; }; then
@@ -659,7 +682,7 @@ ${prompt}"
   # A task started from the live session must not settle that session's pending
   # request with its own sends: it runs without the service's delivery binding.
   out=$(cd "$workdir" &&
-    export TG_DELIVERY_STAMP= TG_DELIVERY_ID= TG_DELIVERY_TASK_ID= TG_DELIVERY_PHASE=final \
+    export PATH="$agent_path" TG_DELIVERY_STAMP= TG_DELIVERY_ID= TG_DELIVERY_TASK_ID= TG_DELIVERY_PHASE=final \
       ATARAX_TASK_QUIET="$quiet" ATARAX_TASK_ID="${task_id:-$(basename "$file" .rem)}" \
       ATARAX_TASK_OCCURRENCE="$epoch" ATARAX_TASK_RUN_KEY="${quiet_run_key:-}" \
       ATARAX_TASK_DELIVERY_DIR="$REM_DIR/.quiet-delivery" &&
@@ -667,6 +690,12 @@ ${prompt}"
   rc=$?
   if [ $rc -ne 0 ]; then
     log_message "run $(basename "$file"): помилка виконання rc=$rc: $(printf '%s' "$out" | tail -c 200 | tr '\n' ' ')"
+    # A limit that names its reset is kept with the occurrence: a retry-safe run goes again after it (run_occurrence).
+    if [ -n "${check_journal:-}" ] && [ "$rc" != 124 ] && [[ "$(failure_reason "$rc" "$out")" == "вичерпано ліміт Claude"* ]]; then
+      local reset
+      reset=$(limit_reset_epoch "$out")
+      is_uint "$reset" && atomic_text "$check_journal/limit-reset" "$reset"
+    fi
     # The owner hears about it rather than facing silence. Status 4 marks the
     # printed notice as the owner's, never the task's chat: that can be a group
     # or a client.
@@ -1222,6 +1251,16 @@ deliver_saved_run() {
     [ -e "$journal/retry-pending" ] && retry_dead_run "$journal"
     return 0
   fi
+  if [ "$state" = limit_wait ]; then
+    # The clock is read again here: an earlier retry in this tick can run for minutes, and the reset and quiet hours
+    # are judged against the real time (Codex, 10.10.2026). Other occurrences keep the tick's own time.
+    local retry_at tick_now
+    tick_now="${NOW_EPOCH:-$(date +%s)}"
+    retry_at=$(cat "$journal/retry-at" 2>/dev/null) || retry_at=""
+    is_uint "$retry_at" && [ "$tick_now" -lt "$(decimal_value "$retry_at")" ] && return 0
+    retry_limited_run "$journal"
+    return 0
+  fi
   if [ "$state" = agent_failed ]; then
     # Nothing is left to deliver. The record stays until its alert is sent, may
     # have been, or another one today already covered the task: without an
@@ -1336,11 +1375,24 @@ run_occurrence() {
   fi
   run_agent_task "$file" "$body" > "$result_temp"
   rc=$?
+  local limit_retry=0 reset
+  [ "$rc" = 4 ] && [ -s "$journal/limit-reset" ] && retry_allowed "$journal" && limit_retry=1
   # The run has ended and its outcome follows, so nobody may take it for dead.
   rm -f "$journal/runner"
   case $rc in
     0) ;;
-    4) # A failure notice is the owner's alert, never this task's chat.
+    4) # A retry-safe run refused by a Claude limit goes again once the limit resets (Арти, 09.10.2026: idealista-18 and
+       # leads-check-18 failed at 18:00 on a limit that reset at 18:30, and the next try was a day later). Nothing is
+       # sent now: the late result says why it is late, and a failed retry is told as any failure.
+       reset=$(cat "$journal/limit-reset" 2>/dev/null)
+       if [ "$limit_retry" = 1 ] && is_uint "$reset" &&
+          atomic_text "$journal/retry-at" "$(( $(decimal_value "$reset") + 60 ))" &&
+          atomic_text "$journal/state" limit_wait; then
+         rm -f "$result_temp"
+         log_message "scheduled run $(basename "$journal"): Claude limit; runs once more after the reset"
+         return
+       fi
+       # A failure notice is the owner's alert, never this task's chat.
        if mv "$result_temp" "$journal/failure.txt" &&
           atomic_text "$journal/state" agent_failed; then
          deliver_saved_run "$journal"
@@ -1405,6 +1457,32 @@ retry_dead_run() {
   # used): a failed write here leaves it owed (Codex, 28.09).
   atomic_text "$journal/state" running || return 0
   log_message "retrying scheduled run $(basename "$journal") once: its task is retry-safe"
+  run_occurrence "$journal" "$source" "$(message_body "$source")" 2 "$late"
+}
+
+# A retry-safe run that a Claude limit refused runs once, after the reset and outside its quiet hours. Its result
+# opens with a line saying when it was due.
+retry_limited_run() {
+  local journal="$1" source="$1/source.rem" late due
+  local f chat thread_id epoch task_id run_mode=1 quiet_run="" quiet_run_key="" check_cmd="" check_key=""
+  [ ! -e "$journal/retried" ] && [ -f "$source" ] && [ "$(header_value "$source" RETRY_SAFE)" = 1 ] || {
+    atomic_text "$journal/state" uncertain
+    log_message "UNCERTAIN scheduled run $(basename "$journal"): limited run cannot be retried"
+    return 0
+  }
+  in_quiet_hours "$source" && return 0
+  f="$source"
+  check_cmd=$(header_value "$source" CHECK)
+  check_key=$(cat "$journal/name" 2>/dev/null)
+  chat=$(header_value "$source" CHAT)
+  thread_id=$(header_value "$source" THREAD_ID)
+  epoch=$(header_value "$source" EPOCH)
+  task_id=$(header_value "$source" TASK)
+  [ -n "$task_id" ] || task_id=$(cat "$journal/name" 2>/dev/null)
+  is_uint "$epoch" && due=$(clock_time "$(decimal_value "$epoch")") || due=""
+  late=$(owner_notice schedule.late_limit "Запуск о {time} чекав, поки скинеться ліміт Claude, — ось результат:" time="$due")
+  atomic_text "$journal/state" running || return 0
+  log_message "retrying scheduled run $(basename "$journal") once: its Claude limit has reset"
   run_occurrence "$journal" "$source" "$(message_body "$source")" 2 "$late"
 }
 

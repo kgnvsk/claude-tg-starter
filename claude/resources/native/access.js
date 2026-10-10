@@ -10,6 +10,8 @@ import { isIP } from "net";
 var FILE_ID = /^[A-Za-z0-9_-]{10,256}$/;
 var ACCOUNT = /^[A-Za-z0-9][A-Za-z0-9._%+-]*@[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?\.[A-Za-z]{2,63}$/;
 var LABEL_CONTROLS = /[\x00-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]/;
+var INSTAGRAM_RIGHTS = ["instagram.read", "instagram.publish", "instagram.comments.reply", "instagram.direct.send"];
+var TELEGRAM_GROUP_RIGHTS = ["telegram.group.read", "telegram.message.send"];
 var BUSINESS_CAPABILITIES = {
   sheet: [["google.sheets.read"], ["google.sheets.write"]],
   doc: [["google.docs.read", "google.drive.read"], ["google.docs.write", "google.drive.share"]],
@@ -19,7 +21,7 @@ var BUSINESS_CAPABILITIES = {
     ["google.drive.read", "google.docs.read", "google.sheets.read", "google.slides.read"],
     ["google.drive.share", "google.docs.write", "google.sheets.write"]
   ],
-  mailbox: [["google.gmail.read"], ["google.gmail.send"]],
+  mailbox: [["google.gmail.read"], ["google.gmail.send", "google.gmail.modify"]],
   calendar: [["google.calendar.read"], ["google.calendar.write"]],
   contacts: [["google.contacts.read"], ["google.contacts.write"]],
   tasks: [["google.tasks.read"], ["google.tasks.write"]]
@@ -77,12 +79,30 @@ function resourceFromControl(input, current) {
         id: input.id,
         label,
         connector: "telegram",
-        capabilityIds: input.access === "read_write" ? ["telegram.group.read", "telegram.message.send"] : ["telegram.group.read"],
+        capabilityIds: input.access === "read_write" ? [...TELEGRAM_GROUP_RIGHTS] : ["telegram.group.read"],
         config: { source: "static", [labelKey]: label }
+      };
+    } else if (input.connector === "telegram" && input.kind === "channel" && exactFields(input, ["action", "id", "label", "connector", "kind", "chatId"]) && /^-100\d{5,17}$/.test(input.chatId)) {
+      labelKey = `channel.${input.chatId}`;
+      resource2 = {
+        id: input.id,
+        label,
+        connector: "telegram",
+        capabilityIds: ["telegram.channel.post"],
+        config: { source: "static", [labelKey]: label }
+      };
+    } else if (input.connector === "instagram" && input.kind === "account" && exactFields(input, ["action", "id", "label", "connector", "kind", "businessId", "access"]) && typeof input.businessId === "string" && /^\d{5,30}$/.test(input.businessId) && ["read", "read_write"].includes(input.access)) {
+      labelKey = `account.${input.businessId}`;
+      resource2 = {
+        id: input.id,
+        label,
+        connector: "instagram",
+        capabilityIds: input.access === "read_write" ? [...INSTAGRAM_RIGHTS] : ["instagram.read"],
+        config: { [labelKey]: label }
       };
     } else
       throw new Error("invalid business resource");
-    return fixedScope(resource2, current, labelKey, resource2.connector === "telegram" ? ["telegram.group.read", "telegram.message.send"] : resource2.capabilityIds);
+    return fixedScope(resource2, current, labelKey, resource2.connector === "telegram" ? input.kind === "channel" ? ["telegram.channel.post"] : TELEGRAM_GROUP_RIGHTS : resource2.connector === "instagram" ? INSTAGRAM_RIGHTS : resource2.capabilityIds);
   }
   if (typeof input.kind !== "string" || !Object.hasOwn(BUSINESS_CAPABILITIES, input.kind) || !["read", "read_write"].includes(input.access) || typeof input.account !== "string" || input.account.length > 254 || !ACCOUNT.test(input.account)) {
     throw new Error("invalid business resource");
@@ -200,6 +220,18 @@ function createdGoogleSlideFiles(db, resourceId) {
 import { createHash } from "crypto";
 
 // modules/telegram-corporate/capabilities.ts
+var RESOURCE_CONNECTORS = Object.freeze([
+  "memory",
+  "google",
+  "sql",
+  "meta",
+  "gads",
+  "telegram",
+  "image",
+  "browser",
+  "vercel",
+  "instagram"
+]);
 function capability(id, options) {
   return { id, delegable: true, ...options };
 }
@@ -264,7 +296,7 @@ var CAPABILITY_CATALOG = Object.freeze({
   "google.gmail.read": capability("google.gmail.read", {
     kind: "read",
     adapter: "google",
-    operations: ["search", "get"],
+    operations: ["search", "get", "labels"],
     sharedAllowed: true,
     requiresResource: true,
     requiresConfirmation: false
@@ -357,6 +389,14 @@ var CAPABILITY_CATALOG = Object.freeze({
     requiresResource: true,
     requiresConfirmation: true
   }),
+  "google.gmail.modify": capability("google.gmail.modify", {
+    kind: "write",
+    adapter: "google",
+    operations: ["create_label", "modify", "archive", "trash"],
+    sharedAllowed: false,
+    requiresResource: true,
+    requiresConfirmation: true
+  }),
   "google.calendar.write": capability("google.calendar.write", {
     kind: "write",
     adapter: "google",
@@ -432,6 +472,46 @@ var CAPABILITY_CATALOG = Object.freeze({
   "telegram.message.send": capability("telegram.message.send", {
     kind: "outbound",
     adapter: "telegram",
+    operations: ["send"],
+    sharedAllowed: false,
+    requiresResource: true,
+    requiresConfirmation: true
+  }),
+  "telegram.channel.post": capability("telegram.channel.post", {
+    kind: "outbound",
+    adapter: "telegram",
+    operations: ["post"],
+    sharedAllowed: false,
+    requiresResource: true,
+    requiresConfirmation: true
+  }),
+  "instagram.read": capability("instagram.read", {
+    kind: "read",
+    adapter: "instagram",
+    operations: ["media", "comments", "insights"],
+    sharedAllowed: true,
+    requiresResource: true,
+    requiresConfirmation: false
+  }),
+  "instagram.publish": capability("instagram.publish", {
+    kind: "outbound",
+    adapter: "instagram",
+    operations: ["image", "reel"],
+    sharedAllowed: false,
+    requiresResource: true,
+    requiresConfirmation: true
+  }),
+  "instagram.comments.reply": capability("instagram.comments.reply", {
+    kind: "outbound",
+    adapter: "instagram",
+    operations: ["reply"],
+    sharedAllowed: false,
+    requiresResource: true,
+    requiresConfirmation: true
+  }),
+  "instagram.direct.send": capability("instagram.direct.send", {
+    kind: "outbound",
+    adapter: "instagram",
     operations: ["send"],
     sharedAllowed: false,
     requiresResource: true,
@@ -1611,7 +1691,7 @@ class CapabilityStore {
     const label = resource.label.trim();
     if (label.length === 0 || label.length > 120)
       throw new Error("invalid resource label");
-    if (!["memory", "google", "sql", "meta", "gads", "telegram", "image", "browser", "vercel"].includes(resource.connector)) {
+    if (!RESOURCE_CONNECTORS.includes(resource.connector)) {
       throw new Error("unknown resource connector");
     }
     if (resource.capabilityIds.length === 0)
@@ -3015,11 +3095,37 @@ var REQUIRED_ARGUMENTS = {
   "google.drive.read:get": ["fileId"],
   "google.drive.share:share": ["fileId", "email", "role"],
   "google.gmail.read:get": ["messageId"],
+  "google.gmail.read:labels": [],
+  "google.gmail.modify:create_label": ["name"],
+  "google.gmail.modify:archive": ["threadIds"],
+  "google.gmail.modify:trash": ["threadIds"],
   "google.calendar.read:get": ["eventId"],
   "google.contacts.read:get": ["resourceName"],
   "google.tasks.read:get": ["tasklistId", "taskId"],
   "google.tasks.write:complete": ["tasklistId", "taskId"]
 };
+var GMAIL_EXACT = {
+  "google.gmail.read:labels": "gmail.labels.list",
+  "google.gmail.modify:create_label": "gmail.labels.create",
+  "google.gmail.modify:modify": "gmail.labels.modify",
+  "google.gmail.modify:archive": "gmail.labels.modify",
+  "google.gmail.modify:trash": "gmail.labels.modify"
+};
+var GMAIL_THREAD_ID = /^[A-Za-z0-9]{6,64}$/;
+var GMAIL_THREADS_PER_CALL = 50;
+function gmailThreadIds(value) {
+  if (!Array.isArray(value) || value.length === 0 || value.length > GMAIL_THREADS_PER_CALL)
+    return null;
+  if (!value.every((id) => typeof id === "string" && GMAIL_THREAD_ID.test(id)))
+    return null;
+  return new Set(value).size === value.length ? value : null;
+}
+function gmailLabels(value) {
+  if (!Array.isArray(value) || value.length === 0 || value.length > 10)
+    return null;
+  const labels = value.map((label) => text2(label, 225));
+  return labels.every((label) => label != null && !label.includes(",") && label.trim() === label) ? labels.join(",") : null;
+}
 var CREATE_SHARE_EMAIL = /^[A-Za-z0-9_%+-]+(?:\.[A-Za-z0-9_%+-]+)*@(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$/;
 function exactKeys3(value, keys) {
   const actual = Object.keys(value).sort();
@@ -3170,6 +3276,7 @@ class GoogleAdapter {
     const isSheetBatch = request.capability === "google.sheets.write" && request.operation === "batch_update";
     const isSheetUpdate = request.capability === "google.sheets.write" && request.operation === "update_cells";
     const isDocRead = request.capability === "google.docs.read" && request.operation === "get";
+    const gmailExact = GMAIL_EXACT[`${request.capability}:${request.operation}`];
     const configuredRecipient = isSheetCreate ? request.resource.config.createShareEmail : undefined;
     const recipient = configuredRecipient === undefined ? null : text2(configuredRecipient, 254);
     if (configuredRecipient !== undefined && (recipient == null || recipient.indexOf("@") > 64 || !CREATE_SHARE_EMAIL.test(recipient))) {
@@ -3242,7 +3349,7 @@ class GoogleAdapter {
         join5(this.home, "bin", "gog"),
         "--no-input",
         "--json",
-        ...isSheetBatch ? ["--enable-commands-exact=api.call,api.sheets.spreadsheets.batchupdate"] : isSheetLayout ? ["--readonly", "--enable-commands-exact=api.call,api.sheets.spreadsheets.get"] : isSheetMetadata ? ["--readonly", "--enable-commands-exact=sheets.metadata"] : isSheetReadFormat ? ["--readonly", "--enable-commands-exact=sheets.read-format"] : [`--enable-commands=${service}`],
+        ...gmailExact != null ? [`--enable-commands-exact=${gmailExact}`, "--gmail-no-send"] : isSheetBatch ? ["--enable-commands-exact=api.call,api.sheets.spreadsheets.batchupdate"] : isSheetLayout ? ["--readonly", "--enable-commands-exact=api.call,api.sheets.spreadsheets.get"] : isSheetMetadata ? ["--readonly", "--enable-commands-exact=sheets.metadata"] : isSheetReadFormat ? ["--readonly", "--enable-commands-exact=sheets.read-format"] : [`--enable-commands=${service}`],
         isSheetBatch || isSheetLayout ? "api" : service,
         ...operation
       ],
@@ -3257,7 +3364,7 @@ class GoogleAdapter {
       ...isDocRead ? { maxOutputBytes: 1024 * 1024 } : {}
     };
     const result = await this.run(command, signal);
-    const isWrite = request.capability.endsWith(".write") || request.capability.endsWith(".send") || request.capability === "google.drive.share";
+    const isWrite = request.capability.endsWith(".write") || request.capability.endsWith(".send") || request.capability === "google.drive.share" || request.capability === "google.gmail.modify";
     if (result.exitCode === 0) {
       if (result.stdoutTruncated === true) {
         return { ok: false, code: isWrite ? "uncertain" : "failed", message: isWrite ? "\u0414\u0456\u044F \u043C\u043E\u0433\u043B\u0430 \u0432\u0438\u043A\u043E\u043D\u0430\u0442\u0438\u0441\u044C, \u0430\u043B\u0435 Google \u043F\u043E\u0432\u0435\u0440\u043D\u0443\u0432 \u043D\u0435\u043F\u043E\u0432\u043D\u0438\u0439 \u0440\u0435\u0437\u0443\u043B\u044C\u0442\u0430\u0442. \u041D\u0435 \u043F\u043E\u0432\u0442\u043E\u0440\u044E\u0439 \u0437\u0430\u043F\u0438\u0441 \u0430\u0432\u0442\u043E\u043C\u0430\u0442\u0438\u0447\u043D\u043E; \u0441\u043F\u043E\u0447\u0430\u0442\u043A\u0443 \u043F\u0435\u0440\u0435\u0432\u0456\u0440 \u0439\u043E\u0433\u043E \u0441\u0442\u0430\u043D." : "Google \u043F\u043E\u0432\u0435\u0440\u043D\u0443\u0432 \u043D\u0435\u043F\u043E\u0432\u043D\u0438\u0439 \u0440\u0435\u0437\u0443\u043B\u044C\u0442\u0430\u0442 \u0447\u0435\u0440\u0435\u0437 \u043B\u0456\u043C\u0456\u0442 \u043E\u0431\u0441\u044F\u0433\u0443. \u0417\u043C\u0435\u043D\u0448 \u0434\u0456\u0430\u043F\u0430\u0437\u043E\u043D \u0447\u0438\u0442\u0430\u043D\u043D\u044F \u0430\u0431\u043E \u0437\u0430\u043F\u0438\u0442; \u0446\u0435 \u043D\u0435 \u0434\u043E\u043A\u0430\u0437 \u0432\u0456\u0434\u0441\u0443\u0442\u043D\u043E\u0441\u0442\u0456 \u0434\u0430\u043D\u0438\u0445." };
@@ -3277,6 +3384,8 @@ class GoogleAdapter {
       }
       if (isDocRead)
         return this.docPage(request, result.stdout);
+      if (gmailExact === "gmail.labels.modify")
+        return this.threadLabelResult(result.stdout);
       let receiptId = isWrite && !isSheetBatch ? this.receipt(result.stdout) : undefined;
       if (isSheetBatch) {
         try {
@@ -3378,6 +3487,19 @@ class GoogleAdapter {
       message: this.failureMessage(result.exitCode, result.stderr)
     };
   }
+  threadLabelResult(stdout) {
+    try {
+      const results = JSON.parse(stdout).results;
+      if (!Array.isArray(results) || results.length === 0 || !results.every((row) => typeof row?.threadId === "string" && typeof row.success === "boolean"))
+        throw new Error("shape");
+      const failed = results.filter((row) => !row.success);
+      if (failed.length === 0)
+        return { ok: true, data: JSON.stringify({ changedThreads: results.length }) };
+      return { ok: false, code: "failed", message: `\u0417\u043C\u0456\u043D\u0435\u043D\u043E ${results.length - failed.length} \u0437 ${results.length} \u043B\u0438\u0441\u0442\u0456\u0432. ` + `\u041D\u0435 \u0432\u0434\u0430\u043B\u043E\u0441\u044F: ${failed.slice(0, 10).map((row) => `${row.threadId} (${scrub(String(row.error ?? "")).slice(0, 120) || "\u0431\u0435\u0437 \u043F\u043E\u044F\u0441\u043D\u0435\u043D\u043D\u044F"})`).join("; ")}. ` + "\u041F\u043E\u0432\u0442\u043E\u0440\u0438 \u043B\u0438\u0448\u0435 \u0434\u043B\u044F \u0446\u0438\u0445 \u043B\u0438\u0441\u0442\u0456\u0432, \u044F\u043A\u0449\u043E \u043F\u0440\u0438\u0447\u0438\u043D\u0430 \u0443\u0441\u0443\u043D\u0435\u043D\u0430." };
+    } catch {
+      return { ok: false, code: "uncertain", message: "Google \u043D\u0435 \u043F\u0456\u0434\u0442\u0432\u0435\u0440\u0434\u0438\u0432 \u0440\u0435\u0437\u0443\u043B\u044C\u0442\u0430\u0442 \u0437\u043C\u0456\u043D\u0438 \u044F\u0440\u043B\u0438\u043A\u0456\u0432. \u041F\u0435\u0440\u0435\u0432\u0456\u0440 \u043B\u0438\u0441\u0442\u0438 \u043F\u043E\u0448\u0443\u043A\u043E\u043C, \u043F\u0435\u0440\u0448 \u043D\u0456\u0436 \u043F\u043E\u0432\u0442\u043E\u0440\u044E\u0432\u0430\u0442\u0438." };
+    }
+  }
   failureMessage(exitCode, stderr) {
     const scrubbed = scrub(stderr ?? "");
     return scrubbed.length > 0 ? `Google CLI \u043F\u043E\u0432\u0435\u0440\u043D\u0443\u0432 \u043F\u043E\u043C\u0438\u043B\u043A\u0443 (\u043A\u043E\u0434 ${exitCode}): ${scrubbed}` : `Google CLI \u043F\u043E\u0432\u0435\u0440\u043D\u0443\u0432 \u043F\u043E\u043C\u0438\u043B\u043A\u0443 (\u043A\u043E\u0434 ${exitCode}) \u0431\u0435\u0437 \u043F\u043E\u044F\u0441\u043D\u0435\u043D\u043D\u044F.`;
@@ -3398,6 +3520,14 @@ class GoogleAdapter {
       const literalGuidance = request.operation === "update_cells" && exactKeys3(args, ["spreadsheetId", "range", "values"]) && spreadsheetId != null && GOOGLE_FILE_ID.test(spreadsheetId) && text2(args.range, 512) != null && hasOnlySheetsLiteralPrefixErrors(args.values) && JSON.stringify(args.values).length <= 1e4 ? " update_cells \u0432\u0438\u043A\u043E\u0440\u0438\u0441\u0442\u043E\u0432\u0443\u0454 USER_ENTERED: \u043F\u043E\u0447\u0430\u0442\u043A\u043E\u0432\u0456 =, +, -, @, \u043D\u0430\u0432\u0456\u0442\u044C \u043F\u0456\u0441\u043B\u044F \u043F\u0440\u043E\u0431\u0456\u043B\u0456\u0432, \u043F\u0435\u0440\u0435\u0432\u0456\u0440\u044F\u044E\u0442\u044C\u0441\u044F \u044F\u043A \u043F\u043E\u0442\u0435\u043D\u0446\u0456\u0439\u043D\u0456 \u0444\u043E\u0440\u043C\u0443\u043B\u0438. \u042F\u043A\u0449\u043E \u043F\u043E\u0442\u0440\u0456\u0431\u0435\u043D \u0441\u0430\u043C\u0435 \u0431\u0443\u043A\u0432\u0430\u043B\u044C\u043D\u0438\u0439 \u0442\u0435\u043A\u0441\u0442, \u0432\u0438\u043A\u043E\u0440\u0438\u0441\u0442\u0430\u0439 batch_update \u0437 updateCells \u0442\u0430 userEnteredValue.stringValue, \u044F\u043A\u0449\u043E \u0446\u044F \u043E\u043F\u0435\u0440\u0430\u0446\u0456\u044F \u0434\u043E\u0437\u0432\u043E\u043B\u0435\u043D\u0430 \u0434\u043B\u044F \u0440\u0435\u0441\u0443\u0440\u0441\u0443. \u0417\u0431\u0435\u0440\u0435\u0436\u0438 \u0442\u043E\u0447\u043D\u0435 \u0437\u043D\u0430\u0447\u0435\u043D\u043D\u044F. \u041D\u0435 \u0432\u0438\u0434\u0430\u043B\u044F\u0439 \u0456 \u043D\u0435 \u0437\u0430\u043C\u0456\u043D\u044E\u0439 \u0441\u0438\u043C\u0432\u043E\u043B\u0438 \u0437\u0430\u0440\u0430\u0434\u0438 \u043F\u0440\u043E\u0445\u043E\u0434\u0436\u0435\u043D\u043D\u044F \u043F\u0435\u0440\u0435\u0432\u0456\u0440\u043A\u0438." : "";
       return `${base} \u041F\u0435\u0440\u0435\u0432\u0456\u0440 \u0441\u0442\u0440\u0443\u043A\u0442\u0443\u0440\u0443: ${required?.join(", ")}.${literalGuidance} \u0414\u043E\u0437\u0432\u043E\u043B\u0435\u043D\u0456 \u043B\u043E\u043A\u0430\u043B\u044C\u043D\u0456 \u043E\u043F\u0435\u0440\u0430\u0446\u0456\u0457 \u0437 \u0434\u0430\u043D\u0438\u043C\u0438/\u043E\u0444\u043E\u0440\u043C\u043B\u0435\u043D\u043D\u044F\u043C \u0456 \u0437\u0432\u0438\u0447\u0430\u0439\u043D\u0456 \u0444\u043E\u0440\u043C\u0443\u043B\u0438 \u0437 A1-\u043F\u043E\u0441\u0438\u043B\u0430\u043D\u043D\u044F\u043C\u0438. \u0417\u043E\u0432\u043D\u0456\u0448\u043D\u0456 \u0434\u0436\u0435\u0440\u0435\u043B\u0430, IMAGE/IMPORT*, \u043F\u043E\u0441\u0438\u043B\u0430\u043D\u043D\u044F-\u0444\u0443\u043D\u043A\u0446\u0456\u0457, \u043D\u0435\u0432\u0456\u0434\u043E\u043C\u0456 \u0444\u0443\u043D\u043A\u0446\u0456\u0457 \u0442\u0430 \u0456\u043C\u0435\u043D\u043E\u0432\u0430\u043D\u0456 \u0434\u0456\u0430\u043F\u0430\u0437\u043E\u043D\u0438/\u0432\u0438\u0440\u0430\u0437\u0438 \u043D\u0435 \u0434\u043E\u0437\u0432\u043E\u043B\u0435\u043D\u0456; \u0434\u043B\u044F \u0456\u043C\u0435\u043D\u043E\u0432\u0430\u043D\u043E\u0433\u043E \u0434\u0456\u0430\u043F\u0430\u0437\u043E\u043D\u0443 \u0432\u043A\u0430\u0436\u0438 \u044F\u0432\u043D\u0456 A1-\u043A\u043E\u043E\u0440\u0434\u0438\u043D\u0430\u0442\u0438. \u0424\u043E\u0440\u043C\u0443\u043B\u0438 \u043D\u0435 \u043F\u0435\u0440\u0435\u0442\u0432\u043E\u0440\u044E\u044E\u0442\u044C\u0441\u044F \u043D\u0430 \u0442\u0435\u043A\u0441\u0442. \u041B\u0456\u043C\u0456\u0442 JSON \u2014 11000 \u0441\u0438\u043C\u0432\u043E\u043B\u0456\u0432 \u0434\u043B\u044F batch_update, 10000 \u0434\u043B\u044F values.`;
     }
+    if (request.capability === "google.gmail.modify" && request.operation === "modify") {
+      return `${base} \u041F\u043E\u0442\u0440\u0456\u0431\u043D\u0456 threadIds (1\u2013${GMAIL_THREADS_PER_CALL} \u0456\u0434\u0435\u043D\u0442\u0438\u0444\u0456\u043A\u0430\u0442\u043E\u0440\u0456\u0432 \u043B\u0438\u0441\u0442\u0456\u0432 \u0437 gmail search) \u0456 \u0445\u043E\u0447\u0430 \u0431 \u043E\u0434\u043D\u0435 \u0437 add \u0430\u0431\u043E remove \u2014 \u043C\u0430\u0441\u0438\u0432\u0438 \u043D\u0430\u0437\u0432 \u0447\u0438 ID \u044F\u0440\u043B\u0438\u043A\u0456\u0432 \u0431\u0435\u0437 \u043A\u043E\u043C.`;
+    }
+    if (required?.includes("threadIds")) {
+      return `${base} \u041F\u043E\u0442\u0440\u0456\u0431\u0435\u043D \u043B\u0438\u0448\u0435 threadIds: \u043C\u0430\u0441\u0438\u0432 \u0456\u0437 1\u2013${GMAIL_THREADS_PER_CALL} \u0456\u0434\u0435\u043D\u0442\u0438\u0444\u0456\u043A\u0430\u0442\u043E\u0440\u0456\u0432 \u043B\u0438\u0441\u0442\u0456\u0432 \u0437 google.gmail.read/search, \u0431\u0435\u0437 \u043F\u043E\u0432\u0442\u043E\u0440\u0456\u0432.`;
+    }
+    if (required?.length === 0)
+      return `${base} \u0426\u044F \u043E\u043F\u0435\u0440\u0430\u0446\u0456\u044F \u043D\u0435 \u043F\u0440\u0438\u0439\u043C\u0430\u0454 \u0430\u0440\u0433\u0443\u043C\u0435\u043D\u0442\u0456\u0432.`;
     if (required == null)
       return `${base} \u041F\u0435\u0440\u0435\u0432\u0456\u0440 \u043F\u0435\u0440\u0435\u043B\u0456\u043A \u0430\u0440\u0433\u0443\u043C\u0435\u043D\u0442\u0456\u0432 \u0446\u0456\u0454\u0457 \u043E\u043F\u0435\u0440\u0430\u0446\u0456\u0457.`;
     return `${base} \u041F\u043E\u0442\u0440\u0456\u0431\u043D\u0456 \u0440\u0456\u0432\u043D\u043E \u0442\u0430\u043A\u0456 \u0430\u0440\u0433\u0443\u043C\u0435\u043D\u0442\u0438: ${required.join(", ")}. ` + `\u041F\u043E\u0432\u0442\u043E\u0440\u0438 \u0437\u0430\u043F\u0438\u0442, \u0432\u043A\u0430\u0437\u0430\u0432\u0448\u0438 \u0457\u0445 \u0443\u0441\u0456 \u0439 \u043D\u0435 \u0434\u043E\u0434\u0430\u044E\u0447\u0438 \u0456\u043D\u0448\u0438\u0445.`;
@@ -3675,6 +3805,7 @@ class GoogleAdapter {
       return match[1] === "search_console" ? "searchconsole" : match[1];
     const writes = {
       "google.gmail.send": "gmail",
+      "google.gmail.modify": "gmail",
       "google.calendar.write": "calendar",
       "google.sheets.write": "sheets",
       "google.docs.write": "docs",
@@ -3835,7 +3966,32 @@ class GoogleAdapter {
       }
       return null;
     }
+    if (request.capability === "google.gmail.modify") {
+      if (request.operation === "create_label") {
+        if (!exactKeys3(args, ["name"]))
+          return null;
+        const name = text2(args.name, 225);
+        return name == null || name.trim() !== name ? null : ["labels", "create", name];
+      }
+      const allowed = request.operation === "modify" ? ["threadIds", "add", "remove"] : ["threadIds"];
+      if (!["modify", "archive", "trash"].includes(request.operation) || Object.keys(args).some((key) => !allowed.includes(key)))
+        return null;
+      const threadIds = gmailThreadIds(args.threadIds);
+      if (threadIds == null)
+        return null;
+      if (request.operation === "archive")
+        return ["labels", "modify", ...threadIds, "--remove", "INBOX"];
+      if (request.operation === "trash")
+        return ["labels", "modify", ...threadIds, "--add", "TRASH", "--remove", "INBOX"];
+      const add = args.add == null ? null : gmailLabels(args.add);
+      const remove = args.remove == null ? null : gmailLabels(args.remove);
+      if (args.add != null && add == null || args.remove != null && remove == null || add == null && remove == null)
+        return null;
+      return ["labels", "modify", ...threadIds, ...add == null ? [] : ["--add", add], ...remove == null ? [] : ["--remove", remove]];
+    }
     if (request.capability === "google.gmail.read") {
+      if (request.operation === "labels")
+        return exactKeys3(args, []) ? ["labels", "list"] : null;
       if (request.operation === "search") {
         if (!exactKeys3(args, Object.hasOwn(args, "max") ? ["query", "max"] : ["query"]))
           return null;

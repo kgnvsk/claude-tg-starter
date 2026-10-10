@@ -26,6 +26,12 @@ C) МОВА ВІДПОВІДІ (Манзік, 02.10.2026): після годин
    (запис про попередження живе 30 днів).
    Не вдалося прочитати архів або записати, що попередження вже було, — пропускаємо.
 
+D) ПОСТІЙНІ ДОРУЧЕННЯ (Арти, 10.10.2026): «всегда», «каждый день», «запомни» власника лишалися в розмові й зникали
+   з наступним стисненням. Першу відповідь на таке повідомлення власника в його особистому чаті зупиняє одне
+   нагадування записати доручення: правило — у «# Правила власника» в ~/CLAUDE.md, регулярну дію — автозадачею.
+   Якщо ~/CLAUDE.md змінено після повідомлення, правило вже записане й відповідь іде одразу. Одне нагадування на
+   запит, як у C.
+
 Одноразовий bypass (не довше 5 хв):
 touch ~/.claude/state/tg-format-enforcer.bypass
 """
@@ -52,6 +58,12 @@ NOT_PROSE = re.compile(r"```.*?```|`[^`\n]*`|https?://\S+|@\w+|\S+[/\\_.]\S+", r
 REPLY_PROSE_LETTERS = 40
 LANGUAGE_WARNED = os.path.join(AGENT_ROOT, ".claude/state/tg-format-enforcer.language")
 LANGUAGE_WARNING_DAYS = 30  # a request still open after this long may get its warning once more
+DURABLE_WARNED = os.path.join(AGENT_ROOT, ".claude/state/tg-format-enforcer.durable")
+DURABLE = re.compile(
+    r"(?<!\w)(?:всегда|каждый\s+(?:день|раз|вечер|час)|каждое\s+утро|каждую\s+неделю|ежедневно|еженедельно|"
+    r"по\s+утрам|по\s+вечерам|никогда|запомни|возьми\s+за\s+правило|впредь|с\s+этого\s+момента|отныне|"
+    r"завжди|щодня|щоранку|щовечора|щотижня|кожного\s+(?:дня|разу|вечора|ранку)|кожен\s+(?:день|раз)|ніколи|"
+    r"запам['’ʼ]ятай|надалі|відтепер|візьми\s+за\s+правило)(?!\w)", re.I)
 
 
 def log(msg: str) -> None:
@@ -160,13 +172,13 @@ def other_script(asked: str, text: str) -> str:
     return ""
 
 
-def first_warning(delivery: str) -> bool:
-    """True when this request has had no language warning within the retention time and the warning is now on
+def first_warning(delivery: str, path: str = LANGUAGE_WARNED) -> bool:
+    """True when this request has had no warning of this kind within the retention time and the warning is now on
     record. A record that cannot be read or written gives False: a reply is never stopped twice for one request."""
     now = int(time.time())
     try:
-        os.makedirs(os.path.dirname(LANGUAGE_WARNED), exist_ok=True)
-        with open(LANGUAGE_WARNED, "a+") as record:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a+") as record:
             fcntl.flock(record, fcntl.LOCK_EX)  # two reply hooks at once must not both find «no warning yet»
             record.seek(0)
             lines = record.read().splitlines()
@@ -183,9 +195,41 @@ def first_warning(delivery: str) -> bool:
                 record.write("".join(f"{request}\t{at}\n" for request, at in kept.items()))
             record.write(f"{delivery}\t{now}\n")
     except OSError:
-        log("language check skipped: the warning record cannot be kept")
+        log("warning skipped: its record cannot be kept")
         return False
     return True
+
+
+def owner_chat() -> str:
+    """The primary owner's private chat, as the agent profile names it; empty when unknown."""
+    try:
+        with open(os.path.join(AGENT_ROOT, ".agent-profile.env"), encoding="utf-8") as profile:
+            for line in profile:
+                if line.startswith("OWNER_CHAT_ID="):
+                    return line.split("=", 1)[1].strip().strip("\"'")
+    except OSError:
+        pass
+    return ""
+
+
+def recorded_after(chat: str, delivery: str) -> bool:
+    """True when ~/CLAUDE.md changed after the request arrived: the rule is already written down. Unknown counts as
+    not recorded, so the reminder still comes, once."""
+    try:
+        archive = sqlite3.connect(f"file:{os.path.join(TELEGRAM_STATE, 'messages.db')}?mode=ro", uri=True, timeout=1.0)
+        try:
+            row = archive.execute("SELECT ts FROM messages WHERE chat_id=? AND direction='in' AND message_id=? "
+                                  "ORDER BY ts DESC LIMIT 1", (chat, int(delivery.rsplit(":", 1)[-1]))).fetchone()
+        finally:
+            archive.close()
+        arrived = int(row[0]) if row and str(row[0]).isdigit() else None
+        changed = os.stat(os.path.join(AGENT_ROOT, "CLAUDE.md")).st_mtime
+    except (sqlite3.Error, OSError, ValueError):
+        return False
+    if arrived is None:
+        return False
+    # The archive keeps milliseconds; an old row may hold seconds.
+    return changed * (1000 if arrived > 10**11 else 1) >= arrived
 
 
 def main() -> None:
@@ -268,6 +312,21 @@ def main() -> None:
             f"\n"
             f"Відповідай мовою її останнього повідомлення і повтори один раз. Якщо текст іншою мовою — "
             f"саме те, що вона просила (лист, переклад, цитата), додай зверху один рядок її мовою."
+        )
+        print(json.dumps({"decision": "block", "reason": msg}))
+        sys.exit(0)
+
+    # ПРОВЕРКА D: постійне доручення власника записане, а не лише сказане; одне нагадування на запит.
+    owner = owner_chat()
+    durable = DURABLE.search(asked) if delivery and owner and str(tool_input.get("chat_id") or "") == owner else None
+    if durable and not recorded_after(owner, delivery) and first_warning(delivery, DURABLE_WARNED):
+        log(f"BLOCK durable: owner request={delivery} word={durable.group(0)!r}")
+        msg = (
+            f"📌 ПОСТІЙНЕ ДОРУЧЕННЯ: власник написав «{durable.group(0)}». Таке доручення має пережити стиснення розмови.\n"
+            f"\n"
+            f"Перед відповіддю запиши його: правило — рядком у розділ «# Правила власника» в ~/CLAUDE.md, з датою; "
+            f"регулярну дію (перевірку, звіт, нагадування) — автозадачею через reminder-task. У відповіді коротко скажи, "
+            f"що записав. Якщо вже записано або це не постійне доручення — просто надішли відповідь ще раз."
         )
         print(json.dumps({"decision": "block", "reason": msg}))
         sys.exit(0)
