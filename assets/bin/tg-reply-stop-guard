@@ -895,6 +895,19 @@ def runtime_task_origin(origin: object) -> bool:
     return isinstance(origin, dict) and origin.get("kind") == "task-notification" and "server" not in origin
 
 
+def runtime_task_prompt(event: dict) -> object:
+    if event.get('isSidechain') is True:
+        return None
+    if event.get('type') == 'user' and runtime_task_origin(event.get('origin')):
+        return (event.get('message') or {}).get('content')
+    if event.get('type') == 'attachment':
+        attachment = event.get('attachment') or {}
+        if (attachment.get('type') == 'queued_command' and attachment.get('commandMode') == 'task-notification'
+                and (attachment.get('origin') is None or runtime_task_origin(attachment.get('origin')))):
+            return attachment.get('prompt')
+    return None
+
+
 def listed_event_disposition(event: dict) -> tuple[str, object, object]:
     """Return continuation, carrier, or ambiguous for an ancestry event."""
     event_type = event.get("type")
@@ -2012,14 +2025,7 @@ def native_background_work(events: list[dict], turn_events: list[dict], delivery
 
         # Process launches and completions in native order: a completed agent
         # may be resumed again even within this same Telegram request.
-        text = None
-        if event.get('type') == 'user' and runtime_task_origin(event.get('origin')):
-            text = (event.get('message') or {}).get('content')
-        elif event.get('type') == 'attachment':
-            attachment = event.get('attachment') or {}
-            if (attachment.get('type') == 'queued_command' and attachment.get('commandMode') == 'task-notification'
-                    and (attachment.get('origin') is None or runtime_task_origin(attachment.get('origin')))):
-                text = attachment.get('prompt')
+        text = runtime_task_prompt(event)
         # The runtime's origin already marks the notice; the CLI may write a line around its
         # block, so the one block is found rather than matched whole (29.09).
         if (isinstance(text, str) and text.count('<task-notification>') == 1
@@ -2267,8 +2273,47 @@ def callback_task_owner(hook: dict, task_ids: list[str]) -> tuple[str | None, tu
     return (next(iter(owners)) if owners else None), (), False
 
 
+def late_notice_after_completed_run(conn: sqlite3.Connection, session: str, stamp: str,
+                                    task_id: str, observed_at: int) -> bool:
+    """An extra end with no binding cannot revive an already answered run.
+
+    Use the launch history at the notice's time, not the mutable task owner: the
+    same task can have been resumed again since then. An unreturned launch, an
+    ambiguous origin or an answer delivered only after the notice proves nothing.
+    No request is rebound or marked complete here.
+    """
+    launches = conn.execute(
+        'SELECT created_at,resolved_at,state FROM delivery_task_launches '
+        'WHERE session_id=? AND stamp=? AND task_id=? AND created_at<=? '
+        'ORDER BY created_at DESC,rowid DESC LIMIT 2',
+        (session, stamp, task_id, observed_at),
+    ).fetchall()
+    if (not launches or launches[0][2] != 'resolved' or launches[0][1] is None
+            or launches[0][1] > observed_at
+            or len(launches) > 1 and launches[0][0] == launches[1][0]):
+        return False
+    returned = conn.execute(
+        'SELECT delivery_id,occurrence,max(observed_at) FROM delivery_task_returns '
+        'WHERE session_id=? AND stamp=? AND task_id=? AND observed_at>=? AND observed_at<? '
+        'AND delivery_id IS NOT NULL AND occurrence IS NOT NULL GROUP BY delivery_id,occurrence',
+        (session, stamp, task_id, launches[0][1], observed_at),
+    ).fetchall()
+    if len(returned) != 1:
+        return False
+    delivery, _, returned_at = returned[0]
+    return conn.execute(
+        'SELECT 1 FROM delivery_results r JOIN delivery_receipts c ON c.delivery_id=r.delivery_id '
+        'AND c.turn_id=r.turn_id AND c.chat_id=r.chat_id AND c.thread_id IS r.thread_id AND c.stamp=r.stamp '
+        "WHERE r.delivery_id=? AND r.session_id=? AND r.stamp=? AND r.state='complete' "
+        'AND r.acknowledged_at IS NOT NULL AND r.request_payload IS NOT NULL '
+        "AND r.finished_at BETWEEN ? AND ? AND c.source='reply' AND c.created_at BETWEEN ? AND ? LIMIT 1",
+        (delivery, session, stamp, returned_at, observed_at, returned_at, observed_at),
+    ).fetchone() is not None
+
+
 def completed_visible_callbacks(
     hook: dict, callbacks: list[dict], pending_launches: dict[str, int],
+    *, events: list[dict] = (),
 ) -> bool:
     """Prove every current callback against its immutable original request.
 
@@ -2280,6 +2325,18 @@ def completed_visible_callbacks(
     stamp = os.environ.get('TG_DELIVERY_STAMP')
     if not session or not stamp:
         return False
+    # Only the CLI's exact end without a launch id can use the late-end proof.
+    # A foreign explicit launch, missing transcript or quoted notice stays unbound.
+    late_notices = set()
+    for event in events:
+        text = runtime_task_prompt(event)
+        if (isinstance(text, str) and text.count('<task-notification>') == 1
+                and text.count('</task-notification>') == 1 and text.count('<task-id>') == 1
+                and '<tool-use-id' not in text
+                and re.search(r'<status>(completed|failed)</status>', text)):
+            task = re.search(r'<task-id>([A-Za-z0-9_-]{1,128})</task-id>', text)
+            if task:
+                late_notices.add((task.group(1), hashlib.sha256(text.encode('utf-8')).hexdigest()))
     try:
         with closing(sqlite3.connect(f"file:{telegram_state_dir() / 'messages.db'}?mode=ro", uri=True, timeout=0.2)) as conn:
             turn = conn.execute(
@@ -2310,10 +2367,18 @@ def completed_visible_callbacks(
             ).fetchall()
             if not current and not returns:
                 return True
-            if len(current) != len(returns):
-                return False
-            if any((callback['task_id'], callback['prompt_hash']) != row[:2]
-                   for callback, row in zip(current, returns)):
+            # A refused Stop can keep one ledger turn open across several CLI
+            # carriers. Older callbacks then leave the visible ancestry, while
+            # their immutable returns and exact final receipts remain. Every
+            # visible callback must still match a recorded return, in order.
+            visible = {}
+            next_callback = 0
+            for index, row in enumerate(returns):
+                if (next_callback < len(current)
+                        and (current[next_callback]['task_id'], current[next_callback]['prompt_hash']) == row[:2]):
+                    visible[index] = current[next_callback]
+                    next_callback += 1
+            if next_callback != len(current):
                 return False
             # Two identical notifications tied to different requests cannot
             # be distinguished solely by their order in a resumed transcript.
@@ -2322,18 +2387,22 @@ def completed_visible_callbacks(
                 by_hash.setdefault(prompt_hash, set()).add(delivery_id)
             if any(len(owners) > 1 for owners in by_hash.values()):
                 return False
-            for callback, (task_id, _, delivery_id, observed_at, occurrence) in zip(current, returns):
-                if not delivery_id and occurrence is not None:
+            for index, (task_id, prompt_hash, delivery_id, observed_at, occurrence) in enumerate(returns):
+                callback = visible.get(index)
+                if callback is not None and not delivery_id and occurrence is not None:
                     continue  # A request-less worker returned: nothing is owed once it is read.
-                if not callback['external'] and not delivery_id:
+                if callback is not None and not callback['external'] and not delivery_id:
                     continue  # This turn's own native launch was read above.
                 if not delivery_id:
                     # No request registered this worker, so there is none to answer. Guard and
                     # shadow may not block for it (NOVSKY, 27.09): its launch turn recorded
                     # would_block_unowned_worker. A callback the ledger never saw stays unproven.
-                    if obligations and conn.execute(
+                    if callback is not None and obligations and conn.execute(
                             "SELECT 1 FROM delivery_task_owners WHERE session_id=? AND stamp=? AND task_id=? "
                             "AND delivery_id IS NULL AND state='unowned'", (session, stamp, task_id)).fetchone():
+                        continue
+                    if (obligations and (task_id, prompt_hash) in late_notices
+                            and late_notice_after_completed_run(conn, session, stamp, task_id, observed_at)):
                         continue
                     return False
                 result = conn.execute(
@@ -2364,7 +2433,7 @@ def completed_visible_callbacks(
                     result[5] == turn[0] or (result[9] is not None and result[9] >= observed_at))
                 # A progress receipt after the callback defers the request to a task
                 # launched after it, or to another of its obligations still running.
-                successor = (result[3] == 'deferred' and result[6] >= observed_at
+                successor = (callback is not None and result[3] == 'deferred' and result[6] >= observed_at
                              and (pending_launches.get(result[4], -1) > callback['index']
                                   or (obligations and conn.execute(
                                       "SELECT 1 FROM delivery_task_owners WHERE session_id=? AND stamp=? "
@@ -2789,7 +2858,7 @@ def evaluate_stop(hook: dict) -> None:
             if native_task_deferred(hook, callback_owner, native_work['pending']):
                 record_unowned_workers(hook, callback_owner, native_work)
                 if (native_work['unbound_callback'] or has_callback_return) and not completed_visible_callbacks(
-                    hook, native_work['callback_events'], native_work['pending_launches'],
+                    hook, native_work['callback_events'], native_work['pending_launches'], events=events,
                 ):
                     block_delegation(
                         'Another native callback in this turn has no exact final reply '
@@ -2821,7 +2890,7 @@ def evaluate_stop(hook: dict) -> None:
             if not native_work['unknown'] and native_task_deferred(hook, delivery_id, native_work['pending']):
                 record_unowned_workers(hook, delivery_id, native_work)
                 if (native_work['unbound_callback'] or has_callback_return) and not completed_visible_callbacks(
-                    hook, native_work['callback_events'], native_work['pending_launches'],
+                    hook, native_work['callback_events'], native_work['pending_launches'], events=events,
                 ):
                     block_delegation(
                         'A native callback in this turn still needs an exact result '
@@ -2842,7 +2911,7 @@ def evaluate_stop(hook: dict) -> None:
                 'to durably defer this request until its native callback. Do not use phase=final or no_reply before reading the result.')
             return
     if has_callback_return and not completed_visible_callbacks(
-            hook, native_work['callback_events'], native_work['pending_launches']):
+            hook, native_work['callback_events'], native_work['pending_launches'], events=events):
         block_delegation(
             'A native callback is recorded for this turn, but its exact original '
             'request result is not yet proven. Wait for the full transcript and '
@@ -2858,7 +2927,7 @@ def evaluate_stop(hook: dict) -> None:
             return
     if native_work['unbound_callback']:
         callbacks_complete = completed_visible_callbacks(
-            hook, native_work['callback_events'], native_work['pending_launches'],
+            hook, native_work['callback_events'], native_work['pending_launches'], events=events,
         )
         if callbacks_complete and (terminal_targets or not targets):
             return
