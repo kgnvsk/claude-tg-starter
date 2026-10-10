@@ -7,7 +7,7 @@
     "local-foundation-v1"
   ],
   "source": "codex/starter/product.json",
-  "sourceRevision": "e18fe95ad6c1981443371a90bb324226bd0236ef",
+  "sourceRevision": "3472e3d12bc7f80e9fa7157462027acf7e179232",
   "sourceDirty": false,
   "features": [
     "browser"
@@ -137,7 +137,7 @@
     "modules/telegram-corporate/live-engines.ts": "8b107f7d7ed6a5bebfe1cb7a34d14c0e5016d101995dbc7a3d10aa6de6fecddd",
     "modules/telegram-corporate/live-session.ts": "c28d31c88f267c4185ff91b01f564455c8ed1f375323ffdd137e896c30e3e8ac",
     "modules/telegram-corporate/media.ts": "39ac18f208f7d2a12d3080eedb0b23e440b868e1ba4eb959bc8ebdd3cd863a9d",
-    "modules/telegram-corporate/migration-plan.ts": "33100f826599eb3ee4b764e29af4e47485f19dfb067f1922bd5d0148ae34da00",
+    "modules/telegram-corporate/migration-plan.ts": "0a1a3685290cf7c50cc815291dd5cfcef8d02aed975f93477f20e7e6db1434a9",
     "modules/telegram-corporate/native-file-reply.ts": "bbaad3bc89f3ee58d56ba9950ca483628b39b1d339bdb80f75ae9d682417e56a",
     "modules/telegram-corporate/native-mcp.ts": "196dd871a64377075b5ea041a3ff58cbebe1aa11589b4316286a14c21dc6b9c2",
     "modules/telegram-corporate/native-profile.ts": "aa745a5ca6fa0c81db72b7e127652d5409cb631b05a2a670bd71ce3dbd06b875",

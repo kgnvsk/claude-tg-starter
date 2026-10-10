@@ -1,8 +1,8 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-10-10.e18fe95ad6c1`
+- Реліз: `2026-10-10.3472e3d12bc7`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `e18fe95ad6c1981443371a90bb324226bd0236ef`
+- Ревізія вихідного комплекту: `3472e3d12bc7f80e9fa7157462027acf7e179232`
 - Дата релізу: `2026-10-10`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
@@ -19,8 +19,7 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    WhatsApp first messages keep a safe pace; one daily list of failed runs (#240)
-    Never block the bot's answers; the owner's group of two and a pasted /unstick work (#239)
+    The update preflight accepts an owner-confirmed chat rule's trusted write, as the store does (#241)
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не
