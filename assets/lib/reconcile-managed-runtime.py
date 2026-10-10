@@ -63,6 +63,7 @@ MANAGED_BIN_NAMES = frozenset(
         "hubspot-crm",
         "icloud-mail",
         "inbox-secretary",
+        "owner_outbound.py",
         "install-plugins",
         "kit-module",
         "learning-review",
