@@ -519,7 +519,10 @@ alert() {
     # malformed-tool: the restart that would clear a broken tool-call loop failed.
     # vault-sync-failing: the notes have had no history and no backup for hours, and
     # vault-sync's own log was the only place that said so (03.10.2026: 11 days).
-    case "$key" in browser-down|crash-loop|low-disk|service-down|stuck-escalate|corporate-paused|corporate-unavailable|limit-detector-silent|api-error-turns|answered-unsettled|malformed-tool|vault-sync-failing) ;; *) return 0 ;; esac
+    # whatsapp-unlinked: WhatsApp dropped the owner's linked server; nothing is read
+    # or sent there until he links it again (Арти, 09.10.2026: twice in a day, and he
+    # learned it from a stopped broadcast).
+    case "$key" in browser-down|crash-loop|low-disk|service-down|stuck-escalate|corporate-paused|corporate-unavailable|limit-detector-silent|api-error-turns|answered-unsettled|malformed-tool|vault-sync-failing|whatsapp-unlinked) ;; *) return 0 ;; esac
     if [ -n "$scope" ] && ! [[ "$scope" =~ ^-?[0-9]+_[0-9]+$ ]]; then
         return 0
     fi
@@ -958,6 +961,80 @@ VAULT_SYNC_PY
 VAULT_SYNC_STALL=$(vault_sync_stall)
 if [ -n "$VAULT_SYNC_STALL" ]; then
     alert "vault-sync-failing" "$VAULT_SYNC_STALL" 86400
+fi
+
+# WhatsApp unlinked the owner's server. The cause is the bridge's own «[logged-out]» line (whatsmeow's LoggedOut only,
+# never a first pairing or a reconnect: Codex K230-P2-1), in either log a bridge writes; a link is only its
+# «[connected]» line, printed once the session is authenticated («[session] existing session restored» comes before
+# that: K230-R4-P1-1). Every bridge start first writes «[start] <number>.<unix>.<pid>» through wa-bridge-run, which
+# takes the number from both logs under one lock and so never resets (K230-R5-P1-1); the lines of both logs fall in
+# one order, run by run, without ties (K230-R4-P1-2): the newest of them says whether the server is linked now, and an old logged-out process beside the
+# one wa-link started decides nothing (K230-R2-P1-2). The session store only adds that no device row is certainly
+# unlinked; a row is no proof of a link, because whatsmeow reports LoggedOut even when deleting the row fails
+# (K230-R3-P1-1). Each logout is its own incident, named by its log, its run and its place, all found from the line
+# itself backward, so the name never changes as the log grows (K230-P1-1, K230-R2-P1-1, K230-R4-P2-1): a second logout
+# is told even if no tick saw it linked in between or its log was emptied in between, the same one again only a week
+# later, and a notice Telegram did not take is tried again on the next tick (alert keeps no stamp for it).
+whatsapp_logout_incident() {
+    local home="$1"
+    [ -n "$home" ] && [ -f "$home/session.db" ] || return 0
+    python3 - "$home" <<'WA_LOG_PY' 2>/dev/null || true
+import hashlib, os, sqlite3, sys
+home = sys.argv[1]
+try:
+    store = sqlite3.connect(f"file:{os.path.join(home, 'session.db')}?mode=ro", uri=True, timeout=5)
+    device = store.execute("SELECT 1 FROM whatsmeow_device LIMIT 1").fetchone() is not None
+except sqlite3.Error:
+    sys.exit()  # a store that cannot be read says nothing either way
+CHUNK, LIMIT = 1 << 20, 512 << 20  # ponytail: a log is searched at most half a gigabyte back
+
+def last_line(log, prefix, end):
+    """(place, line) of the last line starting with prefix that begins before byte `end`, a line start; else None."""
+    pos, carry = end, b""
+    while pos > 0 and end - pos < LIMIT:
+        step = min(CHUNK, pos)
+        pos -= step
+        log.seek(pos)
+        shift = 1 if pos == 0 else 0  # the file's first line has no newline before it
+        block = b"\n" * shift + log.read(step) + carry
+        at = block.rfind(b"\n" + prefix)
+        if at >= 0:
+            stop = block.find(b"\n", at + 1)
+            return pos + at + 1 - shift, block[at + 1:stop if stop >= 0 else len(block)]
+        carry = block[shift:shift + 256]
+    return None
+
+def newest(index, path):
+    """The newest link and the newest logout line of one log, as (run number, log, place, kind, run token)."""
+    found = []
+    try:
+        with open(path, "rb") as log:
+            size, inode = os.fstat(log.fileno()).st_size, os.fstat(log.fileno()).st_ino
+            for kind, prefix in (("in", b"[connected]"), ("out", b"[logged-out]")):
+                hit = last_line(log, prefix, size)
+                if hit is None:
+                    continue
+                head = last_line(log, b"[start] ", hit[0])
+                token = head[1][8:].strip().decode(errors="replace") if head else f"inode{inode}"
+                number = token.split(".", 1)[0]
+                # Lines before any start line are the oldest run.
+                found.append((int(number) if head and number.isdigit() else 0, index, hit[0], kind, token))
+    except OSError:
+        pass
+    return found
+
+lines = sorted(newest(0, os.path.join(home, "bridge.log")) + newest(1, os.path.join(home, "link.log")))
+logouts = [line for line in lines if line[3] == "out"]
+if not logouts or (device and lines[-1][3] == "in"):
+    sys.exit()  # never unlinked here, or linked again since
+number, index, place, _, token = logouts[-1]
+digest = hashlib.sha256(f"{index}:{token}@{place}".encode()).hexdigest()
+print(f"{int(digest[:12], 16)}_{int(digest[12:24], 16)}")
+WA_LOG_PY
+}
+WHATSAPP_LOGOUT=$(whatsapp_logout_incident "$H/.claude/personal-inbox/whatsapp")
+if [ -n "$WHATSAPP_LOGOUT" ]; then
+    alert "whatsapp-unlinked" "WhatsApp відв'язав сервер: повідомлення WhatsApp зараз не читаються й не надсилаються. Щоб прив'язати знову, напиши мені «прив'яжи WhatsApp»." 604800 "$WHATSAPP_LOGOUT"
 fi
 
 # Corporate work has its own durable queue. Never infer a global Telegram hang
