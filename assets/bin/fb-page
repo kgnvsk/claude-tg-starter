@@ -1,0 +1,262 @@
+#!/usr/bin/env python3
+"""Operate one owned Facebook Page through Meta's official Graph API with a Page access token.
+
+Арти, 10.10.2026: the page was run through a person's saved browser login, and Facebook blocked that person. A Page
+token from Meta Business (a system user's token does not expire) is the official way; it lives in a file named by
+~/.config/facebook-page/config.env and never leaves this helper.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from pathlib import Path
+import re
+import sys
+from urllib import error, parse, request
+
+
+CONFIG = Path(os.environ.get("FB_PAGE_CONFIG", str(Path.home() / ".config/facebook-page/config.env")))
+GRAPH_BASE = os.environ.get("FB_GRAPH_BASE", "https://graph.facebook.com").rstrip("/")
+DEFAULT_VERSION = "v25.0"
+MAX_ROWS = 100
+OBJECT_ID = re.compile(r"^[0-9]{5,30}(?:_[0-9]{5,30})?$")
+POST_FIELDS = "id,message,created_time,permalink_url"
+COMMENT_FIELDS = "id,message,from,created_time,parent"
+
+
+class CliError(Exception):
+    """Expected failure without credential disclosure."""
+
+
+def load_env() -> dict[str, str]:
+    try:
+        lines = CONFIG.expanduser().read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise CliError(f"Facebook page config missing: {CONFIG}") from exc
+    values: dict[str, str] = {}
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, value = stripped.split("=", 1)
+        values[key.strip()] = value.strip()
+    page = values.get("FB_PAGE_ID", "")
+    token_path = Path(values.get("FB_PAGE_TOKEN_FILE", "")).expanduser()
+    if not page.isdigit() or not token_path.is_absolute():
+        raise CliError("FB_PAGE_ID or FB_PAGE_TOKEN_FILE is not configured")
+    try:
+        token = token_path.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise CliError(f"Facebook page token missing: {token_path}") from exc
+    if not token:
+        raise CliError("Facebook page token is empty")
+    return {"page": page, "token": token, "version": values.get("FB_GRAPH_VERSION") or DEFAULT_VERSION}
+
+
+def graph_request(
+    config: dict[str, str],
+    method: str,
+    path: str,
+    *,
+    query: dict[str, object] | None = None,
+    form: dict[str, object] | None = None,
+    json_body: dict[str, object] | None = None,
+    timeout: int = 30,
+) -> dict[str, object]:
+    url = f"{GRAPH_BASE}/{config['version']}/{path.lstrip('/')}"
+    if query:
+        url = f"{url}?{parse.urlencode(query)}"
+    headers = {"Authorization": f"Bearer {config['token']}", "Accept": "application/json",
+               "User-Agent": "claude-premium-facebook-page/1"}
+    data = None
+    if json_body is not None:
+        data = json.dumps(json_body, separators=(",", ":")).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    elif form is not None:
+        data = parse.urlencode(form).encode("utf-8")
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+    req = request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with request.urlopen(req, timeout=timeout) as response:
+            raw = response.read()
+    except error.HTTPError as exc:
+        raise CliError(f"Facebook API returned HTTP {exc.code}") from exc
+    except (error.URLError, TimeoutError) as exc:
+        raise CliError("Facebook API is unavailable or timed out") from exc
+    try:
+        value = json.loads(raw)
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise CliError("Facebook API returned invalid JSON") from exc
+    if not isinstance(value, dict) or "error" in value:
+        raise CliError("Facebook API rejected the request")
+    return value
+
+
+def object_id(value: str) -> str:
+    if not OBJECT_ID.fullmatch(value or ""):
+        raise argparse.ArgumentTypeError("invalid Facebook object ID")
+    return value
+
+
+def bounded_limit(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("limit must be an integer") from exc
+    if not 1 <= parsed <= MAX_ROWS:
+        raise argparse.ArgumentTypeError(f"limit must be between 1 and {MAX_ROWS}")
+    return parsed
+
+
+def public_url(value: str) -> str:
+    parsed = parse.urlparse(value)
+    if (parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password
+            or parsed.hostname in {"localhost", "127.0.0.1", "::1"}):
+        raise argparse.ArgumentTypeError("URL must be a public HTTPS URL without credentials")
+    return value
+
+
+def read_text(path: Path, max_chars: int) -> str:
+    try:
+        text = path.expanduser().read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise CliError(f"cannot read text file: {path}") from exc
+    if not text:
+        raise CliError(f"text file is empty: {path}")
+    if len(text) > max_chars:
+        raise CliError(f"text exceeds {max_chars} characters")
+    return text
+
+
+def page_post(config: dict[str, str], post_id: str) -> None:
+    """A post of this page: its id carries the page's prefix and the page's feed returns it."""
+    if not post_id.startswith(config["page"] + "_"):
+        raise CliError("this post is not on the page")
+    found = graph_request(config, "GET", post_id, query={"fields": "id"})
+    if found.get("id") != post_id:
+        raise CliError("this post is not on the page")
+
+
+def comment_under(config: dict[str, str], post_id: str, comment_id: str) -> None:
+    """The comment is among the post's own comments (replies included), read page by page."""
+    after = None
+    for _ in range(10):
+        query: dict[str, object] = {"fields": "id", "filter": "stream", "limit": 100}
+        if after:
+            query["after"] = after
+        page = graph_request(config, "GET", f"{post_id}/comments", query=query)
+        if any(item.get("id") == comment_id for item in page.get("data") or []):
+            return
+        after = ((page.get("paging") or {}).get("cursors") or {}).get("after")
+        if not after or not (page.get("paging") or {}).get("next"):
+            break
+    raise CliError("this comment is not under the page's post")
+
+
+def writing(kind: str) -> None:
+    """The line the corporate adapter reads: after it a request that changes the page may have been sent."""
+    print(f"Writing to Facebook page: {kind}", file=sys.stderr, flush=True)
+
+
+def confirmed(args: argparse.Namespace) -> None:
+    if not args.confirm:
+        raise CliError("Facebook writes require --confirm after owner approval")
+
+
+def print_json(value: dict[str, object]) -> int:
+    print(json.dumps(value, ensure_ascii=False, indent=2))
+    return 0
+
+
+def permalink(config: dict[str, str], object_id_value: str) -> dict[str, object]:
+    try:
+        return graph_request(config, "GET", object_id_value, query={"fields": "id,permalink_url"})
+    except CliError:
+        return {"id": object_id_value}
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser("doctor", help="verify the page token")
+    posts = commands.add_parser("posts", help="list the page's posts")
+    posts.add_argument("--limit", type=bounded_limit, default=25)
+    comments = commands.add_parser("comments", help="list comments on one of the page's posts")
+    comments.add_argument("post_id", type=object_id)
+    comments.add_argument("--limit", type=bounded_limit, default=50)
+    publish = commands.add_parser("publish", help="publish a text post, optionally with a link")
+    publish.add_argument("--message-file", type=Path, required=True)
+    publish.add_argument("--link", type=public_url)
+    publish.add_argument("--confirm", action="store_true")
+    photo = commands.add_parser("photo", help="publish a photo from a public URL")
+    photo.add_argument("--url", type=public_url, required=True)
+    photo.add_argument("--message-file", type=Path, required=True)
+    photo.add_argument("--confirm", action="store_true")
+    reply = commands.add_parser("reply", help="reply to one comment under one of the page's posts")
+    reply.add_argument("post_id", type=object_id)
+    reply.add_argument("comment_id", type=object_id)
+    reply.add_argument("--message-file", type=Path, required=True)
+    reply.add_argument("--confirm", action="store_true")
+    message = commands.add_parser("message", help="answer a person in the page's Messenger inbox")
+    message.add_argument("recipient_id", type=object_id)
+    message.add_argument("--message-file", type=Path, required=True)
+    message.add_argument("--confirm", action="store_true")
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    try:
+        config = load_env()
+        page = config["page"]
+        if args.command == "doctor":
+            return print_json(graph_request(config, "GET", page, query={"fields": "id,name"}))
+        if args.command == "posts":
+            return print_json(graph_request(config, "GET", f"{page}/posts",
+                                            query={"fields": POST_FIELDS, "limit": args.limit}))
+        if args.command == "comments":
+            page_post(config, args.post_id)
+            return print_json(graph_request(config, "GET", f"{args.post_id}/comments",
+                                            query={"fields": COMMENT_FIELDS, "limit": args.limit}))
+        confirmed(args)
+        if args.command == "publish":
+            text = read_text(args.message_file, 5000)
+            writing("post")
+            created = graph_request(config, "POST", f"{page}/feed",
+                                    form={"message": text, **({"link": args.link} if args.link else {})})
+            if not isinstance(created.get("id"), str):
+                raise CliError("Facebook did not return the post ID")
+            return print_json({"ok": True, **permalink(config, created["id"])})
+        if args.command == "photo":
+            text = read_text(args.message_file, 5000)
+            writing("photo")
+            created = graph_request(config, "POST", f"{page}/photos", form={"url": args.url, "caption": text}, timeout=60)
+            post = created.get("post_id") or created.get("id")
+            if not isinstance(post, str):
+                raise CliError("Facebook did not return the photo post ID")
+            return print_json({"ok": True, **permalink(config, post)})
+        if args.command == "reply":
+            text = read_text(args.message_file, 2000)
+            page_post(config, args.post_id)
+            comment_under(config, args.post_id, args.comment_id)
+            writing("comment reply")
+            created = graph_request(config, "POST", f"{args.comment_id}/comments", form={"message": text})
+            if not isinstance(created.get("id"), str):
+                raise CliError("Facebook did not return the reply ID")
+            return print_json({"ok": True, "id": created["id"]})
+        text = read_text(args.message_file, 2000)
+        writing("message")
+        sent = graph_request(config, "POST", f"{page}/messages", json_body={
+            "recipient": {"id": args.recipient_id}, "messaging_type": "RESPONSE", "message": {"text": text}})
+        if not isinstance(sent.get("message_id"), str):
+            raise CliError("Facebook did not return the message ID")
+        return print_json({"ok": True, "messageId": sent["message_id"]})
+    except (CliError, ValueError) as exc:
+        print(f"fb-page: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

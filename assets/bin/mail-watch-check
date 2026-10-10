@@ -1,0 +1,152 @@
+#!/usr/bin/env python3
+"""mail-watch-check — new letters since the last look, one line each; nothing printed when nothing is new.
+
+The look of the mail listening mode (owner, 10.10.2026: «режим слушания для почты … при подключении почты агент
+спрашивает: слушание, по запросу или по расписанию»). A scheduled task runs it as CHECK= every few minutes: it costs
+no model run, and the scheduler wakes the agent only when it prints something. It reads mail only and keeps its own
+marks per set of mailboxes, so a daily sorting task still sees everything. Only that one task runs it: a look by hand
+would take the letters the task is about to show.
+
+  mail-watch-check [--gmail EMAIL]... [--icloud] [--skip-from TEXT]...
+
+Gmail goes through ~/bin/gog (the wrapper that loads the keyring), iCloud through ~/bin/icloud-mail. The first look
+only remembers where each mailbox stands. Every later look takes all that came since the last good one, page after
+page (Codex #235 R1): in Gmail every in:inbox letter from an hour before that look, in iCloud every UID above the last
+one seen, oldest first. A mailbox that cannot be read keeps its place for the next look while the others are still
+read; after half an hour of failures one line says so, once. Lines are printed before the marks move, so letters a
+look could not hand on come again instead of being lost.
+"""
+import argparse
+import hashlib
+import json
+import os
+import re
+import subprocess
+import time
+
+HOME = os.path.expanduser("~")
+EMAIL = re.compile(r"^[^@\s/]{1,64}@[A-Za-z0-9.-]{1,190}\.[A-Za-z]{2,24}$")
+MARGIN = 3600      # Gmail may index a letter a little after it arrives: each window starts an hour early
+BATCH = 100        # iCloud letters per call, icloud-mail's maximum
+DEADLINE = 45      # seconds for the whole look: the scheduler allows 60 and runs the model when a look hangs
+TELL_AFTER = 1800  # a mailbox unreadable this long gets one line
+
+
+class NoTime(Exception):
+    """The look's time went to other mailboxes; this one keeps its place and is not counted as failing."""
+
+
+def call(args, deadline):
+    left = deadline - time.monotonic()
+    if left < 2:
+        raise NoTime()
+    out = subprocess.run(args, capture_output=True, text=True, timeout=left)
+    if out.returncode != 0:
+        raise RuntimeError(f"{os.path.basename(args[0])} exited {out.returncode}")
+    return json.loads(out.stdout or "{}")
+
+
+def gmail(account, box, deadline):
+    start = int(time.time())
+    data = call([os.path.join(HOME, "bin/gog"), "--no-input", "--json", "--gmail-no-send", "-a", account, "gmail",
+                 "messages", "search", f"in:inbox after:{box.get('since', start) - MARGIN}", "--max", "100", "--all"],
+                deadline)
+    rows = data.get("messages") if isinstance(data, dict) else data
+    rows = [row for row in rows or [] if isinstance(row, dict) and row.get("id")]
+    seen = set(box.get("seen", []))
+    new = [row for row in rows if str(row["id"]) not in seen] if "since" in box else []
+    # The next window opens an hour before this look, inside this window, so marking this window's letters is enough.
+    return new, {"since": start, "seen": [str(row["id"]) for row in rows]}
+
+
+def icloud(box, deadline):
+    tool, start = os.path.join(HOME, "bin/icloud-mail"), int(time.time())
+    if "uid" not in box:
+        # The last UID and the numbering it belongs to are taken together (Codex #235 R2).
+        data = call([tool, "list", "--max", "1"], deadline)
+        rows = data.get("messages", [])
+        return [], {"uid": max([int(row["uid"]) for row in rows] or [0]), "validity": data.get("uidvalidity"),
+                    "at": start}
+    new, uid, validity = [], box["uid"], box.get("validity")
+    for _ in range(5):
+        data = call([tool, "list", "--after-uid", str(uid), "--max", str(BATCH)], deadline)
+        if data.get("uidvalidity") is not None and validity not in (None, data["uidvalidity"]):
+            # iCloud renumbered the mailbox: old and new letters got new UIDs, so none can be told apart. Remember it
+            # afresh and say so once instead of staying blind or showing every letter as new.
+            since = time.strftime("%d.%m %H:%M", time.localtime(box.get("at", start)))
+            _, fresh = icloud({}, deadline)
+            return [{"notice": f"скринька перенумерувала листи — листи з {since} переглянь у самій пошті"}], fresh
+        validity = data.get("uidvalidity", validity)
+        rows = [row for row in data.get("messages", []) if int(row["uid"]) > uid]
+        new += rows
+        last = max([uid, int(data.get("last_uid", uid))] + [int(row["uid"]) for row in rows])
+        done, uid = last == uid or len(rows) < BATCH, last
+        if done:
+            break
+    return new, {"uid": uid, "validity": validity, "at": start}
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--gmail", action="append", default=[])
+    parser.add_argument("--icloud", action="store_true")
+    parser.add_argument("--skip-from", action="append", default=[])
+    args = parser.parse_args()
+    if not args.gmail and not args.icloud or any(not EMAIL.fullmatch(account) for account in args.gmail):
+        parser.error("name at least one mailbox: --gmail EMAIL or --icloud")
+    boxes = [(f"gmail {account}", lambda box, deadline, account=account: gmail(account, box, deadline))
+             for account in args.gmail]
+    if args.icloud:
+        boxes.append(("icloud", icloud))
+    key = hashlib.sha256(json.dumps([sorted(args.gmail), args.icloud]).encode()).hexdigest()[:16]
+    state_path = os.path.join(HOME, ".local/state/mail-watch", f"{key}.json")
+    try:
+        with open(state_path, encoding="utf-8") as handle:
+            state = json.load(handle)
+    except (OSError, ValueError):
+        state = {}
+    skip = [text.lower() for text in args.skip_from if text.strip()]
+    deadline = time.monotonic() + DEADLINE
+    lines, after = [], dict(state)
+    # A mailbox that keeps failing goes last, and each one gets its share of the time left, so one that hangs never
+    # starves the others (Codex #235 R2).
+    boxes.sort(key=lambda item: "failing_since" in (state.get(item[0]) if isinstance(state.get(item[0]), dict) else {}))
+    for index, (name, look) in enumerate(boxes):
+        box = state.get(name) if isinstance(state.get(name), dict) else {}
+        share = time.monotonic() + (deadline - time.monotonic()) / (len(boxes) - index)
+        try:
+            rows, after[name] = look(box, share)
+        except NoTime:
+            continue
+        except Exception:
+            now = int(time.time())
+            box = {**box, "failing_since": box.get("failing_since", now)}
+            if now - box["failing_since"] >= TELL_AFTER and not box.get("told"):
+                since = time.strftime("%d.%m %H:%M", time.localtime(box["failing_since"]))
+                fix = "gog auth list" if name.startswith("gmail") else "icloud-mail doctor"
+                lines.append(f"{name} | не читається з {since} — перевір вхід ({fix})")
+                box["told"] = True
+            after[name] = box
+            continue
+        for row in rows:
+            sender = str(row.get("from", ""))
+            if "notice" in row:
+                lines.append(f"{name} | {row['notice']}")
+            elif not any(text in sender.lower() for text in skip):
+                lines.append(f"{name} | {row.get('date', '')} | {sender} | {row.get('subject', '')}")
+    # Lines first, marks after (Codex #235 R1): a look stopped between the two shows the same letters again next time.
+    if lines:
+        print("\n".join(lines), flush=True)
+    if after != state:
+        try:
+            os.makedirs(os.path.dirname(state_path), mode=0o700, exist_ok=True)
+            temp = state_path + ".tmp"
+            with open(temp, "w", encoding="utf-8") as handle:
+                json.dump(after, handle)
+            os.replace(temp, state_path)
+        except OSError:
+            pass  # marks unchanged: the same letters come once more, and a failed look would wake the model instead
+
+
+if __name__ == "__main__":
+    main()

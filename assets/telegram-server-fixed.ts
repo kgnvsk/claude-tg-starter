@@ -6413,17 +6413,17 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     ...(CORPORATE_ENABLED || (OWNER_CHAT_ID && existsSync(CORPORATE_MODULE)) ? [{
       name: 'corporate_policy_preview',
-      description: 'Prepare a real owner-confirmed permission change, preserving unrelated grants. For a lasting rule in the current group/topic use current_chat=true and the current delivery_id: it applies to all participants only there, and a resource write needs trusted=true. Send a concrete card there; the owner confirms it by button or replying "підтверджую правило". A one-time yes executes the named task on the owner behalf and must not change a policy. integrations.manage is only for a named user, never a group; it shares no owner credentials.',
+      description: 'Change a permission on the owner\u2019s own word, preserving unrelated grants. Always pass the current owner request delivery_id: his order in his private chat, or with current_chat=true in his current group/topic, is the decision and applies at once; he gets what changed, with nothing to press. A lasting rule for the current group/topic applies to all participants only there, and a resource write needs trusted=true. Without the owner\u2019s current request a card goes to him to confirm. A one-time yes executes the named task on the owner behalf and must not change a policy. integrations.manage is only for a named user, never a group; it shares no owner credentials.',
       inputSchema: {
         type: 'object',
         additionalProperties: false,
         properties: {
           subject: {
             type: 'string',
-            description: 'Exact subject: user:<telegram_id>, group:<chat_id>, topic:<chat_id>:<thread_id>, agent:default, or agent:installed:<agent_id>:<unix_uid> for a connected agent. For revocation use an empty proposedGrants array. A preview always requires real owner confirmation.',
+            description: 'Exact subject: user:<telegram_id>, group:<chat_id>, topic:<chat_id>:<thread_id>, agent:default, or agent:installed:<agent_id>:<unix_uid> for a connected agent. For revocation use an empty proposedGrants array.',
           },
           current_chat: { type: 'boolean', description: 'Permanent rule for the authenticated owner’s current group/topic. Never use for one-time consent.' },
-          delivery_id: { type: 'string', description: 'Exact current owner request delivery_id; required with current_chat.' },
+          delivery_id: { type: 'string', description: 'Exact delivery_id of the owner request in this turn; with it the change applies at once. Required with current_chat.' },
           proposedGrants: {
             type: 'array',
             maxItems: 64,
@@ -6445,15 +6445,15 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     }, {
       name: 'corporate_resource_preview',
-      description: 'Prepare registration or revocation of an exact work resource for the primary owner in their personal chat. The owner already has authority; no superadmin role or Novsky access is needed. For a Google calendar use the connected account email, calendarId and access=read or read_write. Other supported kinds name their exact file, account, group or origin. A Telegram channel is connector=telegram kind=channel with its numeric chatId (resolve @username with Bot API getChat; the bot must be the channel administrator). The owner’s connected Instagram is connector=instagram kind=account with the businessId that ig-social doctor reports and access=read or read_write. Never guess the target or share a personal calendar by default. This only sends Confirm/Cancel to the owner; it neither verifies/connects Google nor grants employee access. After confirmation grant the selected resource with corporate_policy_preview. Do not pause/resume the company in the shell: confirmation performs its own maintenance and queues current company work again.',
+      description: 'Register or revoke an exact work resource on the primary owner\u2019s word. Pass the delivery_id of his request in this turn in his private chat: it is the decision and applies at once; without it a card goes to him to confirm. The owner already has authority; no superadmin role or Novsky access is needed. For a Google calendar use the connected account email, calendarId and access=read or read_write. Other supported kinds name their exact file, account, group or origin. A Telegram channel is connector=telegram kind=channel with its numeric chatId (resolve @username with Bot API getChat; the bot must be the channel administrator). The owner’s connected Instagram is connector=instagram kind=account with the businessId that ig-social doctor reports and access=read or read_write. A Facebook Page is connector=facebook kind=page with its numeric pageId (fb-page doctor confirms the token). A YouTube channel is connector=youtube kind=channel with the connected Google account and its UC… channelId. Never guess the target or share a personal calendar by default. Without the owner\u2019s current request it sends him Confirm/Cancel; either way it neither verifies/connects Google nor grants employee access. Once registered, grant the selected resource with corporate_policy_preview. Do not pause/resume the company in the shell: confirmation performs its own maintenance and queues current company work again.',
       inputSchema: {
         type: 'object', additionalProperties: false,
         properties: {
           action: { type: 'string', enum: ['register', 'revoke'] },
           id: { type: 'string', pattern: '^[a-z0-9][a-z0-9._-]{0,63}$' },
           label: { type: 'string', maxLength: 120 },
-          connector: { type: 'string', enum: ['google', 'meta', 'gads', 'browser', 'memory', 'image', 'telegram', 'instagram'] },
-          kind: { type: 'string', enum: ['sheet', 'doc', 'slide', 'file', 'folder', 'mailbox', 'calendar', 'contacts', 'tasks', 'ad_account', 'customer', 'origin', 'company', 'generator', 'group', 'channel', 'account'] },
+          connector: { type: 'string', enum: ['google', 'meta', 'gads', 'browser', 'memory', 'image', 'telegram', 'instagram', 'facebook', 'youtube'] },
+          kind: { type: 'string', enum: ['sheet', 'doc', 'slide', 'file', 'folder', 'mailbox', 'calendar', 'contacts', 'tasks', 'ad_account', 'customer', 'origin', 'company', 'generator', 'group', 'channel', 'account', 'page'] },
           account: { type: 'string', maxLength: 254 },
           spreadsheetId: { type: 'string', pattern: '^[A-Za-z0-9_-]{10,256}$' },
           fileId: { type: 'string', pattern: '^[A-Za-z0-9_-]{10,256}$' },
@@ -6463,7 +6463,10 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           origin: { type: 'string', maxLength: 2048 },
           chatId: { type: 'string', pattern: '^-[0-9]{5,20}$' },
           businessId: { type: 'string', pattern: '^[0-9]{5,30}$' },
+          pageId: { type: 'string', pattern: '^[0-9]{5,30}$' },
+          channelId: { type: 'string', pattern: '^UC[A-Za-z0-9_-]{22}$' },
           access: { type: 'string', enum: ['read', 'read_write'] },
+          delivery_id: { type: 'string', description: 'Exact delivery_id of the owner request in this turn; with it the change applies at once.' },
         },
         required: ['action', 'id'],
       },
@@ -6473,12 +6476,19 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
 
 mcp.setRequestHandler(CallToolRequestSchema, async req => {
   const args = (req.params.arguments ?? {}) as Record<string, unknown>
+  // A preview applied at once on the owner's word keeps its description, never its «confirm by button» line
+  // (Codex K237-P2-1).
+  const appliedSummary = (summary: string, ok: boolean, reason?: string): string =>
+    summary.split('\n').filter(line => !/Підтверди кнопкою|Confirmation pauses company sessions/.test(line)).join('\n')
+    + `\n\n${ok ? '✅ Застосовано за словом власника.' : '⚠️ Не застосовано: ' + (reason ?? 'помилка')}`
   try {
     switch (req.params.name) {
       case 'corporate_resource_preview': {
         if (!OWNER_CHAT_ID) throw new Error('corporate resource controls are unavailable')
-        const allowed = args.action === 'revoke' ? ['action', 'id']
-          : ['action', 'id', 'label', 'connector', 'kind', 'account', 'spreadsheetId', 'fileId', 'calendarId', 'accountId', 'customerId', 'origin', 'chatId', 'access']
+        // The kinds the schema offers (Instagram businessId, Facebook pageId, YouTube channelId) are accepted here too;
+        // before, the owner's own registration of them was refused and the agent answered that it could not.
+        const allowed = args.action === 'revoke' ? ['action', 'id', 'delivery_id']
+          : ['action', 'id', 'label', 'connector', 'kind', 'account', 'spreadsheetId', 'fileId', 'calendarId', 'accountId', 'customerId', 'origin', 'chatId', 'businessId', 'pageId', 'channelId', 'access', 'delivery_id']
         if (!['register', 'revoke'].includes(String(args.action)) || typeof args.id !== 'string'
           || !/^[a-z0-9][a-z0-9._-]{0,63}$/.test(args.id)
           || Object.keys(args).some(key => !allowed.includes(key)) || JSON.stringify(args).length > 4096) {
@@ -6486,8 +6496,20 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         }
         const corporate = await corporateRuntimeReady()
         if (!corporate?.previewResource) throw new Error('corporate resource controls are unavailable')
-        const preview = await corporate.previewResource(args, OWNER_CHAT_ID)
+        const { delivery_id: deliveryId, ...control } = args
+        let ownerMessage: number | null = null
+        if (typeof deliveryId === 'string') {
+          const { currentOwnerPrivateRequest } = await import(new URL('./chat-policy.ts', pathToFileURL(CORPORATE_MODULE)).href)
+          ownerMessage = currentOwnerPrivateRequest(MSG_DB, OWNER_CHAT_ID, DELIVERY_STAMP, deliveryId)
+        }
+        const preview = await corporate.previewResource(control, OWNER_CHAT_ID)
         if (!preview.ok) throw new Error('corporate resource preview rejected')
+        if (ownerMessage != null) {
+          // Owner, 10.10.2026: his order in his private chat is the decision; he gets what changed, nothing to press.
+          const outcome = await corporate.approveResourcePreview(preview.token, { chatType: 'private', chatId: OWNER_CHAT_ID, userId: OWNER_CHAT_ID, messageId: ownerMessage })
+          await sendCorporateText(OWNER_CHAT_ID, null, ownerMessage, appliedSummary(preview.summary, outcome.ok, outcome.reason))
+          return { content: [{ type: 'text', text: outcome.ok ? 'Ресурс змінено за словом власника; йому надіслано, що змінено. Доступ співробітників налаштовується окремо.' : `Ресурс не змінено (${outcome.reason}).` }] }
+        }
         await sendCorporateText(OWNER_CHAT_ID, null, null, preview.summary, { resourceToken: preview.token })
         return { content: [{ type: 'text', text: 'Ресурс ще не змінено. Власнику надіслано точний опис і кнопки підтвердження та скасування; доступ співробітників налаштовується окремо.' }] }
       }
@@ -6532,11 +6554,16 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           if (!corporate?.bindPolicyPreviewMessage) throw new Error('chat policy controls are unavailable')
           const preview = await corporate.previewPolicy({ subject, proposedGrants, conversation }, OWNER_CHAT_ID)
           if (!preview.ok) throw new Error('current chat policy preview rejected')
-          const messageId = await sendCorporateText(conversation.chatId, conversation.threadId ?? null, null, preview.summary, { policyToken: preview.token })
+          // Owner, 10.10.2026 («у владельца должен быть полный доступ … какие карточки?»): his own request in this chat is
+          // the decision. The rule is bound to that message and applied at once; the chat gets what changed.
+          const messageId = Number(String(args.delivery_id).split(':').pop())
           if (!corporate.bindPolicyPreviewMessage(preview.token, { chatId: conversation.chatId, messageId, threadId: conversation.threadId })) {
-            throw new Error('policy card was not bound; nothing granted')
+            throw new Error('policy rule was not bound to the owner request; nothing granted')
           }
-          return { content: [{ type: 'text', text: 'Постійне правило ще не застосоване. Точну картку надіслано в цей чат або тему; потрібне підтвердження власника на ній. Разове «так, зараз» нічого не змінює.' }] }
+          const outcome = await corporate.approvePolicyPreview(preview.token, { ...conversation, messageId })
+          await sendCorporateText(conversation.chatId, conversation.threadId ?? null, messageId,
+            appliedSummary(preview.summary, outcome.ok, outcome.reason))
+          return { content: [{ type: 'text', text: outcome.ok ? 'Правило застосовано за словом власника; у чат надіслано, що змінено.' : `Правило не застосовано (${outcome.reason}).` }] }
         }
         if (subject.startsWith('agent:installed:')) {
           const { CapabilityStore } = await import(new URL('./capability-store.ts', pathToFileURL(CORPORATE_MODULE)).href)
@@ -6550,11 +6577,25 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         }
         const corporate = await corporateRuntimeReady()
         if (!corporate) throw new Error('corporate runtime unavailable')
+        let ownerMessage: number | null = null
+        if (typeof args.delivery_id === 'string') {
+          const { currentOwnerPrivateRequest } = await import(new URL('./chat-policy.ts', pathToFileURL(CORPORATE_MODULE)).href)
+          ownerMessage = currentOwnerPrivateRequest(MSG_DB, OWNER_CHAT_ID, DELIVERY_STAMP, args.delivery_id)
+        }
         const preview = await corporate.previewPolicy(
           { subject, proposedGrants },
           OWNER_CHAT_ID,
         )
         if (!preview.ok) throw new Error('corporate policy preview rejected')
+        if (ownerMessage != null) {
+          // Owner, 10.10.2026 («у владельца должен быть полный доступ … какие карточки?»): his order in his private chat
+          // is the decision. Applied at once; he gets what changed, with nothing to press.
+          const outcome = await corporate.approvePolicyPreview(preview.token,
+            { chatType: 'private', chatId: OWNER_CHAT_ID, userId: OWNER_CHAT_ID, messageId: ownerMessage })
+          await sendCorporateText(OWNER_CHAT_ID, null, ownerMessage,
+            appliedSummary(preview.summary, outcome.ok, outcome.reason))
+          return { content: [{ type: 'text', text: outcome.ok ? 'Права змінено за словом власника; йому надіслано, що змінено.' : `Права не змінено (${outcome.reason}).` }] }
+        }
         await sendCorporateText(
           OWNER_CHAT_ID,
           null,

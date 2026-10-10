@@ -1,0 +1,304 @@
+#!/usr/bin/env python3
+"""Operate one owned YouTube channel through the YouTube Data API with the Google sign-in gog already keeps.
+
+Арти, 10.10.2026: the marketing group needed uploads, descriptions and comment replies on the company channel. gog
+reads YouTube but cannot write or upload, so this helper takes the account's stored sign-in from gog for one call,
+turns it into a short-lived access token and talks to the API itself. The account must have been connected with the
+YouTube scopes (gog auth add <email> --services youtube --extra-scopes …youtube.force-ssl,…youtube.upload). Every
+call first proves the token serves the pinned channel. Nothing secret is printed.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import tempfile
+from urllib import error, parse, request
+
+
+API = os.environ.get("YT_API_BASE", "https://www.googleapis.com/youtube/v3").rstrip("/")
+UPLOAD = os.environ.get("YT_UPLOAD_BASE", "https://www.googleapis.com/upload/youtube/v3").rstrip("/")
+TOKEN_URL = os.environ.get("YT_TOKEN_URL", "https://oauth2.googleapis.com/token")
+GOG = os.environ.get("YT_GOG", str(Path.home() / "bin" / "gog"))
+FORCE_SSL = "https://www.googleapis.com/auth/youtube.force-ssl"
+FULL = "https://www.googleapis.com/auth/youtube"
+UPLOAD_SCOPE = "https://www.googleapis.com/auth/youtube.upload"
+CHANNEL = re.compile(r"^UC[A-Za-z0-9_-]{22}$")
+VIDEO = re.compile(r"^[A-Za-z0-9_-]{11}$")
+COMMENT = re.compile(r"^[A-Za-z0-9_.-]{10,100}$")
+EMAIL = re.compile(r"^[^@\s/]{1,64}@[A-Za-z0-9.-]{1,190}\.[A-Za-z]{2,24}$")
+MAX_ROWS = 50
+MAX_VIDEO_BYTES = 2 * 1024 ** 3  # ponytail: 2 GB per upload; raise it when a channel needs longer videos
+CHUNK = 8 * 1024 * 1024
+
+
+class CliError(Exception):
+    """Expected failure without credential disclosure."""
+
+
+def client_credentials(client: str) -> tuple[str, str]:
+    name = "credentials.json" if client in ("", "default") else f"credentials-{client}.json"
+    roots = (Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share"),
+             Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config"))
+    for root in roots:
+        try:
+            raw = json.loads((root / "gogcli" / name).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        block = raw.get("installed") or raw.get("web") or raw
+        client_id, secret = block.get("client_id"), block.get("client_secret")
+        if isinstance(client_id, str) and isinstance(secret, str) and client_id and secret:
+            return client_id, secret
+    raise CliError("Google OAuth client credentials are not configured for gog")
+
+
+def access_token(account: str, scopes: set[str]) -> str:
+    """A short-lived access token for the account, from the sign-in gog stores. The exported refresh token lives in
+    a private temporary folder for the length of one exchange."""
+    with tempfile.TemporaryDirectory(prefix="yt-channel-") as folder:
+        os.chmod(folder, 0o700)
+        out = Path(folder) / "token.json"
+        result = subprocess.run([GOG, "--no-input", "--enable-commands-exact=auth.tokens.export",
+                                 "auth", "tokens", "export", account, "--out", str(out)],
+                                capture_output=True, text=True, timeout=60)
+        if result.returncode != 0 or not out.exists():
+            raise CliError("the Google sign-in for this account is not available on this server")
+        try:
+            stored = json.loads(out.read_text(encoding="utf-8"))
+        except ValueError as exc:
+            raise CliError("the stored Google sign-in is unreadable") from exc
+    granted = set(stored.get("scopes") or [])
+    if granted and not scopes & granted:
+        raise CliError("this Google sign-in has no YouTube permission; reconnect it with the YouTube scopes")
+    client_id, secret = client_credentials(str(stored.get("client") or ""))
+    form = parse.urlencode({"client_id": client_id, "client_secret": secret,
+                            "refresh_token": stored.get("refresh_token") or "", "grant_type": "refresh_token"}).encode()
+    try:
+        with request.urlopen(request.Request(TOKEN_URL, data=form, method="POST"), timeout=30) as response:
+            token = json.loads(response.read()).get("access_token")
+    except (error.URLError, TimeoutError, ValueError) as exc:
+        raise CliError("Google did not issue an access token; the account may need to be reconnected") from exc
+    if not isinstance(token, str) or not token:
+        raise CliError("Google did not issue an access token")
+    return token
+
+
+def api(token: str, method: str, path: str, *, query: dict | None = None, body: dict | None = None,
+        base: str = API, headers: dict | None = None, data: bytes | None = None, timeout: int = 60):
+    url = f"{base}/{path.lstrip('/')}" + (f"?{parse.urlencode(query)}" if query else "")
+    sent = {"Authorization": f"Bearer {token}", "Accept": "application/json", **(headers or {})}
+    if body is not None:
+        data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        sent["Content-Type"] = "application/json; charset=UTF-8"
+    try:
+        with request.urlopen(request.Request(url, data=data, headers=sent, method=method), timeout=timeout) as response:
+            return response.headers, response.read()
+    except error.HTTPError as exc:
+        raise CliError(f"YouTube API returned HTTP {exc.code}") from exc
+    except (error.URLError, TimeoutError) as exc:
+        raise CliError("YouTube API is unavailable or timed out") from exc
+
+
+def api_json(token: str, method: str, path: str, **kwargs) -> dict:
+    _, raw = api(token, method, path, **kwargs)
+    try:
+        value = json.loads(raw) if raw else {}
+    except ValueError as exc:
+        raise CliError("YouTube API returned invalid JSON") from exc
+    if not isinstance(value, dict) or "error" in value:
+        raise CliError("YouTube API rejected the request")
+    return value
+
+
+def own_channel(token: str, channel: str) -> None:
+    mine = api_json(token, "GET", "channels", query={"part": "id", "mine": "true", "maxResults": 50})
+    if channel not in {item.get("id") for item in mine.get("items") or []}:
+        raise CliError("this Google sign-in does not manage the pinned channel")
+
+
+def video_on_channel(token: str, video_id: str, channel: str) -> None:
+    if not VIDEO.fullmatch(video_id or ""):
+        raise CliError("this comment is not under a video")
+    items = api_json(token, "GET", "videos", query={"part": "snippet", "id": video_id}).get("items") or []
+    if len(items) != 1 or items[0].get("snippet", {}).get("channelId") != channel:
+        raise CliError("this video is not on the pinned channel")
+
+
+def writing(kind: str) -> None:
+    """The line the corporate adapter reads: after it a request that changes the channel may have been sent."""
+    print(f"Writing to YouTube: {kind}", file=sys.stderr, flush=True)
+
+
+def read_text(path: Path | None, max_chars: int) -> str | None:
+    if path is None:
+        return None
+    try:
+        text = path.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise CliError(f"cannot read text file: {path}") from exc
+    if len(text) > max_chars:
+        raise CliError(f"text exceeds {max_chars} characters")
+    return text
+
+
+def pattern(regex: re.Pattern, what: str):
+    def check(value: str) -> str:
+        if not regex.fullmatch(value or ""):
+            raise argparse.ArgumentTypeError(f"invalid {what}")
+        return value
+    return check
+
+
+def bounded_limit(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("limit must be an integer") from exc
+    if not 1 <= parsed <= MAX_ROWS:
+        raise argparse.ArgumentTypeError(f"limit must be between 1 and {MAX_ROWS}")
+    return parsed
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--account", type=pattern(EMAIL, "account"), required=True)
+    parser.add_argument("--channel", type=pattern(CHANNEL, "channel ID"), required=True)
+    commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser("doctor", help="prove the sign-in serves the channel")
+    videos = commands.add_parser("videos", help="the channel's latest videos")
+    videos.add_argument("--limit", type=bounded_limit, default=25)
+    comments = commands.add_parser("comments", help="comment threads of one video")
+    comments.add_argument("video_id", type=pattern(VIDEO, "video ID"))
+    comments.add_argument("--limit", type=bounded_limit, default=50)
+    update = commands.add_parser("update", help="change a video's title or description")
+    update.add_argument("video_id", type=pattern(VIDEO, "video ID"))
+    update.add_argument("--title-file", type=Path)
+    update.add_argument("--description-file", type=Path)
+    update.add_argument("--confirm", action="store_true")
+    reply = commands.add_parser("reply", help="reply to one comment")
+    reply.add_argument("comment_id", type=pattern(COMMENT, "comment ID"))
+    reply.add_argument("--message-file", type=Path, required=True)
+    reply.add_argument("--confirm", action="store_true")
+    upload = commands.add_parser("upload", help="upload one video file")
+    upload.add_argument("--file", type=Path, required=True)
+    upload.add_argument("--title-file", type=Path, required=True)
+    upload.add_argument("--description-file", type=Path)
+    upload.add_argument("--privacy", choices=("private", "unlisted", "public"), default="private")
+    upload.add_argument("--confirm", action="store_true")
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    try:
+        write = args.command in ("update", "reply", "upload")
+        if write and not args.confirm:
+            raise CliError("YouTube writes require --confirm after owner approval")
+        scopes = {FORCE_SSL, FULL} | ({UPLOAD_SCOPE} if args.command == "upload" else set())
+        token = access_token(args.account, scopes if write else scopes | {"https://www.googleapis.com/auth/youtube.readonly"})
+        own_channel(token, args.channel)
+        if args.command == "doctor":
+            print(json.dumps({"ok": True, "channel": args.channel}))
+            return 0
+        if args.command == "videos":
+            found = api_json(token, "GET", "search", query={"part": "snippet", "forMine": "true", "channelId": args.channel,
+                                                            "type": "video", "order": "date", "maxResults": args.limit})
+            found["items"] = [item for item in found.get("items") or []
+                              if item.get("snippet", {}).get("channelId") == args.channel]
+            print(json.dumps(found, ensure_ascii=False, indent=1))
+            return 0
+        if args.command == "comments":
+            video_on_channel(token, args.video_id, args.channel)
+            found = api_json(token, "GET", "commentThreads", query={"part": "snippet", "videoId": args.video_id,
+                                                                    "maxResults": args.limit, "textFormat": "plainText"})
+            print(json.dumps(found, ensure_ascii=False, indent=1))
+            return 0
+        if args.command == "update":
+            title, description = read_text(args.title_file, 100), read_text(args.description_file, 5000)
+            if not title and description is None:
+                raise CliError("nothing to change: give a title or a description")
+            current = api_json(token, "GET", "videos", query={"part": "snippet", "id": args.video_id}).get("items") or []
+            if len(current) != 1 or current[0].get("snippet", {}).get("channelId") != args.channel:
+                raise CliError("this video is not on the pinned channel")
+            snippet = current[0]["snippet"]
+            changed = {key: snippet[key] for key in ("title", "description", "categoryId", "tags", "defaultLanguage")
+                       if key in snippet}
+            if title:
+                changed["title"] = title
+            if description is not None:
+                changed["description"] = description
+            writing("video details")
+            saved = api_json(token, "PUT", "videos", query={"part": "snippet"},
+                             body={"id": args.video_id, "snippet": changed})
+            print(json.dumps({"ok": True, "id": saved.get("id"), "url": f"https://youtu.be/{args.video_id}"}))
+            return 0
+        if args.command == "reply":
+            text = read_text(args.message_file, 10000)
+            if not text:
+                raise CliError("text file is empty")
+            threads = api_json(token, "GET", "commentThreads", query={"part": "snippet", "id": args.comment_id}).get("items") or []
+            if len(threads) != 1:
+                raise CliError("reply only to a top-level comment of the pinned channel's video")
+            video_on_channel(token, str(threads[0].get("snippet", {}).get("videoId") or ""), args.channel)
+            writing("comment reply")
+            saved = api_json(token, "POST", "comments", query={"part": "snippet"},
+                             body={"snippet": {"parentId": args.comment_id, "textOriginal": text}})
+            print(json.dumps({"ok": True, "id": saved.get("id")}))
+            return 0
+        title, description = read_text(args.title_file, 100), read_text(args.description_file, 5000) or ""
+        if not title:
+            raise CliError("an upload needs a title")
+        size = args.file.stat().st_size if args.file.is_file() else 0
+        if not 0 < size <= MAX_VIDEO_BYTES:
+            raise CliError("the video file is missing, empty or too large")
+        writing("upload")
+        headers, _ = api(token, "POST", "videos", base=UPLOAD,
+                         query={"uploadType": "resumable", "part": "snippet,status"},
+                         body={"snippet": {"title": title, "description": description},
+                               "status": {"privacyStatus": args.privacy, "selfDeclaredMadeForKids": False}},
+                         headers={"X-Upload-Content-Length": str(size), "X-Upload-Content-Type": "video/*"})
+        session = headers.get("Location") or ""
+        parsed = parse.urlparse(session)
+        # The token goes only to Google's own upload host.
+        if parsed.scheme != "https" or parsed.hostname not in {"www.googleapis.com", "youtube.googleapis.com"}:
+            raise CliError("YouTube did not open an upload session")
+        with args.file.open("rb") as video:
+            sent, raw, done = 0, b"", False
+            while not done:
+                video.seek(sent)
+                part = video.read(CHUNK)
+                last = sent + len(part) - 1
+                try:
+                    with request.urlopen(request.Request(session, data=part, method="PUT", headers={
+                            "Authorization": f"Bearer {token}", "Content-Type": "video/*",
+                            "Content-Length": str(len(part)), "Content-Range": f"bytes {sent}-{last}/{size}"}),
+                            timeout=300) as response:
+                        raw, done = response.read(), True
+                except error.HTTPError as exc:
+                    if exc.code != 308:
+                        raise CliError(f"YouTube upload returned HTTP {exc.code}") from exc
+                    # Resume from what YouTube acknowledged; no Range means it kept nothing of this request.
+                    acknowledged = re.fullmatch(r"bytes=0-(\d+)", exc.headers.get("Range") or "")
+                    sent = int(acknowledged.group(1)) + 1 if acknowledged else 0
+                    if sent >= size:
+                        raise CliError("YouTube acknowledged the whole file without confirming the video")
+        try:
+            video_id = json.loads(raw).get("id")
+        except ValueError:
+            video_id = None
+        if not isinstance(video_id, str) or not VIDEO.fullmatch(video_id):
+            raise CliError("YouTube did not confirm the uploaded video ID")
+        print(json.dumps({"ok": True, "id": video_id, "url": f"https://youtu.be/{video_id}", "privacy": args.privacy}))
+        return 0
+    except (CliError, OSError, subprocess.SubprocessError, ValueError) as exc:
+        print(f"yt-channel: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

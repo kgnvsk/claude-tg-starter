@@ -1,8 +1,8 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-10-10.56f00363199f`
+- Реліз: `2026-10-10.049421c380c6`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `56f00363199f7ea3dcc56fcb06a08e760c677044`
+- Ревізія вихідного комплекту: `049421c380c669f2d9ccf7ecb36b45b838126f6f`
 - Дата релізу: `2026-10-10`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
@@ -19,8 +19,10 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    Scheduled tasks catch up after a Claude limit; the owner's standing orders get written down (#233)
-    Company rights for Instagram, the company channel and mailbox organizing (#232)
+    The owner's word applies at once; every owner rule reaches every turn (#237)
+    Daily repeats keep their local hour when summer time ends or starts (#236)
+    Mail listening mode: the agent asks how to watch a newly connected mailbox (#235)
+    Company rights for the Facebook Page and the YouTube channel (#234)
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не

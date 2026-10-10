@@ -31,12 +31,14 @@
     "bin/claude-login",
     "bin/claude-telegram-bot",
     "bin/delivery-shadow-report",
+    "bin/fb-page",
     "bin/gh",
     "bin/group-observation",
     "bin/html-to-pdf",
     "bin/install-plugins",
     "bin/kit-module",
     "bin/learning-review",
+    "bin/mail-watch-check",
     "bin/memory-budget-guard",
     "bin/memory-doctor",
     "bin/memory-embeddings-config",
@@ -86,7 +88,8 @@
     "bin/update-safety-check",
     "bin/vault-sync",
     "bin/verify-telegram-bot",
-    "bin/wiki-hot-inject"
+    "bin/wiki-hot-inject",
+    "bin/yt-channel"
   ],
   "managed": [
     ".local/bin/deno",
@@ -136,6 +139,7 @@
     "bin/codex-image-generate",
     "bin/codex-image-result",
     "bin/delivery-shadow-report",
+    "bin/fb-page",
     "bin/findata",
     "bin/gh",
     "bin/gog",
@@ -149,6 +153,7 @@
     "bin/install-plugins",
     "bin/kit-module",
     "bin/learning-review",
+    "bin/mail-watch-check",
     "bin/media-dl",
     "bin/meet-bot",
     "bin/memory-budget-guard",
@@ -219,6 +224,7 @@
     "bin/video-edit",
     "bin/video-ingest",
     "bin/wiki-hot-inject",
+    "bin/yt-channel",
     "bin/yt-dl"
   ]
 }

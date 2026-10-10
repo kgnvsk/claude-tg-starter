@@ -25,6 +25,7 @@
 #   UNTIL_EPOCH=<last_allowed_send_boundary>
 #   COUNT=<successful_send_count>
 #   CADENCE_EPOCH=<original_repeat_grid_start> (internal, set on quiet deferral)
+#   LOCAL_ANCHOR=<first_slot_of_a_whole_day_repeat> (internal: its local time of day is kept)
 # Header lines form the leading KEY=value block. Everything after that block
 # is the message body. Unknown optional headers are preserved but not sent.
 
@@ -284,11 +285,29 @@ local_boundary_epoch() {
   fi
 }
 
+# The first slot after now on a whole-day grid that keeps the anchor's local time of day: the anchor's local date plus
+# step, 2·step… days at the same wall-clock time in the timezone (Codex #235 P2, 10.10.2026).
+next_local_day() {
+  python3 - "$@" <<'PY' 2>/dev/null
+import datetime, sys
+from zoneinfo import ZoneInfo
+anchor, zone, step, now = int(sys.argv[1]), ZoneInfo(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
+start = datetime.datetime.fromtimestamp(anchor, zone).replace(tzinfo=None)
+slot = lambda k: int((start + datetime.timedelta(days=k * step)).replace(tzinfo=zone).timestamp())
+k = max(1, (now - anchor) // (step * 86400) + 1)
+while k > 1 and slot(k - 1) > now:
+    k -= 1
+while slot(k) <= now:
+    k += 1
+print(slot(k))
+PY
+}
+
 atomic_update_repeat() {
-  local file="$1" next_epoch="$2" next_count="$3" anchor="${4:-}" temp
+  local file="$1" next_epoch="$2" next_count="$3" anchor="${4:-}" local_anchor="${5:-}" temp
   temp=$(mktemp "${file}.tmp.XXXXXX") || return 1
-  if ! awk -v next_epoch="$next_epoch" -v next_count="$next_count" -v anchor="$anchor" '
-    BEGIN { headers = 1; count_written = 0; anchor_written = 0 }
+  if ! awk -v next_epoch="$next_epoch" -v next_count="$next_count" -v anchor="$anchor" -v local_anchor="$local_anchor" '
+    BEGIN { headers = 1; count_written = 0; anchor_written = 0; local_written = 0 }
     headers && /^EPOCH=/ {
       print "EPOCH=" next_epoch
       next
@@ -303,17 +322,25 @@ atomic_update_repeat() {
       anchor_written = 1
       next
     }
+    headers && /^LOCAL_ANCHOR=/ {
+      if (!local_written) print
+      local_written = 1
+      next
+    }
     headers && !/^[A-Z][A-Z0-9_]*=/ {
       if (!count_written) print "COUNT=" next_count
       if (anchor != "" && !anchor_written) print "CADENCE_EPOCH=" anchor
+      if (local_anchor != "" && !local_written) print "LOCAL_ANCHOR=" local_anchor
       count_written = 1
       anchor_written = 1
+      local_written = 1
       headers = 0
     }
     { print }
     END {
       if (headers && !count_written) print "COUNT=" next_count
       if (headers && anchor != "" && !anchor_written) print "CADENCE_EPOCH=" anchor
+      if (headers && local_anchor != "" && !local_written) print "LOCAL_ANCHOR=" local_anchor
     }
   ' "$file" > "$temp"; then
     rm -f "$temp"
@@ -354,6 +381,16 @@ settle_reminder() {
   fi
   local missed=$(( (now - anchor) / repeat ))
   local next_epoch=$(( anchor + (missed + 1) * repeat ))
+  # Whole days keep their local hour in the task's timezone: a daily 21:00 stays 21:00 when summer time ends instead
+  # of moving to 20:00 (Codex #235 P2, 10.10.2026). The first slot is kept as LOCAL_ANCHOR, so the day a time does
+  # not exist (01:30 when the clock jumps to 02:00) fires an hour later on the clock and the next day is 01:30 again
+  # (Codex #236 R1). Without a timezone, or when the wall clock cannot be read, the elapsed grid above stays.
+  local wall_anchor=""
+  if [ -n "${timezone:-}" ] && [ $((repeat % 86400)) -eq 0 ]; then
+    wall_anchor="${local_anchor:-$anchor}"
+    next_epoch=$(next_local_day "$wall_anchor" "$timezone" $((repeat / 86400)) "$now") || next_epoch=""
+    case $next_epoch in ''|*[!0-9]*) next_epoch=$(( anchor + (missed + 1) * repeat )) wall_anchor="" ;; esac
+  fi
   local next_count=$((count + 1))
   if [ -n "$until" ] && [ "$next_epoch" -gt "$until" ]; then
     if ! rm -f "$f"; then
@@ -362,7 +399,7 @@ settle_reminder() {
     fi
     settled=1
     log_message "fired final $(basename "$f") → chat=$chat count=$next_count"
-  elif atomic_update_repeat "$f" "$next_epoch" "$next_count"; then
+  elif atomic_update_repeat "$f" "$next_epoch" "$next_count" "" "$wall_anchor"; then
     settled=1
     log_message "fired $(basename "$f") → chat=$chat; next=$next_epoch count=$next_count"
   else
@@ -1597,6 +1634,18 @@ for f in "$REM_DIR"/*.rem; do
       continue
     fi
     cadence_epoch=$(decimal_value "$cadence_epoch")
+  fi
+
+  local_anchor=""
+  if has_header "$f" LOCAL_ANCHOR; then
+    local_anchor=$(header_value "$f" LOCAL_ANCHOR)
+    if is_uint "$local_anchor" && [ "$(decimal_value "$local_anchor")" -gt 0 ] &&
+       [ "$(decimal_value "$local_anchor")" -le "$epoch" ]; then
+      local_anchor=$(decimal_value "$local_anchor")
+    else
+      log_message "ignored invalid LOCAL_ANCHOR in $f"
+      local_anchor=""
+    fi
   fi
 
   count=0

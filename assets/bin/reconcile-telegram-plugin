@@ -28,10 +28,16 @@ UPSTREAM_SERVER_SHA256 = (
 )
 UPSTREAM_PACKAGE_START = "bun install --no-summary 1>&2 && bun server.ts"
 GOLDEN_SERVER_SHA256 = (
-    "e7981f247a5b3e927e71ff03547cc286fe08ec77d4f684bf104886e9c9110aa2"
+    "7f02ec77f73ed0b18b4b53e0a30790c993845a884491aedc40feb6ec004a4372"
 )
 PREVIOUS_GOLDEN_SERVER_SHA256S = frozenset(
     {
+        # A golden of the owner-word branch before its wording fix (Codex K237).
+        "448b46d89d1d3a6761ca186db8a92e7d334ada9d22956b01ca6fb9f32ef9d764",
+        # The golden before the owner’s own word in his chat applied a rights change at once.
+        "a5091abf171df4d04df95eb14ba9f433bdfd88977da97fc96724f1cb7fa4e087",
+        # The golden before the owner could register a Facebook Page and a YouTube channel from chat.
+        "e7981f247a5b3e927e71ff03547cc286fe08ec77d4f684bf104886e9c9110aa2",
         # The golden before the owner could register a company channel and Instagram from chat.
         "5185727608f318ca486cd9782f2a53ad243c20cc30ed5edf8413a144c14201e1",
         # An earlier head of kit #229, never released: the history test walks every committed receiver.

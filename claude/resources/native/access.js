@@ -12,6 +12,8 @@ var ACCOUNT = /^[A-Za-z0-9][A-Za-z0-9._%+-]*@[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z
 var LABEL_CONTROLS = /[\x00-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]/;
 var INSTAGRAM_RIGHTS = ["instagram.read", "instagram.publish", "instagram.comments.reply", "instagram.direct.send"];
 var TELEGRAM_GROUP_RIGHTS = ["telegram.group.read", "telegram.message.send"];
+var FACEBOOK_RIGHTS = ["facebook.page.read", "facebook.page.publish", "facebook.page.comments.reply", "facebook.page.messages.send"];
+var YOUTUBE_RIGHTS = ["youtube.read", "youtube.update", "youtube.comments.reply", "youtube.upload"];
 var BUSINESS_CAPABILITIES = {
   sheet: [["google.sheets.read"], ["google.sheets.write"]],
   doc: [["google.docs.read", "google.drive.read"], ["google.docs.write", "google.drive.share"]],
@@ -100,9 +102,27 @@ function resourceFromControl(input, current) {
         capabilityIds: input.access === "read_write" ? [...INSTAGRAM_RIGHTS] : ["instagram.read"],
         config: { [labelKey]: label }
       };
+    } else if (input.connector === "facebook" && input.kind === "page" && exactFields(input, ["action", "id", "label", "connector", "kind", "pageId", "access"]) && typeof input.pageId === "string" && /^\d{5,30}$/.test(input.pageId) && ["read", "read_write"].includes(input.access)) {
+      labelKey = `page.${input.pageId}`;
+      resource2 = {
+        id: input.id,
+        label,
+        connector: "facebook",
+        capabilityIds: input.access === "read_write" ? [...FACEBOOK_RIGHTS] : ["facebook.page.read"],
+        config: { [labelKey]: label }
+      };
+    } else if (input.connector === "youtube" && input.kind === "channel" && exactFields(input, ["action", "id", "label", "connector", "kind", "account", "channelId", "access"]) && typeof input.account === "string" && ACCOUNT.test(input.account) && typeof input.channelId === "string" && /^UC[A-Za-z0-9_-]{22}$/.test(input.channelId) && ["read", "read_write"].includes(input.access)) {
+      labelKey = `channel.${input.channelId}`;
+      resource2 = {
+        id: input.id,
+        label,
+        connector: "youtube",
+        capabilityIds: input.access === "read_write" ? [...YOUTUBE_RIGHTS] : ["youtube.read"],
+        config: { account: input.account, [labelKey]: label }
+      };
     } else
       throw new Error("invalid business resource");
-    return fixedScope(resource2, current, labelKey, resource2.connector === "telegram" ? input.kind === "channel" ? ["telegram.channel.post"] : TELEGRAM_GROUP_RIGHTS : resource2.connector === "instagram" ? INSTAGRAM_RIGHTS : resource2.capabilityIds);
+    return fixedScope(resource2, current, labelKey, resource2.connector === "telegram" ? input.kind === "channel" ? ["telegram.channel.post"] : TELEGRAM_GROUP_RIGHTS : resource2.connector === "instagram" ? INSTAGRAM_RIGHTS : resource2.connector === "facebook" ? FACEBOOK_RIGHTS : resource2.connector === "youtube" ? YOUTUBE_RIGHTS : resource2.capabilityIds);
   }
   if (typeof input.kind !== "string" || !Object.hasOwn(BUSINESS_CAPABILITIES, input.kind) || !["read", "read_write"].includes(input.access) || typeof input.account !== "string" || input.account.length > 254 || !ACCOUNT.test(input.account)) {
     throw new Error("invalid business resource");
@@ -230,7 +250,9 @@ var RESOURCE_CONNECTORS = Object.freeze([
   "image",
   "browser",
   "vercel",
-  "instagram"
+  "instagram",
+  "facebook",
+  "youtube"
 ]);
 function capability(id, options) {
   return { id, delegable: true, ...options };
@@ -513,6 +535,70 @@ var CAPABILITY_CATALOG = Object.freeze({
     kind: "outbound",
     adapter: "instagram",
     operations: ["send"],
+    sharedAllowed: false,
+    requiresResource: true,
+    requiresConfirmation: true
+  }),
+  "facebook.page.read": capability("facebook.page.read", {
+    kind: "read",
+    adapter: "facebook",
+    operations: ["posts", "comments"],
+    sharedAllowed: true,
+    requiresResource: true,
+    requiresConfirmation: false
+  }),
+  "facebook.page.publish": capability("facebook.page.publish", {
+    kind: "outbound",
+    adapter: "facebook",
+    operations: ["post", "photo"],
+    sharedAllowed: false,
+    requiresResource: true,
+    requiresConfirmation: true
+  }),
+  "facebook.page.comments.reply": capability("facebook.page.comments.reply", {
+    kind: "outbound",
+    adapter: "facebook",
+    operations: ["reply"],
+    sharedAllowed: false,
+    requiresResource: true,
+    requiresConfirmation: true
+  }),
+  "facebook.page.messages.send": capability("facebook.page.messages.send", {
+    kind: "outbound",
+    adapter: "facebook",
+    operations: ["send"],
+    sharedAllowed: false,
+    requiresResource: true,
+    requiresConfirmation: true
+  }),
+  "youtube.read": capability("youtube.read", {
+    kind: "read",
+    adapter: "youtube",
+    operations: ["videos", "comments"],
+    sharedAllowed: true,
+    requiresResource: true,
+    requiresConfirmation: false
+  }),
+  "youtube.update": capability("youtube.update", {
+    kind: "outbound",
+    adapter: "youtube",
+    operations: ["details"],
+    sharedAllowed: false,
+    requiresResource: true,
+    requiresConfirmation: true
+  }),
+  "youtube.comments.reply": capability("youtube.comments.reply", {
+    kind: "outbound",
+    adapter: "youtube",
+    operations: ["reply"],
+    sharedAllowed: false,
+    requiresResource: true,
+    requiresConfirmation: true
+  }),
+  "youtube.upload": capability("youtube.upload", {
+    kind: "outbound",
+    adapter: "youtube",
+    operations: ["upload"],
     sharedAllowed: false,
     requiresResource: true,
     requiresConfirmation: true

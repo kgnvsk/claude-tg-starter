@@ -23,6 +23,7 @@ from pathlib import Path
 
 RULES_CAP = 3500
 RULES_LINE_CAP = 130
+RULES_LINE_MIN = 48  # past the cap every rule still shows at least its first words
 
 
 def owner_rules(path: Path | None = None, cap: int = RULES_CAP) -> str:
@@ -34,10 +35,19 @@ def owner_rules(path: Path | None = None, cap: int = RULES_CAP) -> str:
         start = next(i for i, line in enumerate(lines) if line.strip() == "# Правила власника")
     except (OSError, UnicodeError, StopIteration):
         return ""
-    body = []
+    body, inside_block = [], False
     for line in lines[start + 1:]:
-        # Novsky's installation contacts and any next top-level part are not rules.
-        if line.startswith(("# ", "<!-- novsky-")):
+        # Novsky's installation contacts are not rules, but the owner's rules go on below them (Арти, 10.10.2026: every
+        # rule since 07.10 sat under the block and none reached a turn). The next top-level part ends the section.
+        if line.startswith("<!-- /novsky-"):
+            inside_block = False
+            continue
+        if line.startswith("<!-- novsky-"):
+            inside_block = True
+            continue
+        if inside_block:
+            continue
+        if line.startswith("# "):
             break
         body.append(line.rstrip())
     text = "\n".join(body).strip()
@@ -53,8 +63,11 @@ def owner_rules(path: Path | None = None, cap: int = RULES_CAP) -> str:
     rules = [line.strip() for line in body if line.strip() and not line.lstrip().startswith("#")
              and (not line[0].isspace() or re.match(r" {1,3}(?:[-*+•]|\d+[.)]) ", line))]
     rules = rules or [line.strip() for line in body if line.strip()]
+    # Each rule gets an equal share of the room, so a long section shows the first words of all of them, not the
+    # full first half (Арти, 10.10.2026: «+39 more» hid every rule the owner had added that week).
+    room = max(RULES_LINE_MIN, min(RULES_LINE_CAP, (cap - 40 - used) // max(1, len(rules)) - 1))
     for k, rule in enumerate(rules):
-        short = rule if len(rule) <= RULES_LINE_CAP else rule[:RULES_LINE_CAP].rsplit(" ", 1)[0] + "…"
+        short = rule if len(rule) <= room else rule[:room].rsplit(" ", 1)[0] + "…"
         if used + len(short) + 1 > cap - 40:
             out.append(f"… +{len(rules) - k} more in ~/CLAUDE.md")
             break
