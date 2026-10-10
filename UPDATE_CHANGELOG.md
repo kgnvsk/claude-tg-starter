@@ -1,8 +1,8 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-10-10.049421c380c6`
+- Реліз: `2026-10-10.6d188dc952f5`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `049421c380c669f2d9ccf7ecb36b45b838126f6f`
+- Ревізія вихідного комплекту: `6d188dc952f54a9a397ed5dbefbd32f5c23d9596`
 - Дата релізу: `2026-10-10`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
@@ -19,10 +19,7 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    The owner's word applies at once; every owner rule reaches every turn (#237)
-    Daily repeats keep their local hour when summer time ends or starts (#236)
-    Mail listening mode: the agent asks how to watch a newly connected mailbox (#235)
-    Company rights for the Facebook Page and the YouTube channel (#234)
+    The owner's own request to send something is his consent (#238)
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не
