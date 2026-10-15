@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import base64
 import codecs
 import hashlib
@@ -84,6 +84,8 @@ class UpdatePlan:
     source_revision: str
     decisions: tuple[Decision, ...]
     baseline: dict[str, object]
+    preimages: dict[str, FileState] = field(default_factory=dict)
+    merged: dict[str, bytes] = field(default_factory=dict)
 
 
 def decide(
@@ -324,7 +326,10 @@ def rendered_target_bytes(
     if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
         raise UpdateError(f"managed target is unsafe: {relative}")
     context = values if values is not None else render_context(home)
-    return render_template_bytes(payload, context, relative)
+    rendered = render_template_bytes(payload, context, relative)
+    if re.search(rb"\{\{[A-Z_]+\}\}", rendered):
+        raise UpdateError(f"unfilled kit template marker: {relative}")
+    return rendered
 
 
 def load_legacy_templates(kit: Path) -> dict[str, dict[str, bytes]]:
@@ -535,11 +540,114 @@ def metadata_state(value: dict[str, object]) -> FileState:
     )
 
 
+def state_metadata(value: FileState) -> dict[str, object]:
+    return {"sha256": value.digest, "kind": value.kind, "mode": value.mode}
+
+
+def read_operator_file(path: Path) -> bytes:
+    """Plans may authorize replacing scripts; only the invoking operator may write them."""
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        info = os.fstat(descriptor)
+        if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                or info.st_uid != os.geteuid() or info.st_mode & 0o022
+                or info.st_size > 8 * 1024 * 1024):
+            raise UpdateError("unsafe operator resolution file")
+        with os.fdopen(descriptor, "rb", closefd=False) as handle:
+            payload = handle.read(8 * 1024 * 1024 + 1)
+        if len(payload) != info.st_size:
+            raise UpdateError("operator resolution file changed while reading")
+        return payload
+    finally:
+        os.close(descriptor)
+
+
+def prepare_resolutions(home: Path, kit: Path, plan: UpdatePlan, output: Path,
+                        keep_live: list[str], take_kit: list[str], merges: list[str]) -> dict:
+    choices: dict[str, tuple[str, str | None]] = {}
+    for action, names in (("keep-live", keep_live), ("take-kit", take_kit), ("merge", merges)):
+        for choice in names:
+            name, _, source = choice.partition("=") if action == "merge" else (choice, "", None)
+            if name in choices or name not in plan.baseline["files"] or (action == "merge" and not source):
+                raise UpdateError("each selected managed file needs one resolution")
+            choices[name] = action, source
+    if not choices:
+        raise UpdateError("no file resolutions selected")
+    entries = {}
+    for name, (action, source) in choices.items():
+        live = inspect_live(home, name)
+        if live.kind != "file":
+            raise UpdateError("a resolution needs an existing regular live file")
+        target = plan.baseline["files"][name]
+        entry = {"action": action, "before": state_metadata(live), "target": target}
+        if action == "merge":
+            payload = read_operator_file(Path(source))
+            entry["payload"] = base64.b64encode(payload).decode("ascii")
+            entry["after"] = state_metadata(FileState(hashlib.sha256(payload).hexdigest(), "file", 0o755))
+        else:
+            entry["after"] = entry["before"] if action == "keep-live" else target
+        entries[name] = entry
+    document = {"schemaVersion": 1, "home": str(home.absolute()), "productId": plan.product_id,
+                "sourceRevision": plan.source_revision, "entries": entries}
+    # Refuse an output path in the live tree: preparation must not rewrite it.
+    if output.resolve().is_relative_to(home.resolve()):
+        raise UpdateError("prepare resolutions outside the agent home")
+    atomic_install_bytes((json.dumps(document, indent=2, sort_keys=True) + "\n").encode(), output, 0o600)
+    return document
+
+
+def resolved_decisions(home: Path, plan: UpdatePlan, path: Path) -> UpdatePlan:
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise UpdateError("duplicate resolution key")
+            result[key] = value
+        return result
+    doc = json.loads(read_operator_file(path), object_pairs_hook=unique)
+    if (not isinstance(doc, dict) or set(doc) != {"schemaVersion", "home", "productId", "sourceRevision", "entries"}
+            or type(doc["schemaVersion"]) is not int or doc["schemaVersion"] != 1
+            or doc["home"] != str(home.absolute()) or doc["productId"] != plan.product_id
+            or doc["sourceRevision"] != plan.source_revision or not isinstance(doc["entries"], dict)):
+        raise UpdateError("resolution belongs to another home, product or release")
+    decisions = {d.path: d for d in plan.decisions}
+    merged = {}
+    for name, entry in doc["entries"].items():
+        if name not in plan.baseline["files"] or not isinstance(entry, dict):
+            raise UpdateError("resolution names an unmanaged file")
+        action = entry.get("action")
+        keys = {"action", "before", "target", "after"} | ({"payload"} if action == "merge" else set())
+        if set(entry) != keys or action not in {"keep-live", "take-kit", "merge"}:
+            raise UpdateError("invalid resolution action")
+        # Reuse the strict baseline metadata validator for every recorded state.
+        for key in ("before", "target", "after"):
+            validate_baseline({**plan.baseline, "files": {name: entry[key]}})
+        if entry["target"] != plan.baseline["files"][name]:
+            raise UpdateError("resolution target changed")
+        before, after = metadata_state(entry["before"]), metadata_state(entry["after"])
+        if action == "keep-live" and after != before or action == "take-kit" and entry["after"] != entry["target"]:
+            raise UpdateError("resolution postimage is inconsistent")
+        if action == "merge":
+            payload = base64.b64decode(entry["payload"], validate=True)
+            if after != FileState(hashlib.sha256(payload).hexdigest(), "file", 0o755):
+                raise UpdateError("merged payload does not match its digest")
+            merged[name] = payload
+        live = plan.preimages[name]
+        if live not in (before, after):
+            raise UpdateError(f"live file changed since resolution: {name}")
+        decision = "preserve" if action == "keep-live" else "accept" if live == after else "install"
+        decisions[name] = Decision(name, decision, "operator-" + action)
+    return UpdatePlan(plan.product_id, plan.source_revision, tuple(decisions.values()), plan.baseline,
+                      plan.preimages, merged)
+
+
 def build_plan(
     home: Path,
     kit: Path,
     policy_path: Path,
     baseline_path: Path,
+    *,
+    resolutions: Path | None = None,
 ) -> UpdatePlan:
     validate_baseline_location(home, baseline_path)
     product_id, revision = source_identity(kit)
@@ -557,8 +665,10 @@ def build_plan(
     previous_files = previous["files"] if previous is not None else {}
     legacy_templates: dict[str, dict[str, bytes]] | None = None
     decisions = []
+    preimages = {}
     for relative in sorted(set(previous_files) | set(targets)):
         live = inspect_live(home, relative)
+        preimages[relative] = live
         target = targets.get(relative, FileState(None, "absent", None))
         baseline_state = (
             metadata_state(previous_files[relative])
@@ -620,7 +730,8 @@ def build_plan(
         "sourceRevision": revision,
         "files": files,
     }
-    return UpdatePlan(product_id, revision, tuple(decisions), baseline)
+    plan = UpdatePlan(product_id, revision, tuple(decisions), baseline, preimages)
+    return resolved_decisions(home, plan, resolutions) if resolutions is not None else plan
 
 
 def atomic_install(
@@ -688,9 +799,22 @@ def apply_plan(
     blocked = {"conflict", "unclassified"}
     if any(decision.action in blocked for decision in plan.decisions):
         raise UpdateError("managed runtime update is blocked by owner changes")
+    for relative, expected in plan.preimages.items():
+        if inspect_live(home, relative) != expected:
+            raise UpdateError(f"managed live file changed before apply: {relative}")
+    if source_identity(kit) != (plan.product_id, plan.source_revision):
+        raise UpdateError("managed release changed before apply")
+    values = render_context(home)
+    payloads = {}
+    # Freeze every candidate before replacing the first file, including files
+    # whose operator decision is keep-live. A changed render invalidates consent.
+    for relative, expected in plan.baseline["files"].items():
+        payload = rendered_target_bytes(home, kit, relative, values)
+        if hashlib.sha256(payload).hexdigest() != expected["sha256"]:
+            raise UpdateError("managed render context changed before apply")
+        payloads[relative] = plan.merged.get(relative, payload)
     baseline_path.parent.mkdir(parents=True, exist_ok=True)
     baseline_existed = baseline_path.is_file()
-    values = render_context(home)
     with tempfile.TemporaryDirectory(
         prefix=".managed-runtime-transaction.",
         dir=baseline_path.parent,
@@ -713,17 +837,19 @@ def apply_plan(
         baseline_backup = transaction / "baseline.preimage"
         if baseline_existed:
             shutil.copy2(baseline_path, baseline_backup, follow_symlinks=False)
+        # Backup can take time. A fresh owner edit invalidates the whole set;
+        # this is still before mutation, so never roll it back to our preimage.
+        for relative, expected in plan.preimages.items():
+            if inspect_live(home, relative) != expected:
+                raise UpdateError(f"managed live file changed during backup: {relative}")
+        for relative, (backup, mode) in preimages.items():
+            if backup is not None and FileState(hash_file(backup), "file", mode) != plan.preimages[relative]:
+                raise UpdateError(f"managed backup changed: {relative}")
         try:
             for decision in plan.decisions:
                 target = live_path(home, decision.path)
                 if decision.action == "install":
-                    payload = rendered_target_bytes(
-                        home, kit, decision.path, values
-                    )
-                    expected = plan.baseline["files"][decision.path]["sha256"]
-                    if hashlib.sha256(payload).hexdigest() != expected:
-                        raise UpdateError("managed render context changed during apply")
-                    atomic_install_bytes(payload, target, uid=uid, gid=gid)
+                    atomic_install_bytes(payloads[decision.path], target, uid=uid, gid=gid)
                 elif decision.action == "remove":
                     target.unlink(missing_ok=True)
             if not defer_baseline:

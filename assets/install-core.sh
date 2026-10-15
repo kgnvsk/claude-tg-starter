@@ -707,12 +707,21 @@ for runtime in bun claude; do
 done
 
 echo "[2/7] керовані ресурси; дані власника зберігаються"
+RUNTIME_RESOLUTION_ARGS=()
+if [ -n "${NOVSKY_UPDATE_RESOLUTIONS:-}" ]; then
+  [ "$CLAUDE_UPDATE_MAINTENANCE" = 1 ] || {
+    echo "FATAL: рішення конфліктів застосовуються лише у вікні обслуговування" >&2
+    exit 2
+  }
+  RUNTIME_RESOLUTION_ARGS=(--resolutions "$NOVSKY_UPDATE_RESOLUTIONS")
+fi
 python3 "$KIT/assets/bin/update-safety-check" apply \
   --home "$H" \
   --kit "$KIT" \
   --policy "$KIT/assets/product/managed-runtime.json" \
   --baseline "$H/.claude/product/managed-runtime-baseline.json" \
   --owner "$AGENT_USER" \
+  "${RUNTIME_RESOLUTION_ARGS[@]}" \
   --defer-baseline
 # BEGIN browser helper install
 if product_has_feature browser; then
@@ -971,14 +980,8 @@ else
 fi
 
 MANAGED_RENDERED_FILES=("$H/CLAUDE.md" "$MANAGED_CLAUDE" "$MANAGED_PRODUCT" "$ACCESS_FILE")
-while IFS= read -r -d '' source; do
-  destination="$H/bin/$(basename "$source")"
-  MANAGED_RENDERED_FILES+=("$destination")
-  if grep -q '{{[A-Z_]*}}' "$source"; then
-    render_template "$destination" "$destination"
-  fi
-  chmod 755 "$destination"
-done < <(find "$KIT/assets/bin" -maxdepth 1 -type f -print0)
+# Managed bin candidates were rendered and checked before apply. Never render
+# or chmod the live files again: they may be owner-preserved or approved merges.
 initialize_limit_recovery_state
 # Managed skills are already rendered and checked by their applicator. Owner
 # text retained there must not pass through the template renderer again.
@@ -1529,7 +1532,7 @@ python3 "$KIT/assets/bin/update-safety-check" accept \
   --kit "$KIT" \
   --policy "$KIT/assets/product/managed-runtime.json" \
   --baseline "$H/.claude/product/managed-runtime-baseline.json" \
-  --owner "$AGENT_USER"
+  --owner "$AGENT_USER" "${RUNTIME_RESOLUTION_ARGS[@]}"
 render_template "$KIT/assets/templates/CLAUDE.md.template" "$MANAGED_CLAUDE" \
   --accept-baseline "$PERSONA_BASELINE_CLAUDE"
 render_template "$ROLE_PROFILE" "$MANAGED_PRODUCT" \

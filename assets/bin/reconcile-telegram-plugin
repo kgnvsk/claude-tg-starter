@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import fcntl
 import grp
 import hashlib
@@ -14,7 +14,10 @@ from pathlib import Path
 import pwd
 import re
 import stat
+import subprocess
 import sys
+import tempfile
+import time
 from typing import Literal
 import uuid
 
@@ -651,6 +654,16 @@ UPSTREAM_FILE_SHA256 = {
     "skills/configure/SKILL.md": "16b06bf2ac5ede250d0c620ce4e6cf3878c9704246b8f52390fde5f280a17f73",
 }
 DYNAMIC_ROOTS = {".in_use", "node_modules"}
+# Official 0.0.6 at 7e401edac7ca6449c4f549fda9e1b43385496bef. The
+# maintenance upgrade accepts this exact source (or a reviewed kit server).
+LEGACY_FILES = {**UPSTREAM_FILE_SHA256,
+    ".claude-plugin/plugin.json": "034ac185f5790fab4127ba5b8c3ece4b9df1bf3b3f0dd1c98062dc3c18bd3b2a",
+    "README.md": "137bbbfd3a4961e84ab58100f27d7af1f18d5e497f53405c64e021b72f93f654",
+    "package.json": "364a9286a10497daeecce94607682f31de522413252209dd82778d8d9fff2b47",
+    "server.ts": "8f20ec0c96ab0a257424d882760b33f1312575524f4ba0803102d468605b7a0b",
+    "skills/access/SKILL.md": "c499635ef8a9a68cb166bb737a7f4d0620154d1bc9e96934cb8b630fadf22c86",
+    "skills/configure/SKILL.md": "7a58fa4efd09dd8323894e0e505bc21de11e657994710a3c535f9f5072fe36b3",
+}
 RUNTIME_ORPHAN_MARKER = ".orphaned_at"
 MAX_JSON_BYTES = 256 * 1024
 MAX_SERVER_BYTES = 4 * 1024 * 1024
@@ -682,7 +695,7 @@ class ActiveInstall:
 
 @dataclass(frozen=True)
 class ReconcileResult:
-    status: Literal["official", "golden", "patched"]
+    status: Literal["official", "golden", "patched", "upgrade-ready", "upgraded"]
     version: str
     changed: bool
 
@@ -936,7 +949,7 @@ def load_contract(path: Path) -> CompatibilityContract:
     return _contract_for_home(home.parent, path)
 
 
-def _contract_for_home(home: Path, path: Path) -> CompatibilityContract:
+def _contract_for_home(home: Path, path: Path, *, allow_previous_golden: bool = False) -> CompatibilityContract:
     resolved_home, uid = _home_identity(home)
     value = _read_json_file(
         resolved_home,
@@ -968,7 +981,8 @@ def _contract_for_home(home: Path, path: Path) -> CompatibilityContract:
         or upstream.get("serverSha256") != UPSTREAM_SERVER_SHA256
         or upstream.get("packageStart") != UPSTREAM_PACKAGE_START
         or upstream.get("files") != UPSTREAM_FILE_SHA256
-        or golden.get("serverSha256") != GOLDEN_SERVER_SHA256
+        or (golden.get("serverSha256") != GOLDEN_SERVER_SHA256 and not (
+            allow_previous_golden and golden.get("serverSha256") in PREVIOUS_GOLDEN_SERVER_SHA256S))
     ):
         raise _fail("контракт Telegram не відповідає підтримуваній версії")
     upstream_sha = upstream.get("serverSha256")
@@ -1049,7 +1063,7 @@ def _validate_source_tree(
         else:
             raise _fail("дерево Telegram plugin містить неочікуваний тип шляху")
     if actual_files != expected_files or actual_directories != expected_directories:
-        raise _fail("дерево Telegram plugin не відповідає official 0.0.7")
+        raise _fail(f"дерево Telegram plugin не відповідає official {contract.supported_version}")
 
     server_status: Literal["official", "previous-golden", "golden"] = "official"
     for relative, expected_digest in contract.upstream_files.items():
@@ -1108,7 +1122,7 @@ def _validate_plugin_files(
         uid,
         label="package Telegram plugin",
     )
-    if manifest.get("name") != "telegram" or manifest.get("version") != SUPPORTED_VERSION:
+    if manifest.get("name") != "telegram" or manifest.get("version") != contract.supported_version:
         raise _fail("установлена версія Telegram plugin не підтримується")
     scripts = package.get("scripts")
     if (
@@ -1138,7 +1152,7 @@ def resolve_active_install(
     record = records[0]
     if not isinstance(record, dict):
         raise _fail("ledger Telegram plugin має некоректний запис")
-    if record.get("scope") != "user" or record.get("version") != SUPPORTED_VERSION:
+    if record.get("scope") != "user" or record.get("version") != contract.supported_version:
         raise _fail("активний Telegram plugin не має підтримуваної user-версії")
     raw_install = record.get("installPath")
     if not isinstance(raw_install, str) or not raw_install:
@@ -1148,7 +1162,7 @@ def resolve_active_install(
         resolved_home
         / ".claude/plugins/cache/claude-plugins-official/telegram"
     )
-    if install_root.parent != expected_parent or install_root.name != SUPPORTED_VERSION:
+    if install_root.parent != expected_parent or install_root.name != contract.supported_version:
         raise _fail("installPath Telegram plugin не відповідає активному cache")
     install, _status = _validate_plugin_files(
         resolved_home,
@@ -1433,6 +1447,109 @@ def reconcile(
     return result
 
 
+def _require_upgrade_window(home: Path, uid: int) -> None:
+    if os.environ.get("CLAUDE_UPDATE_MAINTENANCE") != "1":
+        raise _fail("перехід версії Telegram дозволено лише у вікні обслуговування")
+    hold = _read_regular(home, home / "logs/restart-hold.until", uid, label="restart hold", limit=32)
+    try:
+        until = int(hold.strip())
+        service = "claude-telegram.service" if home.name == "claude" else f"claude-telegram@{home.name}.service"
+        status = subprocess.run(["systemctl", "is-active", service], capture_output=True, text=True, timeout=10,
+                                env={"PATH": "/usr/bin:/bin"})
+    except (ValueError, OSError, subprocess.TimeoutExpired):
+        raise _fail("не вдалося довести зупинку служби для переходу Telegram") from None
+    if not time.time() < until <= time.time() + 86400 or status.returncode != 3 or status.stdout.strip() != "inactive":
+        raise _fail("перехід Telegram потребує зупиненої служби та чинного restart hold")
+
+
+def upgrade_legacy(home: Path, golden: Path, contract_path: Path, *, apply: bool):
+    """Only the reviewed 0.0.6 → 0.0.7 transition; no network/source discovery."""
+    home, uid = _home_identity(home)
+    ledger_path = home / ".claude/plugins/installed_plugins.json"
+    before = _read_regular(home, ledger_path, uid, label="plugin ledger", limit=MAX_JSON_BYTES)
+    ledger = _strict_json(before, "plugin ledger")
+    records = ledger.get("plugins", {}).get(PLUGIN_ID) if isinstance(ledger.get("plugins"), dict) else None
+    if not isinstance(records, list) or len(records) != 1 or not isinstance(records[0], dict):
+        raise _fail("неоднозначний запис Telegram plugin")
+    if records[0].get("version") == SUPPORTED_VERSION:
+        return _reconcile_detailed(home, golden, contract_path, apply=apply)
+    if records[0].get("version") != "0.0.6":
+        raise _fail("немає перевіреного переходу для цієї версії Telegram")
+    contract = _contract_for_home(home, contract_path, allow_previous_golden=True)
+    golden_bytes = _read_regular(home, golden, uid, label="golden Telegram", limit=MAX_SERVER_BYTES)
+    if hashlib.sha256(golden_bytes).hexdigest() != contract.golden_server_sha256:
+        raise _fail("живий golden Telegram має невідоме походження")
+    legacy = replace(contract, supported_version="0.0.6", upstream_files=LEGACY_FILES,
+                     upstream_server_sha256=LEGACY_FILES["server.ts"],
+                     upstream_package_start="bun install --no-summary && bun server.ts")
+    old = resolve_active_install(home, legacy)
+    source = home / ".claude/plugins/marketplaces/claude-plugins-official/external_plugins/telegram"
+    _validate_plugin_files(home, uid, source, contract, source_only=True)
+    target = old.root.with_name(SUPPORTED_VERSION)
+    if os.path.lexists(target):
+        _validate_plugin_files(home, uid, target, contract, source_only=False)
+    if not apply:
+        return ReconcileResult("upgrade-ready", SUPPORTED_VERSION, False), old
+    _require_upgrade_window(home, uid)
+    lock = _lock(home, uid)
+    try:
+        # Both old and new code are proven before dependency installation. Copy
+        # only pinned files, never marketplace node_modules, .in_use or extras.
+        resolve_active_install(home, legacy)
+        payloads = {}
+        for name, digest in contract.upstream_files.items():
+            data = _read_regular(home, source / name, uid, label=name, limit=MAX_SERVER_BYTES)
+            if hashlib.sha256(data).hexdigest() != digest:
+                raise _fail("джерело Telegram змінилося")
+            payloads[name] = data
+        if not os.path.lexists(target):
+            with tempfile.TemporaryDirectory(prefix=".telegram-upgrade-", dir=target.parent) as temporary:
+                prepared = Path(temporary) / SUPPORTED_VERSION
+                prepared.mkdir(mode=0o700)
+                for name, data in payloads.items():
+                    path = prepared / name
+                    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                    path.write_bytes(data)
+                    path.chmod(0o644)
+                if os.path.lexists(target):
+                    raise _fail("цільовий кеш Telegram з’явився під час підготовки")
+                os.rename(prepared, target)
+        _validate_plugin_files(home, uid, target, contract, source_only=False)
+        bun = home / ".local/bin/bun"
+        if not bun.is_file(): bun = home / ".bun/bin/bun"
+        try:
+            installed = subprocess.run([str(bun), "install", "--frozen-lockfile", "--ignore-scripts"],
+                cwd=target, env={"HOME": str(home), "PATH": f"{home}/.local/bin:{home}/.bun/bin:/usr/bin:/bin"},
+                capture_output=True, timeout=120)
+            if installed.returncode != 0:
+                raise _fail("залежності Telegram не встановлено; активним лишився старий кеш")
+        except (OSError, subprocess.TimeoutExpired):
+            raise _fail("залежності Telegram не встановлено; активним лишився старий кеш") from None
+        _validate_plugin_files(home, uid, target, contract, source_only=False)
+        resolve_active_install(home, legacy)
+        _require_upgrade_window(home, uid)
+        records[0].update(version=SUPPORTED_VERSION, installPath=str(target), gitCommitSha=UPSTREAM_COMMIT)
+        payload = (json.dumps(ledger, ensure_ascii=False, indent=2) + "\n").encode()
+        directory = _open_directory_chain_fd(home, ledger_path.parent, uid)
+        temporary = ".installed_plugins." + uuid.uuid4().hex
+        try:
+            fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory)
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(payload); handle.flush(); os.fsync(handle.fileno())
+            if _read_regular_at(directory, ledger_path.name, uid, label="plugin ledger", limit=MAX_JSON_BYTES) != before:
+                raise _fail("plugin ledger змінився; перемикання скасовано")
+            os.replace(temporary, ledger_path.name, src_dir_fd=directory, dst_dir_fd=directory)
+            os.fsync(directory)
+        finally:
+            try: os.unlink(temporary, dir_fd=directory)
+            except FileNotFoundError: pass
+            os.close(directory)
+        return ReconcileResult("upgraded", SUPPORTED_VERSION, True), ActiveInstall(
+            target, target / "server.ts", target / "package.json", target / ".claude-plugin/plugin.json")
+    finally:
+        os.close(lock)
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Перевіряє сумісність Telegram plugin 0.0.7 і golden patch.",
@@ -1443,6 +1560,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--marketplace-source-check", action="store_true")
+    parser.add_argument("--upgrade-legacy", action="store_true")
     return parser
 
 
@@ -1470,6 +1588,10 @@ def main(arguments: list[str] | None = None) -> int:
                 package=marketplace_root / "package.json",
                 manifest=marketplace_root / ".claude-plugin/plugin.json",
             )
+        elif options.upgrade_legacy:
+            result, install = upgrade_legacy(home, golden, contract_path, apply=options.apply)
+            if options.apply and result.status == "upgraded":
+                result, install = _reconcile_detailed(home, golden, contract_path, apply=True)
         else:
             result, install = _reconcile_detailed(
                 home,

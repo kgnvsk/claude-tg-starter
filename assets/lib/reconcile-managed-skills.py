@@ -523,8 +523,61 @@ def seed_baseline(
     return report, True
 
 
+def seed_agents(agents_root: Path, baseline_path: Path, old_source: Path,
+                source: Path) -> tuple[dict[str, list[str]], bool]:
+    """Complete missing provenance from exact shipped bytes, without touching agents."""
+    existing = load_baseline(baseline_path, agent_files=True)
+
+    def catalog(root: Path) -> dict[str, Snapshot]:
+        check_path(root)
+        if not root.is_dir():
+            raise PolicyError("немає довіреного каталогу субагентів")
+        check_path(root / "roles")
+        entries = {}
+        for path in (*sorted(root.glob("*.md")), *sorted((root / "roles").glob("*.md"))):
+            if path.name != "README.md" and not AGENT_FILE.fullmatch(path.name):
+                raise PolicyError("некоректне ім’я субагента")
+            if path.name in entries:
+                raise PolicyError("повторне ім’я субагента")
+            entries[path.name] = snapshot(path)
+        if (root / "roles").is_dir():
+            entries["roles"] = snapshot(root / "roles")
+        return entries
+
+    old, targets = catalog(old_source), catalog(source)
+    entries = dict(existing)
+    report: dict[str, list[str]] = {"kit": [], "unresolved": []}
+    for name in sorted((set(old) | set(targets)) - set(existing)):
+        live = checksum(snapshot(agents_root / name))
+        if live is None:
+            continue
+        if live in {checksum(old.get(name)), checksum(targets.get(name))}:
+            entries[name] = live
+            report["kit"].append(name)
+        else:
+            report["unresolved"].append(name)
+    if report["unresolved"]:
+        return report, False
+    write_policy(baseline_path, {"schemaVersion": 1, "entries": entries})
+    return report, True
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
+    if argv and argv[0] == "seed-agents":
+        parser = argparse.ArgumentParser(description="База субагентів із точної довіреної версії старого кита")
+        parser.add_argument("agents_root", type=Path)
+        parser.add_argument("baseline_path", type=Path)
+        parser.add_argument("--old-source", type=Path, required=True)
+        parser.add_argument("--source", type=Path, required=True)
+        args = parser.parse_args(argv[1:])
+        try:
+            report, written = seed_agents(args.agents_root, args.baseline_path, args.old_source, args.source)
+        except (PolicyError, OSError) as error:
+            print(f"помилка засіву субагентів: {error}", file=sys.stderr)
+            return 2
+        print(json.dumps({"written": written, **report}, ensure_ascii=False, sort_keys=True))
+        return 0 if written else 1
     if argv and argv[0] == "seed":
         parser = argparse.ArgumentParser(description="Перша база навичок для інсталяції, старшої за неї")
         parser.add_argument("skills_root", type=Path)

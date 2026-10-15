@@ -64,6 +64,11 @@ CORPORATE_MARKER="$CORPORATE_STATE_DIR/corporate-isolation-activated"
 CORPORATE_ISOLATION_ACTIVATED=0
 TG_CORPORATE_SESSIONS_LIVE=""
 CLAUDE_UPDATE_MAINTENANCE="${CLAUDE_UPDATE_MAINTENANCE:-0}"
+RUNTIME_RESOLUTION_ARGS=()
+if [ -n "${NOVSKY_UPDATE_RESOLUTIONS:-}" ]; then
+  RUNTIME_RESOLUTION_ARGS=(--resolutions "$NOVSKY_UPDATE_RESOLUTIONS")
+  export NOVSKY_UPDATE_RESOLUTIONS
+fi
 case "$CLAUDE_UPDATE_MAINTENANCE" in
   0|1) ;;
   *)
@@ -512,12 +517,15 @@ if [ "$UPDATE_ACTION" = --preflight-all ]; then
   runuser -u "$AGENT_USER" -- env HOME="$H" /usr/bin/timeout --foreground 30s \
     "$PREFLIGHT_RECONCILER" --marketplace-source-check >/dev/null || wall "Telegram plugin source"
   runuser -u "$AGENT_USER" -- env HOME="$H" /usr/bin/timeout --foreground 30s \
-    "$PREFLIGHT_RECONCILER" --json >/dev/null || wall "Telegram plugin receiver"
+    "$PREFLIGHT_RECONCILER" --json >/dev/null 2>&1 || \
+    runuser -u "$AGENT_USER" -- env HOME="$H" /usr/bin/timeout --foreground 30s \
+      "$KIT/assets/bin/reconcile-telegram-plugin" --json --upgrade-legacy >/dev/null \
+    || wall "Telegram plugin receiver"
   plan_status=0
   plan_json="$(python3 "$KIT/assets/bin/update-safety-check" plan --home "$H" --kit "$KIT" \
     --policy "$KIT/assets/product/managed-runtime.json" \
     --baseline "$H/.claude/product/managed-runtime-baseline.json" \
-    --owner "$AGENT_USER" --json)" || plan_status=$?
+    --owner "$AGENT_USER" "${RUNTIME_RESOLUTION_ARGS[@]}" --json)" || plan_status=$?
   [ "$plan_status" -eq 0 ] || wall "managed files: $(printf '%s' "$plan_json" | python3 -c '
 import json, sys
 try:
@@ -660,7 +668,9 @@ runuser -u "$AGENT_USER" -- env HOME="$H" \
   }
 runuser -u "$AGENT_USER" -- env HOME="$H" \
   /usr/bin/timeout --foreground 30s \
-  "$PREFLIGHT_RECONCILER" --json >/dev/null || {
+  "$PREFLIGHT_RECONCILER" --json >/dev/null 2>&1 || \
+  runuser -u "$AGENT_USER" -- env HOME="$H" /usr/bin/timeout --foreground 30s \
+    "$KIT/assets/bin/reconcile-telegram-plugin" --json --upgrade-legacy >/dev/null || {
     echo "FATAL: встановлений Telegram plugin не сумісний із комплектом" >&2
     exit 2
   }
@@ -986,7 +996,7 @@ if [ -n "${PLUGIN_POLICY_DROPS:-}" ]; then
 fi
 # END plugin policy migration
 
-# ---- 3. converge only the reviewed official Telegram 0.0.7 boundary ----
+# ---- 3. migrate a proven legacy cache, then converge the reviewed golden ----
 echo "[4/5] перевіряю Telegram plugin 0.0.7 і накладаю сумісний golden"
 require_primary_service_stopped
 runuser -u "$AGENT_USER" -- env HOME="$H" \
@@ -996,7 +1006,7 @@ runuser -u "$AGENT_USER" -- env HOME="$H" \
   }
 TELEGRAM_RECONCILE_RECEIPT="$(
   runuser -u "$AGENT_USER" -- env HOME="$H" \
-    "$H/bin/reconcile-telegram-plugin" --apply --json
+    "$H/bin/reconcile-telegram-plugin" --apply --json --upgrade-legacy
 )"
 schema_relative="$(
   printf '%s' "$TELEGRAM_RECONCILE_RECEIPT" | python3 -c '
