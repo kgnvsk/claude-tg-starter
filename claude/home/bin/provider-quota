@@ -60,19 +60,40 @@ def claude_available(body):
         return None
     # The live endpoint also returns dashboard metadata, not quota windows.
     # Explicit limits are quota evidence too; malformed/new windows stay unknown.
-    metadata = {'extra_usage', 'limits', 'spend', 'member_dashboard_available', 'seven_day_breakdown'}
+    metadata = {'extra_usage', 'limits', 'spend', 'member_dashboard_available', 'seven_day_breakdown', 'weekly_scoped_shares'}
     windows = [value for key, value in body.items() if key not in metadata and value is not None]
     if not windows or any(type(window) is not dict or not percent(window.get('utilization')) for window in windows):
         return None
     limits = body.get('limits', [])
     if type(limits) is not list or any(type(item) is not dict or not percent(item.get('percent')) or type(item.get('is_active')) is not bool for item in limits):
         return None
+    # Shares describe the dashboard's already checked limits, not another quota window.
+    # Accept only that known shape with a valid index; new/malformed evidence stays unknown.
+    # A Pro account answers weekly_scoped_shares: null — no team shares at all (Manzik, 11.10.2026), not
+    # malformed evidence; any other non-list stays unknown.
+    shares = body.get('weekly_scoped_shares')
+    shares = [] if shares is None else shares
+    if type(shares) is not list or any(
+        type(item) is not dict or set(item) != {'limit_index', 'used_percent_of_weekly', 'allowance_percent_of_weekly'}
+        or type(item['limit_index']) is not int or not 0 <= item['limit_index'] < len(limits)
+        or not percent(item['used_percent_of_weekly']) or not percent(item['allowance_percent_of_weekly'])
+        for item in shares
+    ): return None
     if all(window['utilization'] < 100 for window in windows) and all(item['percent'] < 100 for item in limits): return True
     extra = body.get('extra_usage')
-    if type(extra) is dict and extra.get('is_enabled') is True:
+    if (type(extra) is dict and extra.get('is_enabled') is True
+        and extra.get('disabled_reason') is None and extra.get('user_disabled', False) is False
+        and extra.get('spend_limit_reached', False) is False):
         limit, used = extra.get('monthly_limit'), extra.get('used_credits')
-        if type(limit) in (int, float) and type(used) in (int, float) and math.isfinite(limit) and math.isfinite(used) and 0 <= used < limit:
-            return True
+        if type(used) in (int, float) and math.isfinite(used) and used >= 0:
+            if type(limit) in (int, float) and math.isfinite(limit) and used < limit:
+                return True
+            # An explicit null cap means unlimited, not zero. Require the provider's
+            # positive permission flags; an absent cap or new period limit is no proof.
+            if ('monthly_limit' in extra and limit is None and 'disabled_reason' in extra
+                and extra.get('user_disabled') is False and extra.get('spend_limit_reached') is False
+                and extra.get('daily') is None and extra.get('weekly') is None):
+                return True
     return False
 
 def codex_available(body):

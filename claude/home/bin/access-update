@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import copy
 import fcntl
 import hashlib
 import json
@@ -117,7 +118,7 @@ def reconcile_admins(data: dict, owner: str, additional_csv: str) -> str:
 
 def set_superadmins(data: dict, owner: str, csv: str) -> str:
     """The owner's business assistants: administrators with his rights, never his private chat.
-    Set only from the host (Novsky, installer); no chat helper can grant it."""
+    Used by host reconciliation; current owner requests use team-apply-request."""
     wanted = unique(csv.split(","))
     admins, admitted = set(unique(data.get("admins", []))), set(unique(data.get("allowFrom", [])))
     for chat_id in wanted:
@@ -393,6 +394,7 @@ def settings_list(data: dict, owner: str, actor: str) -> str:
             "name": policy.get("name", group_id),
             "requireMention": policy.get("requireMention", True),
             "observeEnabled": policy.get("observeEnabled", True),
+            "ownerWithoutMention": policy.get("ownerWithoutMention", False),
             "admissionMode": policy.get("admissionMode", "allowlist" if allowed else "all"),
             "allowFrom": allowed,
         }
@@ -428,7 +430,7 @@ def apply_settings(data: dict, owner: str, actor: str, change: dict) -> str:
         policy = groups.get(group_id)
         if not isinstance(policy, dict):
             raise SystemExit("Group is not registered")
-        if setting in {"requireMention", "observeEnabled"} and type(value) is bool:
+        if setting in {"requireMention", "observeEnabled", "ownerWithoutMention"} and type(value) is bool:
             policy[setting] = value
         elif setting == "admissionMode" and value in {"all", "allowlist"}:
             policy["admissionMode"] = value
@@ -477,6 +479,118 @@ def settings_preview(path: Path, owner: str, actor: str, message_id: str, change
                               subject=settings_subject(change), message_id=int(message_id),
                               event="previewed", change_json=json.dumps(change, ensure_ascii=False))
     return json.dumps({"token": token, "expiresAt": expires_at, "summary": summary}, ensure_ascii=False)
+
+
+def current_owner_request(path: Path, data: dict, delivery: str) -> str:
+    """Require the configured owner and a still-open request in the receiver ledger."""
+    if not re.fullmatch(r"-?[1-9]\d{0,19}:[1-9]\d{0,19}", delivery):
+        raise SystemExit("Invalid owner request")
+    # Read under the access lock: a request that ended while waiting must
+    # not authorize a later write. Never take the owner from CLI arguments.
+    config, ledger = path.with_name(".env"), path.with_name("messages.db")
+    stamp = os.environ.get("TG_DELIVERY_STAMP")
+    if not stamp or config.is_symlink() or ledger.is_symlink():
+        raise SystemExit("Дію відхилено: поточне доручення власника не підтверджено")
+    try:
+        owners = [line.split("=", 1)[1].strip().strip("\"'")
+                  for line in config.read_text(encoding="utf-8").splitlines()
+                  if line.startswith("OWNER_CHAT_ID=")]
+        if len(owners) != 1 or not re.fullmatch(r"[1-9]\d{0,19}", owners[0]):
+            raise ValueError("owner")
+        owner = owners[0]
+        with closing(sqlite3.connect(f"file:{ledger}?mode=ro", uri=True, timeout=5)) as db:
+            row = db.execute(
+                "SELECT r.chat_id,r.thread_id,r.request_payload,r.turn_id,t.turn_id FROM delivery_results r "
+                "JOIN delivery_sessions s ON s.session_id=r.session_id AND s.stamp=r.stamp "
+                "JOIN delivery_turns t ON t.turn_id=coalesce(r.response_turn_id,r.turn_id) AND t.session_id=r.session_id "
+                "JOIN delivery_turn_messages m ON m.turn_id=r.turn_id AND m.delivery_id=r.delivery_id "
+                "WHERE r.delivery_id=? AND r.stamp=? AND r.state IN ('pending','deferred') AND t.closed_at IS NULL",
+                (delivery, stamp)).fetchone()
+            # Keep this barrier aligned with telegram-corporate/chat-policy.ts.
+            # An unrelated owner message in a legacy shared turn is not consent
+            # for another person's instruction. Missing provenance also refuses.
+            if row is not None:
+                for (payload,) in db.execute(
+                        "SELECT r.request_payload FROM delivery_turn_messages m "
+                        "LEFT JOIN delivery_results r ON r.delivery_id=m.delivery_id "
+                        "WHERE m.turn_id IN (?,?)", row[3:]):
+                    sender = json.loads(payload).get('params', {}).get('meta', {})
+                    if (sender.get('user_id') != owner or sender.get('forward_from') is not None
+                            or sender.get('sender_chat_id') is not None or sender.get('owner_control_result') is not None):
+                        raise ValueError('mixed turn')
+        if row is None:
+            raise ValueError("carrier")
+        chat, thread, payload = row[:3]
+        meta = json.loads(payload).get("params", {}).get("meta", {})
+        if (not isinstance(meta, dict) or meta.get("user_id") != owner
+                or meta.get("chat_id") != chat or meta.get("delivery_id") != delivery
+                or str(meta.get("message_id")) != delivery.rsplit(":", 1)[1]
+                or delivery.rsplit(":", 1)[0] != chat
+                or meta.get("forward_from") is not None or meta.get("sender_chat_id") is not None
+                or meta.get("owner_control_result") is not None):
+            raise ValueError("identity")
+        if chat == owner:
+            if thread is not None or meta.get("thread_id") is not None:
+                raise ValueError("private topic")
+        else:
+            if (not re.fullmatch(r"-[1-9]\d{0,19}", chat) or chat not in data.get("groups", {})
+                    or meta.get("addressed") == "false"):
+                raise ValueError("group")
+            if thread is None:
+                if meta.get("thread_id") is not None:
+                    raise ValueError("topic")
+                key = f"group:{chat}"
+            else:
+                if not re.fullmatch(r"[1-9]\d{0,19}", str(thread)) or str(meta.get("thread_id")) != str(thread):
+                    raise ValueError("topic")
+                key = f"topic:{chat}:{thread}"
+            if meta.get("conversation_key") != key:
+                raise ValueError("conversation")
+    except (OSError, sqlite3.Error, ValueError, TypeError, AttributeError):
+        raise SystemExit("Дію відхилено: поточне доручення власника не підтверджено") from None
+    return owner
+
+
+def settings_apply_request(path: Path, delivery: str, change_json: str) -> str:
+    """Apply the configured owner's current request, using receiver provenance.
+
+    The owner can use the existing settings allowlist in private or in a
+    registered group. Superadministrators keep their confirmation path.
+    """
+    if len(change_json) > 8192 or not re.fullmatch(r"-?[1-9]\d{0,19}:[1-9]\d{0,19}", delivery):
+        raise SystemExit("Invalid setting request")
+    try:
+        change = json.loads(change_json)
+    except ValueError:
+        raise SystemExit("Invalid setting request") from None
+    if not isinstance(change, dict):
+        raise SystemExit("Invalid setting request")
+
+    def apply(data: dict) -> str:
+        owner = current_owner_request(path, data, delivery)
+        refuse_pinned(data, settings_pin_subject(change))
+        summary = apply_settings(data, owner, owner, change)
+        return json.dumps({"applied": True, "summary": summary, **change}, ensure_ascii=False)
+
+    result = locked_update(path, apply)
+    record_access_event({"action": "settings-request", "delivery_id": delivery, "change": change})
+    return result
+
+
+def team_apply_request(path: Path, delivery: str, target: str, role: str) -> str:
+    """The owner's own current instruction is the confirmation, including in a group."""
+    if not APPROVER.fullmatch(target) or role not in {"admin", "superadmin", "member", "remove"}:
+        raise SystemExit("Недопустима зміна ролі")
+
+    def apply(data: dict) -> str:
+        owner = current_owner_request(path, data, delivery)
+        refuse_pinned(data, f"team:{target}")
+        summary = change_team_role(data, owner, owner, target, role)
+        return json.dumps({"applied": True, "summary": summary, "target": target, "role": role}, ensure_ascii=False)
+
+    result = locked_update(path, apply)
+    record_access_event({"action": "team-request", "delivery_id": delivery, "target": target, "role": role})
+    return result
 
 
 def settings_confirm(path: Path, owner: str, actor: str, token: str, decision: str) -> str:
@@ -713,6 +827,8 @@ def corroborate_requester(path: Path, requester: str, message_id: str, target: s
             return
     if stale:
         raise SystemExit("Дію відхилено: повідомлення-носій старіше за 15 хвилин — попроси адміністратора повторити запит")
+    if private_only:
+        raise SystemExit("Дію відхилено: потрібне власне повідомлення адміністратора в його приватному чаті")
     raise SystemExit(
         "Дію відхилено: носій має бути з приватного чату адміністратора або із зареєстрованої групи, "
         f"де в тому самому повідомленні названо id {target}"
@@ -735,6 +851,11 @@ def record_access_event(event: dict) -> None:
 def allow_chat(data: dict, requester: str, chat_id: str, name: str) -> str:
     if requester not in unique(data.get("admins", [])):
         raise SystemExit("Дію відхилено: користувач не є адміністратором")
+    if not re.fullmatch(r"[1-9][0-9]{0,19}", chat_id):
+        raise SystemExit(
+            "allow-chat додає людину за її Telegram ID. Для групи використовуй "
+            "access-update group-register; її права зберігаються окремо від списку людей."
+        )
     refuse_pinned(data, f"team:{chat_id}")
     allowed = unique(data.get("allowFrom", []))
     if chat_id in allowed:
@@ -792,6 +913,22 @@ def deactivate_group(data: dict, group_id: str, name: str) -> str:
     if name:
         current["name"] = name
     return f"Групу {current.get('name') or group_id} деактивовано ({group_id})"
+
+
+def migrate_group(data: dict, group_id: str, new_id: str) -> str:
+    # Telegram moved the group to a supergroup under a new id; the old entry stays for requests still open there.
+    if not re.fullmatch(r"-[1-9][0-9]{0,19}", group_id) or not re.fullmatch(r"-[1-9][0-9]{0,19}", new_id):
+        raise SystemExit("Некоректний ідентифікатор групи")
+    groups = data.get("groups", {})
+    if not isinstance(groups, dict):
+        raise SystemExit("Поле groups має бути JSON-об’єктом")
+    current = groups.get(group_id)
+    if not isinstance(current, dict):
+        return f"Групу {group_id} не було зареєстровано"
+    if new_id in groups:
+        return f"Група {new_id} вже має свої налаштування"
+    groups[new_id] = copy.deepcopy(current)
+    return f"Налаштування групи {current.get('name') or group_id} перенесено на {new_id}"
 
 
 def resolve_group(data: dict, target: str) -> tuple[str, dict]:
@@ -861,6 +998,10 @@ def main(argv: list[str]) -> int:
             f"       {command_name} team-status <path> <owner> <actor> <token>\n"
             f"       {command_name} settings-list <path> <owner> <actor>\n"
             f"       {command_name} settings-preview <path> <owner> <actor> <message_id> <json>\n"
+            f"       {command_name} settings-apply-request <path> <delivery_id> <json>\n"
+            f"       {command_name} team-apply-request <path> <delivery_id> <person_id> <role>\n"
+            '       settings JSON: {"scope":"group","groupId":"-100…","setting":"requireMention","value":false}\n'
+            '                      {"scope":"agent","setting":"replyToMode","value":"first"}\n'
             f"       {command_name} settings-confirm <path> <owner> <actor> <token> <approve|cancel>\n"
             f"       {command_name} settings-status <path> <owner> <actor> <token>\n"
             f"       {command_name} branch-preview <path> <owner> <manager_agent> <approvers_csv> <json>\n"
@@ -870,7 +1011,8 @@ def main(argv: list[str]) -> int:
             f"       {command_name} revoke <path> <requester> <message_id> <chat_id>\n"
             f"       {command_name} {observation_command} <path> <requester> <on|off|status> <group>\n"
             f"       {command_name} group-register <path> <actor> <group_id> [name]\n"
-            f"       {command_name} group-deactivate <path> <group_id> [name]",
+            f"       {command_name} group-deactivate <path> <group_id> [name]\n"
+            f"       {command_name} group-migrate <path> <group_id> <new_group_id>",
             file=sys.stderr,
         )
         return 2
@@ -893,6 +1035,10 @@ def main(argv: list[str]) -> int:
         message = locked_inspect(path, lambda data: settings_list(data, argv[3], argv[4]))
     elif command == "settings-preview" and len(argv) == 7:
         message = settings_preview(path, argv[3], argv[4], argv[5], argv[6])
+    elif command == "team-apply-request" and len(argv) == 6:
+        message = team_apply_request(path, argv[3], argv[4], argv[5])
+    elif command == "settings-apply-request" and len(argv) == 5:
+        message = settings_apply_request(path, argv[3], argv[4])
     elif command == "settings-confirm" and len(argv) == 7:
         message = settings_confirm(path, argv[3], argv[4], argv[5], argv[6])
     elif command == "settings-status" and len(argv) == 6:
@@ -952,6 +1098,8 @@ def main(argv: list[str]) -> int:
             path,
             lambda data: deactivate_group(data, argv[3], " ".join(argv[4:])),
         )
+    elif command == "group-migrate" and len(argv) == 5:
+        message = locked_update(path, lambda data: migrate_group(data, argv[3], argv[4]))
     else:
         print("Некоректні аргументи команди", file=sys.stderr)
         return 2

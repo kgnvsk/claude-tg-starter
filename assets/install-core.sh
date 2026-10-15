@@ -653,7 +653,14 @@ install -d -o "$AGENT_USER" -g "$AGENT_USER" -m 700 \
   "$H/.cache" "$H/.cache/codex-image" "$H/.cache/codex-image/prompts" \
   "$H/.cache/video-edit" \
   "$H/obsidian-vault/learning/pending" "$H/obsidian-vault/learning/history"
-install -d -m 700 "$CONFIG_DIR"
+# The launcher runs as the agent and must see root's live-engines marker in this folder. Keep the folder readable
+# while the marker is there: a root-only folder silently returned a live-engine agent to the interactive owner
+# session on its update (Manzik, 11.10.2026). The saved settings inside stay 0600.
+if [ -f "$CONFIG_DIR/live-engines-allowed" ] && [ ! -L "$CONFIG_DIR/live-engines-allowed" ]; then
+  install -d -m 755 "$CONFIG_DIR"
+else
+  install -d -m 700 "$CONFIG_DIR"
+fi
 if [ "$PERSONA_EXISTING" = 1 ]; then
   # Preflight proved both files before the first managed runtime write. Seed
   # hashes only from an exact former kit render, then let the normal guard

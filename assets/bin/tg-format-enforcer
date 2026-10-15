@@ -35,6 +35,8 @@ D) ПОСТІЙНІ ДОРУЧЕННЯ (Арти, 10.10.2026): «всегда»,
 Одноразовий bypass (не довше 5 хв):
 touch ~/.claude/state/tg-format-enforcer.bypass
 """
+import importlib.machinery
+import importlib.util
 import fcntl
 import json
 import os
@@ -238,10 +240,6 @@ def main() -> None:
     except Exception:
         sys.exit(0)
 
-    if is_bypassed():
-        log("bypassed via state file")
-        sys.exit(0)
-
     tool_name = data.get("tool_name") or ""
     if tool_name != "mcp__plugin_telegram_telegram__reply":
         sys.exit(0)
@@ -249,6 +247,21 @@ def main() -> None:
     tool_input = data.get("tool_input") or {}
     text = tool_input.get("text") or ""
     fmt = tool_input.get("format") or "markdownv2"  # tool default since 2026-06-23
+
+    delivery, asked = answered_request(data, tool_input)
+    if is_bypassed():
+        log("bypassed via state file")
+        return
+    quality_helper = os.path.join(AGENT_ROOT, "bin/task-review")
+    if delivery and os.path.isfile(quality_helper) and os.environ.get('TASK_REVIEW_MODE') != 'off':
+        try:
+            loader = importlib.machinery.SourceFileLoader("task_quality", quality_helper)
+            spec = importlib.util.spec_from_loader(loader.name, loader)
+            quality = importlib.util.module_from_spec(spec); loader.exec_module(quality)
+            verdict = quality.hook_gate(delivery, text, 'progress' if tool_input.get('phase') == 'progress' else 'final')
+            quality.observe(verdict, answer=text)
+        except Exception:
+            log("task-review shadow unavailable; answer unchanged")
 
     # ПРОВЕРКА A: двойной escape (модель сама заэкранировала, tool сделает второй раз).
     de_block, de_reason = has_double_escape(text) if fmt == "markdownv2" else (False, "")

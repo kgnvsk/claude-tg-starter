@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "_comment": "Canonical JSON digests (sorted keys, no spaces) of plugin policy and contract pairs earlier kits installed. An update may move from one of them to the staged pair only by switching plugins off.",
+  "premium": [
+    {
+      "since": "f4d24e70 (2026-08-12)",
+      "until": "4fe3a6e4 (2026-08-15)",
+      "policy": "abd463d2d227ead4e0d133e8c7436d238283c9bca13946fd3409ed43b575256d",
+      "contract": "7493c29d3d5e38208b301b1376bc6edfcee3adc7f5577ded7961701444856e50"
+    }
+  ]
+}

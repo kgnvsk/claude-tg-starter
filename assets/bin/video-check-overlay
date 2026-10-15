@@ -1,0 +1,322 @@
+#!/usr/bin/env python3
+"""Проверка рилса: текст/плашки/графика НЕ на лице + лицо по центру.
+
+usage:
+  video-check-overlay VIDEO --ass subs.ass [--png file.png@START-END ...] [--skip START-END ...]
+                   [--step 0.25] [--margin 0.15] [--cx 0.40-0.60] [--out DIR]
+
+Как работает (каждые --step секунд, по времени ГОТОВОГО видео):
+  * зона лица (зона обличчя) – детектор YuNet на кадре готового видео; bbox лица
+    расширяется: вверх на --ztop высоты лица (до макушки), вниз на --zbot (шея до
+    воротника), в стороны на --zside ширины (+20%);
+  * текст – файл субтитров/плашек .ass рендерится отдельно на зелёном фоне того же
+    размера: всё, что не зелёное (буквы, подложки плашек, тени), – маска текста;
+  * графика – PNG-оверлеи (графики, карточки) с указанием интервала: непрозрачные
+    пиксели – маска;
+  * нарушение OVERLAP – маска текста/графики пересекает расширенный bbox лица;
+  * нарушение CENTER – центр ведущего по горизонтали вне --cx (по умолчанию 40–60%); не применяется с --allow-no-face;
+  * STACK – в кадре больше одного текстового слоя (субтитр + плашка, или текст +
+    графика-карточка) – по данным .ass (стили Cap / Plate) и интервалам --png;
+  * STRIP – кадр не полный 9:16 (узгоджений формат): размытая/дублированная полоса, рамка
+    «кадр в кадре» или чёрные/однотонные поля. Ищется прямая шов-линия на всю ширину, по разные
+    стороны которой резкость отличается в разы, либо однотонные поля у края кадра.
+    Проверяется на каждом кадре с ведущим (вставки и концовка – по --skip – тоже, кроме полей).
+  * NOFACE – лицо не найдено вне --skip (может значить, что лицо закрыто) – тоже
+    считается нарушением, кадр сохраняется для просмотра глазами.
+  --skip – интервалы, где ведущего в кадре нет по замыслу (вставки, концовка).
+Скрины нарушений с рамками (красная – лицо, синяя – текст) – в --out.
+Код выхода: 0 – нарушений нет, 1 – есть.
+"""
+import argparse, hashlib, json, math, os, subprocess, sys, tempfile
+from pathlib import Path
+RUNTIME = Path.home()/'.local/share/claude-video-check'
+MODEL_URL = 'https://media.githubusercontent.com/media/opencv/opencv_zoo/47534e27c9851bb1128ccc0102f1145e27f23f98/models/face_detection_yunet/face_detection_yunet_2023mar.onnx'
+MODEL_SHA = '8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4'
+
+def setup():
+    """Explicit first-use setup, in a private agent-local environment; never change system Python."""
+    import urllib.request, venv
+    if not (3,9) <= sys.version_info[:2] <= (3,12):
+        raise ValueError('Setup needs Python 3.9–3.12: run this helper with that interpreter.')
+    for folder in [Path.home()/'.local',Path.home()/'.local/share',RUNTIME]:
+        if folder.is_symlink():raise ValueError('unsafe video runtime folder')
+        folder.mkdir(mode=0o700,exist_ok=True)
+    env=RUNTIME/'venv'
+    if env.is_symlink():raise ValueError('unsafe video environment')
+    boundary=next((p for p in (Path(__file__).resolve().parents[1]/'lib/install-env',Path('/opt/claude-tg-starter/assets/lib/install-env')) if p.is_file()),None)
+    if boundary is None:raise ValueError('Kit install-env is missing; restore the managed kit installation before setting up video checking.')
+    clean=[str(boundary),str(Path.home())]
+    subprocess.run(clean+[sys.executable,'-m','venv',str(env)],check=True)
+    subprocess.run(clean+[str(env/'bin/python'),'-m','pip','install','--disable-pip-version-check','numpy==1.26.4','opencv-python-headless==4.10.0.84'],check=True)
+    with urllib.request.urlopen(MODEL_URL,timeout=30) as response:data=response.read(300000)
+    if len(data)!=232589 or hashlib.sha256(data).hexdigest()!=MODEL_SHA:raise ValueError('YuNet model hash mismatch')
+    fd,name=tempfile.mkstemp(dir=RUNTIME,prefix='.model-')
+    try:
+        with os.fdopen(fd,'wb') as out:out.write(data);out.flush();os.fsync(out.fileno())
+        os.replace(name,RUNTIME/'yunet.onnx')
+    finally:Path(name).unlink(missing_ok=True)
+    print('Video checker ready. Run it on the final video and all ASS/PNG overlays, then inspect the contact sheet.')
+
+if __name__=='__main__' and sys.argv[1:]==['--setup']:
+    try:setup()
+    except Exception as exc:sys.exit(str(exc))
+    sys.exit(0)
+
+python=RUNTIME/'venv/bin/python'
+if python.exists() and Path(sys.prefix)!=RUNTIME/'venv':
+    os.execv(str(python),[str(python),str(Path(__file__).resolve()),*sys.argv[1:]])
+try:import numpy as np, cv2
+except ImportError:sys.exit('Video checker needs its local runtime. Run video-check-overlay --setup (Python 3.9–3.12), then repeat the check.')
+
+YUNET = os.environ.get("VIDEO_FACE_MODEL") or str(RUNTIME / "yunet.onnx")
+
+
+def probe(v):
+    o = subprocess.check_output(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+                                 "stream=width,height", "-show_entries", "format=duration", "-of", "json", v])
+    d = json.loads(o)
+    return d["streams"][0]["width"], d["streams"][0]["height"], float(d["format"]["duration"])
+
+
+def frames(cmd, w, h):
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    n = w * h * 3
+    try:
+        while True:
+            b = p.stdout.read(n)
+            if not b:
+                break
+            if len(b) != n:
+                raise ValueError("video decoder returned an incomplete frame")
+            yield np.frombuffer(b, np.uint8).reshape(h, w, 3)
+        if p.wait() != 0:
+            raise ValueError("video decoder failed; no verified result")
+    finally:
+        p.stdout.close()
+        if p.poll() is None:
+            p.terminate()
+            try: p.wait(timeout=5)
+            except subprocess.TimeoutExpired: p.kill(); p.wait()
+
+
+def digest(path):
+    h = hashlib.sha256()
+    with open(path, 'rb') as stream:
+        for chunk in iter(lambda: stream.read(1024*1024), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def verify_coverage(sampled, checked, duration, step):
+    if sampled < max(1, int(math.floor(duration / step + 0.5)) - 1):
+        raise ValueError("video sample coverage is incomplete")
+    if checked == 0:
+        raise ValueError("no frames were checked; no verified result")
+
+
+
+def strip_check(fr, tmask):
+    """Возвращает описание нарушения кадра или None. tmask – маска текста/графики (bool HxW)."""
+    H, W = fr.shape[:2]
+    g = cv2.cvtColor(fr, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    # 1) поля: однотонные строки у верхнего/нижнего края ≥3% высоты
+    # (поле = однотонные строки, которые либо чёрные, либо обрываются прямой линией на всю ширину;
+    #  ровное небо без шва полем не считается)
+    rs = g.std(axis=1); rm = g.mean(axis=1)
+    gy0 = np.abs(np.diff(g, axis=0))
+    for name, idx in (("сверху", np.arange(H)), ("снизу", np.arange(H)[::-1])):
+        n = 0
+        while n < H and rs[idx[n]] < 3.0: n += 1
+        if n >= 0.03 * H and n < H:
+            band = rm[idx[:n]]
+            yb = min(idx[n], idx[n - 1]); edge = float((gy0[min(yb, H - 2)] > 12).mean())
+            if band.max() < 18 or edge > 0.6:
+                return f"STRIP поля {name} {n}px"
+    # 2) шов: прямая горизонталь на всю ширину + резкость по сторонам отличается в разы
+    lap = np.abs(cv2.Laplacian(g, cv2.CV_32F, ksize=3))
+    valid = ~cv2.dilate(tmask.astype(np.uint8), np.ones((15, 15), np.uint8)).astype(bool)
+    gy = np.abs(np.diff(cv2.GaussianBlur(g, (1, 5), 0), axis=0))
+    thr = max(6.0, float(np.percentile(gy, 90)))
+    frac = (gy > thr).mean(axis=1)          # доля столбцов с сильным вертикальным перепадом в строке
+    for y in np.where(frac > 0.85)[0]:
+        if y < 0.08 * H or y > 0.92 * H: continue
+        a = slice(max(0, y - int(0.12 * H)), y - 2); b = slice(y + 3, min(H, y + int(0.12 * H)))
+        va, vb = valid[a], valid[b]
+        if va.mean() < 0.3 or vb.mean() < 0.3: continue
+        sa, sb = float(lap[a][va].mean()), float(lap[b][vb].mean())
+        hi, lo = max(sa, sb), max(1e-3, min(sa, sb))
+        if hi / lo > 3.0:
+            return f"STRIP шов y={y} ({y / H:.0%}), резкость {sa:.1f}/{sb:.1f}"
+    return None
+
+
+def rng(s):
+    a, b = s.split("-")
+    return float(a), float(b)
+
+
+def bbox(mask):
+    ys, xs = np.where(mask)
+    if not len(ys):
+        return None
+    return int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("video")
+    ap.add_argument("--ass")
+    ap.add_argument("--fontsdir")
+    ap.add_argument("--png", action="append", default=[])
+    ap.add_argument("--skip", action="append", default=[])
+    ap.add_argument("--allow-no-face", action="store_true", help="для погоджених кадрів без ведучого (авто, предмети): відсутність обличчя не є помилкою; знайдені обличчя все одно перевіряються")
+    ap.add_argument("--step", type=float, default=0.25)
+    ap.add_argument("--ztop", type=float, default=0.35)
+    ap.add_argument("--zbot", type=float, default=0.50)
+    ap.add_argument("--zside", type=float, default=0.20)
+    ap.add_argument("--no-strip", action="store_true", help="не проверять полосы/рамки (не рекомендуется)")
+    ap.add_argument("--cx", default="0.40-0.60")
+    ap.add_argument("--out")
+    a = ap.parse_args()
+    if not Path(YUNET).is_file():raise ValueError("Face model is missing: run video-check-overlay --setup first.")
+    video_sha = digest(a.video)
+    W, H, dur = probe(a.video)
+    if not math.isfinite(dur) or not 0 < dur <= 3600 or not 0.05 <= a.step <= 0.25 or W*H > 3840*2160:
+        raise ValueError("invalid video duration, dimensions or sample step")
+    checked_inputs = {str(Path(x).resolve()): digest(x) for x in ([a.ass] if a.ass else []) + [x.rsplit('@',1)[0] for x in a.png]}
+    receipt = Path(a.video + '.review.json')
+    receipt.unlink(missing_ok=True)
+    fps = 1 / a.step
+    cx_lo, cx_hi = rng(a.cx)
+    skips = [rng(s) for s in a.skip]
+    pngs = []
+    for s in a.png:
+        path, r = s.rsplit("@", 1)
+        im = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+        if im is None:
+            sys.exit(f"нет файла {path}")
+        alpha = im[:, :, 3] if im.shape[2] == 4 else np.full(im.shape[:2], 255, np.uint8)
+        alpha = cv2.resize(alpha, (W, H), interpolation=cv2.INTER_AREA)
+        pngs.append((rng(r), alpha > 20, os.path.basename(path)))
+    layers = []  # (a, b, kind) текстовые слои из .ass
+    if a.ass:
+        import re as _re
+        def _ts(x):
+            h, m, sec = x.split(":"); return int(h) * 3600 + int(m) * 60 + float(sec)
+        for line in open(a.ass, encoding="utf-8"):
+            m = _re.match(r"Dialogue: \d+,([^,]+),([^,]+),(Cap|Plate|Ph),", line)
+            if m and "\\p1" not in line:
+                layers.append((_ts(m.group(1)), _ts(m.group(2)), "plate" if m.group(3) != "Cap" else "cap"))
+    for (pa, pb), _m, nm in pngs:
+        layers.append((pa, pb, "png:" + nm))
+    out = a.out or os.path.splitext(a.video)[0] + "_overlay_qa"
+    os.makedirs(out, exist_ok=True)
+    # Keep prior evidence and unrelated images; this run gets its own output folder.
+    out = tempfile.mkdtemp(prefix="check-", dir=out)
+
+    vid = frames(["ffmpeg", "-nostdin", "-v", "error", "-i", a.video, "-vf", f"fps={fps}:round=near",
+                  "-f", "rawvideo", "-pix_fmt", "bgr24", "-"], W, H)
+    txt = None
+    if a.ass:
+        esc = a.ass.replace(":", "\\:")
+        flt = f"subtitles={esc}" + (f":fontsdir={a.fontsdir}" if a.fontsdir else "")
+        txt = frames(["ffmpeg", "-nostdin", "-v", "error", "-f", "lavfi", "-i",
+                      f"color=c=0x00FF00:s={W}x{H}:r={fps}:d={dur:.3f}", "-vf", flt,
+                      "-f", "rawvideo", "-pix_fmt", "bgr24", "-"], W, H)
+    det = cv2.FaceDetectorYN.create(YUNET, "", (W, H), 0.6)
+    det.setInputSize((W, H))
+    bad = []; info = []; last_fb = None
+    checked = 0
+    sampled = 0
+    for i, fr in enumerate(vid):
+        sampled += 1
+        t = i * a.step
+        tm = next(txt) if txt is not None else None
+        mask = np.zeros((H, W), bool)
+        if tm is not None:
+            g = tm.astype(int)
+            mask |= (np.abs(g[:, :, 1] - 255) > 40) | (g[:, :, 0] > 60) | (g[:, :, 2] > 60)
+        names = []
+        for (pa, pb), m, nm in pngs:
+            if pa <= t <= pb:
+                mask |= m
+                names.append(nm)
+        if any(x <= t <= y for x, y in skips):
+            continue
+        sp = strip_check(fr, mask) if not a.no_strip else None
+        checked += 1
+        _, faces = det.detect(fr)
+        probs = []
+        fb = None
+        if faces is None or not len(faces):
+            # лицо не найдено (закрыл руками, отвернулся): проверяем последнюю известную зону лица (≤1 с)
+            if last_fb is not None and t - last_fb[0] <= 1.0:
+                lb = last_fb[1]
+                if mask[lb[1]:lb[3] + 1, lb[0]:lb[2] + 1].any():
+                    probs.append("NOFACE+TEXT в последней зоне лица")
+                else:
+                    info.append((t, "лицо не найдено, текст вне последней зоны лица"))
+            elif not a.allow_no_face:
+                probs.append("NOFACE")
+        else:
+            x, y, w, h = faces[0][:4]
+            fb = (max(0, int(x - a.zside * w)), max(0, int(y - a.ztop * h)), min(W - 1, int(x + w + a.zside * w)), min(H - 1, int(y + h + a.zbot * h)))
+            last_fb = (t, fb)
+            cx = (x + w / 2) / W
+            if not a.allow_no_face and not (cx_lo <= cx <= cx_hi):
+                probs.append(f"CENTER cx={cx:.2f}")
+            sub = mask[fb[1]:fb[3] + 1, fb[0]:fb[2] + 1]
+            if sub.any():
+                probs.append(f"OVERLAP {int(sub.sum())}px" + (f" [{','.join(names)}]" if names else ""))
+        if sp: probs.append(sp)
+        act = sorted(set(k for la, lb, k in layers if la + 0.02 <= t < lb - 0.02))
+        if len(act) > 1:
+            probs.append("STACK " + "+".join(act))
+        if probs:
+            bad.append((t, probs))
+            img = fr.copy()
+            tb = bbox(mask)
+            ov = img.copy(); ov[mask] = (255, 120, 0)
+            img = cv2.addWeighted(ov, 0.35, img, 0.65, 0)
+            if fb:
+                cv2.rectangle(img, fb[:2], fb[2:], (0, 0, 255), 2)
+            if tb:
+                cv2.rectangle(img, tb[:2], tb[2:], (255, 0, 0), 1)
+            cv2.putText(img, f"{t:.2f} {' '.join(probs)}", (4, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1)
+            cv2.imwrite(os.path.join(out, f"t{t:07.2f}.jpg"), img)
+    # Drain the overlay decoder too: its final process status is part of the check.
+    if txt is not None:
+        for _ in txt: pass
+    verify_coverage(sampled, checked, dur, a.step)
+    if digest(a.video) != video_sha or any(digest(path) != value for path,value in checked_inputs.items()):
+        raise ValueError("video or overlay inputs changed during verification")
+    name = os.path.basename(a.video)
+    for t, m in info:
+        print(f"  info t={t:7.2f}  {m}")
+    for t, p in bad:
+        print(f"  t={t:7.2f}  {'; '.join(p)}")
+    print(f"{name}: checked={checked} step={a.step}s violations={len(bad)} "
+          f"(OVERLAP={sum(any(x.startswith('OVERLAP') for x in p) for _, p in bad)}, "
+          f"CENTER={sum(any(x.startswith('CENTER') for x in p) for _, p in bad)}, "
+          f"STACK={sum(any(x.startswith('STACK') for x in p) for _, p in bad)}, "
+          f"STRIP={sum(any(x.startswith('STRIP') for x in p) for _, p in bad)}, "
+          f"NOFACE={sum('NOFACE' in p for _, p in bad)}) screens={out if bad else '-'}")
+    if not bad:
+        value = {'schemaVersion': 1, 'checker': 'video-check-overlay-v1', 'checkerSha256': digest(__file__), 'sha256': video_sha,
+                 'sampled': sampled, 'checked': checked, 'step': a.step, 'duration': dur,
+                 'violations': 0, 'inputs': checked_inputs, 'options': vars(a)}
+        temporary = str(receipt) + '.tmp-' + str(os.getpid())
+        try:
+            with open(temporary, 'x', encoding='utf-8') as output:
+                json.dump(value, output, ensure_ascii=False); output.flush(); os.fsync(output.fileno())
+            os.replace(temporary, receipt)
+        finally:
+            Path(temporary).unlink(missing_ok=True)
+    sys.exit(1 if bad else 0)
+
+
+if __name__ == "__main__":
+    try: main()
+    except (ValueError, OSError, StopIteration, subprocess.SubprocessError) as error:
+        print("Video verification failed: " + str(error), file=sys.stderr)
+        sys.exit(2)

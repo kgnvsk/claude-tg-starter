@@ -1,0 +1,224 @@
+#!/usr/bin/env python3
+"""Apply one explicitly requested plan decision across files, pins and reminders, with resumable receipts."""
+import argparse
+from contextlib import closing, contextmanager
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import sqlite3
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+
+class Refused(Exception): pass
+class Uncertain(Exception): pass
+
+def sha(data):return hashlib.sha256(data).hexdigest()
+def root():
+    folder=Path.home()/'.local/state/plan-items'
+    for p in (Path.home()/'.local',Path.home()/'.local/state',folder):
+        if p.is_symlink():raise Refused('unsafe journal path')
+        p.mkdir(mode=0o700,exist_ok=True)
+    return folder
+
+def save(path,value):
+    fd,name=tempfile.mkstemp(dir=path.parent,prefix='.write-')
+    try:
+        with os.fdopen(fd,'w') as out:json.dump(value,out,ensure_ascii=False);out.flush();os.fsync(out.fileno())
+        os.replace(name,path)
+    finally:Path(name).unlink(missing_ok=True)
+
+def plan_path(value):
+    path=Path(value).expanduser()
+    if '..' in path.parts:raise Refused('parent traversal is not a plan path')
+    if not path.is_absolute():path=Path.home()/path
+    home=Path.home().absolute()
+    if path.is_relative_to(home):rel=path.relative_to(home)
+    elif path.is_relative_to(home.resolve()):rel=path.relative_to(home.resolve())
+    else:raise Refused('plan must stay in this agent workspace')
+    if not rel.parts or rel.parts[0] not in ('work','obsidian-vault') or path.suffix not in ('.md','.txt'):raise Refused('only plan text in work or obsidian-vault is accepted')
+    home=home.resolve();path=home/rel
+    for p in (path,*path.parents):
+        if p==home:break
+        if p.is_symlink():raise Refused('symlink plan path')
+    if path.exists() and (not path.is_file() or path.stat().st_nlink!=1):raise Refused('unsafe plan file')
+    return path
+
+def pin_before(pin):
+    state=Path(os.environ.get('TELEGRAM_STATE_DIR') or Path.home()/'.claude/channels/telegram')
+    with closing(sqlite3.connect(f'file:{state/"messages.db"}?mode=ro',uri=True,timeout=1)) as db:
+        row=db.execute("SELECT text FROM messages WHERE chat_id=? AND message_id=? AND direction='out' ORDER BY ts DESC LIMIT 1",(pin['chat'],pin['message'])).fetchone()
+    if not row or sha(str(row[0]).encode())!=pin['beforeSha256']:raise Refused('pin preimage is not the archived outgoing message; re-read the actual pin before preparing')
+
+@contextmanager
+def decision_lock(identifier):
+    if not isinstance(identifier,str) or not re.fullmatch(r'[a-z0-9][a-z0-9-]{0,63}',identifier):raise Refused('invalid decision id')
+    folder=root();fd=os.open(folder/(identifier+'.lock'),os.O_RDWR|os.O_CREAT|os.O_NOFOLLOW,0o600)
+    try:
+        st=os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_nlink!=1:raise Refused('unsafe decision lock')
+        fcntl.flock(fd,fcntl.LOCK_EX)
+        path=folder/(identifier+'.json')
+        if path.is_symlink() or path.exists() and (not path.is_file() or path.stat().st_nlink!=1):raise Refused('unsafe decision journal')
+        yield path
+    finally:os.close(fd)
+
+def prepare(value):
+    if not isinstance(value,dict):raise Refused('invalid manifest')
+    with decision_lock(value.get('id')) as path:
+        if path.exists():raise Refused('decision id already exists; use status/apply, never replace its journal')
+        return prepare_locked(value,path)
+
+def prepare_locked(value,path):
+    if not isinstance(value,dict) or set(value)!={'id','decision','files','pins','reminders','unaffected'}:raise Refused('manifest requires id, decision, files, pins, reminders, unaffected')
+    if not re.fullmatch(r'[a-z0-9][a-z0-9-]{0,63}',value['id']) or not isinstance(value['decision'],str) or not 8<=len(value['decision'])<=2000:raise Refused('invalid decision')
+    if not isinstance(value['unaffected'],dict) or set(value['unaffected'])-{'files','pins','reminders'}:raise Refused('explain every unaffected surface')
+    steps=[]
+    for kind in ('files','pins','reminders'):
+        items=value[kind]
+        if not isinstance(items,list) or len(items)>20:raise Refused('too many plan surfaces')
+        if not items and len(str(value['unaffected'].get(kind,'')))<8:raise Refused('explain why '+kind+' needs no change')
+        for item in items:
+            if kind=='files':
+                if set(item)!={'path','beforeSha256','text'} or not isinstance(item['text'],str) or len(item['text'].encode())>200000:raise Refused('invalid file patch')
+                target=plan_path(item['path']);before=target.read_bytes()
+                if sha(before)!=item['beforeSha256']:raise Refused('plan changed; re-read before preparing')
+                item={**item,'path':str(target),'before':before.decode(),'afterSha256':sha(item['text'].encode())}
+            elif kind=='pins':
+                if set(item)!={'chat','message','beforeSha256','text'} or not re.fullmatch(r'-?[1-9][0-9]{0,19}',str(item['chat'])) or type(item['message']) is not int or item['message']<1 or not isinstance(item['text'],str) or not 1<=len(item['text'])<=4000:raise Refused('invalid pin edit')
+                item={**item,'chat':str(item['chat'])};pin_before(item)
+            else:
+                if set(item)!={'task','chat'} or not re.fullmatch(r'[a-z0-9][a-z0-9._-]{0,63}',item['task']) or not re.fullmatch(r'-?[1-9][0-9]{0,19}',str(item['chat'])):raise Refused('invalid reminder cancellation')
+                item={**item,'chat':str(item['chat'])}
+            steps.append({'kind':kind,'input':item,'state':'pending'})
+    if not steps:raise Refused('no change requested')
+    result={'id':value['id'],'decision':value['decision'],'unaffected':value['unaffected'],'steps':steps,'at':time.time()}
+    save(path,result);return summary(result)
+
+def edit_pin(item):
+    state=Path(os.environ.get('TELEGRAM_STATE_DIR') or Path.home()/'.claude/channels/telegram')
+    token=os.environ.get('TELEGRAM_BOT_TOKEN','')
+    if not token:
+        for line in (state/'.env').read_text().split('\n'):
+            if line.startswith('TELEGRAM_BOT_TOKEN='):token=line.split('=',1)[1].strip()
+    if not token:raise Refused('Telegram sign-in missing; no pin changed')
+    body={'chat_id':item['chat'],'message_id':item['message'],'text':item['text']}
+    request=urllib.request.Request('https://api.telegram.org/bot'+token+'/editMessageText',data=json.dumps(body).encode(),headers={'Content-Type':'application/json'})
+    try:
+        with urllib.request.urlopen(request,timeout=25) as response:result=json.load(response)
+    except urllib.error.HTTPError as exc:
+        try:result=json.load(exc)
+        except Exception:raise Uncertain('pin result unknown; read the pin before continuing')
+        if exc.code==400 and 'message is not modified' in str(result.get('description','')):return {'alreadyApplied':True}
+        if exc.code in (400,401,403,404,429):raise Refused('Telegram refused this pin edit; resolve access/rate limit before retry')
+        raise Uncertain('pin result unknown; read the pin before continuing')
+    except (OSError,ValueError):raise Uncertain('pin result unknown; read the pin before continuing')
+    message=result.get('result',{})
+    if result.get('ok') is not True or str(message.get('chat',{}).get('id'))!=item['chat'] or message.get('message_id')!=item['message'] or message.get('text')!=item['text']:raise Uncertain('pin receipt does not match; do not repeat')
+    return {'message':item['message'],'chat':item['chat']}
+
+def archive_pin(item):
+    state=Path(os.environ.get('TELEGRAM_STATE_DIR') or Path.home()/'.claude/channels/telegram')
+    with closing(sqlite3.connect(f'file:{state/"messages.db"}?mode=rw',uri=True,timeout=2)) as db:
+        rows=db.execute("SELECT text FROM messages WHERE chat_id=? AND message_id=? AND direction='out'",(item['chat'],item['message'])).fetchall()
+        if not rows or any(sha(str(r[0]).encode()) not in (item['beforeSha256'],sha(item['text'].encode())) for r in rows):raise Uncertain('pin archive changed; reconcile before continuing')
+        db.execute("UPDATE messages SET text=? WHERE chat_id=? AND message_id=? AND direction='out'",(item['text'],item['chat'],item['message']));db.commit()
+
+def cancel_reminder(item):
+    # Reuse the scheduler's own lock and cancellation semantics, including legacy tasks without ACTOR.
+    code='''import importlib.machinery,importlib.util,json,os,sys
+from pathlib import Path
+p=Path.home()/'bin/reminder-task';l=importlib.machinery.SourceFileLoader('reminder_plan',str(p));s=importlib.util.spec_from_loader(l.name,l);a=importlib.util.module_from_spec(s);sys.modules[l.name]=a;l.exec_module(a)
+i=json.load(sys.stdin);d=Path(os.environ.get('REM_DIR',str(Path.home()/'.atarax/reminders')))
+with a.queue_lock(d,Path(os.environ.get('LOCK_FILE',str(d)+'.worker.lock'))):
+ h=[r.headers for r in a.task_records(d,i['task'])]+[a.saved_run_headers(j/'source.rem') for j in a.delivery_journals(d,i['task'])]
+ if any(x.get('CHAT')!=i['chat'] for x in h):raise ValueError('reminder belongs to a different chat')
+ print(a.cancel_task(d,i['task']))
+'''
+    run=subprocess.run([sys.executable,'-c',code],input=json.dumps(item),capture_output=True,text=True,timeout=15)
+    if run.returncode!=0 or 'mode=cancelled files=0' not in run.stdout:raise Refused('reminder cancellation is not complete; inspect delivery-status and chat scope')
+    return {'task':item['task'],'chat':item['chat'],'cancelled':True}
+
+def summary(value):
+    return {'id':value['id'],'complete':all(s['state']=='done' for s in value['steps']),
+            'steps':[{'kind':s['kind'],'state':s['state'],'receipt':s.get('receipt'),'reason':s.get('reason')} for s in value['steps']]}
+
+def apply(identifier):
+    with decision_lock(identifier) as path:
+        value=json.loads(path.read_text())
+        for step in value['steps']:
+            if step['state']=='done':continue
+            if step['state'] in ('attempting','uncertain') and step['kind']=='pins':raise Uncertain('pin outcome needs readback; no repeat attempted')
+            item=step['input']
+            try:
+                if step['kind']=='files':
+                    target=plan_path(item['path']);current=sha(target.read_bytes())
+                    if current not in (item['beforeSha256'],item['afterSha256']):raise Refused('plan changed after preparation; preserve the new content')
+                    if current!=item['afterSha256']:
+                        fd,temp=tempfile.mkstemp(dir=target.parent,prefix='.plan-')
+                        try:
+                            with os.fdopen(fd,'w') as out:out.write(item['text']);out.flush();os.fsync(out.fileno())
+                            os.chmod(temp,target.stat().st_mode & 0o777)
+                            if sha(target.read_bytes())!=item['beforeSha256']:raise Refused('plan changed during apply')
+                            os.replace(temp,target)
+                        finally:Path(temp).unlink(missing_ok=True)
+                    receipt={'sha256':sha(target.read_bytes())}
+                elif step['kind']=='pins':
+                    pin_before(item)
+                    step['state']='attempting';save(path,value);receipt=edit_pin(item);archive_pin(item)
+                else:
+                    receipt=cancel_reminder(item)
+                step.update(state='done',receipt=receipt);step.pop('reason',None);save(path,value)
+            except Refused as exc:
+                step.update(state='pending',reason=str(exc));save(path,value);break
+            except Exception:
+                step.update(state='uncertain' if step['kind']=='pins' else 'pending',reason='Result needs inspection; no automatic repeat.');save(path,value);break
+        return summary(value)
+
+def reconcile(identifier,index,message):
+    """Record an actual reread of the uncertain pin, without resending it."""
+    with decision_lock(identifier) as path:
+        value=json.loads(path.read_text())
+        if not 0<=index<len(value['steps']):raise Refused('invalid step')
+        step=value['steps'][index];item=step['input']
+        if step['kind']!='pins' or step['state'] not in ('attempting','uncertain'):raise Refused('only an uncertain pin needs reconciliation')
+        if not isinstance(message,dict) or str(message.get('chat',{}).get('id'))!=item['chat'] or message.get('message_id')!=item['message']:raise Refused('readback belongs to a different pin')
+        text=message.get('text')
+        if text==item['text']:
+            archive_pin(item);step.update(state='done',receipt={'message':item['message'],'chat':item['chat'],'readback':True})
+        elif isinstance(text,str) and sha(text.encode())==item['beforeSha256']:step.update(state='pending')
+        else:raise Refused('pin changed independently; preserve it and prepare a new decision')
+        step.pop('reason',None);save(path,value);return summary(value)
+
+def main():
+    p=argparse.ArgumentParser(description=__doc__);sub=p.add_subparsers(dest='action',required=True)
+    sub.add_parser('schema',help='print a manifest example and the readback rules')
+    q=sub.add_parser('prepare');q.add_argument('manifest',type=Path)
+    q=sub.add_parser('reconcile');q.add_argument('id');q.add_argument('--step',type=int,required=True);q.add_argument('--message-json',type=Path,required=True)
+    for action in ('apply','status'):
+        q=sub.add_parser(action);q.add_argument('id')
+    args=p.parse_args()
+    if args.action=='schema':
+        print(json.dumps({'manifest':{'id':'one-decision','decision':'The owner asked to remove the completed item','files':[{'path':'work/plan.md','beforeSha256':'SHA256 of the current bytes','text':'entire replacement text'}],'pins':[{'chat':'7','message':42,'beforeSha256':'SHA256 of the archived CURRENT pin text','text':'entire replacement text'}],'reminders':[{'task':'plan-review','chat':'7'}],'unaffected':{}},'rules':['Read every affected surface immediately before prepare. A Telegram pin edit has no server-side compare-and-swap: do not race another editor.','Empty files/pins/reminders lists require an explanation in unaffected under that key.','prepare stores preimages; apply resumes only confirmed steps. Never invent completion receipts.','For an uncertain pin, reread that exact message with an available chat tool, save its actual message object, then reconcile ID --step INDEX --message-json FILE. If it changed independently preserve it.','Report complete only when apply/status returns complete=true. Partial work is not rolled back over another editor.']},ensure_ascii=False))
+        return 0
+    if args.action=='prepare':
+        if args.manifest.stat().st_size>500000:raise Refused('manifest too large')
+        result=prepare(json.loads(args.manifest.read_text()))
+    elif args.action=='apply':result=apply(args.id)
+    elif args.action=='reconcile':
+        if args.message_json.stat().st_size>100000:raise Refused('readback too large')
+        result=reconcile(args.id,args.step,json.loads(args.message_json.read_text()))
+    else:
+        if not re.fullmatch(r'[a-z0-9][a-z0-9-]{0,63}',args.id):raise Refused('invalid decision id')
+        result=summary(json.loads((root()/(args.id+'.json')).read_text()))
+    print(json.dumps(result,ensure_ascii=False));return 0
+if __name__=='__main__':
+    try:sys.exit(main())
+    except (Refused,Uncertain,OSError,ValueError,TypeError,KeyError,sqlite3.Error) as exc:print(json.dumps({'complete':False,'reason':str(exc)},ensure_ascii=False));sys.exit(1)

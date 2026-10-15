@@ -442,6 +442,11 @@ ENGLISH_NOTICES.update({
     'auth.code_rejected': "❌ The code did not work (or came with extra text). Write /relogin and I'll send a fresh link; we'll try again.",
     'auth.code_rejected_switch': "❌ The code did not work (or came with extra text). I stay on {who}. Write /relogin and I'll send a fresh link; we'll try again.",
 })
+# The status a chat sees while the native session compacts (tg-compaction-notice). AALL's Polish team
+# had the kit text translated by hand on 25.09.2026; the profile now says it.
+RUSSIAN_NOTICES["compaction.notice"] = "Секундочку, сейчас сжимаю контекст разговора. После этого продолжу задачу."
+POLISH_NOTICES["compaction.notice"] = "Chwileczkę, porządkuję pamięć rozmowy. Zaraz wracam do zadania."
+ENGLISH_NOTICES["compaction.notice"] = "One moment, I'm compacting our conversation. I'll continue the task right after."
 LOCALE_NOTICES = {"ru": RUSSIAN_NOTICES, "pl": POLISH_NOTICES, "en": ENGLISH_NOTICES}
 
 

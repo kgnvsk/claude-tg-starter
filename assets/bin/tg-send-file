@@ -629,6 +629,7 @@ def quiet_file_main(argv: list[str]) -> None:
             filename, data = read_outbox_file(source)
             if not data:
                 raise SendError("tg-send-file: file is empty")
+            check_video_review(chat_id, thread_id, source, filename, data)
             blob_name = f"{digest}.blob"
             quiet_copy_blob(root, blob_name, data)
             record = {"version": 1, "kind": "file", "run_key": run_key, "task": task,
@@ -645,6 +646,20 @@ def quiet_file_main(argv: list[str]) -> None:
             print(f"delivery {state}: saved scheduled file; do not send it again")
     finally:
         os.close(lock)
+
+
+def check_video_review(chat_id, thread_id, path, filename, data):
+    helper=Path.home()/'bin/task-review'
+    if Path(filename).suffix.lower() not in ('.mp4','.mov','.webm','.mkv') or not helper.is_file():return
+    quality=runpy.run_path(str(helper))
+    try:
+        if not quality['video_required'](chat_id,thread_id,os.environ.get('TG_DELIVERY_ID')):return
+        _,receipt=read_outbox_file(path+'.review.json')
+        if len(receipt)>64000:raise ValueError('video review receipt too large')
+        verdict=quality['video_receipt'](hashlib.sha256(data).hexdigest(),json.loads(receipt))
+        if not verdict['ok']:raise ValueError(verdict['message'])
+    except (ValueError,OSError,sqlite3.Error,SendError):
+        raise SendError('tg-send-file: check the exact final video with video-check-overlay before sending; nothing was sent') from None
 
 
 def main(argv: list[str]) -> None:
@@ -670,6 +685,7 @@ def main(argv: list[str]) -> None:
         filename, data = read_outbox_file(path)
         if not data:
             raise SendError("tg-send-file: file is empty")
+        check_video_review(chat_id, thread_id, path, filename, data)
         delivery = runpy.run_path(str(Path(__file__).with_name('tg-send')))
         context = delivery['capture_delivery'](chat_id, thread_id)
         delivery['settle_on_signals'](context, [])

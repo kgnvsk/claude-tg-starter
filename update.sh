@@ -16,6 +16,8 @@
 # Usage: follow the stopped transaction in UPGRADING.md. The outer transaction
 # creates restart-hold.until, drains every worker, and invokes this script with
 # CLAUDE_UPDATE_MAINTENANCE=1. Direct execution is intentionally refused.
+# `--preflight-all`, run on the live agent from a staged kit, changes nothing and
+# names every check the window would stop on, not only the first one.
 set -euo pipefail
 
 [ "$(id -u)" -eq 0 ] || { echo "FATAL: цей скрипт потрібно запускати від root" >&2; exit 1; }
@@ -87,10 +89,28 @@ export NOVSKY_ALLOW_PINNED_LEGACY_SHARED_CONTEXT
 
 UPDATE_ACTION="${1:-}"
 case "${1:-}" in
-  ""|--license-preflight) ;;
+  ""|--license-preflight|--preflight-all) ;;
   *) echo "FATAL: unknown update option" >&2; exit 1 ;;
 esac
 [ "$#" -le 1 ] || { echo "FATAL: unexpected update arguments" >&2; exit 1; }
+# --preflight-all keeps going after a failed check and counts it here.
+WALLS=0
+wall() {
+  echo "WALL: $*" >&2
+  WALLS=$((WALLS + 1))
+}
+# BEGIN check runner
+# A function run after || or inside if has errexit switched off for every command in it, even under its own
+# set -e, so a failed first check is lost when a later one passes (Codex K262-P1-1). A check that must stop
+# the window runs as a plain command here, and its status is read afterwards.
+CHECK_STATUS=0
+run_check() {
+  set +e
+  "$@"
+  CHECK_STATUS=$?
+  set -e
+}
+# END check runner
 
 require_primary_service_stopped() {
   local state status=0
@@ -264,7 +284,7 @@ validate_kit_checkout() {
   # /opt/claude-tg-starter, a targeted instance from /opt/claude-tg-starter@<user>.
   # Only the licence preflight runs from a staged kit beside the live one. This
   # runs before any kit code, so a refusal leaves the folder untouched.
-  if [ "$UPDATE_ACTION" != --license-preflight ]; then
+  if [ "$UPDATE_ACTION" != --license-preflight ] && [ "$UPDATE_ACTION" != --preflight-all ]; then
     own_kit=/opt/claude-tg-starter
     [ "$AGENT_USER" = claude ] || own_kit="$own_kit@$AGENT_USER"
     # /opt itself may be a symlink; the kit must be the real folder under it.
@@ -364,7 +384,11 @@ require_instance_service_target
 # Wrappers call --license-preflight while the agent is still running. Applying
 # an update always verifies again, including retries on existing installations.
 python3 "$KIT/assets/lib/agent-license.py" --saved-env "$ENV_SAVED" \
-  --bot-env "$H/.claude/channels/telegram/.env"
+  --bot-env "$H/.claude/channels/telegram/.env" || {
+    status=$?
+    [ "$UPDATE_ACTION" = --preflight-all ] || exit "$status"
+    wall "licence"
+  }
 # BEGIN pre-stop persona preflight
 # The outer updater runs --license-preflight while the service is still alive.
 # Check the same rendered personas install-core will check after the stop, using
@@ -404,15 +428,28 @@ preflight_personas_before_stop() (
   check_persona() {
     local source="$1" destination="$2" baseline="$3"
     render_template() {
-      local template="$1" output="$2"
+      local template="$1" output="$2" persona_copy status
       shift 2
+      # The agent renders a copy root made: Novsky keeps an old install's previous kit in its root-only
+      # transaction folder, which the agent cannot open (AALL, 11.10.2026). The copy is root's and
+      # read-only in a root folder, so the agent cannot change what was checked (Codex K255-P1-1).
+      persona_copy="$(mktemp -d)"
+      [ -d "$persona_copy" ] || return 1
+      chmod 0755 "$persona_copy" || { rm -rf -- "$persona_copy"; return 1; }
+      if ! install -m 0644 -- "$template" "$persona_copy/template"; then
+        rm -rf -- "$persona_copy"
+        return 1
+      fi
+      status=0
       runuser -u "$AGENT_USER" -- env \
         AGENT_NAME="$AGENT_NAME" OWNER_NAME="${OWNER_NAME:-}" \
         OWNER_TG_USERNAME="${OWNER_TG_USERNAME:-}" OWNER_CHAT_ID="${OWNER_CHAT_ID:-}" \
         BOT_USERNAME="${BOT_USERNAME:-}" TIMEZONE="${TIMEZONE:-}" \
         CALENDAR_EMAIL="${CALENDAR_EMAIL:-}" DEPLOY_DATE="$(date +%F)" \
         AGENT_HOME="$H" AGENT_SERVICE="$AGENT_SERVICE" AGENT_USER="$AGENT_USER" \
-        python3 "$KIT/assets/lib/render-template.py" "$@" "$template" "$output"
+        python3 "$KIT/assets/lib/render-template.py" "$@" "$persona_copy/template" "$output" || status=$?
+      rm -rf -- "$persona_copy"
+      return "$status"
     }
     guard_managed_persona "$action" "$source" "$destination" "$baseline"
   }
@@ -421,11 +458,117 @@ preflight_personas_before_stop() (
   check_persona "$role_profile" \
     "$H/.claude/CLAUDE.product.md" "$H/.claude/product/CLAUDE.product.sha256"
 )
-preflight_personas_before_stop
+run_check preflight_personas_before_stop
+if [ "$CHECK_STATUS" -ne 0 ]; then
+  status=$CHECK_STATUS
+  [ "$UPDATE_ACTION" = --preflight-all ] || exit "$status"
+  wall "managed persona"
+fi
 # END pre-stop persona preflight
 if [ "${1:-}" = --license-preflight ]; then
   exit 0
 fi
+# BEGIN all-walls preflight
+# AALL, 11.10.2026: one rollback after another, each on a wall found only after the stop (module file modes, the plugin
+# policy, skill and subagent baselines); Yuriy asked for this on 08.10. The window's own checks, read-only, on the live agent.
+if [ "$UPDATE_ACTION" = --preflight-all ]; then
+  for optional_name in MODULE_CHANNEL_PUBLISH MODULE_INSTAGRAM_DM MODULE_YOUTUBE_COMMENTS; do
+    optional_value="$(python3 "$KIT/assets/bin/saved-env-export" --value "$ENV_SAVED" "$optional_name")" || {
+      wall "$optional_name unreadable in $ENV_SAVED"
+      continue
+    }
+    case "$optional_value" in
+      ""|0) ;;
+      *) wall "$optional_name=$optional_value: the module needs its own reviewed migration" ;;
+    esac
+  done
+  feature_status=0
+  python3 "$KIT/assets/lib/product-config.py" --file "$KIT/assets/product/runtime.json" \
+    has-feature telegram-corporate-sessions || feature_status=$?
+  if [ "$feature_status" -eq 0 ]; then
+    runuser -u "$AGENT_USER" -- env HOME="$H" python3 \
+      "$KIT/modules/telegram-corporate/module-update-guard.py" check \
+      "$KIT/modules/telegram-corporate" \
+      "$H/.local/share/claude-telegram-corporate" \
+      "$H/.claude/product/corporate-module-baseline.json" "$KIT" || wall "corporate module"
+  elif [ "$feature_status" -ne 1 ]; then
+    wall "corporate module feature unreadable"
+  fi
+  python3 -B "$KIT/assets/lib/install-backup-context.py" --check-current \
+    --allow-maintenance-hold "${legacy_context_args[@]}" \
+    --home "$H" --user "$AGENT_USER" --unit "$AGENT_SERVICE" --engine claude >/dev/null \
+    || wall "backup context needs its migration"
+  env AGENT_USER="$AGENT_USER" bash "$KIT/assets/bin/update-agent-clis" --check || wall "Claude Code / Codex CLI"
+  plugin_drops="$(python3 "$KIT/assets/lib/preflight-maintenance-plugins.py" "$KIT" "$H")" || wall "managed plugin policy"
+  [ -z "${plugin_drops:-}" ] || echo "plugin policy: the window switches off $plugin_drops"
+  if cmp -s "$KIT/assets/product/telegram-plugin-compat.json" \
+      "$H/.claude/product/telegram-plugin-compat.json"; then
+    PREFLIGHT_RECONCILER="$KIT/assets/bin/reconcile-telegram-plugin"
+  else
+    PREFLIGHT_RECONCILER="$H/bin/reconcile-telegram-plugin"
+  fi
+  runuser -u "$AGENT_USER" -- env HOME="$H" /usr/bin/timeout --foreground 30s \
+    "$KIT/assets/bin/plugin-doctor" --json >/dev/null || wall "installed plugins (plugin-doctor)"
+  runuser -u "$AGENT_USER" -- env HOME="$H" /usr/bin/timeout --foreground 30s \
+    "$PREFLIGHT_RECONCILER" --marketplace-source-check >/dev/null || wall "Telegram plugin source"
+  runuser -u "$AGENT_USER" -- env HOME="$H" /usr/bin/timeout --foreground 30s \
+    "$PREFLIGHT_RECONCILER" --json >/dev/null || wall "Telegram plugin receiver"
+  plan_status=0
+  plan_json="$(python3 "$KIT/assets/bin/update-safety-check" plan --home "$H" --kit "$KIT" \
+    --policy "$KIT/assets/product/managed-runtime.json" \
+    --baseline "$H/.claude/product/managed-runtime-baseline.json" \
+    --owner "$AGENT_USER" --json)" || plan_status=$?
+  [ "$plan_status" -eq 0 ] || wall "managed files: $(printf '%s' "$plan_json" | python3 -c '
+import json, sys
+try:
+    actions = json.load(sys.stdin).get("actions", [])
+except ValueError:
+    actions = []
+print(", ".join(a["path"] + " (" + a["action"] + ")" for a in actions if a.get("action") == "conflict")
+      or "update-safety-check plan refused")')"
+  preflight_managed_copies() (
+    set -euo pipefail
+    local exports_file
+    exports_file="$(mktemp)"
+    trap 'rm -f "${exports_file:-}"' EXIT
+    python3 "$KIT/assets/bin/saved-env-export" "$ENV_SAVED" \
+      AGENT_NAME OWNER_NAME OWNER_TG_USERNAME OWNER_CHAT_ID BOT_USERNAME \
+      TIMEZONE CALENDAR_EMAIL ACTIVE_ROLES > "$exports_file"
+    while IFS= read -r -d '' name && IFS= read -r -d '' value; do
+      printf -v "$name" '%s' "$value"
+      export "$name"
+    done < "$exports_file"
+    python3 "$KIT/assets/bin/update-safety-check" profile-export --home "$H" > "$exports_file"
+    while IFS= read -r -d '' name && IFS= read -r -d '' value; do
+      printf -v "$name" '%s' "$value"
+      export "$name"
+    done < "$exports_file"
+    case "$1" in
+      skills)
+        env DEPLOY_DATE="$(date +%F)" AGENT_HOME="$H" AGENT_SERVICE="$AGENT_SERVICE" AGENT_USER="$AGENT_USER" \
+          python3 "$KIT/assets/lib/reconcile-managed-skills.py" \
+          "$H/.claude/skills" "$KIT/assets/product/managed-skills.json" \
+          "$H/.claude/product/managed-skills.json" \
+          --source "$KIT/assets/skills" --external-source "$KIT/assets/external-skills" \
+          --baseline "$H/.claude/product/managed-skills-baseline.json" --check >/dev/null ;;
+      agents)
+        python3 "$KIT/assets/lib/reconcile-managed-skills.py" agents \
+          "$H/.claude/agents" "$KIT/assets/agents" "$H/.claude/product/managed-agents-baseline.json" \
+          --active-roles "${ACTIVE_ROLES:-}" --check >/dev/null ;;
+    esac
+  )
+  run_check preflight_managed_copies skills
+  [ "$CHECK_STATUS" -eq 0 ] || wall "managed skills changed on this server"
+  run_check preflight_managed_copies agents
+  [ "$CHECK_STATUS" -eq 0 ] || wall "managed subagents changed on this server"
+  if [ "$WALLS" -eq 0 ]; then
+    echo "preflight-all: no walls; the window may start"
+    exit 0
+  fi
+  echo "preflight-all: $WALLS wall(s); the window would stop on them, nothing was changed" >&2
+  exit 2
+fi
+# END all-walls preflight
 if [ "$CLAUDE_UPDATE_MAINTENANCE" != 1 ]; then
   echo "FATAL: update.sh працює лише всередині перевіреного maintenance-вікна з UPGRADING.md" >&2
   exit 1
@@ -491,7 +634,9 @@ require_primary_service_stopped
 # A changed managed-plugin policy needs a separate migration with its own
 # rollback plan. A normal kit update keeps the installed CLI/plugin cache and
 # checks the local pinned source before install-core changes any live file.
-python3 "$KIT/assets/lib/preflight-maintenance-plugins.py" "$KIT" "$H"
+# The one migration it takes, an earlier kit's pair switching plugins off, names
+# those plugins here; they are removed after install-core (plugin policy migration).
+PLUGIN_POLICY_DROPS="$(python3 "$KIT/assets/lib/preflight-maintenance-plugins.py" "$KIT" "$H")"
 # With an unchanged golden, use the staged verifier. When this kit advances
 # only its reviewed golden, the installed verifier must inspect the old local
 # contract before install-core installs the new one.
@@ -825,6 +970,21 @@ else
     exit 2
   }
 fi
+
+# BEGIN plugin policy migration
+# The preflight allowed the installed earlier pair only to switch these plugins off
+# (Yuriy, 08.10.2026: a 14.08 install still had example-skills, dropped on 15.08).
+# install-core wrote the new policy and settings; the stale plugins themselves go
+# before the plugin check. The window snapshot holds ~/.claude/plugins, so a later
+# failure restores them with everything else.
+if [ -n "${PLUGIN_POLICY_DROPS:-}" ]; then
+  echo "[4/5] прибираю плагіни, яких комплект більше не постачає: $PLUGIN_POLICY_DROPS"
+  runuser -u "$AGENT_USER" -- env HOME="$H" "$H/bin/install-plugins" --stale-only || {
+    echo "FATAL: не вдалося прибрати застарілі плагіни" >&2
+    exit 2
+  }
+fi
+# END plugin policy migration
 
 # ---- 3. converge only the reviewed official Telegram 0.0.7 boundary ----
 echo "[4/5] перевіряю Telegram plugin 0.0.7 і накладаю сумісний golden"

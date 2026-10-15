@@ -6,6 +6,13 @@
 # Data-driven: читает settings.json, поэтому корректен для любого кита без правок.
 # Идемпотентно. Запускать ПОСЛЕ входа в Claude (Фаза 2), от пользователя claude.
 set -uo pipefail
+# --stale-only: just remove the managed plugins the policy no longer enables (update.sh's plugin policy migration).
+STALE_ONLY=0
+case "${1:-}" in
+  "") ;;
+  --stale-only) STALE_ONLY=1 ;;
+  *) echo "✗ невідомий параметр: $1" >&2; exit 2 ;;
+esac
 
 # The CLI unpacks the plugin tree with whatever umask it inherits, and Debian
 # gives an agent user 002 through pam_umask, so a plugin installed from here
@@ -234,6 +241,10 @@ policy = json.load(open(sys.argv[1], encoding="utf-8"))
 for plugin in sorted(set(policy["managed"]) - set(policy["enabled"])):
     print(plugin)
 ' "$POLICY")
+if [ "$STALE_ONLY" = 1 ]; then
+  [ "$failures" -eq 0 ] || exit 1
+  exit 0
+fi
 
 echo "==> узгодження маркетплейсів (застарілий стан, керований комплектом)"
 while read -r marketplace; do

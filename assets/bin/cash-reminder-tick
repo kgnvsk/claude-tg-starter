@@ -8,6 +8,12 @@
 # Optional headers:
 #   THREAD_ID=<positive_forum_topic_id> (requires a group CHAT)
 #   PARSE=<markdown|markdownv2|html|text>  (default: text)
+#   SILENT=1 → what goes to CHAT arrives without a notification sound (Telegram's
+#            disable_notification), e.g. routine posts to a security group; a QUIET=1
+#            task sends by itself and passes tg-send --silent instead.
+#   NOTICES=chat → the scheduler's notice that this task failed or was cut off goes to
+#            CHAT (its topic, SILENT kept), not to the owner's private chat. A result
+#            CHAT refused or may not have taken is still told to the owner.
 #   RUN=1  → the body is a task for the agent, not a message for the owner:
 #            run it headless and send the RESULT. Everything else (repeat,
 #            quiet hours, until, dedup) behaves exactly the same.
@@ -588,7 +594,7 @@ keep_observation() {
 }
 
 run_agent_task() {
-  local file="$1" prompt="$2" out rc destination="чат ${chat}"
+  local file="$1" prompt="$2" review_request="$2" out rc destination="чат ${chat}"
   local workdir="${AGENT_TASK_DIR:-$HOME/.atarax/agent-task}"
   # A scheduled run sees the live service's PATH, the agent's own wrappers first (Арти, 09.10.2026: under cron's PATH
   # mail-clean ran the bare gog without the ~/bin wrapper that loads the keyring password, and Gmail went unread).
@@ -718,13 +724,28 @@ ${prompt}"
   fi
   # A task started from the live session must not settle that session's pending
   # request with its own sends: it runs without the service's delivery binding.
+  local review_run="" review_result=""
+  if [ -x "$HOME/bin/task-review" ] && [ "${TASK_REVIEW_MODE:-shadow}" != off ]; then
+    review_run=$(mktemp -d "$workdir/task-review.XXXXXXXX") || review_run=""
+    if [ -n "$review_run" ] && ! printf '%s' "$review_request" > "$review_run/request.txt"; then rm -rf -- "$review_run"; review_run=""; fi
+    if [ "$quiet" -eq 0 ] && [ -n "$review_run" ]; then
+    prompt="${prompt}
+
+Перед підсумком звір вимоги, факти та результат. Збережи точний текст відповіді й JSON перевірки checks=[{item,status:verified|missing|not_applicable,evidence}], nextStep для невиконаного. TASK_REVIEW_RUN_DIR/request.txt містить саме це завдання. task-review validate читає JSON {request,answer,review:null} зі stdin і показує потрібні item. Потім task-review record-scheduled --answer-file ФАЙЛ --review-file JSON. Після ok поверни точний текст із answer-file. Невиконане і наступний крок мають бути в самій відповіді. Не повторюй уже зроблені дії. Для NOTHING перевірка не потрібна. Текст доставить планувальник; tg-send не викликай."
+    fi
+  fi
   out=$(cd "$workdir" &&
     export PATH="$agent_path" TG_DELIVERY_STAMP= TG_DELIVERY_ID= TG_DELIVERY_TASK_ID= TG_DELIVERY_PHASE=final \
       ATARAX_TASK_QUIET="$quiet" ATARAX_TASK_ID="${task_id:-$(basename "$file" .rem)}" \
       ATARAX_TASK_OCCURRENCE="$epoch" ATARAX_TASK_RUN_KEY="${quiet_run_key:-}" \
-      ATARAX_TASK_DELIVERY_DIR="$REM_DIR/.quiet-delivery" &&
+      ATARAX_TASK_DELIVERY_DIR="$REM_DIR/.quiet-delivery" TASK_REVIEW_RUN_DIR="$review_run" &&
     ATARAX_SUPPRESS_TELEGRAM=1 ATARAX_TASK_DELIVERY=1 $limit "$HOME/.local/bin/claude" -p --output-format text <<<"$prompt" 2>&1)
   rc=$?
+  if [ "$rc" -eq 0 ] && [ "$quiet" -eq 0 ] && [ -n "$review_run" ]; then
+    # Shadow diagnostics never alter stdout, task status, retry or delivery.
+    printf '%s' "$out" | TASK_REVIEW_RUN_DIR="$review_run" "$HOME/bin/task-review" observe-scheduled >/dev/null 2>&1 || true
+  fi
+  [ -z "$review_run" ] || rm -rf -- "$review_run"
   if [ $rc -ne 0 ]; then
     log_message "run $(basename "$file"): помилка виконання rc=$rc: $(printf '%s' "$out" | tail -c 200 | tr '\n' ' ')"
     # A limit that names its reset is kept with the occurrence: a retry-safe run goes again after it (run_occurrence).
@@ -867,10 +888,12 @@ sys.exit(0 if good else 1)
 # message gets one plain retry only after Telegram definitively rejected it.
 # A timeout or server error may follow an accepted message. Never resend that.
 send_text() {
-  local chat="$1" text="$2" parse="$3" thread="${4:-}" strict_receipt="${5:-0}" resp confirmed=0
+  local chat="$1" text="$2" parse="$3" thread="${4:-}" strict_receipt="${5:-0}" silent="${6:-}" resp confirmed=0
+  local no_sound=()
+  [ "$silent" != 1 ] || no_sound=(--data-urlencode "disable_notification=true")
   local args=(-s -m 10 -X POST "https://api.telegram.org/bot${token}/sendMessage"
               --data-urlencode "chat_id=${chat}"
-              --data-urlencode "text=${text}")
+              --data-urlencode "text=${text}" ${no_sound[@]+"${no_sound[@]}"})
   [ -z "$thread" ] || args+=(--data-urlencode "message_thread_id=${thread}")
   if [ -n "${parse:-}" ] && [ "$parse" != "text" ]; then
     args+=(--data-urlencode "parse_mode=${parse}")
@@ -882,14 +905,14 @@ send_text() {
        definite_markup_rejection "$resp"; then
       resp=$(curl -s -m 10 -X POST "https://api.telegram.org/bot${token}/sendMessage" \
              --data-urlencode "chat_id=${chat}" --data-urlencode "text=${text}" \
-             --data-urlencode "message_thread_id=${thread}" 2>&1)
+             --data-urlencode "message_thread_id=${thread}" ${no_sound[@]+"${no_sound[@]}"} 2>&1)
       message_confirmed "$chat" "$thread" "$resp" &&
         log_message "delivered $(basename "$f") as plain text (markup rejected)"
     fi
   elif ! delivered "$resp" && [ -n "${parse:-}" ] && [ "$parse" != "text" ] &&
        definite_markup_rejection "$resp"; then
     resp=$(curl -s -m 10 -X POST "https://api.telegram.org/bot${token}/sendMessage" \
-           --data-urlencode "chat_id=${chat}" --data-urlencode "text=${text}" 2>&1)
+           --data-urlencode "chat_id=${chat}" --data-urlencode "text=${text}" ${no_sound[@]+"${no_sound[@]}"} 2>&1)
     delivered "$resp" && log_message "delivered $(basename "$f") as plain text (markup rejected)"
   fi
   if [ -n "$thread" ] || [ "$strict_receipt" = 1 ]; then
@@ -1175,6 +1198,11 @@ for journal in [*Path(rem, ".run-delivery").glob("*"), *Path(rem, ".quiet-runs")
     # A run of this very tick ends after its clock was read.
     if state not in ("agent_failed", "blocked", "uncertain") or not -3600 <= now - changed <= 86400:
         continue
+    # NOTICES=chat: the task's own failure was told in its chat, so the owner's digest does not repeat it;
+    # a result that chat refused or may have missed stays the owner's (Арти, 11.10.2026, K254-P2-1).
+    if header(journal / "source.rem", "NOTICES") == "chat" and (
+            state == "agent_failed" or (state == "uncertain" and not (journal / "result.txt").exists())):
+        continue
     task = header(journal / "source.rem", "TASK")
     if not task:
         try:
@@ -1245,7 +1273,7 @@ except Exception:
 # why the news had stopped (Яша Директ, 29-30.08).
 alert_owner_issue() {
   local journal="$1" source="$1/source.rem" owner notice alert_state resp response_class issue
-  local f="$source" epoch thread_id task_id chat where="" run_mode="" pause last started
+  local f="$source" epoch thread_id task_id chat where="" run_mode="" pause last started to to_thread="" to_silent=""
   issue=$(cat "$journal/state" 2>/dev/null) || return 0
   case "$issue" in
     blocked|uncertain) ;;
@@ -1301,7 +1329,14 @@ alert_owner_issue() {
   fi
   # Record intent before calling Telegram: only a definite refusal may retry.
   atomic_text "$journal/owner-alert.state" sending || return 1
-  [ "$chat" = "$owner" ] || where=$(owner_notice schedule.chat " у чат {chat}" chat="$chat")
+  # NOTICES=chat: the task's own failure is told where it works (Арти, 11.10.2026: everything about server
+  # security only in the «Безопасность» group); a result that chat refused or may have missed stays the owner's.
+  to="$owner"
+  if [ "$(header_value "$source" NOTICES)" = chat ] && [ -n "$chat" ] &&
+     { [ "$issue" = agent_failed ] || { [ "$issue" = uncertain ] && [ ! -f "$journal/result.txt" ]; }; }; then
+    to="$chat" to_thread="$thread_id" to_silent=$(header_value "$source" SILENT)
+  fi
+  [ "$chat" = "$to" ] || where=$(owner_notice schedule.chat " у чат {chat}" chat="$chat")
   if [ "$issue" = agent_failed ]; then
     notice=$(cat "$journal/failure.txt")
   elif [ "$issue" = uncertain ] && [ ! -f "$journal/result.txt" ]; then
@@ -1324,7 +1359,7 @@ alert_owner_issue() {
   else
     notice=$(owner_notice schedule.unconfirmed "⚠️ Не вдалося підтвердити доставку результату завдання «{task}»{where}. Він міг надійти, тому автоматично не повторюю, щоб не створити дубль." task="$task_id" where="$where")
   fi
-  if resp=$(send_text "$owner" "$notice" text "" 1); then
+  if resp=$(send_text "$to" "$notice" text "$to_thread" 1 "$to_silent"); then
     atomic_text "$journal/owner-alert.state" sent || return 1
   else
     response_class=$(printf '%s' "$resp" | run_delivery_response_class)
@@ -1419,7 +1454,7 @@ deliver_saved_run() {
     local retry_at tick_now
     tick_now="${NOW_EPOCH:-$(date +%s)}"
     retry_at=$(cat "$journal/retry-at" 2>/dev/null) || retry_at=""
-    is_uint "$retry_at" && [ "$tick_now" -lt "$(decimal_value "$retry_at")" ] && return 0
+    is_uint "$retry_at" && [ "$tick_now" -lt "$(decimal_value "$retry_at")" ] && ! claude_quota_back && return 0
     retry_limited_run "$journal"
     return 0
   fi
@@ -1445,6 +1480,7 @@ deliver_saved_run() {
   chat=$(header_value "$source" CHAT)
   thread_id=$(header_value "$source" THREAD_ID)
   saved_parse=$(header_value "$source" PARSE)
+  saved_silent=$(header_value "$source" SILENT)
   [ "$(header_value "$source" RUN)" = "1" ] && saved_parse=text
   epoch=$(header_value "$source" EPOCH)
   task_id=$(header_value "$source" TASK)
@@ -1485,7 +1521,7 @@ deliver_saved_run() {
       continue
     fi
     atomic_text "$journal/state" sending || return 1
-    if resp=$(send_text "$chat" "$chunk" "$saved_parse" "$thread_id"); then
+    if resp=$(send_text "$chat" "$chunk" "$saved_parse" "$thread_id" 0 "$saved_silent"); then
       index=$((index + 1))
       atomic_text "$journal/cursor" "$prefix$index" || return 1
       atomic_text "$journal/state" ready || return 1
@@ -1593,6 +1629,21 @@ release_check() {
   id=$(cat "$1/check-id" 2>/dev/null) || return 0
   [ -n "$id" ] && [ "$(cat "$CHECK_PENDING_DIR/$name/observed.id" 2>/dev/null)" = "$id" ] || return 0
   rm -rf -- "${CHECK_PENDING_DIR:?}/$name"
+}
+
+# A limit can end before the reset the CLI named: another account or bought extra usage (Арти, 11.10.2026: the account
+# changed at 09:46 and the waiting runs kept waiting for the old account's reset). The account's own quota, read without
+# a model run, lets a waiting run go at once. It is read at most once a tick, and only while a run waits; an unknown
+# answer is not «back».
+claude_quota_back() {
+  if [ -z "${CLAUDE_QUOTA_BACK:-}" ]; then
+    CLAUDE_QUOTA_BACK=0
+    if [ -x "$HOME/bin/provider-quota" ] &&
+       [ "$("$HOME/bin/provider-quota" claude "$HOME" 2>/dev/null)" = '{"available":true}' ]; then
+      CLAUDE_QUOTA_BACK=1
+    fi
+  fi
+  [ "$CLAUDE_QUOTA_BACK" = 1 ]
 }
 
 # A run that died runs once more when its task is retry-safe. The recipient's
@@ -1712,6 +1763,7 @@ for f in "$REM_DIR"/*.rem; do
   chat=$(header_value "$f" CHAT)
   thread_id=$(header_value "$f" THREAD_ID)
   parse=$(header_value "$f" PARSE)
+  silent=$(header_value "$f" SILENT)
   run_mode=$(header_value "$f" RUN)
   quiet_run=$(header_value "$f" QUIET)
   check_cmd=$(header_value "$f" CHECK)
@@ -2116,6 +2168,7 @@ for f in "$REM_DIR"/*.rem; do
       other_parse=$(header_value "$other" PARSE)
       [ "$(header_value "$other" CHAT)" = "$chat" ] &&
         [ "${other_parse:-text}" = "${parse:-text}" ] &&
+        [ "$(header_value "$other" SILENT)" = "$silent" ] &&
         [ -z "$(header_value "$other" THREAD_ID)" ] &&
         [ "$(header_value "$other" RUN)" != "1" ] &&
         ! has_header "$other" REPEAT_SECONDS || continue
@@ -2156,7 +2209,7 @@ for f in "$REM_DIR"/*.rem; do
   sent=0
   accepted=0
   while IFS= read -r -d '' chunk || [ -n "$chunk" ]; do
-    if resp=$(send_text "$chat" "$chunk" "${parse:-}" "$thread_id"); then
+    if resp=$(send_text "$chat" "$chunk" "${parse:-}" "$thread_id" 0 "$silent"); then
       sent=1
       accepted=$((accepted + 1))
     else

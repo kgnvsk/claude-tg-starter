@@ -294,7 +294,7 @@ def turn_records(transcript: pathlib.Path, delivery_id: str) -> list[dict] | Non
     try:
         with transcript.open("rb") as handle:
             handle.seek(max(0, transcript.stat().st_size - TRANSCRIPT_TAIL_BYTES))
-            lines = handle.read().decode("utf-8", "replace").splitlines()
+            lines = handle.read().decode("utf-8", "replace").split("\n")
     except OSError:
         return None
     needle = f'delivery_id="{delivery_id}"'

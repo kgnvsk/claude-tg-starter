@@ -135,6 +135,11 @@ MANAGED_BIN_NAMES = frozenset(
         "verify-telegram-bot",
         "video-edit",
         "video-ingest",
+        "work-tools",
+        "video-check-overlay",
+        "task-review",
+        "owner-rules",
+        "plan-item",
         "wiki-hot-inject",
         "yt-dl",
     }

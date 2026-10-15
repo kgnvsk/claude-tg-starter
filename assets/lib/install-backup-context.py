@@ -678,6 +678,21 @@ def require_kit_origin(home, user, unit, engine, *, source_dir=None):
             raise LocalChanges(f"backup policy changed outside the kit: {path}")
 
 
+def backup_exclusions(existing):
+    if not isinstance(existing, dict):
+        raise ValueError("backup exclusion policy must map paths to reasons")
+    exclusions = dict(existing)
+    defaults = {".novsky-project-installation.json": "host-installation-identity"}
+    for profile in ("google-chrome-for-testing", "google-chrome-for-testing-headless"):
+        defaults[".config/" + profile] = "browser-profile-requires-reauthorization"
+    for root in ("wa-bridge", ".claude/personal-inbox/whatsapp", ".codex/personal-inbox/whatsapp"):
+        for suffix in ("", "-wal", "-shm", "-journal"):
+            defaults[root + "/session.db" + suffix] = "whatsapp-session-requires-relink"
+    for path, reason in defaults.items():
+        exclusions.setdefault(path, reason)
+    return exclusions
+
+
 def install(home, user, unit, engine, *, source_dir=None, python_binary=None):
     if os.geteuid() != 0 or not re.fullmatch(r"[a-zA-Z0-9@_.-]+\.service", unit):
         raise ValueError("root and an exact agent unit are required")
@@ -735,6 +750,7 @@ def install(home, user, unit, engine, *, source_dir=None, python_binary=None):
     context = json.loads(_read(config_path, {account.pw_uid}, limit=128 * 1024)) if config_path.is_file() else {}
     if not isinstance(context, dict):
         raise ValueError("backup context configuration invalid")
+    context['excludePaths'] = backup_exclusions(context.get('excludePaths', {}))
     selected_python = python_binary if python_binary is not None else context.get('pythonExecutable')
     if selected_python is not None:
         context['pythonExecutable'] = agent_python(selected_python, account.pw_uid)

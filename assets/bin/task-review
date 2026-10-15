@@ -1,0 +1,255 @@
+#!/usr/bin/env python3
+"""Request-bound completion review. Checks presence/consistency of evidence, not its semantic truth."""
+import argparse
+from contextlib import closing
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import re
+import sqlite3
+import sys
+import tempfile
+import time
+
+MAX = 100_000
+# A truthful terminal fallback keeps a failed review from trapping the conversation.
+# Only the complete fixed sentence is exempt; appending an unchecked result is not.
+INCOMPLETE = (
+ 'Проверка результата не завершена. Я не могу пока подтвердить выполнение всех условий; выполненные действия повторять не буду.',
+ 'Перевірка результату не завершена. Я поки не можу підтвердити виконання всіх умов; виконані дії не повторюватиму.',
+ 'The result review is incomplete. I cannot yet confirm every requirement; I will not repeat completed actions.',
+ 'Sprawdzenie wyniku nie jest zakończone. Nie mogę jeszcze potwierdzić wszystkich warunków; wykonanych działań nie powtórzę.',
+)
+GENERAL = {'conditions': 'Every requested condition and relevant owner rule, including what remains.',
+           'context': 'The applicable prior chat facts/links; name what was actually read.',
+           'verification': 'The actual result and checks, not a plan or an unverified claim.',
+           'destination': 'The original recipient/topic and the actual delivery status.'}
+FAMILIES = [
+ ('cost', r'(?i)(?:расч[её]т|рассчита|посчита|стоимост|смет|розрах|вартіст|cost estimate|calculate.{0,30}cost)',
+  {'cost_inputs': 'All cost components, units, rates, assumptions and sources; recompute the total.'}),
+ ('transport', r'(?i)(?:доставк|перегон|перевоз|доставлен|transport|delivery).{0,80}(?:стоимост|расч|цен|вартіст|cost)|(?:расч|стоимост|цен|вартіст|cost).{0,80}(?:доставк|перегон|перевоз|transport|delivery)',
+  {'driver': 'Driver time and pay.', 'distance_wear': 'Distance, rate per km and vehicle wear.',
+   'travel': 'Fuel, tolls, parking/ferry.', 'return': 'Return journey and transfers.', 'subsistence': 'Food/lodging, taxes and reserve, or a sourced reason they do not apply.'}),
+ ('video', r'(?i)(?:монтаж|смонтир|змонту|плашк|субтитр|edit.{0,20}video|video.{0,20}edit)',
+  {'video_bytes': 'Checked the exact final video bytes, actual frame coverage and decoder success.',
+   'video_style': 'Owner-approved style; face/overlay and full-frame visual check, no unapproved changes.'}),
+ ('plan', r'(?i)(?:сними|убери|удали|закрой|зніми|видали|remove|complete).{0,70}(?:пункт|задач|план|закреп|pin|plan item)',
+  {'plan_surfaces': 'Plan file, pinned message, scheduled jobs and reminders; receipt per affected surface.'}),
+]
+WORK = re.compile(r'(?i)\b(?:сделай|зроби|создай|створи|проверь|перевір\w*|подключ\w*|налаш\w*|настрой|подготов\w*|підгот\w*|опубликуй|отправь|надішли|сформируй|собери|исправ\w*|почини|create|check|publish|send|prepare|fix)\b')
+REFUSAL = re.compile(r"(?i)(?:не\s+(?:могу|можу|умею|вмію)|(?:I|we)\s+(?:cannot|can't|can’t)|неможливо\s+(?:створити|зробити))")
+
+def sha(text): return hashlib.sha256(text.strip().encode()).hexdigest()
+
+def video_receipt(video_sha, value):
+    checker=Path.home()/'bin/video-check-overlay'
+    try:
+        duration=value.get('duration');step=value.get('step');sampled=value.get('sampled');checked=value.get('checked')
+        ok=(value.get('schemaVersion')==1 and value.get('checker')=='video-check-overlay-v1'
+            and value.get('violations')==0 and value.get('sha256')==video_sha
+            and value.get('checkerSha256')==hashlib.sha256(checker.read_bytes()).hexdigest()
+            and type(checked) is int and checked>0 and type(sampled) is int and sampled>=checked
+            and type(duration) in (int,float) and math.isfinite(duration) and duration>0
+            and type(step) in (int,float) and math.isfinite(step) and .05<=step<=.25
+            and sampled>=max(1,math.floor(duration/step+.5)-1))
+    except (AttributeError,TypeError,OSError):ok=False
+    return {'ok':bool(ok),'message':'Run video-check-overlay on these exact final bytes before sending. Review the contact sheet and owner-approved style too.'}
+
+def requirements(request, answer='', phase='final'):
+    required={}
+    # A completion does not become progress by changing the transport flag.
+    completed = re.search(r'(?i)\b(?:готово|виконано|выполнено|завершено|done|completed)\b', answer)
+    if phase=='final' or completed:
+        for _,rx,checks in FAMILIES:
+            if re.search(rx,request):required.update(checks)
+        if required or WORK.search(request): required={**GENERAL,**required}
+    prose=re.sub(r'```.*?```|`[^`]*`|[«“].*?[»”]','',answer,flags=re.S)
+    if REFUSAL.search(prose):
+        required.update({'capabilities':'Checked the current tools, rights, connection and existing workflows/precedents in this conversation scope.',
+                         'next_step':'A concrete missing condition and how the person/owner can enable it; no bare refusal.'})
+    return required
+
+def validate(request, answer, review, phase='final'):
+    if phase not in ('final','progress'):return {'ok':False,'message':'Unknown answer phase'}
+    if not isinstance(request,str) or not isinstance(answer,str) or len(request)+len(answer)>MAX:return {'ok':False,'message':'Invalid review text'}
+    if answer.strip() in INCOMPLETE:return {'ok':True,'incomplete':True,'required':{}}
+    required=requirements(request,answer,phase)
+    if not required:return {'ok':True,'required':{}}
+    error={'ok':False,'required':required,'message':'Review the actual result before answering. Use task-review record (owner) or review_answer (company/native). Do not repeat completed writes. Name unverified conditions honestly in your answer. The shadow review never suppresses, replaces or reruns an answer.'}
+    if not isinstance(review,dict) or set(review)-{'checks','nextStep'}:return error
+    checks=review.get('checks')
+    if not isinstance(checks,list) or len(checks)>80:return error
+    indexed={}
+    for item in checks:
+        if not isinstance(item,dict) or set(item)!={'item','status','evidence'}:return error
+        key=item.get('item'); evidence=item.get('evidence')
+        if not isinstance(key,str) or key in indexed or item['status'] not in ('verified','missing','not_applicable'):return error
+        if not isinstance(evidence,str) or not 8<=len(evidence.strip())<=3000:return error
+        indexed[key]=item
+    if set(required)-set(indexed):return error
+    if any(indexed[key]['status']=='not_applicable' for key in (*GENERAL,'capabilities','next_step') if key in required):return error
+    missing=[x['evidence'].strip() for x in checks if x['status']=='missing']
+    next_step=review.get('nextStep','')
+    if missing or 'next_step' in required:
+        if not isinstance(next_step,str) or len(next_step.strip())<8 or next_step.strip() not in answer:return error
+        # An incomplete condition must be visible to the person, not hidden in private metadata.
+        if any(x not in answer for x in missing):return error
+    return {'ok':True,'answerSha256':sha(answer),'required':required,'incomplete':bool(missing)}
+
+def state_dir():
+    return Path(os.environ.get('TELEGRAM_STATE_DIR') or (Path(os.environ.get('CLAUDE_CONFIG_DIR') or Path.home()/'.claude')/'channels/telegram'))
+
+def request_text(delivery):
+    if not re.fullmatch(r'-?[0-9]+:[0-9]+',delivery):raise ValueError('invalid delivery id')
+    chat,message=delivery.rsplit(':',1)
+    with closing(sqlite3.connect(f'file:{state_dir()/"messages.db"}?mode=ro',uri=True,timeout=1)) as db:
+        row=db.execute("SELECT text FROM messages WHERE chat_id=? AND message_id=? AND direction='in' ORDER BY ts DESC LIMIT 1",(chat,int(message))).fetchone()
+    if not row or not isinstance(row[0],str):raise ValueError('request is not in the archive')
+    return row[0]
+
+def directory():
+    path=Path.home()/'.claude/state/task-reviews'
+    for p in (Path.home()/'.claude',Path.home()/'.claude/state',path):
+        if p.is_symlink():raise ValueError('unsafe review directory')
+        p.mkdir(mode=0o700,exist_ok=True)
+    return path
+
+def observe(verdict, request='', answer=''):
+    """Shadow only: never hold/replace an answer, even if the checker or its log failed."""
+    if os.environ.get('TASK_REVIEW_MODE') == 'off':return {'ok':True,'mode':'off'}
+    item={'at':time.time(),'mode':'shadow','wouldBlock':not bool(verdict.get('ok')),
+          'required':list(verdict.get('required') or {}),'requestSha256':sha(request),'answerSha256':sha(answer)}
+    try:
+        path=directory()/'shadow.jsonl'
+        if path.is_symlink():raise OSError('unsafe shadow log')
+        # Bounded, private diagnostic metadata; no requests, answers or evidence strings.
+        if path.exists() and path.stat().st_size>1_000_000:path.replace(path.with_suffix('.previous.jsonl'))
+        fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_APPEND|getattr(os,'O_NOFOLLOW',0),0o600)
+        with os.fdopen(fd,'a') as out:out.write(json.dumps(item)+'\n')
+    except (OSError,ValueError):pass
+    return {'ok':True,**item}
+
+
+def record(delivery,answer,review):
+    request=request_text(delivery); result=validate(request,answer,review)
+    if not result['ok']:return result
+    value={'requestSha256':sha(request),'answerSha256':sha(answer),'review':review,'at':time.time()}
+    path=directory()/(sha(delivery)+'.json'); fd,name=tempfile.mkstemp(dir=path.parent,prefix='.review-')
+    try:
+        with os.fdopen(fd,'w') as out:json.dump(value,out,ensure_ascii=False);out.flush();os.fsync(out.fileno())
+        os.replace(name,path)
+    finally:Path(name).unlink(missing_ok=True)
+    return result
+
+def gate(delivery,answer,phase='final'):
+    request=request_text(delivery)
+    if not requirements(request,answer,phase):return {'ok':True}
+    try:
+        path=directory()/(sha(delivery)+'.json')
+        if path.is_symlink() or path.stat().st_size>MAX:raise ValueError('invalid review file')
+        value=json.loads(path.read_text())
+        valid=value.get('requestSha256')==sha(request) and value.get('answerSha256')==sha(answer)
+        review=value.get('review') if valid else None
+    except (OSError,ValueError):review=None
+    return validate(request,answer,review,phase)
+
+def hook_gate(delivery,answer,phase='final'):
+    try:return gate(delivery,answer,phase)
+    except (OSError,ValueError,sqlite3.Error):
+        return {'ok':False,'message':'Could not bind the completion review to this request; do not claim success. Check the original delivery_id.'}
+
+def scheduled_record(answer, review):
+    folder=Path(os.environ['TASK_REVIEW_RUN_DIR'])
+    request=(folder/'request.txt').read_text()
+    result=validate(request,answer,review)
+    if result['ok']:
+        fd,name=tempfile.mkstemp(dir=folder,prefix='.review-')
+        try:
+            with os.fdopen(fd,'w') as out:
+                json.dump({'requestSha256':sha(request),'answerSha256':sha(answer),'review':review},out,ensure_ascii=False)
+                out.flush();os.fsync(out.fileno())
+            os.replace(name,folder/'review.json')
+        finally:Path(name).unlink(missing_ok=True)
+    return result
+
+def scheduled_gate(answer):
+    folder=Path(os.environ['TASK_REVIEW_RUN_DIR']); request=(folder/'request.txt').read_text()
+    if answer.strip() in ('NOTHING','NO_NEW'):return {'ok':True}
+    try:
+        value=json.loads((folder/'review.json').read_text())
+        review=value['review'] if value['requestSha256']==sha(request) and value['answerSha256']==sha(answer) else None
+    except (OSError,KeyError,ValueError):review=None
+    return validate(request,answer,review)
+
+def send_gate(chat, thread, answer, phase='final', named=None):
+    stamp=os.environ.get('TG_DELIVERY_STAMP')
+    if not stamp: return {'ok':True}  # An autonomous notification is not a person's request.
+    try:
+        with closing(sqlite3.connect(f'file:{state_dir()/"messages.db"}?mode=ro',uri=True,timeout=1)) as db:
+            rows=db.execute("SELECT delivery_id FROM delivery_results WHERE chat_id=? AND thread_id IS ? AND stamp=? "
+                            "AND state IN ('started','pending','deferred')",(str(chat),str(thread) if thread is not None else None,stamp)).fetchall()
+        ids=[row[0] for row in rows]
+        if named:
+            if named not in ids: return {'ok':False,'message':'Current request not found; check delivery_id before claiming completion.'}
+            return hook_gate(named,answer,phase)
+        return hook_gate(ids[0],answer,phase) if len(ids)==1 else {'ok':True}
+    except (OSError,sqlite3.Error): return {'ok':False,'message':'Could not read the current request for its completion review.'}
+
+def video_required(chat, thread, named=None):
+    """Read the same conversation/run, never infer a video task from another person's request."""
+    folder=os.environ.get('TASK_REVIEW_RUN_DIR')
+    if folder:return 'video_bytes' in requirements((Path(folder)/'request.txt').read_text())
+    stamp=os.environ.get('TG_DELIVERY_STAMP')
+    if not stamp:return False
+    with closing(sqlite3.connect(f'file:{state_dir()/"messages.db"}?mode=ro',uri=True,timeout=1)) as db:
+        rows=db.execute("SELECT delivery_id FROM delivery_results WHERE chat_id=? AND thread_id IS ? AND stamp=? AND state IN ('started','pending','deferred')",(str(chat),str(thread) if thread is not None else None,stamp)).fetchall()
+    ids=[row[0] for row in rows]
+    if named:
+        if named not in ids:raise ValueError('Current request not found for its video check')
+        ids=[named]
+    return any('video_bytes' in requirements(request_text(delivery)) for delivery in ids)
+
+def main():
+    p=argparse.ArgumentParser(description=__doc__);sub=p.add_subparsers(dest='action',required=True)
+    sub.add_parser('validate')
+    sub.add_parser('video-receipt')
+    sub.add_parser('gate-scheduled')
+    sub.add_parser('observe-scheduled')
+    q=sub.add_parser('record-scheduled');q.add_argument('--answer-file',type=Path,required=True);q.add_argument('--review-file',type=Path,required=True)
+    q=sub.add_parser('inspect');q.add_argument('delivery_id')
+    q=sub.add_parser('record');q.add_argument('--delivery-id',required=True);q.add_argument('--answer-file',type=Path,required=True);q.add_argument('--review-file',type=Path,required=True)
+    args=p.parse_args()
+    if args.action=='video-receipt':
+        raw=sys.stdin.read(MAX+1)
+        if len(raw)>MAX:raise ValueError('receipt too large')
+        value=json.loads(raw);result=video_receipt(value['sha256'],value['receipt'])
+    elif args.action=='validate':
+        raw=sys.stdin.read(MAX+1)
+        if len(raw)>MAX:raise ValueError('review input too large')
+        v=json.loads(raw)
+        if not isinstance(v,dict) or not isinstance(v.get('request'),str) or not isinstance(v.get('answer'),str):raise ValueError('invalid review input')
+        result=validate(v['request'],v['answer'],v.get('review'),v.get('phase','final'))
+    elif args.action=='gate-scheduled':result=scheduled_gate(sys.stdin.read(MAX+1))
+    elif args.action=='observe-scheduled':
+        answer=sys.stdin.read(MAX+1)
+        try:verdict=scheduled_gate(answer)
+        except (OSError,ValueError):verdict={'ok':False}
+        result=observe(verdict,answer=answer)
+    elif args.action=='record-scheduled':
+        if args.answer_file.stat().st_size>MAX or args.review_file.stat().st_size>MAX:raise ValueError('review too large')
+        result=scheduled_record(args.answer_file.read_text(),json.loads(args.review_file.read_text()))
+    elif args.action=='inspect':
+        result={'request':request_text(args.delivery_id),'required':requirements(request_text(args.delivery_id)),
+                'report':{'checks':[{'item':'conditions','status':'verified','evidence':'Actual result and source/receipt, not a promise.'}]}}
+    else:
+        if args.answer_file.stat().st_size>MAX or args.review_file.stat().st_size>MAX:raise ValueError('review too large')
+        result=record(args.delivery_id,args.answer_file.read_text(),json.loads(args.review_file.read_text()))
+    print(json.dumps(result,ensure_ascii=False))
+    return 0 if result.get('ok',True) else 1
+
+if __name__=='__main__':
+    try:sys.exit(main())
+    except (ValueError,OSError,sqlite3.Error) as exc:
+        print(json.dumps({'ok':False,'message':str(exc)},ensure_ascii=False));sys.exit(1)

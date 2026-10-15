@@ -1,0 +1,138 @@
+#!/usr/bin/env python3
+"""Lossless local owner-rule library. Migrate only during an idle, backed-up change window."""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import sys
+import tempfile
+
+HOME = Path.home()
+DIRECTORY = HOME / '.claude/owner-rules'
+CAP = 4500
+
+def digest(data):
+    return hashlib.sha256(data).hexdigest()
+
+def safe_directory(path):
+    if path == HOME:
+        if path.is_symlink(): raise ValueError('unsafe home')
+        return
+    path.relative_to(HOME)
+    safe_directory(path.parent)
+    if path.is_symlink(): raise ValueError('symlinked rules directory')
+    path.mkdir(mode=0o700, exist_ok=True)
+    if not path.is_dir(): raise ValueError('unsafe rules directory')
+
+def atomic(path, content):
+    fd, name=tempfile.mkstemp(dir=path.parent, prefix='.rules-')
+    try:
+        with os.fdopen(fd,'wb') as out:
+            out.write(content); out.flush(); os.fsync(out.fileno())
+        os.replace(name,path)
+    finally:
+        Path(name).unlink(missing_ok=True)
+
+def load():
+    path=DIRECTORY/'index.json'
+    if DIRECTORY.is_symlink() or path.is_symlink(): raise ValueError('unsafe rule library')
+    if path.stat().st_size > 2_000_000: raise ValueError('rule library is too large')
+    value=json.loads(path.read_text())
+    if value.get('schemaVersion') != 1 or not isinstance(value.get('rules'),list): raise ValueError('invalid rule library')
+    return value
+
+def blocks(text):
+    # Start a new block at a margin list item or a heading; retain every continuation, whitespace and paragraph.
+    return [x for x in re.split(r'(?m)(?=^(?:[-*+] |\d+[.)] |#{2,6} ))',text) if x.strip()]
+
+def migrate(expected):
+    path=HOME/'CLAUDE.md'
+    if path.is_symlink() or path.stat().st_nlink != 1: raise ValueError('unsafe CLAUDE.md')
+    original=path.read_bytes()
+    if len(original)>2_000_000 or digest(original)!=expected: raise ValueError('CLAUDE.md changed; inspect the current version')
+    safe_directory(DIRECTORY)
+    if (DIRECTORY/'index.json').exists(): raise ValueError('rule library already exists; do not replace it')
+    core=[]; parts=[]; body=[]; inside=False; contacts=False
+    reference=('# Правила власника\nПравила збережено без скорочень у ~/.claude/owner-rules/index.json. '
+               'Перед роботою: ~/bin/owner-rules context "тема запиту"; повне правило: ~/bin/owner-rules read ID. '
+               'Нові правила власника додавай нижче: вони підхоплюються окремо, чинні правила не губляться.\n')
+    referenced=False
+    def flush():
+        if body: parts.extend(blocks(''.join(body))); body.clear()
+    for line in original.decode('utf-8').splitlines(keepends=True):
+        if line.startswith('<!-- novsky-'):
+            flush(); contacts=True
+        if contacts:
+            core.append(line)
+            if line.startswith('<!-- /novsky-'): contacts=False
+            continue
+        if line.startswith('# '):
+            flush(); inside=line.strip()=='# Правила власника'
+            if inside:
+                if not referenced: core.append(reference);referenced=True
+                continue
+        if inside: body.append(line)
+        else: core.append(line)
+    flush()
+    if not parts: raise ValueError('no owner rules to migrate')
+    rows={}
+    for i,part in enumerate(parts):
+        # Collapse only byte-identical meaningful text; original bytes stay in the immutable backup.
+        text=part.strip(); key=digest(text.encode())[:16]
+        if key in rows and rows[key]['text']!=text: raise ValueError('rule id collision')
+        rows.setdefault(key,{'id':key,'text':text,'occurrences':[]})['occurrences'].append(i+1)
+    backup=DIRECTORY/f'CLAUDE-{expected}.md'
+    with backup.open('xb') as out: out.write(original)
+    os.chmod(backup,0o600)
+    value={'schemaVersion':1,'sourceSha256':expected,'backup':str(backup.relative_to(HOME)),'rules':list(rows.values())}
+    atomic(DIRECTORY/'index.json',(json.dumps(value,ensure_ascii=False,indent=2)+'\n').encode())
+    # The deployment holds the live agent idle. A changed source is still refused here.
+    if path.read_bytes()!=original: raise ValueError('source changed during migration; library saved, CLAUDE.md untouched')
+    atomic(path,''.join(core).encode())
+    return {'backup':str(backup.relative_to(HOME)),'sourceSha256':expected,'coreSha256':digest(path.read_bytes()),
+            'occurrences':len(parts),'uniqueRules':len(rows),'coreBytes':path.stat().st_size}
+
+def tokens(text):
+    return set(re.findall(r'[\w]{3,}',text.lower().replace('ё','е'))) - {'the','and','with','что','как','для','это','его','или','при','все','with'}
+
+def context(query):
+    rows=load()['rules']; words=tokens(query)
+    def score(row):
+        found=tokens(row['text'])
+        return sum(10 if x in found else 1 if not any(c.isdigit() for c in x) and any(len(y)>=5 and len(x)>=5 and (y.startswith(x[:5]) or x.startswith(y[:5])) for y in found) else 0 for x in words)
+    ordered=sorted(enumerate(rows),key=lambda p:(-score(p[1]),p[0]))
+    out=['OWNER RULES: every rule applies; full text: ~/bin/owner-rules read NUMBER or ID.']
+    # Numeric positions keep the always-visible index compact. IDs remain stable in storage.
+    room=max(12,min(64,(3000-len(out[0]))//max(1,len(rows))-8))
+    for i,row in enumerate(rows,1):
+        title=' '.join(row['text'].split())
+        out.append(f"{i}. {title[:room]}"+('…' if len(title)>room else ''))
+    out.append('MATCHED RULE DETAILS (read the full numbered rule when clipped):')
+    for i,row in ordered:
+        if score(row)==0:continue
+        room=CAP-len('\n'.join(out))-40
+        if room<100:break
+        text=row['text'];excerpt=text[:min(room,1500)]
+        out.append(f"{i+1}. {excerpt}"+('…' if excerpt!=text else ''))
+    return '\n'.join(out)
+
+def main():
+    p=argparse.ArgumentParser(description=__doc__); sub=p.add_subparsers(dest='action',required=True)
+    s=sub.add_parser('migrate');s.add_argument('--expected-sha',required=True)
+    s=sub.add_parser('context');s.add_argument('query')
+    s=sub.add_parser('read');s.add_argument('id')
+    args=p.parse_args()
+    if args.action=='migrate': print(json.dumps(migrate(args.expected_sha),ensure_ascii=False))
+    elif args.action=='context': print(context(args.query))
+    else:
+        rows=load()['rules']
+        row=rows[int(args.id)-1] if args.id.isdecimal() and 0<int(args.id)<=len(rows) else next((x for x in rows if x['id']==args.id),None)
+        if row is None: raise ValueError('unknown rule id')
+        print(row['text'])
+
+if __name__=='__main__':
+    try:main()
+    except (ValueError,OSError,KeyError) as exc:
+        print(str(exc),file=sys.stderr);sys.exit(1)

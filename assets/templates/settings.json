@@ -35,6 +35,17 @@
   "skillListingBudgetFraction": 0.08,
   "skillListingMaxDescChars": 240,
   "hooks": {
+    "PermissionRequest": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "{{AGENT_HOME}}/bin/tg-native-task",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
     "PreToolUse": [
       {
         "matcher": "Bash",

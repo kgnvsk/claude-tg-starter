@@ -1032,7 +1032,31 @@ digest = hashlib.sha256(f"{index}:{token}@{place}".encode()).hexdigest()
 print(f"{int(digest[:12], 16)}_{int(digest[12:24], 16)}")
 WA_LOG_PY
 }
+# A linked server keeps its WhatsApp bridge running (Арти, 12.10.2026). A bridge the bot's own session started lives
+# in the service's cgroup, so a service restart (/unstick, an update, this watchdog) ends it, and nothing started it
+# again: the WhatsApp archive stood still for 6.5 hours. This tick is a cron job outside the service, so a bridge it
+# starts outlives the next restart. It starts one only while the server is linked (no open logout, a device in the
+# store) and no hold parks automatic mutations, the way the module starts it; a running bridge is left alone.
+whatsapp_bridge_keepalive() {
+    local home="$1" logout="$2" pid
+    [ "$(id -u)" != 0 ] || return 0
+    [ -x "$H/bin/wa-bridge" ] && [ -x "$H/bin/wa-bridge-run" ] && [ -f "$home/session.db" ] || return 0
+    [ -z "$logout" ] || return 0
+    ! pgrep -u "$(id -u)" -x wa-bridge >/dev/null 2>&1 || return 0
+    python3 - "$home" <<'WA_DEVICE_PY' 2>/dev/null || return 0
+import os, sqlite3, sys
+store = sqlite3.connect(f"file:{os.path.join(sys.argv[1], 'session.db')}?mode=ro", uri=True, timeout=5)
+sys.exit(0 if store.execute("SELECT 1 FROM whatsmeow_device LIMIT 1").fetchone() else 1)
+WA_DEVICE_PY
+    service_mutation_allowed || return 0
+    if pid=$("$H/bin/wa-bridge-run" "$home" bridge.log --start "$H/bin/wa-bridge" 2>>"$LOG"); then
+        echo "[$(date -u +%FT%TZ)] whatsapp bridge was not running while linked; started pid $pid" >> "$LOG"
+    else
+        echo "[$(date -u +%FT%TZ)] whatsapp bridge was not running while linked; start failed" >> "$LOG"
+    fi
+}
 WHATSAPP_LOGOUT=$(whatsapp_logout_incident "$H/.claude/personal-inbox/whatsapp")
+whatsapp_bridge_keepalive "$H/.claude/personal-inbox/whatsapp" "$WHATSAPP_LOGOUT"
 if [ -n "$WHATSAPP_LOGOUT" ]; then
     alert "whatsapp-unlinked" "WhatsApp відв'язав сервер: повідомлення WhatsApp зараз не читаються й не надсилаються. Щоб прив'язати знову, напиши мені «прив'яжи WhatsApp»." 604800 "$WHATSAPP_LOGOUT"
 fi

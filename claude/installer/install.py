@@ -702,7 +702,8 @@ def main():
         from setup import verify_starter_foundation
         result["foundation"] = verify_starter_foundation(home, user, safe_env)
     config["kit"] = {"home": str(home)}
-    from corporate import export_corporate
+    from corporate import export_corporate, provision_corporate_image
+    provision_corporate_image(root, home, user, manifest, safe_env, maintenance=data.get("maintenance") is True)
     corporate = export_corporate(root, home, user, manifest, safe_env, maintenance=data.get("maintenance") is True)
     if corporate:
         config["corporate"] = corporate

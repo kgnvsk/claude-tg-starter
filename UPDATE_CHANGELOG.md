@@ -1,9 +1,9 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-10-10.9942ee19e2be`
+- Реліз: `2026-10-15.61dc662f238a`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `9942ee19e2be1019f5c703c9cd45d16d5182d8b2`
-- Дата релізу: `2026-10-10`
+- Ревізія вихідного комплекту: `61dc662f238a5c5799bb4ca3f311ca8fd18a2a4b`
+- Дата релізу: `2026-10-15`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
 
@@ -19,7 +19,11 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    fix: settle answered callbacks across Telegram carriers (#243)
+    Close owner consent and queue edge cases found in release review
+    fix: recover rejected calendar arguments without false unknown actions
+    fix: keep recorder validation and read errors out of uncertain actions
+    test: wait for fixture delivery before resource maintenance
+    fix: make access approvals actionable and readable
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не

@@ -170,7 +170,7 @@ def read_recent_events(path: Path) -> list[dict] | None:
     except UnicodeDecodeError:
         return None
     events = []
-    for line in decoded.splitlines():
+    for line in decoded.split("\n"):
         if not line.strip():
             continue
         try:

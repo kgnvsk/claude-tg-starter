@@ -28,10 +28,45 @@ UPSTREAM_SERVER_SHA256 = (
 )
 UPSTREAM_PACKAGE_START = "bun install --no-summary 1>&2 && bun server.ts"
 GOLDEN_SERVER_SHA256 = (
-    "6f1dfe3dde2a4671ebb7ea073b9bdb0e2f4060f835842f7b413b0ae5cba58e3c"
+    "c701e186f207be9ae1343b36572d6dbf2e3c3441a4a3be22f637f19fc9bc5926"
 )
 PREVIOUS_GOLDEN_SERVER_SHA256S = frozenset(
     {
+        # The golden before Readable access cards and native continuation of owner decisions.
+        "1ba611f6b1da654d421d1ca5a084eb3c06cd0a867b37a81688eb5f2c56e1f76d",
+        # The golden before typed Analytics Search Console SQL and hosting resource controls.
+        "f81a212961077538f5f2aa9aaff7b6f50859f4625f581f25587dc63aa052781b",
+        # The golden before the owner's resource tool took the meeting recorder (connector=recall kind=recorder).
+        "2f36dc31a5a5f2890770b6512e6e2e56cec95a84bf05cd5c2e6fea4e7bd1132f",
+        # The golden before the owner's resource tool took a Claude connector (connector=mcp kind=connector).
+        "aefc79a34567625dca08c1a77f16ea3e2935ceb94994792e1aab1dbda6dbca1b",
+        # The golden before the owner's resource tool took kind=drive (the whole Google Drive as one switch).
+        "166bed10c6914e982e9ba2a76eb35b1de2ea642a3028c8aac6ac269540bfcfc3",
+        # The golden before the lazy video-only helper path after the quality gate.
+        "156ea60caf1f2a7e0952c551c7c15ea69c0301962abda4656b40e7a653f34edc",
+        # Accepted quality and group-migration heads before composition.
+        "132c9f586fff8af4cd9777dd4039ded84f286cff16bc7820c2e5da1d7f3c0e4c",
+        "61fb6a92ee5a84cfba8eb1b85934e4113c0e2bc448639e68d1b5ccc49398390d",
+        # The golden before a moved group's settings copy was awaited and tried again after a failure, and before a
+        # redirected send dropped the old chat's quote.
+        "8441ec88c761a15310feda53c701f9c8079657c6b97350323b1d3fc281f19b82",
+        # The golden before a group could hand the bot the owner's own messages without a mention and before a send
+        # to a group Telegram moved to a supergroup went on to its new id.
+        "9a04daa13572782bd0a1d5757b5efc8953e0e91ba2af78cc9800449aef2dead9",
+        # The golden before background-task notices named the chat, the request and its time.
+        "a9c1852dccf0eec9e1d7366e040228c419ba7a4229ed54ff1804e827b2751676",
+        # The golden before refusing unrecorded task IDs in sessions with launch-hook evidence.
+        "be6db90670ed94a7566b36fad7b8ca6be2df635ee3da6fe45362b8c751247b27",
+        # The golden before background workers release the closed carrier without completing its result.
+        "7a994af355c3601eb1e331ae92f987c30d7aa0cfecedf7bdc15e8a6540069e77",
+        # The golden before one plain owner reply after applying access.
+        "0c4320f85b3507be20635cfc03d07a1be770c450d11b91075345b5be65bc02fc",
+        # Before /stop collected all owned background requests and acknowledged the queued stop.
+        "8cd3c712ce803167e46cb7f8f979cf2382c79641233c48983fba5ad599d2f70e",
+        # Before /stop dispatched cancellation of an owned native background task.
+        "3e511d164254c372b6ba89eaa1966ba81b14f5b3601aaf91e99398250a9243da",
+        # The golden before premium owner self-service guidance matches immediate application.
+        "6f1dfe3dde2a4671ebb7ea073b9bdb0e2f4060f835842f7b413b0ae5cba58e3c",
         # The golden before the owner's group of two answered him without a mention, every progress went through and a pasted /unstick was a command.
         "7f02ec77f73ed0b18b4b53e0a30790c993845a884491aedc40feb6ec004a4372",
         # A golden of the owner-word branch before its wording fix (Codex K237).

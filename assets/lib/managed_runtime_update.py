@@ -432,6 +432,13 @@ def selected_bin_paths(policy_path: Path) -> list[str]:
 UNSTAMPED_REVISION = "0" * 40
 
 
+def owned_by_root(*paths: Path) -> bool:
+    try:
+        return all(path.stat().st_uid == 0 for path in paths)
+    except OSError:
+        return False
+
+
 def source_identity(kit: Path, *, allow_unstamped: bool = False) -> tuple[str, str]:
     try:
         runtime = json.loads(
@@ -451,8 +458,12 @@ def source_identity(kit: Path, *, allow_unstamped: bool = False) -> tuple[str, s
             raise UpdateError("cannot read release identity") from error
         revision = release.get("sourceKitRevision") if isinstance(release, dict) else None
     elif (kit / ".git").exists() or (kit / ".git").is_file():
+        # The agent reading root's clone trips git's «dubious ownership» guard (Yuriy, 30.09.2026: the plan step of
+        # UPGRADING §1a failed here). Root's own checkout is trusted for this one read; anyone else's stays refused,
+        # because its config could run commands.
+        trust = ["-c", f"safe.directory={kit}"] if owned_by_root(kit, kit / ".git") else []
         result = subprocess.run(
-            ["git", "-C", str(kit), "rev-parse", "HEAD"],
+            ["git", *trust, "-C", str(kit), "rev-parse", "HEAD"],
             check=False,
             capture_output=True,
             text=True,

@@ -49,6 +49,12 @@
 # request; a launch after every request of its turn was answered is
 # request-less (launched_turn NULL). A resume is the next occurrence of the
 # same task ID. The receiver owns the schema.
+#
+# PermissionRequest: nobody watches a worker's terminal prompt, and the owner may
+# never answer its relayed copy, so a subagent or background worker of the
+# Telegram service is refused and continues; it never gets a grant or an
+# interrupt. The main conversation keeps the receiver's owner approval relay,
+# and a root install, which runs on its allow list, keeps it for every call.
 import json
 import os
 import re
@@ -389,7 +395,27 @@ def main() -> int:
         data = json.loads(sys.stdin.read() or "{}")
     except ValueError:
         data = {}
-    if not isinstance(data, dict) or data.get("agent_id"):
+    if not isinstance(data, dict):
+        return 0
+    if data.get("hook_event_name") == "PermissionRequest":
+        if os.environ.get("TG_DELIVERY_STAMP") and data.get("agent_id") and os.geteuid() != 0:
+            print(json.dumps({"hookSpecificOutput": {
+                "hookEventName": "PermissionRequest",
+                "decision": {
+                    "behavior": "deny", "interrupt": False,
+                    "message": (
+                        "This tool was not run: it requires an interactive approval, "
+                        "but this Telegram service has no terminal user to answer it. "
+                        "Keep the task and prepared files. Continue independently permitted work; "
+                        "if this step is necessary, report the specific approval needed to your parent, "
+                        "whose conversation can ask the owner to approve it there. "
+                        "Do not claim the task is still running or complete when it is blocked. "
+                        "Do not bypass this refusal with another tool or change permission settings."
+                    ),
+                },
+            }}))
+        return 0
+    if data.get("agent_id"):
         # A subagent's own call: its notification returns to that subagent, and
         # the Stop guard's parser, which reads only the main thread, counts none.
         return 0

@@ -8,6 +8,7 @@ Nothing in this hook reads the transcript or changes the delivery ledger.
 import concurrent.futures
 import fcntl
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -18,6 +19,18 @@ import sys
 import time
 
 TEXT = 'Секундочку, зараз стискаю контекст розмови. Після цього продовжу завдання.'
+
+
+def notice_text(root):
+    """The status in the agent's notice language (OWNER_NOTICE_LOCALE); Ukrainian without a profile."""
+    try:
+        spec = importlib.util.spec_from_file_location(
+            'agent_notice_locale', Path(__file__).with_name('agent_notice_locale.py'))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module.notice_text('compaction.notice', TEXT, home=root)
+    except Exception:  # noqa: BLE001 — a missing helper keeps the kit text, never stops compaction
+        return TEXT
 
 
 def addressed(payload):
@@ -41,6 +54,7 @@ def main():
             or not isinstance(session, str) or not session or not stamp):
         return
     root = Path(os.environ.get('AGENT_ROOT') or Path.home())
+    text = notice_text(root)
     config = Path(os.environ.get('CLAUDE_CONFIG_DIR') or Path.home() / '.claude')
     state = Path(os.environ.get('TELEGRAM_STATE_DIR') or config / 'channels/telegram')
     with sqlite3.connect(f'file:{state / "messages.db"}?mode=ro', uri=True, timeout=1) as db:
@@ -81,7 +95,7 @@ def main():
 
     def send(target):
         chat, thread = target
-        args = [str(root / 'bin/tg-send'), '--no-watchdog-credit', chat, TEXT]
+        args = [str(root / 'bin/tg-send'), '--no-watchdog-credit', chat, text]
         if thread is not None:
             args += ['--thread-id', thread]
         try:

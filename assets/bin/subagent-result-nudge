@@ -31,7 +31,8 @@ def transcript_for(task_id: str) -> pathlib.Path | None:
 def inspect(path: pathlib.Path) -> tuple[int, bool]:
     """Скільки інструментів справді викликано і чи є маркер у відповіді."""
     tools, marked = 0, False
-    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+    # JSONL records end only at "\n": str.splitlines() also splits inside a record on U+2028/U+2029/U+0085.
+    for line in path.read_text(encoding="utf-8", errors="replace").split("\n"):
         if not line.strip():
             continue
         try:

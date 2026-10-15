@@ -1,0 +1,198 @@
+#!/usr/bin/env python3
+"""Find local workflows before claiming a capability is absent. Never executes them."""
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import sys
+import tempfile
+
+RAW_ROOT = Path(os.environ.get('AGENT_ROOT') or Path.home()).absolute()
+ROOT = RAW_ROOT.resolve()
+CATALOG = ROOT / 'work/tools.json'
+SKIP = {'node_modules', 'vendor', 'venv', '__pycache__', 'archive', 'backups'}
+EXTENSIONS = {'.py', '.sh', '.js', '.mjs', '.cjs', '.ts'}
+PRIVATE = re.compile(r'(?:^|[._-])(?:env|config|credentials?|tokens?|secrets?|passwords?)(?:$|[._-])', re.I)
+# Requests are often Ukrainian/Russian while existing script names are English.
+# These are retrieval hints only, never claims that a discovered tool works.
+SEARCH_ALIASES = {'альбом': ('album',), 'груп': ('group',), 'канал': ('channel',),
+                  'папк': ('folder',), 'диск': ('drive',), 'почт': ('mail',), 'пошт': ('mail',),
+                  'монтаж': ('video',), 'видео': ('video',), 'відео': ('video',), 'календар': ('calendar',)}
+
+
+def local_file(raw):
+    path = Path(raw)
+    if not path.is_absolute():
+        path = ROOT / path
+    path = Path(os.path.abspath(path))
+    if path.is_relative_to(RAW_ROOT):
+        path = ROOT / path.relative_to(RAW_ROOT)
+    rel = path.relative_to(ROOT)
+    if len(rel.parts) < 2 or rel.parts[0] not in ('work', 'bin'):
+        raise ValueError('workflow must be inside this agent work/ or bin/')
+    for i, part in enumerate(rel.parts):
+        if part.startswith('.') or part in SKIP or PRIVATE.search(part):
+            raise ValueError('private or excluded path')
+        p = ROOT.joinpath(*rel.parts[:i + 1])
+        if p.is_symlink():
+            raise ValueError('links are not workflow entries')
+    return path, rel.as_posix()
+
+
+def digest(path):
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > 4_000_000:
+            raise ValueError('workflow must be one bounded regular file')
+        with os.fdopen(fd, 'rb', closefd=False) as stream:
+            return hashlib.sha256(stream.read(4_000_001)).hexdigest()
+    finally:
+        os.close(fd)
+
+
+def catalog():
+    if CATALOG.is_symlink() or CATALOG.parent.is_symlink():
+        raise ValueError('catalog links are refused')
+    if not CATALOG.exists():
+        return {'version': 1, 'tools': {}}
+    if CATALOG.stat().st_size > 256_000:
+        raise ValueError('catalog too large')
+    data = json.loads(CATALOG.read_text())
+    if (not isinstance(data, dict) or data.get('version') != 1 or not isinstance(data.get('tools'), dict)
+            or len(data['tools']) > 200):
+        raise ValueError('invalid catalog')
+    for name, item in data['tools'].items():
+        if (not isinstance(item, dict) or not re.fullmatch(r'[a-z0-9][a-z0-9-]{0,63}', name)
+                or not isinstance(item.get('description'), str) or len(item['description']) > 300
+                or not isinstance(item.get('tags'), list) or len(item['tags']) > 12
+                or any(not isinstance(t, str) or len(t) > 40 for t in item['tags'])
+                or not isinstance(item.get('sha256'), str) or not re.fullmatch(r'[a-f0-9]{64}', item['sha256'])):
+            raise ValueError('invalid catalog entry')
+        local_file(item['path'])
+    return data
+
+
+def register(args):
+    if not re.fullmatch(r'[a-z0-9][a-z0-9-]{0,63}', args.name):
+        raise ValueError('use a short lowercase workflow name')
+    if not 1 <= len(args.description) <= 300 or len(args.tag) > 12 or any(len(t) > 40 for t in args.tag):
+        raise ValueError('description or tags too long')
+    path, rel = local_file(args.path)
+    value = {'path': rel, 'description': args.description, 'tags': args.tag, 'sha256': digest(path)}
+    if CATALOG.parent.is_symlink():
+        raise ValueError('catalog links are refused')
+    CATALOG.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(CATALOG.with_suffix('.lock'), os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, 'a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        data = catalog()
+        data['tools'][args.name] = value
+        if len(data['tools']) > 200:
+            raise ValueError('catalog full')
+        handle, tmp = tempfile.mkstemp(prefix='.tools-', dir=CATALOG.parent)
+        try:
+            with os.fdopen(handle, 'w') as output:
+                json.dump(data, output, ensure_ascii=False, indent=2)
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(tmp, CATALOG)
+        finally:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+    return {'registered': args.name, 'path': rel, 'verified': False,
+            'note': 'Registration records a purpose, not approval, execution or successful verification.'}
+
+
+def inventory(query, limit):
+    rows, known = [], set()
+    for name, item in catalog()['tools'].items():
+        path, rel = local_file(item['path'])
+        try:
+            state = 'present' if digest(path) == item['sha256'] else 'changed'
+        except FileNotFoundError:
+            state = 'missing'
+        except (OSError, ValueError):
+            state = 'unavailable'
+        rows.append({'name': name, **item, 'state': state, 'verified': False, 'registered': True})
+        known.add(rel)
+    incomplete = False
+    for base in ('bin', 'work'):
+        scanned, examined, exhausted = 0, 0, False
+        root = ROOT / base
+        if not root.is_dir() or root.is_symlink():
+            continue
+        for directory, dirs, names in os.walk(root, followlinks=False):
+            dirs[:] = sorted(d for d in dirs if not d.startswith('.') and d not in SKIP
+                             and not PRIVATE.search(d) and not (Path(directory) / d).is_symlink())
+            if len(Path(directory).relative_to(root).parts) >= 5:
+                incomplete = incomplete or bool(dirs)
+                dirs[:] = []
+            for name in sorted(names):
+                examined += 1
+                if examined > 20000:
+                    incomplete = exhausted = True
+                    break
+                path = Path(directory) / name
+                if path.suffix not in EXTENSIONS and not (base == 'bin' and path.suffix == ''):
+                    continue
+                scanned += 1
+                if scanned > 3000:
+                    incomplete = exhausted = True
+                    break
+                try:
+                    path, rel = local_file(path)
+                    info = path.lstat()
+                    if rel in known or not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                        continue
+                except (OSError, ValueError):
+                    continue
+                rows.append({'name': path.stem, 'path': rel, 'description': '', 'tags': [],
+                             'state': 'discovered', 'verified': False, 'registered': False})
+            if exhausted:
+                break
+    words = [t.casefold() for t in re.findall(r'[\w-]{3,}', query)
+             if t.casefold() not in {'the', 'and', 'for', 'with', 'from', 'work', 'bin'}]
+    terms = set(t[:5] for t in words)
+    for stem, aliases in SEARCH_ALIASES.items():
+        if any(word.startswith(stem) for word in words):
+            terms.update(aliases)
+    if terms:
+        def score(row):
+            text = ' '.join([row['name'], row['path'], row['description'], *row['tags']]).casefold()
+            return sum(term in text for term in terms)
+        rows = sorted((row for row in rows if score(row)), key=score, reverse=True)
+    return {'tools': rows[:limit], 'more': len(rows) > limit, 'scanIncomplete': incomplete,
+            'note': 'Local candidates only. Read the script and its receipts; existence is not permission or a working account. '
+                    'Do not execute a discovered script just to test availability. No match is not proof of inability.'}
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest='op', required=True)
+    for op in ('list', 'search'):
+        sub = commands.add_parser(op)
+        if op == 'search':
+            sub.add_argument('query')
+        sub.add_argument('--limit', type=int, choices=range(1, 101), default=30)
+    sub = commands.add_parser('register')
+    sub.add_argument('name')
+    sub.add_argument('path')
+    sub.add_argument('--description', required=True)
+    sub.add_argument('--tag', action='append', default=[])
+    args = parser.parse_args()
+    try:
+        result = register(args) if args.op == 'register' else inventory(getattr(args, 'query', ''), args.limit)
+        print(json.dumps(result, ensure_ascii=False))
+    except (OSError, ValueError, TypeError, KeyError):
+        print('Work tools catalog could not be read or updated; no tool was executed.', file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

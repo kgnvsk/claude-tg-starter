@@ -36,6 +36,7 @@ MANAGED_HOOKS = (
     ("PostToolUse", "Bash|Agent|SendMessage|TaskStop", "{H}/bin/tg-native-task", 10),
     ("PostToolUseFailure", "Bash|Agent|SendMessage|TaskStop", "{H}/bin/tg-native-task", 10),
     ("PostToolBatch", None, "{H}/bin/tg-native-task", 10),
+    ("PermissionRequest", None, "{H}/bin/tg-native-task", 10),
     ("Stop", None, "{H}/bin/tg-reply-stop-guard", 35),
     ("Stop", None, "{H}/bin/tg-turn-end", 5),
     ("StopFailure", None, "{H}/bin/tg-turn-end", 5),
