@@ -332,7 +332,7 @@ def main() -> None:
     # ПРОВЕРКА D: постійне доручення власника записане, а не лише сказане; одне нагадування на запит.
     owner = owner_chat()
     durable = DURABLE.search(asked) if delivery and owner and str(tool_input.get("chat_id") or "") == owner else None
-    if durable and not recorded_after(owner, delivery) and first_warning(delivery, DURABLE_WARNED):
+    if durable and not os.path.isfile(os.path.join(AGENT_ROOT, 'bin/answer-context')) and not recorded_after(owner, delivery) and first_warning(delivery, DURABLE_WARNED):
         log(f"BLOCK durable: owner request={delivery} word={durable.group(0)!r}")
         msg = (
             f"📌 ПОСТІЙНЕ ДОРУЧЕННЯ: власник написав «{durable.group(0)}». Таке доручення має пережити стиснення розмови.\n"

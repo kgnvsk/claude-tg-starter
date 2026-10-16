@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Lossless local owner-rule library. Migrate only during an idle, backed-up change window."""
 import argparse
+from contextlib import contextmanager
+try:import fcntl
+except ImportError:fcntl=None  # native Windows kits use the OS byte-range lock
 import hashlib
 import json
 import os
@@ -8,8 +11,10 @@ from pathlib import Path
 import re
 import sys
 import tempfile
+import stat
+import time
 
-HOME = Path.home()
+HOME = Path(os.environ.get('ANSWER_CONTEXT_HOME') or Path.home())
 DIRECTORY = HOME / '.claude/owner-rules'
 CAP = 4500
 
@@ -31,17 +36,252 @@ def atomic(path, content):
     try:
         with os.fdopen(fd,'wb') as out:
             out.write(content); out.flush(); os.fsync(out.fileno())
+        if path.exists(): os.chmod(name,stat.S_IMODE(path.stat().st_mode))
         os.replace(name,path)
+        if os.name!='nt':
+            directory_fd=os.open(path.parent,os.O_RDONLY)
+            try: os.fsync(directory_fd)
+            finally: os.close(directory_fd)
     finally:
         Path(name).unlink(missing_ok=True)
 
 def load():
-    path=DIRECTORY/'index.json'
-    if DIRECTORY.is_symlink() or path.is_symlink(): raise ValueError('unsafe rule library')
-    if path.stat().st_size > 2_000_000: raise ValueError('rule library is too large')
-    value=json.loads(path.read_text())
-    if value.get('schemaVersion') != 1 or not isinstance(value.get('rules'),list): raise ValueError('invalid rule library')
+    with locked():
+        value=json.loads(read_bytes(DIRECTORY/'index.json'))
+        if value.get('schemaVersion') != 1 or not isinstance(value.get('rules'),list): raise ValueError('invalid rule library')
+        return value
+
+
+def core_path():
+    return HOME/'CLAUDE.md'
+
+
+def read_bytes(path, missing=False, maximum=2_000_000):
+    """No pipe/device/link or failed read can become an empty rule source."""
+    try:
+        metadata=path.lstat()
+    except FileNotFoundError:
+        if missing:return None
+        raise
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink!=1:
+        raise ValueError('unsafe rule source')
+    fd=os.open(path,os.O_RDONLY|getattr(os,'O_NOFOLLOW',0)|getattr(os,'O_NONBLOCK',0))
+    with os.fdopen(fd,'rb') as stream:
+        current=os.fstat(stream.fileno())
+        if not stat.S_ISREG(current.st_mode) or current.st_nlink!=1 or current.st_size>maximum or (current.st_dev,current.st_ino)!=(metadata.st_dev,metadata.st_ino):
+            raise ValueError('unsafe or oversized rule source')
+        value=stream.read(maximum+1)
+    if len(value)>maximum:raise ValueError('rule source too large')
     return value
+
+
+@contextmanager
+def locked():
+    safe_directory(DIRECTORY)
+    fd=os.open(DIRECTORY/'write.lock',os.O_RDWR|os.O_CREAT|getattr(os,'O_NOFOLLOW',0),0o600)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):raise ValueError('unsafe rule lock')
+        if fcntl is not None:fcntl.flock(fd,fcntl.LOCK_EX)
+        else:
+            import msvcrt
+            if os.fstat(fd).st_size==0:os.write(fd,b'0')
+            os.lseek(fd,0,0);deadline=time.monotonic()+2
+            while True:
+                try:msvcrt.locking(fd,msvcrt.LK_NBLCK,1);break
+                except OSError:
+                    if time.monotonic()>=deadline:raise ValueError('rule store busy; retry the current read')
+                    time.sleep(.02)
+        recover()
+        yield
+    finally:os.close(fd)
+
+
+def recover():
+    """Finish a recorded two-file replacement, or retain evidence and refuse a foreign edit.
+
+    All cooperating readers/writers hold the same lock. A crash can leave the old
+    core beside the new library, but no reader accepts that mixed revision.
+    """
+    path=DIRECTORY/'transaction.json'
+    raw=read_bytes(path,True,10_000_000)
+    if raw is None:return
+    tx=json.loads(raw)
+    if not isinstance(tx,dict) or set(tx)!={'core','index','coreTarget'}:raise ValueError('invalid rule transaction target')
+    if tx['coreTarget']!=str(core_path().resolve()):raise ValueError('rule transaction target changed; original journal retained')
+    targets={'index':DIRECTORY/'index.json','core':core_path()}
+    for key,target in targets.items():
+        item=tx[key]
+        if not isinstance(item,dict) or set(item)!={'before','after'} or not isinstance(item['after'],str):
+            raise ValueError('invalid rule transaction')
+        actual=read_bytes(target,True)
+        if actual not in (None if item['before'] is None else item['before'].encode(),item['after'].encode()):
+            raise ValueError('rule source changed during recovery; original and replacement retained')
+    for key,target in targets.items():
+        after=tx[key]['after'].encode()
+        actual=read_bytes(target,True)
+        if actual!=after:
+            if actual!=(None if tx[key]['before'] is None else tx[key]['before'].encode()):
+                raise ValueError('rule source changed before replacement')
+            atomic(target,after)
+    path.unlink()
+
+
+REFERENCE=('Правила збережено без скорочень у ~/.claude/owner-rules/index.json. '
+           'Перед відповіддю прочитай актуальні правила й переписку через answer-context. '
+           'Зміни правил зберігай через owner-rules з джерелом, областю дії та явною заміною старого правила.\n')
+
+
+def core_rules(raw):
+    """Extract only explicit owner-rule sections, preserving every other byte."""
+    kept=[];body=[];parts=[];inside=False;contacts=False;referenced=False
+    def flush():
+        if body:
+            parts.extend(blocks(''.join(body)));body.clear()
+    for line in (raw or b'').decode('utf-8').splitlines(keepends=True):
+        if line.startswith('<!-- novsky-'):flush();contacts=True
+        if contacts:
+            kept.append(line)
+            if line.startswith('<!-- /novsky-'):contacts=False
+            continue
+        if line.startswith('# '):
+            flush();inside=line.strip()=='# Правила власника'
+            kept.append(line)
+            if inside and not referenced:kept.append(REFERENCE);referenced=True
+            continue
+        if inside:
+            if line.startswith('Правила збережено без скорочень у ~/.claude/owner-rules/index.json.'):
+                continue  # The old, exact migration reference is not a rule.
+            body.append(line)
+        else:kept.append(line)
+    flush()
+    if not referenced:kept.append('\n# Правила власника\n'+REFERENCE)
+    return [p.strip() for p in parts if p.strip()],''.join(kept)
+
+
+def _snapshot(scope=None):
+    core=read_bytes(core_path(),True);raw=read_bytes(DIRECTORY/'index.json',True)
+    value=json.loads(raw) if raw is not None else {'schemaVersion':1,'rules':[]}
+    if not isinstance(value,dict) or value.get('schemaVersion')!=1 or not isinstance(value.get('rules'),list):
+        raise ValueError('invalid rule library')
+    rows=[];seen=set()
+    for row in value['rules']:
+        if not isinstance(row,dict) or not isinstance(row.get('id'),str) or not isinstance(row.get('text'),str):
+            raise ValueError('invalid rule')
+        if row['id'] in seen:raise ValueError('duplicate rule ID')
+        seen.add(row['id']);rows.append({**row,'scope':row.get('scope','owner')})
+    texts,cleaned=core_rules(core)
+    existing={(row['scope'],row['text'].strip()) for row in rows}
+    for text in texts:
+        if ('owner',text) in existing:continue
+        identifier='core:'+digest(text.encode())
+        if identifier in seen:raise ValueError('rule id collision')
+        seen.add(identifier);existing.add(('owner',text))
+        rows.append({'id':identifier,'scope':'owner','text':text,'origin':'core'})
+    revision=digest(json.dumps([None if core is None else digest(core),None if raw is None else digest(raw)],separators=(',',':')).encode())
+    owner_context=read_bytes(core_path().parent/'OWNER.md',True)
+    if owner_context is not None:revision=digest((revision+digest(owner_context)).encode())
+    projected=[row for row in rows if scope is None or row['scope'] in (scope,'all')]
+    if scope is not None:
+        # Provenance stays in the owner's private store. A rule published for a
+        # company chat must not carry unrelated words from its private source.
+        projected=[{key:row[key] for key in ('id','key','scope','text') if key in row} for row in projected]
+        revision=digest(json.dumps(projected,sort_keys=True,ensure_ascii=False).encode())
+    result={'revision':revision,'rules':projected}
+    if scope is None:
+        result['legacyContext']={'core':cleaned,'ownerContext':(owner_context or b'').decode()}
+    return result,{'core':core,'index':raw,'value':value,'cleaned':cleaned}
+
+
+def snapshot(scope=None):
+    with locked():return _snapshot(scope)[0]
+
+
+def instruction_receipt(source):
+    with locked():
+        _,state=_snapshot()
+        saved=state['value'].get('appliedChanges',{}).get(f"{source['chatId']}:{source['messageId']}")
+        if saved and saved.get('sourceHash')==digest(json.dumps(source,sort_keys=True,ensure_ascii=False).encode()):
+            return saved.get('disposition')
+
+
+def apply_rules(request, scope=None):
+    """Host-authenticated source is required by the engine adapter; this is storage, not ACL.
+
+    No semantic guessing: the caller reads all active candidates and explicitly
+    names replacements, full conditions/exceptions, and a stable subject/scope.
+    """
+    if not isinstance(request,dict):raise ValueError('invalid rule change')
+    with locked():
+        current,state=_snapshot()
+        applicable=_snapshot(scope)[0] if scope is not None else current
+        source=request.get('source');changes=request.get('changes')
+        if isinstance(source,dict):
+            operation=f"{source.get('chatId')}:{source.get('messageId')}"
+            fingerprint=digest(json.dumps([source,changes,request.get('disposition'),request.get('reason')],sort_keys=True,ensure_ascii=False).encode())
+            saved=state['value'].get('appliedChanges',{}).get(operation)
+            if saved:
+                if saved['fingerprint']!=fingerprint:raise ValueError('owner instruction already saved with a different edit; inspect its receipt')
+                return {'ok':True,'revision':applicable['revision'],'savedIds':saved['savedIds'],'disposition':saved.get('disposition'),'replayed':True}
+        if request.get('revision')!=applicable['revision']:raise ValueError('rules changed; read current rules before saving')
+        ids={row['id'] for row in applicable['rules']}
+        reviewed=request.get('reviewedIds')
+        if not isinstance(reviewed,list) or len(reviewed)!=len(ids) or set(reviewed)!=ids:
+            raise ValueError('review every current rule before replacing conflicts')
+        source=request.get('source')
+        if (not isinstance(source,dict) or set(source)!={'chatId','messageId','text'}
+            or not isinstance(source['chatId'],str) or not re.fullmatch(r'-?\d+',source['chatId'])
+            or type(source['messageId']) is not int or source['messageId']<=0
+            or not isinstance(source['text'],str) or not source['text'].strip() or len(source['text'])>60_000):
+            raise ValueError('source of owner instruction required')
+        changes=request.get('changes')
+        if not isinstance(changes,list) or len(changes)>50:raise ValueError('invalid changes')
+        if changes:
+            if request.get('disposition') not in (None,'applied'):raise ValueError('a rule change must be applied')
+            disposition='applied'
+        else:
+            disposition=request.get('disposition')
+            if disposition not in ('not_rule','clarify') or not isinstance(request.get('reason'),str) or not 20<=len(request['reason'])<=2000:
+                raise ValueError('explain why this is a one-off task or what rule scope needs clarification')
+        removed=set();added=[]
+        for change in changes:
+            if not isinstance(change,dict) or set(change)!={'key','scope','text','replaces'}:raise ValueError('invalid change fields')
+            key,change_scope,text,replaces=(change[k] for k in ('key','scope','text','replaces'))
+            if not isinstance(key,str) or not re.fullmatch(r'[a-z0-9][a-z0-9._-]{0,119}',key):raise ValueError('invalid rule subject')
+            if not isinstance(change_scope,str) or not re.fullmatch(r'owner|all|chat:-?\d+:\d+',change_scope):raise ValueError('explicit rule scope required')
+            if scope is not None and change_scope!=scope:raise ValueError('rule change outside current scope')
+            if not isinstance(text,str) or len(text.strip())>60_000 or (not text.strip() and not replaces):raise ValueError('complete rule text or explicit retirement required')
+            if not isinstance(replaces,list) or len(set(replaces))!=len(replaces) or not set(replaces)<=ids or removed.intersection(replaces):
+                raise ValueError('invalid replacement IDs')
+            if any(row['scope']!=change_scope for row in current['rules'] if row['id'] in replaces):
+                raise ValueError('replacement cannot silently change scope')
+            removed.update(replaces)
+            if text.strip():
+                identifier=digest(json.dumps([change_scope,key,text.strip(),source],sort_keys=True,ensure_ascii=False).encode())[:24]
+                added.append({'id':identifier,'key':key,'scope':change_scope,'text':text.strip(),'source':source,'replaces':replaces})
+        rows=[row for row in current['rules'] if row['id'] not in removed]
+        subjects=set()
+        for row in rows+added:
+            subject=(row['scope'],row.get('key',row['id']))
+            if subject in subjects:raise ValueError('active rule subject already exists; explicitly replace its current version')
+            subjects.add(subject)
+        if len({r['id'] for r in rows+added})!=len(rows+added):raise ValueError('duplicate rule ID')
+        value={**state['value'],'rules':rows+added,'history':[*state['value'].get('history',[]),
+            {'at':int(time.time()),'source':source,'revision':current['revision'],
+             'rules':[row for row in current['rules'] if row['id'] in removed]}]}
+        value['appliedChanges']={**state['value'].get('appliedChanges',{}),
+            operation:{'fingerprint':fingerprint,'savedIds':[row['id'] for row in added],
+                       'sourceHash':digest(json.dumps(source,sort_keys=True,ensure_ascii=False).encode()),
+                       'disposition':disposition,'reason':request.get('reason')}}
+        index=json.dumps(value,ensure_ascii=False,indent=2)+'\n'
+        if len(index.encode())>2_000_000:raise ValueError('rule history is full; archive it before saving')
+        tx={'coreTarget':str(core_path().resolve()),'core':{'before':None if state['core'] is None else state['core'].decode(),'after':state['cleaned']},
+            'index':{'before':None if state['index'] is None else state['index'].decode(),'after':index}}
+        # Keep the original before the first change; never overwrite a previous backup.
+        backup=DIRECTORY/f"before-{current['revision']}.json"
+        if not backup.exists():atomic(backup,json.dumps(tx,ensure_ascii=False).encode())
+        atomic(DIRECTORY/'transaction.json',json.dumps(tx,ensure_ascii=False).encode())
+        recover()
+        return {'ok':True,'revision':_snapshot(scope)[0]['revision'],'savedIds':[row['id'] for row in added],'disposition':disposition}
 
 def blocks(text):
     # Start a new block at a margin list item or a heading; retain every continuation, whitespace and paragraph.
@@ -139,9 +379,12 @@ def main():
     s=sub.add_parser('migrate');s.add_argument('--expected-sha',required=True)
     s=sub.add_parser('context');s.add_argument('query')
     s=sub.add_parser('read');s.add_argument('id')
+    s=sub.add_parser('snapshot');s.add_argument('--scope')
     args=p.parse_args()
-    if args.action=='migrate': print(json.dumps(migrate(args.expected_sha),ensure_ascii=False))
+    if args.action=='migrate':
+        with locked():print(json.dumps(migrate(args.expected_sha),ensure_ascii=False))
     elif args.action=='context': print(context(args.query))
+    elif args.action=='snapshot': print(json.dumps(snapshot(args.scope),ensure_ascii=False))
     else:
         rows=load()['rules']
         row=read_rule(rows,args.id)

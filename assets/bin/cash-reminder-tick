@@ -593,6 +593,13 @@ keep_observation() {
   atomic_text "$1/offers" 0 && atomic_text "$1/observed.id" "$(date +%s)-$$-$RANDOM$RANDOM" && mv -f "$2" "$1/observed.txt"
 }
 
+context_fallback() {
+  local line
+  line=$("$HOME/bin/answer-context" fallback 2>/dev/null) || line=""
+  if [ -n "$line" ]; then printf '%s' "$line";
+  else printf '%s' 'Перевірка правил і переписки ще не завершена. Виконання не підтверджую; уже зроблених дій не повторюю.'; fi
+}
+
 run_agent_task() {
   local file="$1" prompt="$2" review_request="$2" out rc destination="чат ${chat}"
   local workdir="${AGENT_TASK_DIR:-$HOME/.atarax/agent-task}"
@@ -725,7 +732,7 @@ ${prompt}"
   # A task started from the live session must not settle that session's pending
   # request with its own sends: it runs without the service's delivery binding.
   local review_run="" review_result=""
-  if [ -x "$HOME/bin/task-review" ] && [ "${TASK_REVIEW_MODE:-shadow}" != off ]; then
+  if { [ -x "$HOME/bin/task-review" ] && [ "${TASK_REVIEW_MODE:-shadow}" != off ]; } || [ -x "$HOME/bin/answer-context" ]; then
     review_run=$(mktemp -d "$workdir/task-review.XXXXXXXX") || review_run=""
     if [ -n "$review_run" ] && ! printf '%s' "$review_request" > "$review_run/request.txt"; then rm -rf -- "$review_run"; review_run=""; fi
     if [ "$quiet" -eq 0 ] && [ -n "$review_run" ]; then
@@ -734,16 +741,49 @@ ${prompt}"
 Перед підсумком звір вимоги, факти та результат. Збережи точний текст відповіді й JSON перевірки checks=[{item,status:verified|missing|not_applicable,evidence}], nextStep для невиконаного. TASK_REVIEW_RUN_DIR/request.txt містить саме це завдання. task-review validate читає JSON {request,answer,review:null} зі stdin і показує потрібні item. Потім task-review record-scheduled --answer-file ФАЙЛ --review-file JSON. Після ok поверни точний текст із answer-file. Невиконане і наступний крок мають бути в самій відповіді. Не повторюй уже зроблені дії. Для NOTHING перевірка не потрібна. Текст доставить планувальник; tg-send не викликай."
     fi
   fi
+  if [ -x "$HOME/bin/answer-context" ]; then
+    local context_args=(prepare-scheduled --run "$review_run" --chat "$chat" --task "${task_id:-$(basename "$file" .rem)}" --occurrence "$epoch")
+    [ -z "${thread_id:-}" ] || context_args+=(--thread "$thread_id")
+    if ! "$HOME/bin/answer-context" "${context_args[@]}" >/dev/null 2>&1; then
+      [ -z "$review_run" ] || rm -rf -- "$review_run"
+      context_fallback
+      [ "$quiet" -eq 0 ] || return 4
+      return 0
+    fi
+    prompt="${prompt}
+
+Перед відповіддю прочитай ~/bin/answer-context read --scheduled, потім усі сторінки цього snapshot. Для QUIET-доставки в інший чат/тему: read --scheduled --chat ID --thread TOPIC. Повні правила з винятками й обрана переписка обов'язкові; помилка або обрізаний текст не є прочитанням. Не повторюй виконані дії. Завдання планувальника не має права записувати нові правила власника."
+  fi
   out=$(cd "$workdir" &&
     export PATH="$agent_path" TG_DELIVERY_STAMP= TG_DELIVERY_ID= TG_DELIVERY_TASK_ID= TG_DELIVERY_PHASE=final \
       ATARAX_TASK_QUIET="$quiet" ATARAX_TASK_ID="${task_id:-$(basename "$file" .rem)}" \
       ATARAX_TASK_OCCURRENCE="$epoch" ATARAX_TASK_RUN_KEY="${quiet_run_key:-}" \
-      ATARAX_TASK_DELIVERY_DIR="$REM_DIR/.quiet-delivery" TASK_REVIEW_RUN_DIR="$review_run" &&
+      ATARAX_TASK_DELIVERY_DIR="$REM_DIR/.quiet-delivery" TASK_REVIEW_RUN_DIR="$review_run" ANSWER_CONTEXT_RUN_DIR="$review_run" &&
     ATARAX_SUPPRESS_TELEGRAM=1 ATARAX_TASK_DELIVERY=1 $limit "$HOME/.local/bin/claude" -p --output-format text <<<"$prompt" 2>&1)
   rc=$?
   if [ "$rc" -eq 0 ] && [ "$quiet" -eq 0 ] && [ -n "$review_run" ]; then
     # Shadow diagnostics never alter stdout, task status, retry or delivery.
     printf '%s' "$out" | TASK_REVIEW_RUN_DIR="$review_run" "$HOME/bin/task-review" observe-scheduled >/dev/null 2>&1 || true
+    local control_result=0
+    case "$out" in NOTHING|NO_REPLY|NOREPLY|NO_NEW|NONE|SKIP|NOCHANGE|NOUPDATE) control_result=1 ;; esac
+    local context_proof
+    # Keep the read proof with the result: a future tick cannot use a new
+    # transcript or the existence of result.txt as a current read receipt.
+    if [ -x "$HOME/bin/answer-context" ] && [ "$control_result" = 0 ] &&
+       { ! context_proof=$(printf '%s' "$out" | ANSWER_CONTEXT_RUN_DIR="$review_run" "$HOME/bin/answer-context" scheduled-seal 2>/dev/null) ||
+         [ -z "$context_proof" ] || [ -z "${check_journal:-}" ] || ! atomic_text "$check_journal/context-proof.json" "$context_proof"; }; then
+      # The ordinary delivered journal is removed after acknowledgement. Keep
+      # the latest unchecked result per task/destination separately for repair,
+      # without growing a second unbounded per-occurrence archive.
+      local context_key context_saved
+      context_key=$(printf '%s\0%s\0%s' "${task_id:-$file}" "$chat" "${thread_id:-}" | python3 -c 'import hashlib,sys;print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())')
+      context_saved="$REM_DIR/.context-failed/$context_key"
+      if [ -n "$context_key" ] && mkdir -p -m 700 "$context_saved"; then
+        atomic_text "$context_saved/context-unchecked.txt" "$out" && atomic_text "$context_saved/request.txt" "$review_request" || log_message 'context check: unchecked result could not be retained'
+      fi
+      out=$(context_fallback)
+      log_message 'context check incomplete; completed task was not repeated, unchecked text was not sent'
+    fi
   fi
   [ -z "$review_run" ] || rm -rf -- "$review_run"
   if [ $rc -ne 0 ]; then
@@ -1514,6 +1554,15 @@ deliver_saved_run() {
     rm -rf -- "$journal"
     return 0
   fi
+  if [ "$cursor" -eq 0 ] && [ "$(header_value "$source" RUN)" = 1 ] && [ -x "$HOME/bin/answer-context" ]; then
+    if ! "$HOME/bin/answer-context" scheduled-delivery-check --proof "$journal/context-proof.json" --result "$result" \
+       --chat "$chat" --thread "$thread_id" --task "$task_id" --occurrence "$epoch" >/dev/null 2>&1; then
+      # Only a wholly unsent result may change. Sending/uncertain and confirmed
+      # prefixes were handled above; they retain their exact transport bytes.
+      atomic_text "$result" "$(context_fallback)" || return 1
+      log_message 'saved context proof missing or stale; task not repeated, fixed fallback queued'
+    fi
+  fi
   index=0
   while IFS= read -r -d '' chunk || [ -n "$chunk" ]; do
     if [ "$index" -lt "$cursor" ]; then
@@ -1609,6 +1658,10 @@ run_occurrence() {
   if [ -n "$late" ] && ! nothing_to_report "$result_temp"; then
     { printf '%s\n\n' "$late" && cat "$result_temp"; } > "$result_temp.late" &&
       mv -f "$result_temp.late" "$result_temp"
+  fi
+  if [ -x "$HOME/bin/answer-context" ] && [ -f "$journal/context-proof.json" ]; then
+    "$HOME/bin/answer-context" scheduled-rebind --proof "$journal/context-proof.json" --result "$result_temp" >/dev/null 2>&1 ||
+      rm -f -- "$journal/context-proof.json"
   fi
   if [ ! -s "$result_temp" ] || ! atomic_text "$journal/cursor" split:0 ||
      ! mv "$result_temp" "$journal/result.txt" || ! atomic_text "$journal/state" ready; then

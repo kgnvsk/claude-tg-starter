@@ -139,6 +139,7 @@ MANAGED_BIN_NAMES = frozenset(
         "video-check-overlay",
         "task-review",
         "owner-rules",
+        "answer-context",
         "plan-item",
         "wiki-hot-inject",
         "yt-dl",

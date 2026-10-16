@@ -28,6 +28,22 @@ import urllib.error, hashlib, tempfile, fcntl, signal
 from datetime import datetime
 from pathlib import Path
 
+CONTEXT_HELPER = os.path.expanduser('~/bin/answer-context')
+
+
+def require_answer_context(chat, thread, text, delivery=None, file=False):
+    if not os.path.isfile(CONTEXT_HELPER):return  # older/non-Premium installation
+    try:
+        result = subprocess.run(['python3', CONTEXT_HELPER, 'send-check'], input=json.dumps(
+            {'chat':chat,'thread':thread,'text':text,'delivery':delivery,'file':file}),
+            capture_output=True,text=True,timeout=5)
+        verdict=json.loads(result.stdout)
+        if not isinstance(verdict,dict):raise ValueError('Current context verdict is malformed; nothing sent.')
+        if result.returncode==0 and verdict.get('ok') is True:return verdict
+        raise ValueError(json.dumps(verdict,ensure_ascii=False))
+    except (OSError,subprocess.SubprocessError,json.JSONDecodeError) as error:
+        raise ValueError('Current rules/history check unavailable; nothing sent. Read answer-context before answering.') from error
+
 
 def log(message):
     """A line for the operator, in the agent's logs rather than the Bash tool output
@@ -1425,6 +1441,36 @@ def quiet_failure(record, path, code, payload=None):
     quiet_write(path, record)
 
 
+def saved_context_current(record, text, file_sha256=None):
+    if not os.path.isfile(CONTEXT_HELPER):return True,''  # older installation
+    fallback='Перевірка правил і переписки ще не завершена. Виконання не підтверджую; уже зроблених дій не повторюю.'
+    try:
+        checked=subprocess.run(['python3',CONTEXT_HELPER,'delivery-check'],input=json.dumps({
+            'proof':record.get('context_proof'),'text':text,'chat':record['chat'],'thread':record['thread'],
+            'task':record['task'],'occurrence':record['occurrence'],'file_sha256':file_sha256}),capture_output=True,text=True,timeout=5)
+        verdict=json.loads(checked.stdout)
+        if not isinstance(verdict,dict):return False,fallback
+        if isinstance(verdict.get('fallback'),str) and 0<len(verdict['fallback'])<1000:fallback=verdict['fallback']
+        return checked.returncode==0 and verdict.get('ok') is True,fallback
+    except (OSError,subprocess.SubprocessError,ValueError,TypeError):return False,fallback
+
+
+def quiet_file_context_notice(identity, source, text):
+    """A blocked file keeps a durable obligation to this one text fallback."""
+    root=quiet_root();lock=os.open(root/'.lock',os.O_RDWR|os.O_CREAT|os.O_NOFOLLOW,0o600)
+    try:
+        fcntl.flock(lock,fcntl.LOCK_EX)
+        path=root/('file-context-'+identity+'.json')
+        if path.exists():record=quiet_load(path)
+        else:
+            record={'version':1,'run_key':source.get('run_key',''),'task':source['task'],'occurrence':source['occurrence'],
+                    'chat':source['chat'],'thread':source['thread'],'general_topic':source.get('general_topic',False),
+                    'chunks':[text],'cursor':0,'receipts':[],'state':'ready','retry_at':0,'context_fallback':True}
+            quiet_write(path,record)
+        return quiet_send_record(path,record)
+    finally:os.close(lock)
+
+
 def quiet_send_record(path, record):
     if record["state"] == "sending":
         record["state"] = "uncertain"  # a killed sender may have reached Telegram
@@ -1438,6 +1484,12 @@ def quiet_send_record(path, record):
         record["retry_at"] = 0 if destination is False else int(time.time()) + 1
         quiet_write(path, record)
         return record["state"]
+    if record['cursor']==0 and not record['receipts'] and os.path.isfile(CONTEXT_HELPER) and not record.get('context_fallback'):
+        valid,fallback=saved_context_current(record,''.join(record['chunks']))
+        if not valid:
+            record['requested_chunks']=record['chunks']
+            record['chunks']=[fallback];record['context_fallback']=True
+            quiet_write(path,record)
     while record["cursor"] < len(record["chunks"]):
         chunk = record["chunks"][record["cursor"]]
         fields = {"chat_id": record["chat"], "text": chunk}
@@ -1529,13 +1581,14 @@ def quiet_main(arguments):
         if path.exists():
             record = quiet_load(path)
             if (record.get("run_key", ""), record["task"], record["occurrence"], record["chat"], record["thread"],
-                    record["chunks"], record.get("general_topic", False), record.get("silent", False)) != (
+                    record.get('requested_chunks',record["chunks"]), record.get("general_topic", False), record.get("silent", False)) != (
                         run_key, task, occurrence, chat_id, thread_id, chunks, general_topic, silent):
                 raise ValueError("quiet delivery record does not match this message")
         else:
+            context=require_answer_context(chat_id,thread_id,text)
             record = {"version": 1, "run_key": run_key, "task": task, "occurrence": occurrence,
                       "chat": chat_id, "thread": thread_id, "general_topic": general_topic,
-                      "silent": silent, "chunks": chunks,
+                      "silent": silent, "chunks": chunks, 'context_proof':(context or {}).get('proof'),
                       "cursor": 0, "receipts": [], "state": "ready", "retry_at": 0}
             quiet_write(path, record)
         state = quiet_send_record(path, record)
@@ -1585,6 +1638,8 @@ def main(argv):
             recorded = False
         sys.exit(0 if recorded else 1)
     chat_id, text, thread_id, general_topic, watchdog_credit, silent = parse_arguments(arguments)
+    try:require_answer_context(chat_id,thread_id,text,os.environ.get('TG_DELIVERY_ID'))
+    except ValueError as error:sys.exit(str(error))
     if not watchdog_credit and (os.environ.get('TG_DELIVERY_ID') or os.environ.get('TG_DELIVERY_TASK_ID')):
         sys.exit('tg-send: --no-watchdog-credit cannot bind to an inbound delivery')
     quality_helper = os.path.expanduser('~/bin/task-review')

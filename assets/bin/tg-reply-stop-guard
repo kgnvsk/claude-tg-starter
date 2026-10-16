@@ -1702,6 +1702,17 @@ def deliver_pending_answer(turn_events: list[object], chat_id: str,
     text = final_answer_text(turn_events)
     if chat_id.startswith("-") or not text or DECLARED_SILENCE.search(text) or UNSAFE_FALLBACK_TEXT.search(text):
         return False
+    helper = AGENT_ROOT / 'bin/answer-context'
+    if helper.is_file():
+        try:
+            check = subprocess.run(['python3',str(helper),'send-check'],input=json.dumps({'chat':chat_id,'thread':thread_id,'text':text}),capture_output=True,text=True,timeout=5)
+            if check.returncode != 0 or json.loads(check.stdout).get('ok') is not True:
+                from agent_notice_locale import owner_notice_locale
+                # A failed context check never forwards the model's unchecked final.
+                catalog=json.loads(check.stdout).get('fallback',{})
+                text=catalog.get(owner_notice_locale(AGENT_ROOT),'Перевірка правил і переписки ще не завершена. Виконання не підтверджую; уже зроблених дій не повторюю.')
+        except (OSError,ValueError,subprocess.SubprocessError,ImportError):
+            text='Перевірка правил і переписки ще не завершена. Виконання не підтверджую; уже зроблених дій не повторюю.'
     sender = AGENT_ROOT / "bin/tg-send"
     if not os.access(sender, os.X_OK):
         return False

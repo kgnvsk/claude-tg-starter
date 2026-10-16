@@ -5538,7 +5538,25 @@ function answerParts(text: string, limit: number): string[] {
 // startup drain (B4v2 review L5).
 const FORGOT_REPLY_SEND_MS = 5_000
 
+async function requireAnswerContext(chat: string, thread: number | null, text: string, delivery?: string, file = false): Promise<void> {
+  const helper = join(homedir(), 'bin/answer-context')
+  if (!existsSync(helper)) return // older/non-Premium installation
+  await new Promise<void>((resolve, reject) => {
+    const child = execFile('python3', [helper, 'send-check'], { timeout: 5000, maxBuffer: 16000 }, (error, stdout) => {
+      try {
+        const verdict = JSON.parse(stdout)
+        if (!error && verdict.ok === true) { resolve(); return }
+        reject(new Error(JSON.stringify(verdict)))
+      } catch { reject(new Error('Current rules/history check unavailable. Read answer-context before answering; nothing sent.')) }
+    })
+    child.stdin?.on('error', () => {})
+    child.stdin?.end(JSON.stringify({ chat, thread, text, delivery, file }))
+  })
+}
+
 async function forwardForgottenReply(request: HeldRequest): Promise<SendOutcome> {
+  try { await requireAnswerContext(request.chat_id, null, request.final_text!, request.delivery_id) }
+  catch { return 'refused' } // the existing bounded fallback tells the person; no unchecked model text
   const delivery: ResultDelivery = { chat_id: request.chat_id, thread_id: null, phase: 'final', task_id: null,
     targets: [{ turn_id: request.turn_id, delivery_id: request.delivery_id }], generations: [request.result_generation] }
   try { armOutboundAttempt(delivery) } catch (error) {
@@ -6944,6 +6962,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const chunks = text.length ? chunk(text, limit, mode) : []
         const sentIds: number[] = []
         const origin = receiptContext(chat_id, threadId != null ? String(threadId) : null, args.delivery_id)
+        await requireAnswerContext(chat_id, threadId ?? null, text, args.delivery_id as string | undefined, files.length > 0)
         // Snapshot reviewed video before any text/send or delivery mutation. The uploaded buffer is exactly the checked one.
         const reviewedVideos = new Map<string, Buffer>()
         const qualityHelper = files.some(f => /\.(mp4|mov|webm|mkv)$/i.test(f))
@@ -7182,6 +7201,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       }
       case 'edit_message': {
         assertAllowedChat(args.chat_id as string)
+        // The tool has no topic argument: resolve the message being edited, never infer General.
+        const editedRow = MSG_DB.query('SELECT thread_id FROM messages WHERE chat_id=? AND message_id=? AND direction=\'out\' ORDER BY ts DESC LIMIT 1')
+          .get(args.chat_id as string, Number(args.message_id)) as { thread_id: number | null } | null
+        if (existsSync(join(homedir(), 'bin/answer-context')) && !editedRow) throw new Error('Cannot prove the edited message topic; read its original message first')
+        await requireAnswerContext(args.chat_id as string, editedRow?.thread_id ?? null, String(args.text ?? ''))
         // Same default as reply: markdownv2 ON, pre-escape via tg-escape. 2026-06-23.
         const editFormat = (args.format as string | undefined) ?? 'markdownv2'
         const editParseMode = editFormat === "markdownv2" ? "MarkdownV2" as const : editFormat === "markdown" ? "Markdown" as const : undefined

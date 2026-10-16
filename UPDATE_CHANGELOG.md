@@ -1,8 +1,8 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-10-16.c6d874fe27af`
+- Реліз: `2026-10-16.841949b880e6`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `c6d874fe27af3889c508e44f436046b8544fb9fe`
+- Ревізія вихідного комплекту: `841949b880e615f7746245cc3f7f1e82abca062b`
 - Дата релізу: `2026-10-16`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
@@ -19,7 +19,9 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    Manage business access and scoped MCP from admitted chats
+    Validate scheduled file context and isolate resumed final parts
+    Bind current-context proof to saved replies and close review bypasses
+    fix(premium): persist reconciled rules and require fresh scoped context
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не

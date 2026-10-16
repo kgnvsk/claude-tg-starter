@@ -25,6 +25,7 @@ DEPRECATED_HOOKS = (
 MANAGED_HOOKS = (
     ("PreCompact", None, "{H}/bin/tg-compaction-notice", 10),
     ("SessionStart", None, "{H}/bin/wiki-hot-inject", 10),
+    ("SessionStart", None, "{H}/bin/answer-context scheduled-hook", 5),
     ("SessionStart", "compact", "{H}/bin/tg-context-inject", 5),
     ("UserPromptSubmit", None, "{H}/bin/tg-context-inject", 5),
     ("PreToolUse", "Bash", "{H}/bin/no-nested-claude-guard", 5),

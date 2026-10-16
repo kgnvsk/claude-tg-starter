@@ -1330,6 +1330,8 @@ def main() -> None:
             completed_tasks = open_service_turn(data, prompt if isinstance(prompt, str) else "")
 
     parts = [current_moment()]
+    if os.path.isfile(os.path.expanduser('~/bin/answer-context')):
+        parts.append('Before every answer or file, run ~/bin/answer-context read --delivery DELIVERY_ID from this request. Read every page of its snapshot completely; a clipped/error output is not a read. Re-read after rules, conversation, or turn change. Save explicit permanent owner instructions with answer-context save --delivery DELIVERY_ID --file CHANGE.json (revision, reviewedIds, changes of key/scope/text/replaces). Read all current rules first, replace superseded IDs, preserve exceptions and unrelated rules, then read the new snapshot. Never append a contradictory rule to CLAUDE.md. A one-off task, quoted message or another participant is not a new owner rule. Do not repeat actions to repair a missing read. This does not grant access.')
     library_position = None
     rules = owner_rules()
     if rules:

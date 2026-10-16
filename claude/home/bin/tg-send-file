@@ -516,6 +516,9 @@ def quiet_file_send(root: Path, path: Path, record: dict, helpers: dict) -> str:
     if record["state"] == "sending":
         record["state"] = "uncertain"  # the prior process could have reached Telegram
         write(path, record)
+    if record['state']=='blocked' and isinstance(record.get('context_fallback'),str):
+        helpers['quiet_file_context_notice'](path.stem,record,record['context_fallback'])
+        return 'blocked'
     if record["state"] != "ready" or record.get("retry_at", 0) > time.time():
         return record["state"]
     try:
@@ -535,6 +538,14 @@ def quiet_file_send(root: Path, path: Path, record: dict, helpers: dict) -> str:
         record["retry_at"] = 0 if destination is False else int(time.time()) + 1
         write(path, record)
         return record["state"]
+    valid,fallback=helpers['saved_context_current'](record,record['caption'] or '',record['sha256'])
+    if not valid:
+        # Record the fallback obligation before any send; a crash between this
+        # write and queueing the text resumes that same notice on the next tick.
+        record['state']='blocked';record['context_fallback']=fallback
+        write(path,record)
+        helpers['quiet_file_context_notice'](path.stem,record,fallback)
+        return 'blocked'
     photo = Path(record["filename"]).suffix.lower() in PHOTO_SUFFIXES
     body, boundary = multipart(record["chat"], record["filename"], data,
                                record["caption"], file_field="photo" if photo else "document",
@@ -626,17 +637,20 @@ def quiet_file_main(argv: list[str]) -> None:
                         run_key, task, occurrence, chat_id, thread_id, source, caption, general_topic):
                 raise SendError("tg-send-file: quiet file record does not match this request")
         else:
+            context=helpers['require_answer_context'](chat_id,thread_id,caption or '',file=True)
             filename, data = read_outbox_file(source)
             if not data:
                 raise SendError("tg-send-file: file is empty")
             check_video_review(chat_id, thread_id, source, filename, data)
             blob_name = f"{digest}.blob"
             quiet_copy_blob(root, blob_name, data)
+            proof=(context or {}).get('proof')
+            if isinstance(proof,dict):proof={**proof,'fileSha256':hashlib.sha256(data).hexdigest()}
             record = {"version": 1, "kind": "file", "run_key": run_key, "task": task,
                       "occurrence": occurrence, "chat": chat_id, "thread": thread_id,
                       "general_topic": general_topic,
                       "source": source, "filename": filename, "caption": caption,
-                      "size": len(data), "sha256": hashlib.sha256(data).hexdigest(),
+                      "size": len(data), "sha256": hashlib.sha256(data).hexdigest(), 'context_proof':proof,
                       "blob": blob_name, "state": "ready", "retry_at": 0, "receipt": None}
             helpers["quiet_write"](path, record)
         state = quiet_file_send(root, path, record, helpers)
@@ -687,6 +701,7 @@ def main(argv: list[str]) -> None:
             raise SendError("tg-send-file: file is empty")
         check_video_review(chat_id, thread_id, path, filename, data)
         delivery = runpy.run_path(str(Path(__file__).with_name('tg-send')))
+        delivery['require_answer_context'](chat_id,thread_id,caption or '',os.environ.get('TG_DELIVERY_ID'),file=True)
         context = delivery['capture_delivery'](chat_id, thread_id)
         delivery['settle_on_signals'](context, [])
         try:
