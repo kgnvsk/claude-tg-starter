@@ -1,9 +1,9 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-10-15.55b01e69bdb9`
+- Реліз: `2026-10-16.2f7e52acce2b`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `55b01e69bdb960e0bfa3efaebe442f11e8d2377b`
-- Дата релізу: `2026-10-15`
+- Ревізія вихідного комплекту: `2f7e52acce2b818b4c41cf5c68a924480fa29e47`
+- Дата релізу: `2026-10-16`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
 
@@ -19,8 +19,7 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    Preserve approved runtime files through installer finalization
-    Unblock legacy updates without overwriting owner customizations
+    fix: accept successful Claude answers covered by extra usage
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не
