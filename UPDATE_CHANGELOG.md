@@ -1,8 +1,8 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-10-16.407d4fc9ae8b`
+- Реліз: `2026-10-16.c6d874fe27af`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `407d4fc9ae8b854ab0f6679bac4c07dd5d2c6aec`
+- Ревізія вихідного комплекту: `c6d874fe27af3889c508e44f436046b8544fb9fe`
 - Дата релізу: `2026-10-16`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
@@ -19,8 +19,7 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    test: verify native archive consent boundary honestly
-    fix: read numbered owner rules and honor scoped owner approvals
+    Manage business access and scoped MCP from admitted chats
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не

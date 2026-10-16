@@ -157,6 +157,9 @@ def access_admin_audit(db: sqlite3.Connection) -> None:
         UNIQUE(token, event))""")
     if "change_json" not in {row[1] for row in db.execute("PRAGMA table_info(access_admin_audit)")}:
         db.execute("ALTER TABLE access_admin_audit ADD COLUMN change_json TEXT")
+    for name, definition in (("chat_id", "TEXT"), ("thread_id", "INTEGER")):
+        if name not in {row[1] for row in db.execute("PRAGMA table_info(access_admin_audit)")}:
+            db.execute(f"ALTER TABLE access_admin_audit ADD COLUMN {name} {definition}")
     db.execute("""CREATE TRIGGER IF NOT EXISTS access_admin_audit_no_update
         BEFORE UPDATE ON access_admin_audit BEGIN SELECT RAISE(ABORT, 'access audit is append-only'); END""")
     db.execute("""CREATE TRIGGER IF NOT EXISTS access_admin_audit_no_delete
@@ -166,18 +169,22 @@ def access_admin_audit(db: sqlite3.Connection) -> None:
 def record_admin_decision(db: sqlite3.Connection, *, kind: str, token: str, owner: str,
                           actor: str, subject: str, event: str,
                           message_id: int | None = None, decision: str | None = None,
-                          change_json: str | None = None) -> None:
+                          change_json: str | None = None, chat_id: str | None = None,
+                          thread_id: int | None = None) -> None:
     access_admin_audit(db)
-    if message_id is None or change_json is None:
-        row = db.execute("SELECT message_id,change_json FROM access_admin_audit WHERE token=? AND event='previewed'",
+    if message_id is None or change_json is None or chat_id is None:
+        row = db.execute("SELECT message_id,change_json,chat_id,thread_id FROM access_admin_audit WHERE token=? AND event='previewed'",
                          (token,)).fetchone()
         if row:
             message_id = row[0] if message_id is None else message_id
             change_json = row[1] if change_json is None else change_json
+            if chat_id is None:
+                chat_id, thread_id = row[2:]
         # An approval may predate this audit schema; then both fields are null.
     db.execute("INSERT OR IGNORE INTO access_admin_audit "
-               "(ts,kind,token,owner,actor,subject,message_id,decision,event,change_json) VALUES (?,?,?,?,?,?,?,?,?,?)",
-               (int(time.time() * 1000), kind, token, owner, actor, subject, message_id, decision, event, change_json))
+               "(ts,kind,token,owner,actor,subject,message_id,decision,event,change_json,chat_id,thread_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+               (int(time.time() * 1000), kind, token, owner, actor, subject, message_id, decision, event,
+                change_json, chat_id, thread_id))
 
 
 def close_stale_preview(path: Path, table: str, kind: str, token: str, owner: str,
@@ -232,17 +239,87 @@ def settings_pin_subject(change: object) -> str | None:
     return None
 
 
-def confirmation_status(path: Path, table: str, owner: str, actor: str, token: str) -> str:
+def preview_scope_columns(db: sqlite3.Connection, table: str) -> None:
+    if table not in {"access_team_previews", "access_settings_previews"}:
+        raise ValueError("unknown scoped preview table")
+    columns = {row[1] for row in db.execute(f"PRAGMA table_info({table})")}
+    for name, definition in (("chat_id", "TEXT"), ("thread_id", "INTEGER")):
+        if name not in columns:
+            db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+
+
+def management_scope(actor: str, chat_id: str | None, thread_id: str | None) -> tuple[str, int | None]:
+    chat = actor if chat_id is None else chat_id
+    thread = "0" if thread_id is None else thread_id
+    if (not APPROVER.fullmatch(actor) or not re.fullmatch(r"0|[1-9]\d{0,15}", thread)
+            or int(thread) > 9007199254740991
+            or not (chat == actor and thread == "0" or re.fullmatch(r"-[1-9]\d{0,19}", chat))):
+        raise SystemExit("ACCESS_STALE: Invalid management chat")
+    return chat, int(thread) or None
+
+
+def require_management_scope(data: dict, owner: str, actor: str, chat: str, *, stale: bool = False) -> None:
+    try:
+        require_business_administrator(data, owner, actor)
+        groups = data.get("groups", {})
+        if chat != actor and (not isinstance(groups, dict) or not isinstance(groups.get(chat), dict)):
+            raise SystemExit("Management group is not registered")
+    except SystemExit as error:
+        raise SystemExit(f"{'ACCESS_STALE: ' if stale else ''}{error}") from None
+
+
+def management_carrier(path: Path, actor: str, message_id: str, chat: str, thread: int | None) -> None:
+    """A host-owned tool may resolve names; the human confirms the proposed change.
+
+    Its current transport carrier, rather than a target ID in prose, establishes
+    who requested that preview and in exactly which chat/topic.
+    """
+    db_path = path.with_name("messages.db")
+    if db_path.is_symlink() or not db_path.is_file():
+        raise SystemExit("Management carrier unavailable")
+    try:
+        with closing(sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5)) as db:
+            columns = {row[1] for row in db.execute("PRAGMA table_info(messages)")}
+            if chat != actor and "thread_id" not in columns:
+                raise ValueError("group topic provenance unavailable")
+            topic = "COALESCE(thread_id,0)" if "thread_id" in columns else "0"
+            rows = db.execute(f"SELECT ts FROM messages WHERE direction='in' AND user_id=? "
+                              f"AND chat_id=? AND message_id=? AND {topic}=?",
+                              (actor, chat, int(message_id), thread or 0)).fetchall()
+            now = int(time.time() * 1000)
+            if not any(0 <= now - int(row[0]) <= CARRIER_MAX_AGE_S * 1000 for row in rows):
+                raise ValueError("current carrier missing")
+    except (sqlite3.Error, ValueError, TypeError):
+        raise SystemExit("Management carrier unavailable or not current in this chat/topic") from None
+
+
+def confirmation_status(path: Path, table: str, owner: str, actor: str, token: str,
+                        chat_id: str | None = None, thread_id: str | None = None) -> str:
     """Read back a terminal receipt if the confirm process response was lost."""
     if table not in {"access_team_previews", "access_settings_previews", "access_branch_previews"}:
         raise ValueError("unknown confirmation table")
+    scoped = table != "access_branch_previews"
+    if scoped:
+        chat, thread = management_scope(actor, chat_id, thread_id)
+        try:
+            locked_inspect(path, lambda data: require_management_scope(data, owner, actor, chat))
+        except SystemExit:
+            return json.dumps({"state": "missing"})
     db_path = path.with_name("messages.db")
     if db_path.is_symlink() or not db_path.is_file():
         raise SystemExit("Confirmation receipt unavailable")
     with closing(sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2)) as db:
         try:
-            row = db.execute(f"SELECT state FROM {table} WHERE token=? AND owner=? AND actor=?",
-                             (token, owner, actor)).fetchone()
+            if scoped:
+                columns = {row[1] for row in db.execute(f"PRAGMA table_info({table})")}
+                scope_chat = "COALESCE(chat_id,actor)" if "chat_id" in columns else "actor"
+                scope_thread = "COALESCE(thread_id,0)" if "thread_id" in columns else "0"
+                row = db.execute(f"SELECT state FROM {table} WHERE token=? AND owner=? AND actor=? "
+                                 f"AND {scope_chat}=? AND {scope_thread}=?",
+                                 (token, owner, actor, chat, thread or 0)).fetchone()
+            else:
+                row = db.execute(f"SELECT state FROM {table} WHERE token=? AND owner=? AND actor=?",
+                                 (token, owner, actor)).fetchone()
         except sqlite3.OperationalError:
             row = None
     return json.dumps({"state": row[0] if row else "missing"})
@@ -301,39 +378,55 @@ def change_team_role(data: dict, owner: str, actor: str, target: str, role: str)
     return f"Роль {target}: {role}"
 
 
-def team_preview(path: Path, owner: str, actor: str, message_id: str, target: str, role: str) -> str:
-    if not message_id.isdigit():
+def team_preview(path: Path, owner: str, actor: str, message_id: str, target: str, role: str,
+                 chat_id: str | None = None, thread_id: str | None = None) -> str:
+    if not APPROVER.fullmatch(message_id):
         raise SystemExit("Неправильний номер повідомлення")
-    corroborate_requester(path, actor, message_id, target, private_only=True)
+    chat, thread = management_scope(actor, chat_id, thread_id)
+    if chat_id is None:
+        corroborate_requester(path, actor, message_id, target, private_only=True)
+    else:
+        management_carrier(path, actor, message_id, chat, thread)
     snapshot = json.loads(locked_inspect(path, lambda data: json.dumps(data)))
+    require_management_scope(snapshot, owner, actor, chat)
     proposed = json.loads(json.dumps(snapshot))
     refuse_pinned(proposed, f"team:{target}")
     summary = change_team_role(proposed, owner, actor, target, role)
     token = str(uuid.uuid4())
     expires_at = int(time.time() * 1000) + TEAM_PREVIEW_TTL_MS
     with closing(sqlite3.connect(path.with_name("messages.db"), timeout=5)) as db, db:
+        db.execute("BEGIN IMMEDIATE")
         db.execute("""CREATE TABLE IF NOT EXISTS access_team_previews (
             token TEXT PRIMARY KEY, owner TEXT NOT NULL, actor TEXT NOT NULL,
             target TEXT NOT NULL, role TEXT NOT NULL, base_hash TEXT NOT NULL, post_hash TEXT NOT NULL,
             expires_at INTEGER NOT NULL, state TEXT NOT NULL)""")
+        preview_scope_columns(db, "access_team_previews")
         cleanup_access_previews(db, "access_team_previews", expires_at - TEAM_PREVIEW_TTL_MS)
-        db.execute("INSERT INTO access_team_previews VALUES (?,?,?,?,?,?,?,?,'pending')",
-                   (token, owner, actor, target, role, team_fingerprint(snapshot), team_fingerprint(proposed), expires_at))
+        db.execute("INSERT INTO access_team_previews "
+                   "(token,owner,actor,target,role,base_hash,post_hash,expires_at,state,chat_id,thread_id) "
+                   "VALUES (?,?,?,?,?,?,?,?,'pending',?,?)",
+                   (token, owner, actor, target, role, team_fingerprint(snapshot), team_fingerprint(proposed), expires_at,
+                    chat, thread))
         record_admin_decision(db, kind="team", token=token, owner=owner, actor=actor,
                               subject=target, message_id=int(message_id), event="previewed",
-                              change_json=json.dumps({"role": role}, separators=(",", ":")))
+                              change_json=json.dumps({"role": role}, separators=(",", ":")), chat_id=chat, thread_id=thread)
     return json.dumps({"token": token, "expiresAt": expires_at, "summary": summary}, ensure_ascii=False)
 
 
-def team_confirm(path: Path, owner: str, actor: str, token: str, decision: str) -> str:
+def team_confirm(path: Path, owner: str, actor: str, token: str, decision: str,
+                 chat_id: str | None = None, thread_id: str | None = None) -> str:
     if decision not in {"approve", "cancel"}:
         raise SystemExit("Неправильне підтвердження")
+    chat, thread = management_scope(actor, chat_id, thread_id)
+    locked_inspect(path, lambda data: require_management_scope(data, owner, actor, chat, stale=True))
     now = int(time.time() * 1000)
     with closing(sqlite3.connect(path.with_name("messages.db"), timeout=5)) as db, db:
         db.execute("BEGIN IMMEDIATE")
         access_admin_audit(db)
+        preview_scope_columns(db, "access_team_previews")
         row = db.execute("SELECT owner,actor,target,role,base_hash,post_hash,expires_at,state "
-                         "FROM access_team_previews WHERE token=?", (token,)).fetchone()
+                         "FROM access_team_previews WHERE token=? AND COALESCE(chat_id,actor)=? AND COALESCE(thread_id,0)=?",
+                         (token, chat, thread or 0)).fetchone()
         if row is None or row[0] != owner or row[1] != actor:
             raise SystemExit("ACCESS_STALE: Підтвердження відсутнє, прострочене або вже використане")
         if row[7] == "claimed" and decision == "approve":
@@ -349,6 +442,7 @@ def team_confirm(path: Path, owner: str, actor: str, token: str, decision: str) 
                                   change_json=json.dumps({"role": row[3]}, separators=(",", ":")))
     if row[7] == "claimed":
         current = json.loads(locked_inspect(path, lambda data: json.dumps(data)))
+        require_management_scope(current, owner, actor, chat, stale=True)
         if team_fingerprint(current) != row[5]:
             raise SystemExit("Стан зміни ролі невизначений; перевірте поточний список доступу")
         with closing(sqlite3.connect(path.with_name("messages.db"), timeout=5)) as db, db:
@@ -361,6 +455,7 @@ def team_confirm(path: Path, owner: str, actor: str, token: str, decision: str) 
         return "Скасовано"
     _, _, target, role, base_hash, _, _, _ = row
     def apply(data: dict) -> str:
+        require_management_scope(data, owner, actor, chat, stale=True)
         if team_fingerprint(data) != base_hash:
             raise SystemExit("ACCESS_STALE: Склад доступу змінився; створіть нове підтвердження")
         refuse_pinned(data, f"team:{target}", stale=True)
@@ -452,32 +547,42 @@ def apply_settings(data: dict, owner: str, actor: str, change: dict) -> str:
     raise SystemExit("Invalid setting request")
 
 
-def settings_preview(path: Path, owner: str, actor: str, message_id: str, change_json: str) -> str:
-    if not message_id.isdigit() or len(change_json) > 8192:
+def settings_preview(path: Path, owner: str, actor: str, message_id: str, change_json: str,
+                     chat_id: str | None = None, thread_id: str | None = None) -> str:
+    if not APPROVER.fullmatch(message_id) or len(change_json) > 8192:
         raise SystemExit("Invalid setting request")
     try:
         change = json.loads(change_json)
     except ValueError:
         raise SystemExit("Invalid setting request") from None
-    corroborate_requester(path, actor, message_id, "settings", private_only=True)
+    chat, thread = management_scope(actor, chat_id, thread_id)
+    if chat_id is None:
+        corroborate_requester(path, actor, message_id, "settings", private_only=True)
+    else:
+        management_carrier(path, actor, message_id, chat, thread)
     snapshot = json.loads(locked_inspect(path, lambda data: json.dumps(data)))
+    require_management_scope(snapshot, owner, actor, chat)
     proposed = json.loads(json.dumps(snapshot))
     refuse_pinned(proposed, settings_pin_subject(change))
     summary = apply_settings(proposed, owner, actor, change)
     token = str(uuid.uuid4())
     expires_at = int(time.time() * 1000) + TEAM_PREVIEW_TTL_MS
     with closing(sqlite3.connect(path.with_name("messages.db"), timeout=5)) as db, db:
+        db.execute("BEGIN IMMEDIATE")
         db.execute("""CREATE TABLE IF NOT EXISTS access_settings_previews (
             token TEXT PRIMARY KEY, owner TEXT NOT NULL, actor TEXT NOT NULL,
             change_json TEXT NOT NULL, base_hash TEXT NOT NULL, post_hash TEXT NOT NULL,
             expires_at INTEGER NOT NULL, state TEXT NOT NULL)""")
+        preview_scope_columns(db, "access_settings_previews")
         cleanup_access_previews(db, "access_settings_previews", expires_at - TEAM_PREVIEW_TTL_MS)
-        db.execute("INSERT INTO access_settings_previews VALUES (?,?,?,?,?,?,?,'pending')",
+        db.execute("INSERT INTO access_settings_previews "
+                   "(token,owner,actor,change_json,base_hash,post_hash,expires_at,state,chat_id,thread_id) "
+                   "VALUES (?,?,?,?,?,?,?,'pending',?,?)",
                    (token, owner, actor, json.dumps(change, ensure_ascii=False),
-                    team_fingerprint(snapshot), team_fingerprint(proposed), expires_at))
+                    team_fingerprint(snapshot), team_fingerprint(proposed), expires_at, chat, thread))
         record_admin_decision(db, kind="settings", token=token, owner=owner, actor=actor,
                               subject=settings_subject(change), message_id=int(message_id),
-                              event="previewed", change_json=json.dumps(change, ensure_ascii=False))
+                              event="previewed", change_json=json.dumps(change, ensure_ascii=False), chat_id=chat, thread_id=thread)
     return json.dumps({"token": token, "expiresAt": expires_at, "summary": summary}, ensure_ascii=False)
 
 
@@ -593,15 +698,20 @@ def team_apply_request(path: Path, delivery: str, target: str, role: str) -> str
     return result
 
 
-def settings_confirm(path: Path, owner: str, actor: str, token: str, decision: str) -> str:
+def settings_confirm(path: Path, owner: str, actor: str, token: str, decision: str,
+                     chat_id: str | None = None, thread_id: str | None = None) -> str:
     if decision not in {"approve", "cancel"}:
         raise SystemExit("Invalid setting confirmation")
+    chat, thread = management_scope(actor, chat_id, thread_id)
+    locked_inspect(path, lambda data: require_management_scope(data, owner, actor, chat, stale=True))
     now = int(time.time() * 1000)
     with closing(sqlite3.connect(path.with_name("messages.db"), timeout=5)) as db, db:
         db.execute("BEGIN IMMEDIATE")
         access_admin_audit(db)
+        preview_scope_columns(db, "access_settings_previews")
         row = db.execute("SELECT owner,actor,change_json,base_hash,post_hash,expires_at,state "
-                         "FROM access_settings_previews WHERE token=?", (token,)).fetchone()
+                         "FROM access_settings_previews WHERE token=? AND COALESCE(chat_id,actor)=? AND COALESCE(thread_id,0)=?",
+                         (token, chat, thread or 0)).fetchone()
         if row is None or row[0] != owner or row[1] != actor:
             raise SystemExit("ACCESS_STALE: Setting confirmation unavailable")
         if row[6] == "claimed" and decision == "approve":
@@ -618,6 +728,7 @@ def settings_confirm(path: Path, owner: str, actor: str, token: str, decision: s
                                   change_json=row[2])
     if row[6] == "claimed":
         current = json.loads(locked_inspect(path, lambda data: json.dumps(data)))
+        require_management_scope(current, owner, actor, chat, stale=True)
         if team_fingerprint(current) != row[4]:
             raise SystemExit("Setting state uncertain; inspect before retry")
         with closing(sqlite3.connect(path.with_name("messages.db"), timeout=5)) as db, db:
@@ -630,6 +741,7 @@ def settings_confirm(path: Path, owner: str, actor: str, token: str, decision: s
     if decision == "cancel":
         return "Скасовано"
     def apply(data: dict) -> str:
+        require_management_scope(data, owner, actor, chat, stale=True)
         if team_fingerprint(data) != row[3]:
             raise SystemExit("ACCESS_STALE: Settings changed; create a new confirmation")
         refuse_pinned(data, settings_pin_subject(json.loads(row[2])), stale=True)
@@ -993,17 +1105,17 @@ def main(argv: list[str]) -> int:
             f"       {command_name} preserve-admins <path> <chat_id_власника> [additional_csv]\n"
             f"       {command_name} set-superadmins <path> <chat_id_власника> <csv>\n"
             f"       {command_name} team-list <path> <owner> <actor>\n"
-            f"       {command_name} team-preview <path> <owner> <actor> <message_id> <target> <role>\n"
-            f"       {command_name} team-confirm <path> <owner> <actor> <token> <approve|cancel>\n"
-            f"       {command_name} team-status <path> <owner> <actor> <token>\n"
+            f"       {command_name} team-preview <path> <owner> <actor> <message_id> <target> <role> [chat_id thread_id_or_0]\n"
+            f"       {command_name} team-confirm <path> <owner> <actor> <token> <approve|cancel> [chat_id thread_id_or_0]\n"
+            f"       {command_name} team-status <path> <owner> <actor> <token> [chat_id thread_id_or_0]\n"
             f"       {command_name} settings-list <path> <owner> <actor>\n"
-            f"       {command_name} settings-preview <path> <owner> <actor> <message_id> <json>\n"
+            f"       {command_name} settings-preview <path> <owner> <actor> <message_id> <json> [chat_id thread_id_or_0]\n"
             f"       {command_name} settings-apply-request <path> <delivery_id> <json>\n"
             f"       {command_name} team-apply-request <path> <delivery_id> <person_id> <role>\n"
             '       settings JSON: {"scope":"group","groupId":"-100…","setting":"requireMention","value":false}\n'
             '                      {"scope":"agent","setting":"replyToMode","value":"first"}\n'
-            f"       {command_name} settings-confirm <path> <owner> <actor> <token> <approve|cancel>\n"
-            f"       {command_name} settings-status <path> <owner> <actor> <token>\n"
+            f"       {command_name} settings-confirm <path> <owner> <actor> <token> <approve|cancel> [chat_id thread_id_or_0]\n"
+            f"       {command_name} settings-status <path> <owner> <actor> <token> [chat_id thread_id_or_0]\n"
             f"       {command_name} branch-preview <path> <owner> <manager_agent> <approvers_csv> <json>\n"
             f"       {command_name} branch-confirm <path> <owner> <actor> <token> <approve|cancel>\n"
             f"       {command_name} branch-status <path> <owner> <actor> <token>\n"
@@ -1025,24 +1137,24 @@ def main(argv: list[str]) -> int:
         message = locked_update(path, lambda data: set_superadmins(data, argv[3], argv[4]))
     elif command == "team-list" and len(argv) == 5:
         message = locked_inspect(path, lambda data: team_list(data, argv[3], argv[4]))
-    elif command == "team-preview" and len(argv) == 8:
-        message = team_preview(path, argv[3], argv[4], argv[5], argv[6], argv[7])
-    elif command == "team-confirm" and len(argv) == 7:
-        message = team_confirm(path, argv[3], argv[4], argv[5], argv[6])
-    elif command == "team-status" and len(argv) == 6:
-        message = confirmation_status(path, "access_team_previews", argv[3], argv[4], argv[5])
+    elif command == "team-preview" and len(argv) in (8, 10):
+        message = team_preview(path, *argv[3:])
+    elif command == "team-confirm" and len(argv) in (7, 9):
+        message = team_confirm(path, *argv[3:])
+    elif command == "team-status" and len(argv) in (6, 8):
+        message = confirmation_status(path, "access_team_previews", *argv[3:])
     elif command == "settings-list" and len(argv) == 5:
         message = locked_inspect(path, lambda data: settings_list(data, argv[3], argv[4]))
-    elif command == "settings-preview" and len(argv) == 7:
-        message = settings_preview(path, argv[3], argv[4], argv[5], argv[6])
+    elif command == "settings-preview" and len(argv) in (7, 9):
+        message = settings_preview(path, *argv[3:])
     elif command == "team-apply-request" and len(argv) == 6:
         message = team_apply_request(path, argv[3], argv[4], argv[5])
     elif command == "settings-apply-request" and len(argv) == 5:
         message = settings_apply_request(path, argv[3], argv[4])
-    elif command == "settings-confirm" and len(argv) == 7:
-        message = settings_confirm(path, argv[3], argv[4], argv[5], argv[6])
-    elif command == "settings-status" and len(argv) == 6:
-        message = confirmation_status(path, "access_settings_previews", argv[3], argv[4], argv[5])
+    elif command == "settings-confirm" and len(argv) in (7, 9):
+        message = settings_confirm(path, *argv[3:])
+    elif command == "settings-status" and len(argv) in (6, 8):
+        message = confirmation_status(path, "access_settings_previews", *argv[3:])
     elif command == "branch-preview" and len(argv) == 7:
         message = branch_preview(path, argv[3], argv[4], argv[5], argv[6])
     elif command == "branch-confirm" and len(argv) == 7:

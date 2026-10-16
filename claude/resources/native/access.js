@@ -1219,6 +1219,14 @@ CREATE TABLE IF NOT EXISTS corporate_resource_previews (
   resolved_at INTEGER
 );
 
+CREATE TABLE IF NOT EXISTS corporate_business_messages (
+  token TEXT PRIMARY KEY,
+  actor TEXT NOT NULL,
+  chat_id TEXT NOT NULL,
+  thread_id INTEGER,
+  message_id INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS corporate_actions (
   action_id TEXT PRIMARY KEY,
   token TEXT NOT NULL UNIQUE,
@@ -1814,6 +1822,16 @@ class CapabilityStore {
     if (context.messageId != null || context.chatId !== message.chatId || context.threadId !== (message.threadId ?? null))
       return false;
     return this.db.query("UPDATE corporate_policy_previews SET conversation_json=? WHERE token=? AND state='pending' AND conversation_json=?").run(safeJson({ ...context, messageId: message.messageId }), token, row.conversationJson).changes === 1;
+  }
+  bindBusinessMessage(token, message) {
+    const preview = this.preview(token) ?? this.resourcePreview(token);
+    if (!preview || preview.state !== "pending" || !this.businessAdministrator(preview.requestedBy) || !Number.isSafeInteger(message.messageId) || message.messageId <= 0 || !/^-?[1-9]\d{0,19}$/.test(message.chatId) || message.threadId != null && (!message.chatId.startsWith("-") || !Number.isSafeInteger(message.threadId) || message.threadId <= 0) || !message.chatId.startsWith("-") && message.chatId !== preview.requestedBy)
+      return false;
+    return this.db.query("INSERT OR IGNORE INTO corporate_business_messages(token,actor,chat_id,thread_id,message_id) VALUES(?,?,?,?,?)").run(token, preview.requestedBy, message.chatId, message.threadId ?? null, message.messageId).changes === 1;
+  }
+  businessMessageMatches(token, message) {
+    const row = this.db.query("SELECT actor,chat_id AS chatId,thread_id AS threadId,message_id AS messageId FROM corporate_business_messages WHERE token=?").get(token);
+    return row == null ? null : row.actor === message.userId && row.chatId === message.chatId && row.threadId === (message.threadId ?? null) && row.messageId === message.messageId;
   }
   policyTokenForMessage(message) {
     return this.db.query(`SELECT token FROM corporate_policy_previews WHERE state='pending'

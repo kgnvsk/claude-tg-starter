@@ -31,10 +31,12 @@ UPSTREAM_SERVER_SHA256 = (
 )
 UPSTREAM_PACKAGE_START = "bun install --no-summary 1>&2 && bun server.ts"
 GOLDEN_SERVER_SHA256 = (
-    "c701e186f207be9ae1343b36572d6dbf2e3c3441a4a3be22f637f19fc9bc5926"
+    "c9bf64d8cea0cc979528db07ccd98211908f087cfd45aebd512ca3a97bfa6622"
 )
 PREVIOUS_GOLDEN_SERVER_SHA256S = frozenset(
     {
+        # The golden before administrator management from the current chat.
+        "c701e186f207be9ae1343b36572d6dbf2e3c3441a4a3be22f637f19fc9bc5926",
         # The golden before Readable access cards and native continuation of owner decisions.
         "1ba611f6b1da654d421d1ca5a084eb3c06cd0a867b37a81688eb5f2c56e1f76d",
         # The golden before typed Analytics Search Console SQL and hosting resource controls.

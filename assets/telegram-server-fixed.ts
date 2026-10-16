@@ -991,6 +991,11 @@ type CorporateGatewayRuntime = {
     actorUserId: string,
   ): Promise<CorporateGatewayPolicyPreviewResult>
   previewResource(input: Record<string, unknown>, actorUserId: string): Promise<CorporateGatewayPolicyPreviewResult>
+  bindBusinessPreviewMessage(token: string, message: { chatId: string; messageId: number; threadId?: number }): boolean
+  ownerRemoteMcp(identity: CorporateGatewayCallbackContext, request: {
+    action: 'list' | 'connect' | 'disable'; name?: string; scope?: { userId: string; chatId: string; threadId?: number }
+  } | { action: 'list_tools' | 'describe_tool' | 'call_tool'; name: string; tool?: string; arguments?: Record<string, unknown> },
+    host: { requestKey: string; isLive: () => boolean }, signal?: AbortSignal): Promise<string>
   bindPolicyPreviewMessage(token: string, message: { chatId: string; messageId: number; threadId?: number }): boolean
   policyPreviewTokenForMessage(message: { chatId: string; messageId: number; threadId?: number }): string | null
   shutdown(): Promise<void>
@@ -6687,7 +6692,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     }, {
       name: 'corporate_resource_preview',
-      description: 'Register or revoke an exact work resource on the primary owner\u2019s word. Pass the delivery_id of his request in this turn in his private chat: it is the decision and applies at once; without it a card goes to him to confirm. The owner already has authority; no superadmin role or Novsky access is needed. For a Google calendar use the connected account email, calendarId and access=read or read_write. The whole Google Drive of a connected account (every spreadsheet, document, presentation and file, and new ones with read_write) is one switch: connector=google kind=drive with account and access. Analytics uses google/analytics_property with propertyId; Search Console uses google/search_site with siteUrl (both account and access=read). SQL uses sql/bigquery_project with projectId or sql/sqlite_profile with a host-configured profile alias and access=read. Vercel uses vercel/hosting, optional connected team scope and access=read_write; each resource gets its own project namespace. These select existing connections; never ask an employee for host paths or credentials. Other supported kinds name their exact file, account, group or origin. A Telegram channel is connector=telegram kind=channel with its numeric chatId (resolve @username with Bot API getChat; the bot must be the channel administrator). The owner’s connected Instagram is connector=instagram kind=account with the businessId that ig-social doctor reports and access=read or read_write. A Facebook Page is connector=facebook kind=page with its numeric pageId (fb-page doctor confirms the token). A YouTube channel is connector=youtube kind=channel with the connected Google account and its UC… channelId. A Claude connector of this account (ClickUp, Notion, HubSpot…) is connector=mcp kind=connector with name = the part after claude_ai_ in its tool names mcp__claude_ai_<name>__…; granting connector.use on it opens all of that connector\u2019s tools in the chosen chat. The meeting recorder (meet-bot on the Recall.ai key) is connector=recall kind=recorder; meeting.record lets the chosen chat send a bot into a Zoom, Meet, Teams or Webex call and get its transcript. Never guess the target or share a personal calendar by default. Without the owner\u2019s current request it sends him Confirm/Cancel; either way it neither verifies/connects Google nor grants employee access. Once registered, grant the selected resource with corporate_policy_preview. Do not pause/resume the company in the shell: confirmation performs its own maintenance and queues current company work again.',
+      description: 'Register or revoke an exact work resource on the primary owner\u2019s word. Pass the delivery_id of his request in this turn in his private chat, group or topic: it is the decision and applies at once; without it a card goes to him to confirm. The owner already has authority; no superadmin role or Novsky access is needed. For a Google calendar use the connected account email, calendarId and access=read or read_write. The whole Google Drive of a connected account (every spreadsheet, document, presentation and file, and new ones with read_write) is one switch: connector=google kind=drive with account and access. Analytics uses google/analytics_property with propertyId; Search Console uses google/search_site with siteUrl (both account and access=read). SQL uses sql/bigquery_project with projectId or sql/sqlite_profile with a host-configured profile alias and access=read. Vercel uses vercel/hosting, optional connected team scope and access=read_write; each resource gets its own project namespace. These select existing connections; never ask an employee for host paths or credentials. Other supported kinds name their exact file, account, group or origin. A Telegram channel is connector=telegram kind=channel with its numeric chatId (resolve @username with Bot API getChat; the bot must be the channel administrator). The owner’s connected Instagram is connector=instagram kind=account with the businessId that ig-social doctor reports and access=read or read_write. A Facebook Page is connector=facebook kind=page with its numeric pageId (fb-page doctor confirms the token). A YouTube channel is connector=youtube kind=channel with the connected Google account and its UC… channelId. A Claude connector of this account (ClickUp, Notion, HubSpot…) is connector=mcp kind=connector with name = the part after claude_ai_ in its tool names mcp__claude_ai_<name>__…; granting connector.use on it opens all of that connector\u2019s tools in the chosen chat. The meeting recorder (meet-bot on the Recall.ai key) is connector=recall kind=recorder; meeting.record lets the chosen chat send a bot into a Zoom, Meet, Teams or Webex call and get its transcript. Never guess the target or share a personal calendar by default. Without the owner\u2019s current request it sends him Confirm/Cancel; either way it neither verifies/connects Google nor grants employee access. Once registered, grant the selected resource with corporate_policy_preview. Do not pause/resume the company in the shell: confirmation performs its own maintenance and queues current company work again.',
       inputSchema: {
         type: 'object', additionalProperties: false,
         properties: {
@@ -6716,6 +6721,25 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         },
         required: ['action', 'id'],
       },
+    }, {
+      name: 'corporate_mcp',
+      description: 'Manage and use HTTP MCP connections on the authenticated owner’s current request in any admitted private chat, group or topic. Always pass this turn’s delivery_id. For management, scope can bind a named colleague to a selected chat/topic without private bot access; omitted scope selects the owner here. connect starts protected MCP_URL intake in this chat/topic; never put credentials in tool arguments. list shows safe names; disable revokes that binding. list_tools, describe_tool and call_tool use only the owner’s connector in this exact chat/topic and do not accept scope. Inspect the tool schema before calling. Writes require the owner’s instruction; an uncertain result must not be retried automatically.',
+      inputSchema: {
+        type: 'object', additionalProperties: false,
+        properties: {
+          action: { type: 'string', enum: ['list', 'connect', 'disable', 'list_tools', 'describe_tool', 'call_tool'] },
+          name: { type: 'string', pattern: '^[a-z][a-z0-9_-]{0,31}$' },
+          tool: { type: 'string', pattern: '^[A-Za-z0-9_.:-]{1,128}$' },
+          arguments: { type: 'object' },
+          scope: { type: 'object', additionalProperties: false, properties: {
+            userId: { type: 'string', pattern: '^[1-9][0-9]{0,19}$' },
+            chatId: { type: 'string', pattern: '^-?[1-9][0-9]{0,19}$' },
+            threadId: { type: 'integer', minimum: 1, maximum: Number.MAX_SAFE_INTEGER },
+          }, required: ['userId', 'chatId'] },
+          delivery_id: { type: 'string', description: 'Exact delivery_id of the current authenticated owner request.' },
+        },
+        required: ['action', 'delivery_id'],
+      },
     }] : []),
   ],
 }))
@@ -6736,6 +6760,23 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
   })
   try {
     switch (req.params.name) {
+      case 'corporate_mcp': {
+        if (!OWNER_CHAT_ID || typeof args.delivery_id !== 'string') throw new Error('current owner delivery_id is required')
+        const { delivery_id: deliveryId, ...control } = args
+        const { validRemoteMcpRequest, validRemoteMcpUseRequest } = await import(new URL('./remote-mcp.ts', pathToFileURL(CORPORATE_MODULE)).href)
+        if (!validRemoteMcpRequest(control) && !validRemoteMcpUseRequest(control)) throw new Error('invalid corporate MCP request')
+        const { currentOwnerRequestOrigin } = await import(new URL('./chat-policy.ts', pathToFileURL(CORPORATE_MODULE)).href)
+        const origin = currentOwnerRequestOrigin(MSG_DB, OWNER_CHAT_ID, DELIVERY_STAMP, deliveryId)
+        if (!origin) throw new Error('no current authenticated owner request in this chat')
+        const corporate = await corporateRuntimeReady()
+        if (!corporate?.ownerRemoteMcp) throw new Error('corporate MCP controls are unavailable')
+        const host = { requestKey: `${origin.chatId}:${origin.messageId}`, isLive: () => {
+          const current = currentOwnerRequestOrigin(MSG_DB, OWNER_CHAT_ID, DELIVERY_STAMP, deliveryId)
+          return !!current && current.userId === origin.userId && current.chatId === origin.chatId
+            && current.messageId === origin.messageId && current.threadId === origin.threadId
+        } }
+        return { content: [{ type: 'text', text: await corporate.ownerRemoteMcp(origin, control, host) }] }
+      }
       case 'corporate_resource_preview': {
         if (!OWNER_CHAT_ID) throw new Error('corporate resource controls are unavailable')
         // The kinds the schema offers (Instagram businessId, Facebook pageId, YouTube channelId) are accepted here too;
@@ -6750,16 +6791,16 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const corporate = await corporateRuntimeReady()
         if (!corporate?.previewResource) throw new Error('corporate resource controls are unavailable')
         const { delivery_id: deliveryId, ...control } = args
-        let ownerMessage: number | null = null
+        let ownerOrigin: CorporateGatewayCallbackContext | null = null
         if (typeof deliveryId === 'string') {
-          const { currentOwnerPrivateRequest } = await import(new URL('./chat-policy.ts', pathToFileURL(CORPORATE_MODULE)).href)
-          ownerMessage = currentOwnerPrivateRequest(MSG_DB, OWNER_CHAT_ID, DELIVERY_STAMP, deliveryId)
+          const { currentOwnerRequestOrigin } = await import(new URL('./chat-policy.ts', pathToFileURL(CORPORATE_MODULE)).href)
+          ownerOrigin = currentOwnerRequestOrigin(MSG_DB, OWNER_CHAT_ID, DELIVERY_STAMP, deliveryId)
         }
         const preview = await corporate.previewResource(control, OWNER_CHAT_ID)
         if (!preview.ok) throw new Error('corporate resource preview rejected')
-        if (ownerMessage != null) {
-          // Owner, 10.10.2026: his order in his private chat is the decision; he gets what changed, nothing to press.
-          const outcome = await corporate.approveResourcePreview(preview.token, { chatType: 'private', chatId: OWNER_CHAT_ID, userId: OWNER_CHAT_ID, messageId: ownerMessage })
+        if (ownerOrigin) {
+          if (!corporate.bindBusinessPreviewMessage?.(preview.token, ownerOrigin)) throw new Error('owner request not bound')
+          const outcome = await corporate.approveResourcePreview(preview.token, ownerOrigin)
           return ownerChangeResult(outcome, true)
         }
         await sendCorporateText(OWNER_CHAT_ID, null, null, preview.summary, { resourceToken: preview.token })
@@ -9088,6 +9129,7 @@ async function handleInbound(
   text = withHiddenLinks(ctx.message, text)
 
   const access = result.access
+  const admittedAction = result.action
   const from = ctx.from!
   const chat_id = String(ctx.chat!.id)
   const msgId = ctx.message?.message_id
@@ -9105,6 +9147,27 @@ async function handleInbound(
   // A pending connection owns only its credential/callback input, never the
   // person's ordinary dialogue. Consume it before any journal or model sees it.
   let sensitiveIntegrationInput = false
+  let protectedMcpInput = false
+  const mcpInput = /(?:^|\n)\s*MCP_URL\b/i.test(text)
+    || (text.match(/https?:\/\/[^\s<>]+/gi) ?? []).some(raw => {
+      try { return /^mcp\.zoho\./i.test(new URL(raw).hostname) } catch { return false }
+    })
+  const mcpUrlCandidate = !ctx.message?.sender_chat && !ctx.message?.forward_origin
+    && /^\s*https?:\/\/\S+\s*$/i.test(text) && (() => {
+      try {
+        const url = new URL(text.trim())
+        return !((['localhost', '127.0.0.1', '[::1]', 'accounts.google.com'].includes(url.hostname) || /oauth|callback/i.test(url.pathname))
+          && ['code', 'state', 'error'].some(key => url.searchParams.has(key)))
+      } catch { return false }
+    })()
+  const ownerMcpInput = String(from.id) === OWNER_CHAT_ID && mcpInput
+  const ownerMcpUrlCandidate = String(from.id) === OWNER_CHAT_ID && mcpUrlCandidate
+    && (CORPORATE_ENABLED || readCorporateIsolationActivated())
+  // Quoting someone else's secret is not the owner's own setup instruction.
+  if (ownerMcpInput && (ctx.message?.sender_chat || ctx.message?.forward_origin)) {
+    await ctx.reply('Переслані дані підключення не застосовано. Надішли адресу MCP окремим власним повідомленням після початку налаштування.', inboundTopicOptions(ctx))
+    return
+  }
   const ownerInGroup = String(from.id) === OWNER_CHAT_ID && !ctx.message?.sender_chat
     && (ctx.chat?.type === 'group' || ctx.chat?.type === 'supergroup')
   const ownerAddressed = ownerInGroup
@@ -9118,26 +9181,27 @@ async function handleInbound(
     && await bot.api.getChatMemberCount(chat_id).then(count => count === 2, () => false)
   // Owner 10.10.2026: a group of two that waits for a mention still answers him without one (Арти's «Документи»).
   if (ownerAlone && result.action === 'observe') result = { action: 'deliver', access }
-  const ownerShared = ownerAddressed || ownerAlone
+  let ownerShared = ownerAddressed || ownerAlone
   if (ownerShared) {
-    // Full tools do not make a public chat a credential intake. Never retain
-    // a pasted connection secret, even when the company module is unavailable.
-    const setup = /(?:^|\n)\s*(?:META_TOKEN|MCP_URL)\b|\b(?:access_token|refresh_token)\s*[:=]|\bEAA[A-Za-z0-9_-]{16,}\b|\bya29\.[A-Za-z0-9_-]{16,}/i.test(text)
+    // MCP has protected same-chat intake. Other providers keep their existing
+    // private setup flow and stay outside group history, even with no module.
+    const setup = /(?:^|\n)\s*META_TOKEN\b|\b(?:access_token|refresh_token)\s*[:=]|\bEAA[A-Za-z0-9_-]{16,}\b|\bya29\.[A-Za-z0-9_-]{16,}/i.test(text)
       || (text.match(/https?:\/\/[^\s<>]+/gi) ?? []).some(raw => {
         try {
           const url = new URL(raw)
-          return /^mcp\.zoho\./i.test(url.hostname) || ((['localhost', '127.0.0.1', '[::1]', 'accounts.google.com'].includes(url.hostname)
+          return ((['localhost', '127.0.0.1', '[::1]', 'accounts.google.com'].includes(url.hostname)
             || /oauth|callback/i.test(url.pathname)) && ['code', 'state', 'error'].some(key => url.searchParams.has(key)))
         } catch { return false }
       })
-    if (setup) {
+    if (setup && !ownerMcpInput && !ownerMcpUrlCandidate) {
       await ctx.reply('Дані для підключення надішли мені в особистий чат. У групі я їх не зберігаю.', inboundTopicOptions(ctx))
       return
     }
   }
-  if (!ownerShared && !(ctx.chat?.type === 'private' && chat_id === OWNER_CHAT_ID && String(from.id) === OWNER_CHAT_ID) && msgId != null
-    && (CORPORATE_ENABLED || readCorporateIsolationActivated())) {
-    const corporate = await corporateRuntimeForIntake()
+  if (msgId != null && (ownerMcpInput || ownerMcpUrlCandidate || (!ownerShared
+    && !(ctx.chat?.type === 'private' && chat_id === OWNER_CHAT_ID && String(from.id) === OWNER_CHAT_ID)))
+    && (ownerMcpInput || ownerMcpUrlCandidate || CORPORATE_ENABLED || readCorporateIsolationActivated())) {
+    const corporate = ownerMcpUrlCandidate && !ownerMcpInput ? await corporateRuntimeReady() : await corporateRuntimeForIntake()
     if (!corporate) {
       if (shuttingDown) throw new RetryableInboundDeliveryError(new Error('Telegram receiver is stopping'))
       recordCorporateIntakeFailure(ctx, msgId, result.action === 'deliver')
@@ -9145,16 +9209,26 @@ async function handleInbound(
     }
     let consumed: { text: string; sensitive: true } | null | undefined
     try {
-      consumed = await corporate.consumeIntegrationInput?.({
+      consumed = await corporate?.consumeIntegrationInput?.({
         chatType: ctx.chat!.type as 'private' | 'group' | 'supergroup', chatId: chat_id, userId: String(from.id),
+        ...(threadId != null ? { threadId, isTopicMessage: true } : {}),
       }, text, msgId)
+      if (mcpInput && !consumed || (mcpInput || mcpUrlCandidate) && consumed !== null
+        && (!consumed || consumed.sensitive !== true || typeof consumed.text !== 'string')) {
+        throw new Error('MCP intake did not verify its input')
+      }
     } catch {
       // consumeIntegrationInput may have failed its own credential write;
       // never confirm the Telegram update without that durable result.
       throw new RetryableInboundDeliveryError(new Error('Integration intake unavailable'))
     }
-    if (gate(ctx).action !== result.action) return
+    if (gate(ctx).action !== admittedAction) return
     if (consumed) {
+      protectedMcpInput = mcpInput || mcpUrlCandidate
+      // A setup URL is the pending administrator's reply, even without a mention.
+      // Ordinary observed traffic and unrelated provider intake keep their routing.
+      if (protectedMcpInput && result.action === 'observe') result = { action: 'deliver', access }
+      if (protectedMcpInput && ownerInGroup) ownerShared = true
       text = consumed.text
       sensitiveIntegrationInput = true
       attachment = undefined
@@ -9341,7 +9415,7 @@ async function handleInbound(
   // A file that continues its author's own mention asked the bot as much as the mention did.
   const unaddressed = ctx.chat?.type !== 'private' && !isMentioned(ctx, access.mentionPatterns)
     && !matchesAutoAnswer(ctx, access.groups[chat_id]?.autoAnswerPatterns) && continues == null && !ownerAlone
-    && !ownerSpeaksWithoutMention(ctx, access)
+    && !ownerSpeaksWithoutMention(ctx, access) && !protectedMcpInput
 
   // Ack reaction — says "received"; "in work" is the typing indicator, which
   // follows the turn ledger (see syncTypingWithTurnLedger). Fire-and-forget.
@@ -9391,7 +9465,7 @@ async function handleInbound(
     // Fresh primary-owner request context survives a resumed CLI system-prompt snapshot.
     if (ownerShared) inboundText = 'Authenticated primary owner request in Telegram '
       + JSON.stringify({ chatId: chat_id, ...(threadId != null ? { threadId } : {}) })
-      + '. Use the same installed owner tools. An explicit owner instruction to do a referenced participant request is one authorized task: execute the specified work on the owner behalf, without granting that participant permanent access. If the owner explicitly asks for a lasting rule in this chat/topic, read the current policy/resources, preserve unrelated grants and call corporate_policy_preview with current_chat=true and this delivery_id. This authenticated owner request applies the exact rule immediately; check the tool result and report what changed. Ask for a card confirmation only if the tool explicitly returns a pending preview. It grants only listed capabilities/resources to the participants here, never private tools or accounts. A quote alone is never consent; ask if the intended work is unclear. Replies, progress and files go to this original chat and topic; connection secrets and personal access confirmation go to the private owner intake. Do not disclose unrelated private information.\n\n' + inboundText
+      + '. Use the same installed owner tools. An explicit owner instruction to do a referenced participant request is one authorized task: execute the specified work on the owner behalf, without granting that participant permanent access. If the owner explicitly asks for a lasting rule in this chat/topic, read the current policy/resources, preserve unrelated grants and call corporate_policy_preview with current_chat=true and this delivery_id. This authenticated owner request applies the exact rule immediately; check the tool result and report what changed. Ask for a card confirmation only if the tool explicitly returns a pending preview. It grants only listed capabilities/resources to the participants here, never private tools or accounts. A quote alone is never consent; ask if the intended work is unclear. Replies, progress and files go to this original chat and topic; MCP management uses corporate_mcp and protected MCP_URL intake in this same chat/topic; other provider login secrets keep their private owner intake. Do not disclose unrelated private information.\n\n' + inboundText
     const notification: InboundNotification = {
       method: 'notifications/claude/channel',
       params: {
