@@ -1,8 +1,8 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-10-16.841949b880e6`
+- Реліз: `2026-10-16.839694ccacb7`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `841949b880e615f7746245cc3f7f1e82abca062b`
+- Ревізія вихідного комплекту: `839694ccacb776b66b322e72c10ba343e42465d9`
 - Дата релізу: `2026-10-16`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
@@ -19,9 +19,7 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    Validate scheduled file context and isolate resumed final parts
-    Bind current-context proof to saved replies and close review bypasses
-    fix(premium): persist reconciled rules and require fresh scoped context
+    fix(telegram): preserve document names in multipart uploads
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не

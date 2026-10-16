@@ -7,7 +7,7 @@
     "local-foundation-v1"
   ],
   "source": "codex/starter/product.json",
-  "sourceRevision": "841949b880e615f7746245cc3f7f1e82abca062b",
+  "sourceRevision": "839694ccacb776b66b322e72c10ba343e42465d9",
   "sourceDirty": false,
   "features": [
     "browser"
@@ -91,7 +91,7 @@
     "assets/bin/skill-doctor": "23f9dd86a9302eaec6ee43a470d8dc0bc2d60758dde54bc1f43a99679e64510d",
     "assets/bin/speak": "83c3820f5b9fedd1faa7b865d985e4a6093f9e44eab730cd61bf81eb827953c1",
     "assets/bin/telegram-backup-chat.ts": "c92ef1d979533148cd2d9a68197209b9600d67216d4811cddd392d424ef53ae7",
-    "assets/bin/tg-send-file": "69722451835da32b5d4b1a9fdf9e6f1a8c7834bf6734469df8e92a12085a1b27",
+    "assets/bin/tg-send-file": "32ec5d6d2057950a1d619231d91cd655cf21e9d7bb99b81af3fcda48a1c146c0",
     "assets/bin/transcribe": "4072b22c496aa9d31e3784e92eea99a89a647eb72e9d2fdd80fc34673e46a75e",
     "assets/bin/transcribe-telegram": "4915b7c98635f5338ea6ab9a246d739c3e649b0c509fc5cbec1780c8f4f0f049",
     "assets/bin/ukargparse.py": "50bae922beaa0173a070b5d27aefefa73f64bcd89bb18223f4c3a29ca3e28ecc",
@@ -222,7 +222,7 @@
     "home/bin/skill-doctor": "23f9dd86a9302eaec6ee43a470d8dc0bc2d60758dde54bc1f43a99679e64510d",
     "home/bin/speak": "83c3820f5b9fedd1faa7b865d985e4a6093f9e44eab730cd61bf81eb827953c1",
     "home/bin/telegram-backup-chat.ts": "c92ef1d979533148cd2d9a68197209b9600d67216d4811cddd392d424ef53ae7",
-    "home/bin/tg-send-file": "69722451835da32b5d4b1a9fdf9e6f1a8c7834bf6734469df8e92a12085a1b27",
+    "home/bin/tg-send-file": "32ec5d6d2057950a1d619231d91cd655cf21e9d7bb99b81af3fcda48a1c146c0",
     "home/bin/transcribe": "4072b22c496aa9d31e3784e92eea99a89a647eb72e9d2fdd80fc34673e46a75e",
     "home/bin/transcribe-telegram": "4915b7c98635f5338ea6ab9a246d739c3e649b0c509fc5cbec1780c8f4f0f049",
     "home/bin/ukargparse.py": "50bae922beaa0173a070b5d27aefefa73f64bcd89bb18223f4c3a29ca3e28ecc",

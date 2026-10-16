@@ -202,8 +202,9 @@ def multipart(
 ) -> tuple[bytes, str]:
     boundary = f"tg-send-file-{secrets.token_hex(16)}"
     marker = boundary.encode("ascii")
-    ascii_name = re.sub(r"[^A-Za-z0-9._-]", "_", filename) or "document"
-    encoded_name = urllib.parse.quote(filename, safe="")
+    # Bot API URL-decodes filename and ignores filename* (RFC7578 form-data).
+    safe_name = re.sub(r"[\x00-\x1f\x7f]", "_", filename) or "document"
+    encoded_name = urllib.parse.quote(safe_name, safe="")
     parts = [
         b"--" + marker,
         b'Content-Disposition: form-data; name="chat_id"',
@@ -227,7 +228,7 @@ def multipart(
             b"--" + marker,
             (
                 f'Content-Disposition: form-data; name="{file_field}"; '
-                f'filename="{ascii_name}"; filename*=UTF-8\'\'{encoded_name}'
+                f'filename="{encoded_name}"'
             ).encode("ascii"),
             f"Content-Type: {mimetypes.guess_type(filename)[0] or 'application/octet-stream'}".encode("ascii"),
             b"",
