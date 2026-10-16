@@ -97,13 +97,29 @@ def migrate(expected):
 def tokens(text):
     return set(re.findall(r'[\w]{3,}',text.lower().replace('ё','е'))) - {'the','and','with','что','как','для','это','его','или','при','все','with'}
 
+def rule_label(row):
+    # Dotted owner-facing numbers are distinct from positional integer reads.
+    match=re.match(r'^\s*(\d+(?:\.\d+)+)(?=\s|$)',row['text'])
+    return match.group(1) if match else None
+
+def read_rule(rows, identifier):
+    if identifier.isdecimal() and 0<int(identifier)<=len(rows):
+        return rows[int(identifier)-1]
+    row=next((x for x in rows if x['id']==identifier),None)
+    if row is not None:return row
+    matched=[x for x in rows if rule_label(x)==identifier]
+    if len(matched)>1:raise ValueError('ambiguous rule label; read the position or stable ID')
+    if not matched:raise ValueError('unknown rule id')
+    return matched[0]
+
 def context(query):
     rows=load()['rules']; words=tokens(query)
+    labels=set(re.findall(r'(?<![\w.])\d+(?:\.\d+)+(?![\w.])',query))
     def score(row):
         found=tokens(row['text'])
-        return sum(10 if x in found else 1 if not any(c.isdigit() for c in x) and any(len(y)>=5 and len(x)>=5 and (y.startswith(x[:5]) or x.startswith(y[:5])) for y in found) else 0 for x in words)
+        return (1000 if rule_label(row) in labels else 0)+sum(10 if x in found else 1 if not any(c.isdigit() for c in x) and any(len(y)>=5 and len(x)>=5 and (y.startswith(x[:5]) or x.startswith(y[:5])) for y in found) else 0 for x in words)
     ordered=sorted(enumerate(rows),key=lambda p:(-score(p[1]),p[0]))
-    out=['OWNER RULES: every rule applies; full text: ~/bin/owner-rules read NUMBER or ID.']
+    out=['OWNER RULES: every rule applies; full text: ~/bin/owner-rules read POSITION, dotted LABEL, or ID.']
     # Numeric positions keep the always-visible index compact. IDs remain stable in storage.
     room=max(12,min(64,(3000-len(out[0]))//max(1,len(rows))-8))
     for i,row in enumerate(rows,1):
@@ -128,8 +144,7 @@ def main():
     elif args.action=='context': print(context(args.query))
     else:
         rows=load()['rules']
-        row=rows[int(args.id)-1] if args.id.isdecimal() and 0<int(args.id)<=len(rows) else next((x for x in rows if x['id']==args.id),None)
-        if row is None: raise ValueError('unknown rule id')
+        row=read_rule(rows,args.id)
         print(row['text'])
 
 if __name__=='__main__':

@@ -1,8 +1,8 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-10-16.2f7e52acce2b`
+- Реліз: `2026-10-16.407d4fc9ae8b`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `2f7e52acce2b818b4c41cf5c68a924480fa29e47`
+- Ревізія вихідного комплекту: `407d4fc9ae8b854ab0f6679bac4c07dd5d2c6aec`
 - Дата релізу: `2026-10-16`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
@@ -19,7 +19,8 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    fix: accept successful Claude answers covered by extra usage
+    test: verify native archive consent boundary honestly
+    fix: read numbered owner rules and honor scoped owner approvals
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не

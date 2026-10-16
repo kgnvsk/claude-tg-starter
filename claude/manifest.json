@@ -7,7 +7,7 @@
     "local-foundation-v1"
   ],
   "source": "codex/starter/product.json",
-  "sourceRevision": "2f7e52acce2b818b4c41cf5c68a924480fa29e47",
+  "sourceRevision": "407d4fc9ae8b854ab0f6679bac4c07dd5d2c6aec",
   "sourceDirty": false,
   "features": [
     "browser"
@@ -44,7 +44,7 @@
   },
   "sourceFiles": {
     "codex/starter/product.json": "71cf9bae55acfc1b64466557dbbafce19130ffed24a81ea7801f8a10b29ebcb7",
-    "codex/build.py": "11cf2aab4d1ae9c1c9552cd17eec01e794a49498d4aff29509a2b094814cb288",
+    "codex/build.py": "6b7319be3806a621a8cc10603002c7d119f8b82e175b0011a965bec6b571291e",
     "native/build_claude.py": "d8e2abd369bbed16fc74b05ccf1f2dc423cf65cf4207167a4069f59961fdbb70",
     "codex/install.py": "0d0dee99ec03858fbccaada1d10b34cfcecdd34627537c871081c93269e4f015",
     "codex/setup.py": "d950735dde0ed1cdd9a96edd5e52b2573ce4691c938c47b4b56a39176af39e8b",
