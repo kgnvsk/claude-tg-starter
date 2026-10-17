@@ -1,9 +1,9 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-10-16.839694ccacb7`
+- Реліз: `2026-10-17.e2b4045662d2`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `839694ccacb776b66b322e72c10ba343e42465d9`
-- Дата релізу: `2026-10-16`
+- Ревізія вихідного комплекту: `e2b4045662d200252a3bc611b290c694a14a6313`
+- Дата релізу: `2026-10-17`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
 
@@ -19,7 +19,17 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    fix(telegram): preserve document names in multipart uploads
+    Finish stale callback turns in the restart recovery test
+    Check effective Linux filesystem denies for scoped MCP profiles
+    Export the reviewed native administrator isolation runtime
+    Stop nested task processes when their scheduled worker is cancelled
+    Continue interrupted CI by selected modules without repeating completed jobs
+    Handle owner group requests across Python versions and clarify call setup
+    Run media installer CI from a readable isolated kit fixture
+    Keep owner calls authenticated, bound to an ID, and honest about delivery
+    Root cron jobs read the sandbox switch from settings too
+    Root installs run without permission prompts too
+    feat: add owner-only Telegram calls
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не

@@ -600,6 +600,30 @@ context_fallback() {
   else printf '%s' 'Перевірка правил і переписки ще не завершена. Виконання не підтверджую; уже зроблених дій не повторюю.'; fi
 }
 
+task_timeout() {
+  local seconds="$1"
+  shift
+  # macOS has no timeout; the production cap is a safety net. On Linux keep
+  # GNU timeout's group (so its deadline kills descendants), but forward death
+  # of its tick/subshell to that group too. An unbound timeout survived cron's
+  # kill and kept the queue lock, suppressing later work and owner notices.
+  if ! command -v timeout >/dev/null; then "$@"; return $?; fi
+  python3 -c 'import ctypes, os, signal, sys
+if sys.platform == "linux":
+    parent = int(sys.argv[1])
+    if os.getppid() != parent:
+        raise SystemExit(143)
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(1, signal.SIGTERM, 0, 0, 0) != 0:  # PR_SET_PDEATHSIG; preserved by exec
+        raise OSError(ctypes.get_errno(), "could not bind task timeout to its parent")
+    if os.getppid() != parent:
+        raise SystemExit(143)
+os.execvp("timeout", ["timeout", *sys.argv[2:]])' "${BASHPID:-$$}" "$seconds" "$@"
+  # Keep this shell as the recorded parent rather than tail-execing Python.
+  local status=$?
+  return "$status"
+}
+
 run_agent_task() {
   local file="$1" prompt="$2" review_request="$2" out rc destination="чат ${chat}"
   local workdir="${AGENT_TASK_DIR:-$HOME/.atarax/agent-task}"
@@ -607,10 +631,6 @@ run_agent_task() {
   # mail-clean ran the bare gog without the ~/bin wrapper that loads the keyring password, and Gmail went unread).
   local agent_path="$HOME/.local/bin:$HOME/.bun/bin:$HOME/bin:/usr/local/bin:${PATH:-/usr/bin:/bin}"
   mkdir -p "$workdir"
-  # `timeout` is missing on macOS, where the tests also run; the cap is a
-  # safety net, not a requirement.
-  local limit=""
-  command -v timeout >/dev/null && limit="timeout ${AGENT_TASK_TIMEOUT:-900}"
   # Text comes back through here and this worker delivers it, so the nested session
   # stays cut off from Telegram — no duplicate messages, and July's leak path stays
   # shut. A file cannot travel through stdout, so ATARAX_TASK_DELIVERY opens exactly
@@ -669,7 +689,7 @@ run_agent_task() {
   fi
   if [ -n "$pending" ] && [ -z "$held" ] && [ ! -s "$observed" ]; then
     part="$pending/look.$$"
-    if (cd "$workdir" && PATH="$agent_path" ATARAX_SUPPRESS_TELEGRAM=1 ${limit:+timeout 60} bash -c "$check_cmd" 2>/dev/null) > "$part"; then
+    if (cd "$workdir" && PATH="$agent_path" ATARAX_SUPPRESS_TELEGRAM=1 task_timeout 60 bash -c "$check_cmd" 2>/dev/null) > "$part"; then
       # A look whose output cannot be read is kept as its file, never taken for silence (R7-P1-1).
       bare=$(tr -d '[:space:]*`."' < "$part") || held=1
       if [ -z "$held" ] && { [ -z "$bare" ] || printf '%s\n' "$bare" | grep -qxE "NO_NEW|$SILENCE_WORDS"; }; then
@@ -759,7 +779,7 @@ ${prompt}"
       ATARAX_TASK_QUIET="$quiet" ATARAX_TASK_ID="${task_id:-$(basename "$file" .rem)}" \
       ATARAX_TASK_OCCURRENCE="$epoch" ATARAX_TASK_RUN_KEY="${quiet_run_key:-}" \
       ATARAX_TASK_DELIVERY_DIR="$REM_DIR/.quiet-delivery" TASK_REVIEW_RUN_DIR="$review_run" ANSWER_CONTEXT_RUN_DIR="$review_run" &&
-    ATARAX_SUPPRESS_TELEGRAM=1 ATARAX_TASK_DELIVERY=1 $limit "$HOME/.local/bin/claude" -p --output-format text <<<"$prompt" 2>&1)
+    ATARAX_SUPPRESS_TELEGRAM=1 ATARAX_TASK_DELIVERY=1 task_timeout "${AGENT_TASK_TIMEOUT:-900}" "$HOME/.local/bin/claude" -p --output-format text <<<"$prompt" 2>&1)
   rc=$?
   if [ "$rc" -eq 0 ] && [ "$quiet" -eq 0 ] && [ -n "$review_run" ]; then
     # Shadow diagnostics never alter stdout, task status, retry or delivery.
