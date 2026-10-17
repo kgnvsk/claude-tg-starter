@@ -383,6 +383,7 @@ ENGLISH_NOTICES = {
 }
 # The login rescue (claude-auth-rescue) speaks through the same catalog.
 RUSSIAN_NOTICES.update({
+    'auth.busy': '⏳ Предыдущий вход ещё завершается. Новая ссылка пока не создана. Повтори /relogin через минуту, если она ещё нужна.',
     'auth.link': '🔐 Срок действия моей авторизации Claude истёк. Восстанови её за минуту, без SSH:\n1) Открой ссылку ниже и войди в свой аккаунт Claude.\n2) Скопируй код со страницы.\n3) Пришли мне сюда код ОДНИМ сообщением (только код, без слов).\n\n{url}\n\n⏳ Жду код 10 минут. Если не успеешь или ссылка перестанет работать — просто напиши мне /relogin, и я сразу пришлю новую (сколько угодно раз).',
     'auth.switch_link': '🔐 Переключаю аккаунт Claude по твоей команде. Текущий вход{current} работает, пока не завершишь новый:\n1) Открой ссылку ниже и войди в НУЖНЫЙ аккаунт Claude.\n2) Скопируй код со страницы.\n3) Пришли мне сюда код ОДНИМ сообщением (только код, без слов).\n\n{url}\n\n⏳ Жду код 10 минут. Передумал — ничего не присылай, всё останется как есть. Новая ссылка — командой /relogin.',
     'auth.hidden': 'скрыто',
@@ -403,6 +404,7 @@ RUSSIAN_NOTICES.update({
     'auth.code_rejected_switch': '❌ Код не подошёл (или прислан с лишним текстом). Остаюсь на {who}. Напиши /relogin — пришлю новую ссылку, попробуем ещё раз.',
 })
 POLISH_NOTICES.update({
+    'auth.busy': '⏳ Poprzednie logowanie jeszcze się kończy. Nowy link nie został utworzony. Powtórz /relogin za minutę, jeśli nadal go potrzebujesz.',
     'auth.link': '🔐 Moje logowanie do Claude wygasło. Przywróć je w minutę, bez SSH:\n1) Otwórz link poniżej i zaloguj się do swojego konta Claude.\n2) Skopiuj kod ze strony.\n3) Wyślij mi tutaj kod JEDNĄ wiadomością (tylko kod, bez słów).\n\n{url}\n\n⏳ Czekam na kod 10 minut. Jeśli nie zdążysz albo link przestanie działać — po prostu napisz mi /relogin, a od razu wyślę nowy (dowolną liczbę razy).',
     'auth.switch_link': '🔐 Przełączam konto Claude na twoje polecenie. Obecne logowanie{current} działa, dopóki nie dokończysz nowego:\n1) Otwórz link poniżej i zaloguj się do WŁAŚCIWEGO konta Claude.\n2) Skopiuj kod ze strony.\n3) Wyślij mi tutaj kod JEDNĄ wiadomością (tylko kod, bez słów).\n\n{url}\n\n⏳ Czekam na kod 10 minut. Zmieniłeś zdanie — nic nie wysyłaj, wszystko zostanie bez zmian. Nowy link — komendą /relogin.',
     'auth.hidden': 'ukryte',
@@ -423,6 +425,7 @@ POLISH_NOTICES.update({
     'auth.code_rejected_switch': '❌ Kod nie pasuje (albo wysłano go z dodatkowym tekstem). Zostaję przy {who}. Napisz /relogin — wyślę nowy link, spróbujemy jeszcze raz.',
 })
 ENGLISH_NOTICES.update({
+    'auth.busy': '⏳ The previous sign-in is still finishing. No new link has been created yet. Repeat /relogin in a minute if you still need one.',
     'auth.link': "🔐 My Claude login has expired. Restore it in a minute, no SSH needed:\n1) Open the link below and sign in to your Claude account.\n2) Copy the code from the page.\n3) Send me the code here in ONE message (just the code, no words).\n\n{url}\n\n⏳ I'll wait 10 minutes for the code. If you miss it or the link stops working, just write /relogin and I'll send a fresh one right away (as many times as needed).",
     'auth.switch_link': "🔐 Switching the Claude account at your command. The current login{current} keeps working until you finish the new one:\n1) Open the link below and sign in to the RIGHT Claude account.\n2) Copy the code from the page.\n3) Send me the code here in ONE message (just the code, no words).\n\n{url}\n\n⏳ I'll wait 10 minutes for the code. Changed your mind? Send nothing and everything stays as it is. A fresh link: /relogin.",
     'auth.hidden': 'hidden',

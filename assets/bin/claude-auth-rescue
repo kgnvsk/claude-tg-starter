@@ -102,6 +102,7 @@ PROC_ROOT = Path("/proc")
 
 URL_TIMEOUT_S = 75        # waiting for the OAuth URL to appear in CLI output
 CODE_TIMEOUT_S = 600      # waiting for the owner to send the code back
+MANUAL_LOCK_WAIT_S = 60   # let a superseded code waiter release its singleton lock
 DEBOUNCE_S = 1200         # min gap between rescue attempts
 # One automatic link per outage. After it, only the owner's /relogin may
 # start another flow; an ignored link must not become a stream of reminders.
@@ -683,16 +684,57 @@ def save_state() -> None:
     STATE_FILE.write_text(json.dumps({"ts": time.time(), "pid": os.getpid()}))
 
 
-def acquire_lock() -> int | None:
+def acquire_lock(wait_s: float = 0) -> int | None:
     """Allow only one interactive OAuth flow per agent."""
     LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
     descriptor = os.open(LOCK_FILE, os.O_CREAT | os.O_RDWR, 0o600)
+    deadline = time.monotonic() + wait_s
     try:
-        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
+        while True:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return descriptor
+            except BlockingIOError:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    os.close(descriptor)
+                    return None
+                time.sleep(min(0.1, remaining))
+    except BaseException:
         os.close(descriptor)
-        return None
-    return descriptor
+        raise
+
+
+class ReloginSuperseded(Exception):
+    """A newer authorized command replaces this code wait, not the live login."""
+
+
+def relogin_requested_since(since_ms: int) -> bool:
+    try:
+        primary = owner_chat()
+        chats = {primary} if manual_relogin_chat(primary) else set()
+        try:
+            access = json.loads(ACCESS_FILE.read_text(encoding="utf-8"))
+            for chat in access.get("superadmins", []):
+                if isinstance(chat, str) and manual_relogin_chat(chat):
+                    chats.add(chat)
+        except (OSError, ValueError, TypeError, AttributeError):
+            pass
+        with closing(sqlite3.connect(f"file:{MESSAGES_DB}?mode=ro", uri=True, timeout=2)) as conn:
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(messages)")}
+            if "user_id" not in columns:
+                chats &= {primary}  # legacy schema proves only the configured owner's DM
+            if not chats:
+                return False
+            rows = conn.execute(
+                f"SELECT text FROM messages WHERE chat_id IN ({','.join('?' for _ in chats)}) "
+                "AND direction='in' AND ts>? "
+                + ("AND chat_id=user_id" if "user_id" in columns else ""),
+                (*sorted(chats), since_ms))
+            return any(isinstance(text, str) and re.fullmatch(
+                r"\s*/?(relogin|релог[іи]н|перевхід)\s*", text, re.IGNORECASE) for (text,) in rows)
+    except (OSError, ValueError, TypeError, sqlite3.Error):
+        return False
 
 
 def owner_wrote_since(since_ms: int) -> bool:
@@ -720,6 +762,10 @@ def wait_code_from_owner(chat: str, since_ms: int, state: str = "",
     while time.time() < deadline:
         if manual_target and not manual_relogin_chat(chat):
             return ""
+        # Read before the auth probe: a fresh private /relogin must release the
+        # old waiter's lock, not leave the new process blocked for ten minutes.
+        if relogin_requested_since(since_ms):
+            raise ReloginSuperseded()
         # A desktop operator may complete a separate login while this rescue is
         # waiting on its own OAuth code. Stop immediately instead of sending a
         # false "still logged out / link expired" alert ten minutes later.
@@ -777,9 +823,16 @@ def login_outcome(switching_from: str, switched_to: str, warn: str,
 
 
 def main(force: bool = False, chat_override: str | None = None) -> int:
-    lock_descriptor = acquire_lock()
+    lock_descriptor = acquire_lock(wait_s=MANUAL_LOCK_WAIT_S if force else 0)
     if lock_descriptor is None:
         log("another rescue flow is active")
+        if force:
+            chat = chat_override or owner_chat()
+            if manual_relogin_chat(chat):
+                send(bot_token(), chat, say("auth.busy",
+                    "⏳ Попередній вхід ще завершується. Нове посилання поки не створено. "
+                    "Повтори /relogin за хвилину, якщо воно ще потрібне."))
+            return 75
         return 0
     if chat_override is not None and (not force or not manual_relogin_chat(chat_override)):
         log("manual relogin recipient no longer authorized")
@@ -926,8 +979,21 @@ def main(force: bool = False, chat_override: str | None = None) -> int:
     log("oauth url sent to authorized chat; waiting for code" if outcome == "delivered"
         else "oauth url send unconfirmed (it may have arrived); waiting for code")
 
-    code = wait_code_from_owner(chat, since_ms, state, switching_from, chat_override is not None,
-                                switching=switching)
+    try:
+        code = wait_code_from_owner(chat, since_ms, state, switching_from, chat_override is not None,
+                                   switching=switching)
+    except ReloginSuperseded:
+        # This unreaped child belongs to this flow; never signal a PID found by
+        # name (another bot may share the Unix user). Release only after it ends.
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        os.waitpid(pid, 0)
+        os.close(fd)
+        log("code wait superseded by a newer authorized /relogin")
+        os.close(lock_descriptor)
+        return 0
     if code is None:
         try:
             os.kill(pid, signal.SIGKILL)

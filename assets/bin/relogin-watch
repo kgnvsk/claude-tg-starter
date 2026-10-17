@@ -118,16 +118,11 @@ def main() -> int:
     requests = {chat: ts for chat, ts in requests.items() if chat in authorized}
     if requests:
         chat = max(requests, key=requests.get)
-        # exactly ONE live login flow: kill any stale one first (no verifier clobber)
-        subprocess.run(["pkill", "-f", "claude auth login"],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        for stale in (AGENT_ROOT / "logs/auth-rescue.state",):
-            try:
-                stale.unlink()
-            except OSError:
-                pass
+        # The waiting rescue observes this private command, stops only its own
+        # login child and releases its lock. The replacement waits for that
+        # handoff; killing CLI children here left their rescue parent locked.
         subprocess.Popen(
-            ["/usr/bin/timeout", "900", str(RESCUE), "--force", "--chat", chat],
+            ["/usr/bin/timeout", "960", str(RESCUE), "--force", "--chat", chat],
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL, start_new_session=True)
         # Network notices can each block for 15 seconds. The rescue must be
