@@ -62,9 +62,9 @@ class LocalChanges(ValueError):
 class ConfiguredBackup(ValueError):
     """A configured backup still runs on an old kit's schedule."""
 
-# A temporary, explicit maintenance exception for the two owner canaries on
-# 38.49.212.20. Fresh installs and ordinary fleet updates always require the
-# current shared collector. No customer policy may be added or changed.
+# A temporary, explicit maintenance exception for the two owner canaries on the
+# owner's test server. Fresh installs and ordinary fleet updates always require
+# the current shared collector. No customer policy may be added or changed.
 LEGACY_CANARY_IDENTITIES = frozenset({
     ("/home/claude-8709793308", "claude-8709793308",
      "claude-telegram@claude-8709793308.service", "claude"),
