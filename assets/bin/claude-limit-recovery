@@ -1590,6 +1590,23 @@ def scan_incremental(projects_dir: Path, state: dict) -> tuple[dict, list[dict]]
     return current, batches
 
 
+# Claude 2.1.301 re-appends a turn's tail when the next queued prompt starts: the same events under their
+# uuids, stamped with the new prompt's id and the current working folder (ST, 17.10.2026).
+COSMETIC_DUPLICATE_KEYS = {"slug", "cwd", "promptId"}
+
+
+def _tool_result_lost_output(previous: object, repeated: object) -> bool:
+    """The copy's tool result only lost output text the first one had; every other field is identical."""
+    if not isinstance(previous, dict) or not isinstance(repeated, dict) or previous.keys() != repeated.keys():
+        return False
+    for key, value in previous.items():
+        if json.dumps(value, sort_keys=True) == json.dumps(repeated[key], sort_keys=True):
+            continue
+        if key not in ("stdout", "stderr") or not isinstance(value, str) or repeated[key] != "":
+            return False
+    return True
+
+
 def _batch_uuid_map(events: list[dict]) -> dict[str, dict]:
     result: dict[str, dict] = {}
     for envelope in events:
@@ -1600,11 +1617,14 @@ def _batch_uuid_map(events: list[dict]) -> dict[str, dict]:
         if not isinstance(event_uuid, str) or not event_uuid:
             raise StateError("invalid transcript event identifier")
         if event_uuid in result:
-            # Claude may append the same event with a cosmetic session slug.
-            # Ignore only that top-level field; all ancestry, content and
-            # provenance must remain identical, including JSON value types.
-            previous = {key: value for key, value in result[event_uuid].items() if key != "slug"}
-            repeated = {key: value for key, value in record.items() if key != "slug"}
+            # Claude may append the same event with a cosmetic session slug, or re-append it with the next prompt's
+            # id, the current folder and a tool result that lost its output. Ignore only those; all ancestry,
+            # content and provenance must remain identical, including JSON value types.
+            previous = {key: value for key, value in result[event_uuid].items() if key not in COSMETIC_DUPLICATE_KEYS}
+            repeated = {key: value for key, value in record.items() if key not in COSMETIC_DUPLICATE_KEYS}
+            if _tool_result_lost_output(previous.get("toolUseResult"), repeated.get("toolUseResult")):
+                previous.pop("toolUseResult")
+                repeated.pop("toolUseResult")
             if json.dumps(previous, sort_keys=True) != json.dumps(repeated, sort_keys=True):
                 raise StateError("duplicate transcript event identifier")
             # Keep the first object so an appended copy cannot become new work.

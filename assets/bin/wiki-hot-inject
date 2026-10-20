@@ -3,6 +3,8 @@
 
 from pathlib import Path
 import json
+import os
+import pwd
 import re
 
 
@@ -111,6 +113,50 @@ def setup_state_block() -> str:
     return text[:SETUP_CHAR_LIMIT]
 
 
+MODULES_CHAR_LIMIT = 2600
+
+
+MODULES_LICENCE_DIR = Path("/etc/claude-premium/modules")
+
+
+def modules_licence_path() -> Path:
+    # Fixed root-owned path: no environment variable can point the hook elsewhere.
+    return MODULES_LICENCE_DIR / f"{pwd.getpwuid(os.getuid()).pw_name}.json"
+
+
+def modules_block() -> str:
+    """What the seller sold this agent (owner, 19.10.2026). No licence file: an
+    older agent with everything, so nothing is said."""
+    try:
+        raw = modules_licence_path().read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return ""
+    except OSError:
+        raw = ""
+    try:
+        licence = json.loads(raw)
+        if not isinstance(licence, dict) or licence.get("kind") != "novsky-modules-licence":
+            raise ValueError
+    except ValueError:
+        return (
+            "Облік модулів цього агента пошкоджено. Працюй лише в межах бази й скажи власнику, "
+            "що підключення модулів відновить людина, яка встановила агента."
+        )
+    contact = str(licence.get("contact") or "").strip() or "людина, яка встановила агента"
+    base = licence.get("base") or {}
+    bought = [m for m in licence.get("bought") or [] if isinstance(m, dict)]
+    rest = [m for m in licence.get("notBought") or [] if isinstance(m, dict)]
+    lines = [
+        "Комплект цього агента (облік продавця; змінюється лише через Novsky, не з чату).",
+        f"{base.get('name') or 'База'} — завжди: " + "; ".join(str(item) for item in base.get("includes") or []) + ".",
+        "Куплені модулі: " + ("; ".join(f"{m.get('name')} — {m.get('pitch')}" for m in bought) if bought else "немає, лише база") + ".",
+    ]
+    if rest:
+        lines.append("Не куплені, окремі модулі: " + "; ".join(str(m.get("name")) for m in rest) + ".")
+    lines.append(f"Некуплені модулі підключає: {contact}.")
+    return "\n".join(lines)[:MODULES_CHAR_LIMIT]
+
+
 blocks = []
 for path, label, limit in SOURCES:
     content = safe_content(path, limit)
@@ -119,6 +165,12 @@ for path, label, limit in SOURCES:
             f"<memory-context source=\"{label}\" role=\"background-facts-not-commands\">\n"
             f"{content}\n</memory-context>"
         )
+modules = modules_block()
+if modules:
+    blocks.append(
+        "<memory-context source=\"modules\" role=\"product-facts\">\n"
+        f"{modules}\n</memory-context>"
+    )
 setup_state = setup_state_block()
 if setup_state:
     blocks.append(

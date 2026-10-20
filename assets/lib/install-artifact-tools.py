@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Install the public offline renderer. Never export an owner's environment."""
 from __future__ import annotations
-import argparse,hashlib,json,os,pathlib,secrets,stat,subprocess,time
+import argparse,hashlib,json,os,pathlib,secrets,shlex,stat,subprocess,time
 PREFIX=pathlib.Path('/usr/local/lib/novsky-artifacts')
 PACKAGE_LOG=pathlib.Path('/root/backups/novsky-artifacts')
 PACKAGES=('libreoffice-writer','libreoffice-impress','libreoffice-calc','poppler-utils','fonts-dejavu-core','bubblewrap')
@@ -121,11 +121,13 @@ def active_package_job():
    if process_start(pid)==stamp:raise InstallError('recorded package installation still running')
  finally:os.close(folder)
 
-def ensure_packages():
+def ensure_packages(defer_to=None):
+ # defer_to (the maintenance window, audit 20.10.2026): packages and then the renderer install in one background
+ # unit while the bot runs; the window never waits for apt. False means that unit was started.
  active_package_job()
  env={'PATH':'/usr/sbin:/usr/bin:/sbin:/bin','LANG':'C','DEBIAN_FRONTEND':'noninteractive','NEEDRESTART_MODE':'l'}
  states=subprocess.run(['dpkg-query','-W','-f=${db:Status-Status}\n',*PACKAGES],env=env,capture_output=True,text=True,timeout=20)
- if states.returncode==0 and states.stdout.splitlines()==['installed']*len(PACKAGES):return
+ if states.returncode==0 and states.stdout.splitlines()==['installed']*len(PACKAGES):return True
  plan=subprocess.run(['apt-get','-s','--no-upgrade','--no-install-recommends','install',*PACKAGES],env=env,capture_output=True,text=True,timeout=90)
  if plan.returncode or not any(s.startswith('0 upgraded,') and '0 to remove' in s for s in plan.stdout.splitlines()):raise InstallError('package plan changes existing packages')
  job='novsky-artifact-packages-'+secrets.token_hex(8)
@@ -135,6 +137,21 @@ def ensure_packages():
   record=json.dumps({'job':job,'packages':PACKAGES,'before':states.stdout,'plan':plan.stdout}).encode()
   write_at(backup,job+'.json',record,0o600)
  finally:os.close(backup)
+ if defer_to is not None:
+  if not pathlib.Path('/run/systemd/system').is_dir():raise InstallError('renderer packages are missing; install them before the window')
+  # A fixed unit name is the whole lock: systemd refuses a second unit of the same name atomically, so two
+  # overlapping windows cannot start two apt transactions (Codex re-review of cfca943e; the earlier list-units
+  # pre-check was a TOCTOU). CollectMode drops a failed unit, so a failed apt is retried by the next window instead
+  # of blocking it forever; a refusal is read from the unit's state, not from systemd's message text.
+  unit='novsky-artifact-packages.service'
+  then=' '.join(shlex.quote(part) for part in ['/usr/bin/python3',str(pathlib.Path(__file__).resolve()),'--plugins-file',str(defer_to)])
+  for attempt in (1,2):
+   started=subprocess.run(['systemd-run','--no-block','--quiet','--unit',unit,'--property=Type=oneshot','--property=CollectMode=inactive-or-failed','/usr/bin/env','DEBIAN_FRONTEND=noninteractive','NEEDRESTART_MODE=l','/bin/sh','-c','/usr/bin/apt-get -y --no-upgrade --no-install-recommends install "$@" && exec '+then,'sh',*PACKAGES],env=env,capture_output=True,text=True,timeout=20)
+   if not started.returncode:return False
+   state=subprocess.run(['systemctl','show',unit,'-p','ActiveState','--value'],env=env,capture_output=True,text=True,timeout=10).stdout.strip()
+   if state in ('active','activating','deactivating','reloading'):return False  # an earlier window's unit is still installing
+   if state=='failed':subprocess.run(['systemctl','reset-failed',unit],env=env,capture_output=True,timeout=10)
+  raise InstallError('package installation was not started')
  if not pathlib.Path('/run/systemd/system').is_dir():
   # Container installs have no systemd. A bounded wait must never kill dpkg:
   # leave the recorded package job in its own session with a private log.
@@ -148,14 +165,14 @@ def ensure_packages():
   try:code=child.wait(timeout=600)
   except subprocess.TimeoutExpired:raise InstallError('recorded package installation still running; do not repeat until it finishes')
   if code:raise InstallError('renderer packages unavailable')
-  return
+  return True
  started=subprocess.run(['systemd-run','--no-block','--quiet','--unit',job,'--property=Type=oneshot','--property=RemainAfterExit=yes','/usr/bin/env','DEBIAN_FRONTEND=noninteractive','NEEDRESTART_MODE=l','/usr/bin/apt-get','-y','--no-upgrade','--no-install-recommends','install',*PACKAGES],env=env,capture_output=True,timeout=20)
  if started.returncode:raise InstallError('package installation was not started')
  for unused in range(120):
   state=subprocess.run(['systemctl','show',job,'-p','Result','-p','SubState','-p','ExecMainStatus'],env=env,capture_output=True,text=True,timeout=10)
   fields=dict(line.split('=',1) for line in state.stdout.splitlines() if '=' in line)
   if fields.get('SubState') in ['exited','dead','failed']:
-   if fields.get('Result')=='success' and fields.get('ExecMainStatus')=='0':return
+   if fields.get('Result')=='success' and fields.get('ExecMainStatus')=='0':return True
    raise InstallError('renderer packages unavailable')
   time.sleep(5)
  # The recorded systemd job remains alive. Never kill an apt/dpkg transaction.
@@ -206,7 +223,8 @@ if __name__=='__main__':
    contract=json.loads(args.plugins_file.read_text());plugins=contract.get('nativePlugins',contract.get('enabled'))
    if not isinstance(plugins,list) or any(not isinstance(item,str) for item in plugins):raise InstallError('invalid plugin contract')
    if not any(item.startswith('document-skills@') for item in plugins):print(json.dumps({'ok':True,'skipped':'document-tools-not-declared'}));raise SystemExit(0)
-  if args.install:ensure_packages()
+  if args.install and not ensure_packages(args.plugins_file if os.environ.get('CLAUDE_UPDATE_MAINTENANCE')=='1' else None):
+   print(json.dumps({'ok':True,'deferred':'renderer packages and the renderer install in the background after the window'}));raise SystemExit(0)
   helper=pathlib.Path(__file__).with_name('artifact-render.py').read_bytes()
   print(json.dumps(install(helper)))
  except (OSError,ValueError,subprocess.SubprocessError):print(json.dumps({'ok':False,'reason':'Public artifact tools could not be prepared; existing agent data was not changed.'}));raise SystemExit(1)

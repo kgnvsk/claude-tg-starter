@@ -6,6 +6,7 @@ backup. Plan and license-preflight run without stopping or changing the agent.
 """
 from __future__ import annotations
 
+from datetime import date
 import hashlib
 import importlib.util
 import json
@@ -236,6 +237,70 @@ def skill_destination(home: Path, relative: str) -> str:
     return (directory.relative_to(home) / Path(*parts[3:])).as_posix()
 
 
+def skill_identity(home: Path, data: dict, previous: dict) -> dict[str, str]:
+    saved = previous.get("skillIdentity", {})
+    if not isinstance(saved, dict):
+        raise ValueError("invalid saved skill identity")
+    values = {}
+    for setting, placeholder in (("ownerName", "OWNER_NAME"), ("ownerUsername", "OWNER_TG_USERNAME"),
+                                 ("botUsername", "BOT_USERNAME")):
+        if data.get("maintenance") is True and placeholder in saved:
+            value = saved[placeholder]
+        else:
+            value = data.get(setting, saved.get(placeholder, ""))
+        if value is None:
+            value = ""
+        if not isinstance(value, str) or len(value) > 256 or any(ord(c) < 32 or ord(c) == 127 for c in value):
+            raise ValueError("invalid skill identity: " + setting)
+        if setting.endswith("Username"):
+            value = value.removeprefix("@")
+            if value and not re.fullmatch(r"[A-Za-z0-9_]{5,32}", value):
+                raise ValueError("invalid skill identity: " + setting)
+        values[placeholder] = value
+    agent_name = data["agentName"]
+    if not isinstance(agent_name, str) or len(agent_name) > 256 or any(ord(c) < 32 or ord(c) == 127 for c in agent_name):
+        raise ValueError("invalid skill identity: agentName")
+    user = data.get("user") or data.get("id") or home.name
+    if not isinstance(user, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", user):
+        raise ValueError("invalid skill identity: account")
+    deployed = saved.get("DEPLOY_DATE", date.today().isoformat())
+    if not isinstance(deployed, str) or not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", deployed):
+        raise ValueError("invalid saved skill identity date")
+    return {**values, "AGENT_NAME": agent_name, "OWNER_CHAT_ID": str(data["ownerChatId"]),
+            "TIMEZONE": data["timezone"], "AGENT_HOME": str(home), "AGENT_USER": user,
+            "AGENT_SERVICE": "com.novsky.agent." + user if data.get("id") else "codex-telegram@" + user + ".service",
+            "CALENDAR_EMAIL": "primary", "DEPLOY_DATE": deployed}
+
+
+def render_skill(data: bytes, values: dict[str, str]) -> bytes:
+    placeholder = re.compile(r"\{\{([A-Z_]+)\}\}")
+
+    def replace(text):
+        return placeholder.sub(lambda match: str(values.get(match[1], match[0])), text)
+
+    text = data.decode()
+    parts = text.split("---", 2)
+    if text.startswith("---\n") and len(parts) == 3:
+        lines = []
+        for line in parts[1].splitlines(keepends=True):
+            if not placeholder.search(line):
+                lines.append(line)
+                continue
+            scalar = re.fullmatch(r"([A-Za-z_][\w-]*:[ \t]*)([^\n]+)(\n?)", line)
+            if not scalar:
+                raise ValueError("unsupported skill template header")
+            value = scalar[2].strip()
+            if value.startswith('"'):
+                value = json.loads(value)
+            elif value.startswith("'") and value.endswith("'"):
+                value = value[1:-1].replace("''", "'")
+            lines.append(scalar[1] + json.dumps(replace(value), ensure_ascii=False) + scalar[3])
+        text = "---" + "".join(lines) + "---" + replace(parts[2])
+    else:
+        text = replace(text)
+    return text.encode()
+
+
 def plan_reconcile(root: Path, home: Path, manifest: dict, previous: dict, render: dict | None = None) -> dict:
     """Read every managed target and ownership conflict without creating files."""
     writes, baseline, targets, acknowledged_hotfixes = [], {}, [], []
@@ -273,8 +338,7 @@ def plan_reconcile(root: Path, home: Path, manifest: dict, previous: dict, rende
                 raise ValueError("unrendered executable: " + relative)
         elif render and relative.startswith(("home/.claude/skills/", "home/.agents/skills/")) and relative.split("/")[3] in manifest.get("firstPartySkills", ()):
             # First-party skills carry the same placeholders the server renders.
-            for name, value in render.items():
-                data = data.replace(("{{" + name + "}}").encode(), str(value).encode())
+            data = render_skill(data, render)
             if b"{{" in data and re.search(rb"\{\{[A-Z_]+\}\}", data):
                 raise ValueError("unrendered skill template: " + relative)
         if path.exists():
@@ -602,8 +666,9 @@ def main():
     from setup import configure, plan_configuration
     configuration = plan_configuration(home, data, previous)
     data = configuration["data"]
-    previous = {**previous, "ownerChatId": data["ownerChatId"], "timezone": data["timezone"]}
-    plan = plan_reconcile(root, home, manifest, previous)
+    previous = {**previous, "ownerChatId": data["ownerChatId"], "timezone": data["timezone"],
+                "skillIdentity": skill_identity(home, data, previous)}
+    plan = plan_reconcile(root, home, manifest, previous, previous["skillIdentity"])
     files = plan["files"]
     manifest_path = safe_path(home, ".local/share/novsky-kit/manifest.json")
     inventory_path = safe_path(config_dir, user + ".integrations.json")
@@ -620,6 +685,12 @@ def main():
     # The kit was reviewed with one Codex CLI. Novsky and codex/server.py install it after the
     # read-only plan and before this step (census 26.09: 0.153.3 and 0.154.0 ran side by side).
     codex_cli = {"installed": installed_codex_cli(home, user), "required": required_codex_cli(root)}
+    # Novsky installs the pinned CLI after this plan. An older kit must not replace
+    # a newer client needed by the agent's current model (GPT-6.1 Sol needs 0.163).
+    if action == "plan" and data.get("maintenance") is True and codex_cli["installed"]:
+        if tuple(map(int, codex_cli["installed"].split("."))) > tuple(map(int, codex_cli["required"].split("."))):
+            raise ValueError(f"maintenance would downgrade Codex CLI {codex_cli['installed']} to {codex_cli['required']}; "
+                             "keep the running agent unchanged and use a kit reviewed with its current CLI")
     directories = ("bin", ".agents", ".codex/agents", "obsidian-vault/.codex", ".local/lib", ".local/bin", ".npm-global", ".local/state/novsky-codex", ".local/share/novsky-kit", ".venvs", ".config")
     for relative in directories:
         path = safe_path(home, relative)
@@ -717,7 +788,7 @@ def main():
                                    capture_output=True, timeout=180)
         if collector.returncode:
             raise ValueError("encrypted backup context installation failed")
-    atomic(state_path, json.dumps({"productId": manifest["productId"], "revision": manifest["sourceRevision"], "payload": str(root), "files": files, "configSha": digest(config_text.encode()), "capabilities": result, "state": "ready"}), 0, 0)
+    atomic(state_path, json.dumps({"productId": manifest["productId"], "revision": manifest["sourceRevision"], "payload": str(root), "files": files, "configSha": digest(config_text.encode()), "skillIdentity": previous["skillIdentity"], "capabilities": result, "state": "ready"}), 0, 0)
     print(json.dumps({"ok": True, "productId": manifest["productId"], "capabilities": result}))
 
 

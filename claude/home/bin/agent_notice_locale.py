@@ -399,7 +399,7 @@ RUSSIAN_NOTICES.update({
     'auth.switched_elsewhere': '✅ Аккаунт Claude уже изменён другим способом: теперь {who}. ',
     'auth.restored_elsewhere': '✅ Вход в Claude уже восстановлен другим способом. ',
     'auth.queue_unchecked': '⚠️ Вход восстановлен, но очередь ещё требует проверки. Запросы сохранены.',
-    'auth.transport_failed': '⚠️ Авторизация Claude восстановлена, но Telegram-канал не запустился после двух безопасных перезапусков. Восстановление не отмечено завершённым — нужна проверка канала.',
+    'auth.transport_failed': '⚠️ Авторизация Claude восстановлена, но Telegram-канал не запустился. Восстановление не отмечено завершённым — нужна проверка канала.',
     'auth.code_rejected': '❌ Код не подошёл (или прислан с лишним текстом). Напиши /relogin — пришлю новую ссылку, попробуем ещё раз.',
     'auth.code_rejected_switch': '❌ Код не подошёл (или прислан с лишним текстом). Остаюсь на {who}. Напиши /relogin — пришлю новую ссылку, попробуем ещё раз.',
 })
@@ -420,7 +420,7 @@ POLISH_NOTICES.update({
     'auth.switched_elsewhere': '✅ Konto Claude zostało już zmienione w inny sposób: teraz {who}. ',
     'auth.restored_elsewhere': '✅ Logowanie do Claude zostało już przywrócone w inny sposób. ',
     'auth.queue_unchecked': '⚠️ Logowanie przywrócone, ale kolejka wymaga jeszcze sprawdzenia. Zapytania zapisane.',
-    'auth.transport_failed': '⚠️ Logowanie do Claude przywrócone, ale kanał Telegram nie uruchomił się po dwóch bezpiecznych restartach. Przywrócenia nie oznaczono jako zakończonego — trzeba sprawdzić kanał.',
+    'auth.transport_failed': '⚠️ Logowanie do Claude przywrócone, ale kanał Telegram się nie uruchomił. Przywrócenia nie oznaczono jako zakończonego — trzeba sprawdzić kanał.',
     'auth.code_rejected': '❌ Kod nie pasuje (albo wysłano go z dodatkowym tekstem). Napisz /relogin — wyślę nowy link, spróbujemy jeszcze raz.',
     'auth.code_rejected_switch': '❌ Kod nie pasuje (albo wysłano go z dodatkowym tekstem). Zostaję przy {who}. Napisz /relogin — wyślę nowy link, spróbujemy jeszcze raz.',
 })
@@ -441,7 +441,7 @@ ENGLISH_NOTICES.update({
     'auth.switched_elsewhere': '✅ The Claude account was already changed another way: now {who}. ',
     'auth.restored_elsewhere': '✅ The Claude login was already restored another way. ',
     'auth.queue_unchecked': '⚠️ Login restored, but the queue still needs a check. Requests are saved.',
-    'auth.transport_failed': '⚠️ The Claude login is restored, but the Telegram channel did not start after two safe restarts. The recovery is not marked complete — the channel needs a check.',
+    'auth.transport_failed': '⚠️ The Claude login is restored, but the Telegram channel did not start. The recovery is not marked complete — the channel needs a check.',
     'auth.code_rejected': "❌ The code did not work (or came with extra text). Write /relogin and I'll send a fresh link; we'll try again.",
     'auth.code_rejected_switch': "❌ The code did not work (or came with extra text). I stay on {who}. Write /relogin and I'll send a fresh link; we'll try again.",
 })

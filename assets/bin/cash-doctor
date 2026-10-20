@@ -46,9 +46,13 @@ else
   bad "токен бота порожній у telegram/.env"
 fi
 
-# 5. codex (картинки) — только если модуль установлен
-if [ -x "$H/.npm-global/bin/codex" ]; then
-  if timeout 20 "$H/.npm-global/bin/codex" login status 2>&1 | grep -q "Logged in"; then
+# 5. codex (картинки) — только если модуль установлен: Novsky ставит CLI в ~/.local/bin, старые установки — в ~/.npm-global/bin
+CODEX_CLI=""
+for cli in "$H/.npm-global/bin/codex" "$H/.local/bin/codex"; do
+  [ -x "$cli" ] && { CODEX_CLI=$cli; break; }
+done
+if [ -n "$CODEX_CLI" ]; then
+  if timeout 20 "$CODEX_CLI" login status 2>&1 | grep -q "Logged in"; then
     ok "Codex авторизовано (зображення працюють)"
   else
     warn "Codex не авторизовано → gpt-image-2 не працює (codex login --device-auth)"

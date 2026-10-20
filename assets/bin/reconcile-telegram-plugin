@@ -31,10 +31,20 @@ UPSTREAM_SERVER_SHA256 = (
 )
 UPSTREAM_PACKAGE_START = "bun install --no-summary 1>&2 && bun server.ts"
 GOLDEN_SERVER_SHA256 = (
-    "375f3748e783ba9913ec03fa542307cd606702dd552c7dddd696203d25ca6044"
+    "a075ed65d000e7adbd449cc59512019c4eacec50f964c9b2bf5d2283537dab20"
 )
 PREVIOUS_GOLDEN_SERVER_SHA256S = frozenset(
     {
+        # The second head of PR 315, before late photos came as all pictures or all files.
+        "0384aff0a52144756d7f9d4c6894befbe5358b11939067b4e90a6389aa2591f0",
+        # Arti's hotfix of 18.10.2026 as installed: late photos come as all pictures or all files.
+        "c6c7b9b99952e1c46238a6268aca9d623bdc3fc006023c551d6d9cf8464904ca",
+        # Arti's hotfix of 18.10.2026: the 15.10 golden with company chats taking any file (hotfix/arti-any-file-20261018).
+        "1aadf8c4cf422289baf542e238018bee507760c73987dcec601e763157c2d9f6",
+        # The first head of PR 315 (any file), before the reply and late-bound pictures came as files too.
+        "958428dfb368c81451dc4ed019cfb948a13cc39037e9872718fa4bced0151f28",
+        # The golden before company chats took any file (owner, 18.10.2026).
+        "375f3748e783ba9913ec03fa542307cd606702dd552c7dddd696203d25ca6044",
         # The golden before full scoped rules and conversation required before delivery.
         "ffa07c1bd79bb5097d12479babb37458c03fb3ba4a60c395f47ba3e1c92a2fb6",
         # Reviewed main: administrator management from the current chat.

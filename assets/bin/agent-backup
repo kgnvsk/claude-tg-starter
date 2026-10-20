@@ -69,6 +69,16 @@ SECRET_PATTERNS = (
     re.compile(rb"xox[baprs]-[A-Za-z0-9-]{20,}"),
     re.compile(rb"-----BEGIN (?:OPENSSH |RSA |EC )?PRIVATE KEY-----"),
 )
+# settings.json env holds a process's credentials under any vendor's name (FAL_KEY, a custom token,
+# a password inside a database URL), which the patterns above do not know. The name or a URL login
+# marks the value, and the backup keeps [REDACTED] in its place (audit 20.10.2026).
+SETTINGS_NAME = "home/.claude/settings.json"
+REDACTED = "[REDACTED]"
+CREDENTIAL_ENV_NAME = re.compile(
+    r"(?:^|_)(?:API_?KEY|KEY|TOKEN|SECRET|PASSWORD|PASSWD|PASSPHRASE|PAT|HASH|COOKIES?|CREDENTIALS?)(?:_|$)"
+    r"|(?:TOKEN|SECRET|PASSWORD|APIKEY)$"
+)
+URL_LOGIN = re.compile(rb"[A-Za-z][A-Za-z0-9+.-]*://[^\s/:@]+:[^\s/@]+@")
 
 
 def sha256_bytes(data: bytes) -> str:
@@ -110,6 +120,28 @@ def contains_secret(data: bytes) -> bool:
         raise ValueError("unsafe connection store")
     fingerprint = (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
     return any(value in data for value in connection_literals(str(HOME), fingerprint))
+
+
+def masked_settings(data: bytes) -> bytes:
+    """settings.json with each credential-like env value as [REDACTED]; the same bytes when none is."""
+    try:
+        settings = json.loads(data)
+    except ValueError as error:
+        raise ValueError(f"unreadable JSON: {SETTINGS_NAME}") from error
+    env = settings.get("env") if isinstance(settings, dict) else None
+    if not isinstance(env, dict):
+        return data
+    masked = False
+    # ponytail: a duplicate env name keeps only its last value here; an earlier one meets contains_secret alone.
+    for name, value in env.items():
+        if value in ("", None, REDACTED):
+            continue
+        text = str(value).encode()
+        if (CREDENTIAL_ENV_NAME.search(name.upper().replace("-", "_"))
+                or URL_LOGIN.search(text) or any(pattern.search(text) for pattern in SECRET_PATTERNS)):
+            env[name] = REDACTED
+            masked = True
+    return (json.dumps(settings, ensure_ascii=False, indent=2) + "\n").encode() if masked else data
 
 
 def safe_managed_customizations() -> list[tuple[Path, str]]:
@@ -208,6 +240,8 @@ def read_safe_file(source: Path, archive_name: str) -> tuple[bytes, int]:
             data = handle.read(MAX_FILE_BYTES + 1)
         if len(data) != metadata.st_size or len(data) > MAX_FILE_BYTES:
             raise ValueError(f"file changed or exceeds size limit: {archive_name}")
+        if archive_name == SETTINGS_NAME:
+            data = masked_settings(data)
         if contains_secret(data):
             raise ValueError(f"secret-like content detected: {archive_name}")
         return data, stat.S_IMODE(metadata.st_mode)
@@ -425,7 +459,7 @@ def verify_archive(path: Path) -> dict:
             if archive.getinfo(name).file_size > MAX_FILE_BYTES:
                 raise ValueError(f"file exceeds GitHub size limit: {name}")
             data = archive.read(name)
-            if contains_secret(data):
+            if contains_secret(data) or name == SETTINGS_NAME and masked_settings(data) != data:
                 raise ValueError(f"secret-like content detected: {name}")
             if len(data) != item["size"] or sha256_bytes(data) != item["sha256"]:
                 raise ValueError(f"checksum mismatch: {name}")

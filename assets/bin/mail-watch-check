@@ -22,6 +22,7 @@ import json
 import os
 import re
 import subprocess
+import tempfile
 import time
 
 HOME = os.path.expanduser("~")
@@ -99,7 +100,8 @@ def main():
     if args.icloud:
         boxes.append(("icloud", icloud))
     key = hashlib.sha256(json.dumps([sorted(args.gmail), args.icloud]).encode()).hexdigest()[:16]
-    state_path = os.path.join(HOME, ".local/state/mail-watch", f"{key}.json")
+    state_dir = os.environ.get("MAIL_WATCH_STATE_DIR") or os.path.join(HOME, ".local/state/mail-watch")
+    state_path = os.path.join(state_dir, f"{key}.json")
     try:
         with open(state_path, encoding="utf-8") as handle:
             state = json.load(handle)
@@ -138,14 +140,22 @@ def main():
     if lines:
         print("\n".join(lines), flush=True)
     if after != state:
+        temp = None
         try:
             os.makedirs(os.path.dirname(state_path), mode=0o700, exist_ok=True)
-            temp = state_path + ".tmp"
-            with open(temp, "w", encoding="utf-8") as handle:
+            descriptor, temp = tempfile.mkstemp(prefix=".mail-watch-", dir=state_dir)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
                 json.dump(after, handle)
             os.replace(temp, state_path)
+            temp = None
         except OSError:
             pass  # marks unchanged: the same letters come once more, and a failed look would wake the model instead
+        finally:
+            if temp is not None:
+                try:
+                    os.unlink(temp)
+                except OSError:
+                    pass
 
 
 if __name__ == "__main__":

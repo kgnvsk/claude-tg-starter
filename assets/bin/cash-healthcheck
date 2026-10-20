@@ -542,13 +542,20 @@ alert() {
         echo "[$(date -u +%FT%TZ)] ALERT [${key}]: no valid recipient configured" >> "$LOG"
         return 0
     fi
+    # The token reaches curl in its config on stdin, never as an argument other users can read in /proc.
+    if ! [[ -n ${BOT_TOKEN:-} && ${BOT_TOKEN:-} != *'"'* && ${BOT_TOKEN:-} != *'\'* && ${BOT_TOKEN:-} != *$'\n'* && ${BOT_TOKEN:-} != *$'\r'* ]]; then
+        # Nothing is sent, but the alert itself is still logged below and no cooldown starts.
+        echo "[$(date -u +%FT%TZ)] ALERT [${key}]: bot token missing or malformed" >> "$LOG"
+        recipients=""
+    fi
     local chat_id delivered=0 first=1
     while IFS= read -r chat_id; do
         [ -n "$chat_id" ] || continue
-        if curl -sS --fail --max-time 10 -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+        if curl -sS --fail --max-time 10 -X POST -K - \
             --data-urlencode "chat_id=${chat_id}" \
             --data-urlencode "text=🚨 {{AGENT_NAME}}, перевірка стану: ${msg}" \
-            --data-urlencode "parse_mode=HTML" >/dev/null 2>&1; then
+            --data-urlencode "parse_mode=HTML" >/dev/null 2>&1 \
+            <<<"url = \"https://api.telegram.org/bot${BOT_TOKEN}/sendMessage\""; then
             [ "$first" = 1 ] && delivered=1
         else
             echo "[$(date -u +%FT%TZ)] ALERT [${key}]: delivery failed for one configured recipient" >> "$LOG"
@@ -1503,9 +1510,14 @@ CODEX_STAMP=$STAMP/cash-codex-check.ts
 NOW_S=$(date +%s)
 LAST_CODEX=$(cat "$CODEX_STAMP" 2>/dev/null || echo 0)
 # Only if the images option is installed (codex present) — else base installs false-alert.
-if [ -x "$H/.npm-global/bin/codex" ] && [ $(( NOW_S - LAST_CODEX )) -ge 1800 ]; then
+# Novsky's images step puts the CLI in ~/.local/bin; older installs have it in ~/.npm-global/bin.
+CODEX_CLI=""
+for cli in "$H/.npm-global/bin/codex" "$H/.local/bin/codex"; do
+    [ -x "$cli" ] && { CODEX_CLI=$cli; break; }
+done
+if [ -n "$CODEX_CLI" ] && [ $(( NOW_S - LAST_CODEX )) -ge 1800 ]; then
     echo "$NOW_S" > "$CODEX_STAMP"
-    if ! timeout 20 "$H/.npm-global/bin/codex" login status 2>&1 | grep -q "Logged in"; then
+    if ! timeout 20 "$CODEX_CLI" login status 2>&1 | grep -q "Logged in"; then
         alert "codex-auth-dead" "Не працює генерація картинок: злетів вхід у Codex. Напиши нам — ми перелогінимо." 7200
     fi
 fi

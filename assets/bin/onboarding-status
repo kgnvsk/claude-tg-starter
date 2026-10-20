@@ -39,6 +39,9 @@ GOOGLE_SERVICES = {
     "sheets",
     "tasks",
 }
+# A seller's licence (owner, 19.10.2026) opens only the Google services of bought modules, and gog refuses the
+# rest, so the check asks for those alone. Fixed root-owned path, as gog and kit-module read it.
+MODULE_LICENCE_DIR = Path("/etc/claude-premium/modules")
 DEFAULT_REQUIRED_CHECKS = (
     "core",
     "claude_auth",
@@ -399,6 +402,16 @@ def vercel_authenticated() -> bool:
     return code == 0 and bool(output.strip())
 
 
+def required_google_services() -> set[str]:
+    try:
+        licence = json.loads((MODULE_LICENCE_DIR / f"{HOME.owner()}.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError, KeyError):
+        return GOOGLE_SERVICES  # no licence: an older agent with everything, as before
+    if not isinstance(licence, dict) or licence.get("kind") != "novsky-modules-licence":
+        return GOOGLE_SERVICES
+    return GOOGLE_SERVICES & set(licence.get("googleServices") or [])
+
+
 def gog_authenticated() -> bool:
     command = str(GOG_BIN) if GOG_BIN.is_file() else "gog"
     code, output = command_output([command, "auth", "list", "--json"])
@@ -410,7 +423,7 @@ def gog_authenticated() -> bool:
         return False
     return any(
         isinstance(account, dict)
-        and GOOGLE_SERVICES.issubset(set(account.get("services", [])))
+        and required_google_services().issubset(set(account.get("services", [])))
         for account in accounts
     )
 

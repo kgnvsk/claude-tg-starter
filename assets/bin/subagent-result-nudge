@@ -19,6 +19,10 @@ import sys
 
 MARKER = re.compile(r"\[worker v\d+\]")
 TASK = re.compile(r"<task-id>([a-zA-Z0-9_-]+)</task-id>")
+# Арти, 17.10.2026: a researcher came back without the Amazon its owner had named, the note below sent the agent to
+# check three prices, and the owner got one shop. Every result is held against the request before it is passed on.
+COMPLETE = ("Звір результат із запитом: усе, що людина назвала (джерела, магазини, кількість, формат), є? "
+            "Неповний — поверни субагенту доробити, людині не надсилай як готове.")
 
 
 def transcript_for(task_id: str) -> pathlib.Path | None:
@@ -74,10 +78,10 @@ def main() -> int:
         note = ("У відповіді субагента немає маркера базових правил — вони могли "
                 "не дійти. Звір ключове число або факт самостійно.")
     else:
-        return 0
+        note = ""
     print(json.dumps({"hookSpecificOutput": {
         "hookEventName": "UserPromptSubmit",
-        "additionalContext": f"[перевірка субагента] {note}",
+        "additionalContext": f"[перевірка субагента] {note} {COMPLETE}".replace("  ", " "),
     }}, ensure_ascii=False))
     return 0
 

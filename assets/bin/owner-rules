@@ -352,26 +352,32 @@ def read_rule(rows, identifier):
     if not matched:raise ValueError('unknown rule id')
     return matched[0]
 
-def context(query):
-    rows=load()['rules']; words=tokens(query)
+def ranked(rows, query):
+    """The rules that share the query's words, best first: a dotted label it names, then exact words, then words
+    sharing their first five letters. A rule that shares nothing is left out."""
+    words=tokens(query)
     labels=set(re.findall(r'(?<![\w.])\d+(?:\.\d+)+(?![\w.])',query))
     def score(row):
         found=tokens(row['text'])
         return (1000 if rule_label(row) in labels else 0)+sum(10 if x in found else 1 if not any(c.isdigit() for c in x) and any(len(y)>=5 and len(x)>=5 and (y.startswith(x[:5]) or x.startswith(y[:5])) for y in found) else 0 for x in words)
-    ordered=sorted(enumerate(rows),key=lambda p:(-score(p[1]),p[0]))
-    out=['OWNER RULES: every rule applies; full text: ~/bin/owner-rules read POSITION, dotted LABEL, or ID.']
+    scored=[(score(row),i,row) for i,row in enumerate(rows)]
+    return [(i,row) for value,i,row in sorted(scored,key=lambda p:(-p[0],p[1])) if value>0]
+
+def context(query):
+    rows=load()['rules']
+    ordered=ranked(rows,query)
+    out=['OWNER RULES: apply only the scope named on each rule; all means every scope. Full text: ~/bin/owner-rules read POSITION, dotted LABEL, or ID.']
     # Numeric positions keep the always-visible index compact. IDs remain stable in storage.
     room=max(12,min(64,(3000-len(out[0]))//max(1,len(rows))-8))
     for i,row in enumerate(rows,1):
         title=' '.join(row['text'].split())
-        out.append(f"{i}. {title[:room]}"+('…' if len(title)>room else ''))
+        out.append(f"{i}. [scope={row.get('scope','owner')}] {title[:room]}"+('…' if len(title)>room else ''))
     out.append('MATCHED RULE DETAILS (read the full numbered rule when clipped):')
     for i,row in ordered:
-        if score(row)==0:continue
         room=CAP-len('\n'.join(out))-40
         if room<100:break
         text=row['text'];excerpt=text[:min(room,1500)]
-        out.append(f"{i+1}. {excerpt}"+('…' if excerpt!=text else ''))
+        out.append(f"{i+1}. [scope={row.get('scope','owner')}] {excerpt}"+('…' if excerpt!=text else ''))
     return '\n'.join(out)
 
 def main():

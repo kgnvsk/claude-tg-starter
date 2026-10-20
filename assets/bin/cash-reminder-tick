@@ -24,6 +24,7 @@
 #            died is run once more; its result reaches CHAT with a late line.
 #            A run refused by a Claude limit runs once more after the reset.
 #   TASK=<stable_task_identifier>
+#   SEND_GATE=<command> (with RUN=1: looked at again before a wholly unsent result is sent; silence drops it)
 #   REPEAT_SECONDS=<positive_interval>
 #   TIMEZONE=<safe_IANA_timezone>
 #   QUIET_START=<hour_or_HH:MM>
@@ -872,6 +873,20 @@ sys.stdout.write("\0".join(parts))
 # word. Мартин got NO_REPLY (23 and 25.09), Yuriy got NOTHING (Максимус, 26 and 28.09) and NOREPLY six
 # times (24.08); Максимус's box carried a check for it by hand.
 SILENCE_WORDS='NOTHING|NOREPLY|NO_REPLY|NONE|SKIP|NOCHANGE|NOUPDATE'
+# SEND_GATE=<command> (with RUN=1): a look again right before a wholly unsent result is delivered, fresh each time and
+# never kept like CHECK. Nothing printed, NO_NEW, a silence word, a failure or a hang: the result is dropped, not sent
+# (first-day check-ins, review 19.10.2026: a reply made before «не зараз», or one delayed into the night, stays unsent).
+send_gate_open() {
+  local gate out dir="${AGENT_TASK_DIR:-$HOME/.atarax/agent-task}"
+  gate=$(header_value "$1" SEND_GATE)
+  [ -n "$gate" ] || return 0
+  [ -d "$dir" ] || dir="$HOME"
+  out=$(cd "$dir" && PATH="$HOME/.local/bin:$HOME/.bun/bin:$HOME/bin:/usr/local/bin:${PATH:-/usr/bin:/bin}" \
+    ATARAX_SUPPRESS_TELEGRAM=1 task_timeout 60 bash -c "$gate" 2>/dev/null) || return 1
+  out=$(printf '%s' "$out" | tr -d '[:space:]*`."')
+  [ -n "$out" ] && ! printf '%s\n' "$out" | grep -qxE "NO_NEW|$SILENCE_WORDS"
+}
+
 nothing_to_report() {
   tr -d '[:space:]*`."' < "$1" | grep -qxE "$SILENCE_WORDS"
 }
@@ -951,28 +966,28 @@ send_text() {
   local chat="$1" text="$2" parse="$3" thread="${4:-}" strict_receipt="${5:-0}" silent="${6:-}" resp confirmed=0
   local no_sound=()
   [ "$silent" != 1 ] || no_sound=(--data-urlencode "disable_notification=true")
-  local args=(-s -m 10 -X POST "https://api.telegram.org/bot${token}/sendMessage"
+  local args=(-s -m 10 -X POST -K -
               --data-urlencode "chat_id=${chat}"
               --data-urlencode "text=${text}" ${no_sound[@]+"${no_sound[@]}"})
   [ -z "$thread" ] || args+=(--data-urlencode "message_thread_id=${thread}")
   if [ -n "${parse:-}" ] && [ "$parse" != "text" ]; then
     args+=(--data-urlencode "parse_mode=${parse}")
   fi
-  resp=$(curl "${args[@]}" 2>&1)
+  resp=$(curl "${args[@]}" 2>&1 <<<"$tg_send_cfg")
   if [ -n "$thread" ]; then
     if ! message_confirmed "$chat" "$thread" "$resp" &&
        [ -n "${parse:-}" ] && [ "$parse" != "text" ] &&
        definite_markup_rejection "$resp"; then
-      resp=$(curl -s -m 10 -X POST "https://api.telegram.org/bot${token}/sendMessage" \
+      resp=$(curl -s -m 10 -X POST -K - \
              --data-urlencode "chat_id=${chat}" --data-urlencode "text=${text}" \
-             --data-urlencode "message_thread_id=${thread}" ${no_sound[@]+"${no_sound[@]}"} 2>&1)
+             --data-urlencode "message_thread_id=${thread}" ${no_sound[@]+"${no_sound[@]}"} 2>&1 <<<"$tg_send_cfg")
       message_confirmed "$chat" "$thread" "$resp" &&
         log_message "delivered $(basename "$f") as plain text (markup rejected)"
     fi
   elif ! delivered "$resp" && [ -n "${parse:-}" ] && [ "$parse" != "text" ] &&
        definite_markup_rejection "$resp"; then
-    resp=$(curl -s -m 10 -X POST "https://api.telegram.org/bot${token}/sendMessage" \
-           --data-urlencode "chat_id=${chat}" --data-urlencode "text=${text}" ${no_sound[@]+"${no_sound[@]}"} 2>&1)
+    resp=$(curl -s -m 10 -X POST -K - \
+           --data-urlencode "chat_id=${chat}" --data-urlencode "text=${text}" ${no_sound[@]+"${no_sound[@]}"} 2>&1 <<<"$tg_send_cfg")
     delivered "$resp" && log_message "delivered $(basename "$f") as plain text (markup rejected)"
   fi
   if [ -n "$thread" ] || [ "$strict_receipt" = 1 ]; then
@@ -1574,6 +1589,11 @@ deliver_saved_run() {
     rm -rf -- "$journal"
     return 0
   fi
+  if [ "$cursor" -eq 0 ] && [ "$(header_value "$source" RUN)" = "1" ] && ! send_gate_open "$source"; then
+    log_message "scheduled run $(basename "$journal"): its send gate is closed now; the saved result is not sent"
+    rm -rf -- "$journal"
+    return 0
+  fi
   if [ "$cursor" -eq 0 ] && [ "$(header_value "$source" RUN)" = 1 ] && [ -x "$HOME/bin/answer-context" ]; then
     if ! "$HOME/bin/answer-context" scheduled-delivery-check --proof "$journal/context-proof.json" --result "$result" \
        --chat "$chat" --thread "$thread_id" --task "$task_id" --occurrence "$epoch" >/dev/null 2>&1; then
@@ -1777,6 +1797,10 @@ retry_limited_run() {
 
 token=$(grep '^TELEGRAM_BOT_TOKEN=' "$TOKEN_FILE" | head -n1 | cut -d= -f2-)
 [ -n "$token" ] || { log_message "empty token"; exit 0; }
+# The token reaches curl in its config on stdin, never as an argument every user of the server can read in /proc
+# (partner, 19.10). A token with other characters could add curl options, so it is refused.
+[[ -n $token && $token != *'"'* && $token != *'\'* && $token != *$'\n'* && $token != *$'\r'* ]] || { log_message "malformed token"; exit 0; }
+tg_send_cfg="url = \"https://api.telegram.org/bot${token}/sendMessage\""
 
 now="${NOW_EPOCH:-$(date +%s)}"
 if ! is_uint "$now"; then
@@ -2331,10 +2355,10 @@ for f in "$REM_DIR"/*.rem; do
       give_up_chat=$(owner_chat_id)
       notice=$(owner_notice reminder.undelivered "⚠️ Не вдалося доставити нагадування «{name}». Telegram відхилив: {reason}" \
         name="$(basename "$f" .rem)" reason="$(printf '%s' "$resp" | tr -d '\n' | cut -c1-180)")
-      curl -s -m 10 -X POST "https://api.telegram.org/bot${token}/sendMessage" \
+      curl -s -m 10 -X POST -K - \
         --data-urlencode "chat_id=${give_up_chat:-$chat}" \
         --data-urlencode "text=${notice}" \
-        >/dev/null 2>&1
+        >/dev/null 2>&1 <<<"$tg_send_cfg"
     fi
   fi
   for i in "${!plain_sources[@]}"; do

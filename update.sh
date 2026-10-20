@@ -98,6 +98,9 @@ case "${1:-}" in
   *) echo "FATAL: unknown update option" >&2; exit 1 ;;
 esac
 [ "$#" -le 1 ] || { echo "FATAL: unexpected update arguments" >&2; exit 1; }
+# The update never asks the operator anything. Run as `bash -s` from a script, every child (install-core, the
+# video-edit doctor and its ffmpeg) inherited the rest of that script on stdin and could eat it (partner, 16.10).
+exec </dev/null
 # --preflight-all keeps going after a failed check and counts it here.
 WALLS=0
 wall() {
@@ -504,6 +507,34 @@ if [ "$UPDATE_ACTION" = --preflight-all ]; then
     --home "$H" --user "$AGENT_USER" --unit "$AGENT_SERVICE" --engine claude >/dev/null \
     || wall "backup context needs its migration"
   env AGENT_USER="$AGENT_USER" bash "$KIT/assets/bin/update-agent-clis" --check || wall "Claude Code / Codex CLI"
+  # The window keeps the owner's tools and never downloads them, so each missing one stopped it after the stop
+  # (partner, 16.10: gh, then ~/.venvs/heif). The checks install-core runs right after the stop, read-only here.
+  preflight_window_dependencies() (
+    set -euo pipefail
+    local status=0
+    CLAUDE_UPDATE_MAINTENANCE=1
+    MODULE_TELEGRAM_CORPORATE="$(python3 "$KIT/assets/bin/saved-env-export" --value "$ENV_SAVED" MODULE_TELEGRAM_CORPORATE)"
+    MODULE_TELEGRAM_CORPORATE="${MODULE_TELEGRAM_CORPORATE:-1}"
+    MODULE_INSTAGRAM_DM="$(python3 "$KIT/assets/bin/saved-env-export" --value "$ENV_SAVED" MODULE_INSTAGRAM_DM)"
+    MODULE_INSTAGRAM_DM="${MODULE_INSTAGRAM_DM:-0}"
+    product_has_feature() {
+      local feature_status=0
+      python3 "$KIT/assets/lib/product-config.py" --file "$KIT/assets/product/runtime.json" \
+        has-feature "$1" || feature_status=$?
+      if [ "$feature_status" -eq 2 ]; then
+        echo "FATAL: конфігурація продукту некоректна" >&2
+        exit 2
+      fi
+      return "$feature_status"
+    }
+    source "$KIT/assets/lib/maintenance-preflight.sh"
+    verify_preserved_vercel_cli || status=1
+    verify_maintenance_dependencies || status=1
+    verify_external_side_effects || status=1
+    return "$status"
+  )
+  run_check preflight_window_dependencies
+  [ "$CHECK_STATUS" -eq 0 ] || wall "window dependencies: restore each missing one named above before the window"
   plugin_drops="$(python3 "$KIT/assets/lib/preflight-maintenance-plugins.py" "$KIT" "$H")" || wall "managed plugin policy"
   [ -z "${plugin_drops:-}" ] || echo "plugin policy: the window switches off $plugin_drops"
   if cmp -s "$KIT/assets/product/telegram-plugin-compat.json" \
@@ -896,6 +927,19 @@ cleanup_exports() {
   rm -f "$SAVED_EXPORTS"
 }
 trap 'cleanup_exports; remove_maintenance_dropin' EXIT
+# The seller changes an agent's paid modules in Novsky; the request outranks the saved list (owner, 19.10.2026).
+_requested_modules_set=0
+_requested_modules=""
+if [ "${NOVSKY_MODULES_REQUEST+x}" = x ]; then
+  _requested_modules_set=1
+  _requested_modules="$NOVSKY_MODULES_REQUEST"
+fi
+_requested_contact_set=0
+_requested_contact=""
+if [ "${NOVSKY_MODULES_CONTACT_REQUEST+x}" = x ]; then
+  _requested_contact_set=1
+  _requested_contact="$NOVSKY_MODULES_CONTACT_REQUEST"
+fi
 python3 "$KIT/assets/bin/saved-env-export" "$ENV_SAVED" > "$SAVED_EXPORTS"
 # Novsky can supply a new key privately when migrating an older saved config.
 _requested_license_key="${NOVSKY_LICENSE_KEY:-}"
@@ -907,6 +951,12 @@ done < "$SAVED_EXPORTS"
 [ -z "$_requested_license_key" ] || export NOVSKY_LICENSE_KEY="$_requested_license_key"
 [ -z "$_requested_bot_token" ] || export TELEGRAM_BOT_TOKEN="$_requested_bot_token"
 unset _requested_license_key _requested_bot_token
+if [ "${_requested_modules_set:-0}" = 1 ]; then
+  export NOVSKY_MODULES="$_requested_modules"
+  [ "${_requested_contact_set:-0}" = 1 ] || export NOVSKY_MODULES_CONTACT="${NOVSKY_MODULES_CONTACT:-}"
+fi
+[ "${_requested_contact_set:-0}" = 0 ] || export NOVSKY_MODULES_CONTACT="$_requested_contact"
+unset _requested_modules_set _requested_modules _requested_contact_set _requested_contact NOVSKY_MODULES_REQUEST NOVSKY_MODULES_CONTACT_REQUEST
 rm -f "$SAVED_EXPORTS"
 SAVED_EXPORTS=""
 

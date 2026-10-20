@@ -1,0 +1,245 @@
+#!/usr/bin/env python3
+"""Перший тиждень зі власником: агент сам пише в перший день і на 2-й, 3-й та 7-й день.
+
+    onboarding-checkins start    поставити чекіни (після першого знайомства); повтор додає лише непоставлені
+    onboarding-checkins stop     власник сказав «не зараз» / «досить» — зняти все й більше не ставити
+    onboarding-checkins status   що поставлено і чи все знято
+    onboarding-checkins gate N   перевірка перед запуском чекіна N (reminder-task --check): порожньо — не писати
+
+Кожен чекін — звичайне надійне нагадування reminder-task з --run: у свій час агент
+сам складає коротке повідомлення за інструкцією нижче. Час рахується в поясі
+власника, тихий вечір і ніч пропускаються (власник, 19.10.2026). Чекін, що запізнився
+на ніч або прийшов після «не зараз», нічого не пише: gate перевіряє це в момент запуску.
+"""
+from __future__ import annotations
+
+from contextlib import contextmanager
+from datetime import datetime, timedelta
+import fcntl
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import time
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+HOME = Path.home()
+PROFILE = HOME / ".agent-profile.env"
+STATE = HOME / ".claude/memory/onboarding-checkins.json"
+LOCK = HOME / ".claude/memory/.onboarding-checkins.lock"
+REMINDER = HOME / "bin/reminder-task"
+TASK = "onboarding-checkin-{}"
+GATE = "~/bin/onboarding-checkins gate {}"
+WINDOW = (9, 21)  # години власника, коли чекін може писати
+
+CHECKINS = (
+    "Знайомство, перший день, через кілька годин. Подивись у USER.md, hot.md і сьогоднішню розмову, що власник розповів "
+    "про себе і що ви вже зробили. Напиши йому коротко, 2–4 речення: спитай, як іде, і запропонуй одну наступну "
+    "конкретну річ, яку можеш узяти на себе, з бази або куплених модулів (блок «Комплект цього агента»), привʼязану до "
+    "його справ. Не перелічуй усе підряд.",
+    "Знайомство, підсумок першого дня. Коротко напиши: що ви сьогодні зробили й налаштували, що ти запамʼятав про "
+    "власника і його справи, що буде завтра (наприклад, ранковий план, якщо підключено календар). Закінчи одним "
+    "питанням: що ще він хотів би передати тобі.",
+    "Знайомство, другий день. Покажи одну корисну можливість, якою власник ще не користувався, на прикладі його справ: "
+    "голосові, пересилання листів чи документів, нагадування або куплений модуль. Одне повідомлення, 2–3 речення.",
+    "Знайомство, третій день. Коротко спитай, що виходить, а що ні, і чи є справа, яка забирає в нього час і яку ти міг "
+    "би робити регулярно. Запропонуй один конкретний варіант.",
+    "Знайомство, сьомий день. Коротко підсумуй, що ти вже робиш для власника, і запропонуй наступний крок. Це останнє "
+    "повідомлення знайомства: далі пиши лише у відповідь або за розкладом, який він сам погодив.",
+)
+
+
+def profile_value(name: str) -> str:
+    try:
+        lines = PROFILE.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return ""
+    for line in lines:
+        if line.startswith(name + "="):
+            return line[len(name) + 1:].strip().strip("'\"")
+    return ""
+
+
+def load_state() -> dict:
+    try:
+        data = json.loads(STATE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(state: dict) -> None:
+    STATE.parent.mkdir(parents=True, exist_ok=True)
+    handle, temporary = tempfile.mkstemp(prefix=".onboarding-checkins.", dir=str(STATE.parent))
+    with os.fdopen(handle, "w", encoding="utf-8") as stream:
+        json.dump(state, stream, ensure_ascii=False, indent=2)
+        stream.write("\n")
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, STATE)
+
+
+@contextmanager
+def locked():
+    """start і stop — один перехід за раз: stop посеред start не губиться."""
+    LOCK.parent.mkdir(parents=True, exist_ok=True)
+    with open(LOCK, "a") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        yield
+
+
+def now_stamp() -> int:
+    forced = os.environ.get("ONBOARDING_CHECKINS_NOW")
+    return int(forced) if forced and forced.isdigit() else int(time.time())
+
+
+def now_local(zone: ZoneInfo) -> datetime:
+    return datetime.fromtimestamp(now_stamp(), zone)
+
+
+def owner_zone() -> ZoneInfo:
+    return ZoneInfo(profile_value("TIMEZONE") or "UTC")
+
+
+def slots(now: datetime) -> list[tuple[int, datetime]]:
+    """(номер чекіна, коли). Ніч і пізній вечір пропускаються."""
+    plan: list[tuple[int, datetime]] = []
+    soon = (now + timedelta(hours=3)).replace(second=0, microsecond=0)
+    if soon.date() == now.date() and 9 <= soon.hour < 20:
+        plan.append((1, soon))
+    evening = now.replace(hour=20, minute=0, second=0, microsecond=0)
+    if evening - now >= timedelta(hours=3):
+        plan.append((2, evening))
+    for number, days in ((3, 1), (4, 2), (5, 6)):
+        day = (now + timedelta(days=days)).replace(hour=10, minute=0, second=0, microsecond=0)
+        plan.append((number, day))
+    return plan
+
+
+def reminder(*args: str) -> subprocess.CompletedProcess:
+    return subprocess.run([str(REMINDER), *args], capture_output=True, text=True)
+
+
+def start() -> int:
+    with locked():
+        state = load_state()
+        if state.get("stoppedAt") or state.get("stopRequestedAt"):
+            print("Власник зупинив знайомство; нових чекінів не ставлю.")
+            return 3
+        chat = profile_value("OWNER_CHAT_ID")
+        zone_name = profile_value("TIMEZONE") or "UTC"
+        if not chat.isdigit():
+            print("Не знайдено OWNER_CHAT_ID у ~/.agent-profile.env", file=sys.stderr)
+            return 2
+        try:
+            zone = ZoneInfo(zone_name)
+        except ZoneInfoNotFoundError:
+            print(f"Невідомий пояс власника: {zone_name}", file=sys.stderr)
+            return 2
+        # The plan is fixed at the first start; a repeat only adds what failed, at its first time.
+        plan = state.get("plan") or {TASK.format(number): int(when.timestamp()) for number, when in slots(now_local(zone))}
+        done = [task for task in state.get("tasks", []) if task in plan]
+        state = {"startedAt": state.get("startedAt") or now_stamp(), "plan": plan, "tasks": done}
+        save_state(state)
+        failed = []
+        for task, at in plan.items():
+            if task in done:
+                continue
+            if at <= now_stamp():
+                continue  # its time passed before it could be set: a day-one note is not sent days later
+            number = int(task.rsplit("-", 1)[1])
+            result = reminder("one", "--task", task, "--actor", chat, "--chat", chat, "--at", str(at),
+                              "--text", CHECKINS[number - 1], "--run", "--check", GATE.format(number),
+                              "--send-gate", GATE.format(number))
+            if result.returncode != 0:
+                failed.append(task)
+                print(f"Не вдалося поставити {task}: {(result.stderr or result.stdout).strip()}", file=sys.stderr)
+                continue
+            done.append(task)
+            save_state(state)
+            print(f"{task}: {datetime.fromtimestamp(at, zone).strftime('%Y-%m-%d %H:%M')} ({zone_name})")
+        if failed:
+            print("Не поставлено: " + ", ".join(failed) + ". Повтори `onboarding-checkins start`.", file=sys.stderr)
+            return 1
+        if not done:
+            print("Усі чекіни знайомства вже в минулому; нічого не ставлю.")
+        return 0
+
+
+def stop() -> int:
+    with locked():
+        state = load_state()
+        state["stopRequestedAt"] = state.get("stopRequestedAt") or now_stamp()
+        save_state(state)
+        pending = []
+        tasks = list(state.get("plan") or []) or [TASK.format(n) for n in range(1, len(CHECKINS) + 1)]
+        for task in tasks:
+            result = reminder("cancel", "--task", task)
+            if result.returncode != 0 and "not found" not in (result.stderr or "").lower():
+                pending.append(task)
+        state["cancelPending"] = pending
+        if pending:
+            state.pop("stoppedAt", None)
+        else:
+            state["stoppedAt"] = now_stamp()
+        save_state(state)
+    if pending:
+        print("Зупинку записано, але не знято: " + ", ".join(pending) + ". Вони вже не напишуть (gate), "
+              "а зняти їх — повтори `onboarding-checkins stop`.", file=sys.stderr)
+        return 1
+    print("Знайомство зупинено: більше сам не пишу, лише у відповідь.")
+    return 0
+
+
+def gate(number: str) -> int:
+    """Перед запуском чекіна: друкує рядок, лише коли писати можна. Завжди код 0 (збій перевірки reminder-task
+    сприйняв би як дозвіл)."""
+    try:
+        state = load_state()
+        if state.get("stoppedAt") or state.get("stopRequestedAt"):
+            return 0
+        local = now_local(owner_zone())
+        if not WINDOW[0] <= local.hour < WINDOW[1]:
+            return 0
+        print(f"Знайомство триває; у власника {local.strftime('%H:%M')}, чекін {number} можна надіслати.")
+    except Exception:  # noqa: BLE001 — будь-який збій: краще промовчати, ніж писати вночі чи після «не зараз»
+        return 0
+    return 0
+
+
+def status() -> int:
+    state = load_state()
+    if state.get("cancelPending"):
+        print("Зупинку записано, але не знято: " + ", ".join(state["cancelPending"]) + ". Повтори `onboarding-checkins stop`.")
+        return 1
+    if state.get("stoppedAt"):
+        print("Зупинено власником.")
+    elif state.get("tasks"):
+        print("Поставлено: " + ", ".join(state["tasks"]))
+        missing = [task for task, at in (state.get("plan") or {}).items() if task not in state["tasks"] and at > now_stamp()]
+        if missing:
+            print("Не поставлено: " + ", ".join(missing) + ". Повтори `onboarding-checkins start`.")
+            return 1
+    else:
+        print("Чекіни ще не ставились.")
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    command = argv[1] if len(argv) > 1 else ""
+    if command == "start":
+        return start()
+    if command == "stop":
+        return stop()
+    if command == "status":
+        return status()
+    if command == "gate" and len(argv) > 2:
+        return gate(argv[2])
+    print(__doc__.strip().splitlines()[0], file=sys.stderr)
+    print("usage: onboarding-checkins start|stop|status|gate N", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))

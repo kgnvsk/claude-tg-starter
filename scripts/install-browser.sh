@@ -39,6 +39,9 @@ chmod -R a+rX "$STATE/ms-playwright"
 install -m 644 "$KIT/assets/browser/browser-smoke.mjs" "$RUNTIME/browser-smoke.mjs"
 install -m 644 "$KIT/assets/browser/browser-mcp-smoke.mjs" "$RUNTIME/browser-mcp-smoke.mjs"
 install -m 644 "$KIT/assets/systemd/claude-browser.service" /etc/systemd/system/claude-browser.service
+# Private networks denied, memory and tasks bounded: the kit drop-ins every update writes too.
+. "$KIT/assets/lib/browser-dropins.sh"
+write_browser_dropins /etc/systemd/system/claude-browser.service.d
 install -m 755 -o claude -g claude "$KIT/assets/bin/browser-doctor" "$CLAUDE_HOME/bin/browser-doctor"
 install -m 755 -o claude -g claude "$KIT/assets/bin/browser-pdf.mjs" "$CLAUDE_HOME/bin/browser-pdf.mjs"
 install -m 755 -o claude -g claude "$KIT/assets/bin/html-to-pdf" "$CLAUDE_HOME/bin/html-to-pdf"

@@ -37,8 +37,37 @@ ALLOWED_PREFIXES = (
 )
 
 
+SETTINGS = Path(".claude/settings.json")
+REDACTED = "[REDACTED]"
+
+
 def digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def unmasked_settings(data: bytes, target: Path) -> tuple[bytes, list[str]]:
+    """The backup's settings.json with each env value agent-backup masked taken from the live file.
+
+    A masked name the live file lacks is left out and returned, for the owner to enter again."""
+    if REDACTED.encode() not in data:
+        return data, []
+    settings = json.loads(data)
+    env = settings.get("env") if isinstance(settings, dict) else None
+    if not isinstance(env, dict):
+        return data, []
+    try:
+        live = json.loads(target.read_bytes()).get("env")
+    except (OSError, ValueError, AttributeError):
+        live = None
+    live = live if isinstance(live, dict) else {}
+    missing = []
+    for name in [name for name, value in env.items() if value == REDACTED]:
+        if live.get(name) in (None, "", REDACTED):
+            del env[name]
+            missing.append(name)
+        else:
+            env[name] = live[name]
+    return (json.dumps(settings, ensure_ascii=False, indent=2) + "\n").encode(), missing
 
 
 def allowed(relative: Path, managed_paths: set[Path] | None = None) -> bool:
@@ -162,6 +191,7 @@ def restore(archive_path: Path, home: Path) -> dict:
     account = pwd.getpwnam("claude")
     restored = 0
     backed_up = 0
+    secrets_to_reenter: list[str] = []
     replaced: list[tuple[Path, Path | None]] = []
     try:
         for item in entries:
@@ -175,6 +205,9 @@ def restore(archive_path: Path, home: Path) -> dict:
                 backed_up += 1
             target.parent.mkdir(parents=True, exist_ok=True)
             data = archive.read(item["path"])
+            if relative == SETTINGS:
+                data, missing = unmasked_settings(data, target)
+                secrets_to_reenter += missing
             fd, temporary = tempfile.mkstemp(prefix=target.name + ".", dir=target.parent)
             try:
                 with os.fdopen(fd, "wb") as handle:
@@ -218,6 +251,7 @@ def restore(archive_path: Path, home: Path) -> dict:
         "files": restored,
         "previousFilesSaved": backed_up,
         "safetyCopy": str(safety),
+        "secretsToReenter": secrets_to_reenter,
     }
 
 

@@ -78,6 +78,7 @@ MANAGED_BIN_NAMES = frozenset(
         "meta-ads",
         "no-nested-claude-guard",
         "no-secrets-guard",
+        "onboarding-checkins",
         "onboarding-reminder",
         "onboarding-status",
         "plugin-doctor",

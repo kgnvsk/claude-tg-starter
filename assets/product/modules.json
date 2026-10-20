@@ -1,0 +1,170 @@
+{
+  "schemaVersion": 1,
+  "reason": "Модулі продукту: що входить у базу і що продається окремо (власник, 19.10.2026). Продавець відмічає куплені модулі в Novsky (NOVSKY_MODULES); агент без цього налаштування працює як раніше, з усім комплектом. Id збігаються з src/shared/agent-modules.ts у Novsky; невідомий id зупиняє встановлення.",
+  "base": {
+    "name": "База",
+    "includes": [
+      "Telegram цілодобово",
+      "голосові повідомлення й відповіді голосом",
+      "документи: Word, Excel, PDF, презентації, архіви",
+      "довгострокова памʼять про людей, проєкти й рішення",
+      "підлаштування під стиль спілкування",
+      "безпечне зберігання й контроль доступу",
+      "пошук і читання сайтів",
+      "нагадування"
+    ],
+    "skills": ["backup-recovery", "research", "spreadsheets"],
+    "checks": ["skills", "core", "memory", "memory_semantic_search", "claude_auth", "telegram_service", "browser", "plugins", "voice_transcription", "memory_backup"]
+  },
+  "modules": [
+    {
+      "id": "calendar",
+      "name": "Календар",
+      "pitch": "веду Google-календар: зустрічі голосом, нагадування, вільні вікна, ранковий план дня",
+      "skills": ["google-workspace"],
+      "kitModules": [],
+      "checks": ["google_workspace"],
+      "googleServices": ["calendar", "meet", "contacts", "tasks"]
+    },
+    {
+      "id": "tasks",
+      "name": "Задачі",
+      "pitch": "веду завдання в таск-менеджері: створюю голосом, стежу за строками й навантаженням",
+      "skills": ["asana-tasks"],
+      "kitModules": [],
+      "checks": ["asana_tasks"],
+      "googleServices": ["tasks"]
+    },
+    {
+      "id": "spreadsheets",
+      "name": "Таблиці й дані",
+      "pitch": "працюю з Google Таблицями наживо, рахую, зводжу й аналізую дані, роблю звіти з баз",
+      "skills": ["google-workspace", "sql-readonly"],
+      "kitModules": [],
+      "checks": ["google_workspace", "sql_readonly"],
+      "googleServices": ["sheets", "drive", "docs"]
+    },
+    {
+      "id": "team",
+      "name": "Робочі чати й команда",
+      "pitch": "працюю в робочих Telegram-групах: фіксую домовленості, нагадую про обіцянки, роблю дайджести; даю працівникам власний доступ",
+      "skills": ["pm-assistant", "team-access"],
+      "kitModules": [],
+      "checks": []
+    },
+    {
+      "id": "mail",
+      "name": "Пошта і доступи",
+      "pitch": "розбираю пошту, сортую за важливістю, готую відповіді, керую доступом до документів на Диску",
+      "skills": ["google-workspace", "icloud-mail"],
+      "kitModules": [],
+      "checks": ["google_workspace"],
+      "googleServices": ["gmail", "drive", "docs", "contacts"]
+    },
+    {
+      "id": "creatives",
+      "name": "Креативи і графіка",
+      "pitch": "створюю обкладинки, ілюстрації, схеми, інфографіку й інші зображення",
+      "skills": ["brand-fonts", "codex-imagegen"],
+      "kitModules": [],
+      "checks": ["codex_auth"]
+    },
+    {
+      "id": "web",
+      "name": "Сайти й веб-сторінки",
+      "pitch": "роблю посадкові сторінки, дашборди, форми й сайти та публікую їх за посиланням",
+      "skills": ["brand-fonts", "vault-web", "vercel-deploy", "web-report"],
+      "kitModules": ["vault-web"],
+      "checks": ["vercel_cli", "vercel_auth"]
+    },
+    {
+      "id": "meetings",
+      "name": "Розшифровка зустрічей",
+      "pitch": "приходжу на Zoom, Meet чи Teams, записую й роблю протокол із рішеннями й завданнями",
+      "skills": ["meet-listen"],
+      "kitModules": [],
+      "checks": ["meeting_secretary"],
+      "googleServices": ["meet"]
+    },
+    {
+      "id": "instagram",
+      "name": "Instagram і Facebook",
+      "pitch": "відповідаю в Direct і коментарях, публікую дописи й Reels, збираю статистику сторінки",
+      "skills": ["facebook-page", "instagram-dm"],
+      "kitModules": ["instagram-dm"],
+      "checks": []
+    },
+    {
+      "id": "messengers",
+      "name": "Особисті Telegram і WhatsApp",
+      "pitch": "читаю твої особисті Telegram і WhatsApp, нагадую, кому ти не відповів, пишу на твоє прохання",
+      "skills": ["personal-inbox"],
+      "kitModules": ["personal-inbox"],
+      "checks": []
+    },
+    {
+      "id": "calls",
+      "name": "Дзвінки",
+      "pitch": "дзвоню тобі в Telegram із коротким голосовим повідомленням, коли щось термінове",
+      "skills": ["telegram-calls"],
+      "kitModules": ["telegram-calls"],
+      "checks": []
+    },
+    {
+      "id": "video",
+      "name": "Монтаж і створення відео",
+      "pitch": "монтую розмовні відео й Reels, роблю субтитри, анімовані ролики й промо-відео",
+      "skills": [
+        "brag-slim", "brand-fonts", "context-aware-reels", "embedded-captions", "faceless-explainer", "figma",
+        "general-video", "hyperframes", "hyperframes-animation", "hyperframes-cli", "hyperframes-core",
+        "hyperframes-creative", "hyperframes-keyframes", "hyperframes-registry", "media-use", "motion-graphics",
+        "music-to-video", "pr-to-video", "product-launch-video", "remotion-to-hyperframes", "slideshow",
+        "social-video-edit", "talking-head-recut", "video-craft"
+      ],
+      "kitModules": [],
+      "checks": ["video_edit"]
+    },
+    {
+      "id": "marketing",
+      "name": "Маркетинг і аналітика",
+      "pitch": "аналізую конкурентів і соцмережі, рекламу Meta, трафік сайту й відеокреативи",
+      "skills": ["analyze-video", "apify-social-research", "google-growth-analytics", "google-workspace", "meta-ads-analytics"],
+      "kitModules": [],
+      "checks": ["apify_social_data", "growth_analytics", "meta_ads"],
+      "googleServices": ["analytics", "searchconsole"]
+    },
+    {
+      "id": "youtube",
+      "name": "YouTube",
+      "pitch": "веду YouTube-канал: відео, описи, відповіді на коментарі, щоденне зведення",
+      "skills": ["google-workspace", "youtube-comments"],
+      "kitModules": ["youtube-comments"],
+      "checks": [],
+      "googleServices": ["youtube"]
+    },
+    {
+      "id": "channel",
+      "name": "Публікації в Telegram-канал",
+      "pitch": "публікую погоджені дописи в твій Telegram-канал і веду автопостинг із джерел",
+      "skills": ["auto-publisher", "channel-publishing"],
+      "kitModules": ["channel-publishing"],
+      "checks": []
+    },
+    {
+      "id": "crm",
+      "name": "Продажі і CRM",
+      "pitch": "веду CRM: угоди, етапи воронки, нотатки й звірку з іншими системами",
+      "skills": ["business-systems-integration", "hubspot-crm"],
+      "kitModules": [],
+      "checks": ["hubspot_crm"]
+    },
+    {
+      "id": "research-data",
+      "name": "Тендери і фінансові дані",
+      "pitch": "шукаю тендери, збираю звітність і ринкові дані публічних компаній",
+      "skills": ["finance-data", "sec-edgar-research", "tender-watch"],
+      "kitModules": [],
+      "checks": ["sec_edgar"]
+    }
+  ]
+}

@@ -65,17 +65,19 @@ const CORPORATE_ACTIVATED_MARKER = join(
 )
 const CORPORATE_TEMPORARILY_UNAVAILABLE =
   '⚠️ Корпоративний режим тимчасово недоступний. Спробуй трохи пізніше.'
+// Every file reaches a company chat (owner, 18.10.2026); only a message that is no file and no text is refused.
 const CORPORATE_FILE_INSPECTION_DISABLED =
-  '⚠️ Підтримуються фото та зображення JPEG/PNG/GIF/WebP до 3 МБ, голосові й аудіо, відео MP4/MOV/WEBM, а також документи PDF, DOCX, XLSX, PPTX, TXT, MD, CSV і TSV до 20 МБ. Інші файли надішли як текст.'
+  '⚠️ Такий тип повідомлення я не відкриваю. Напиши текстом або надішли файлом.'
 const CORPORATE_VOICE_UNRECOGNIZED = 'Не розчув запис. Надішли голосове ще раз або напиши запит текстом — і я відповім.'
 const CORPORATE_FILE_TOO_LARGE =
   '⚠️ Файл більший за 20 МБ — Telegram не передає такі файли ботам. Надішли коротший запис, частину файлу або текст.'
-// Files a company job could not take are named in its text, so the worker says
-// so instead of answering as if nothing had been sent.
+// Files a company job could not take are named in its text, with the reason when it is known, so the worker
+// answers the person (a link instead, a smaller part) rather than as if nothing had been sent.
 const UNOPENED_NAMES: Record<string, string> = { video: 'відео', video_note: 'відеокружок', photo: 'фото', voice: 'запис', audio: 'запис' }
-function unopenedLine(files: { kind: string; name?: string }[]): string {
-  const names = files.map(file => UNOPENED_NAMES[file.kind] ?? (file.name ? `файл «${file.name}»` : 'файл'))
-  return `(Не відкрито: ${names.join(', ')}. ${CORPORATE_FILE_INSPECTION_DISABLED.replace(/^⚠️\s*/u, '')})`
+function unopenedLine(files: { kind: string; name?: string; size?: number }[]): string {
+  const names = files.map(file => (UNOPENED_NAMES[file.kind] ?? (file.name ? `файл «${file.name}»` : 'файл'))
+    + ((file.size ?? 0) > 20 * 1024 * 1024 ? ' — більший за 20 МБ, Telegram не передає такі файли ботам' : ''))
+  return `(Не відкрито: ${names.join(', ')}.)`
 }
 
 function isOwnerServiceControlInput(
@@ -8726,9 +8728,7 @@ async function downloadCorporateDocument(ctx: Context, attachment: AttachmentMet
 // corporate module still types, bounds and validates the bytes.
 async function downloadCorporateDocumentFile(api: Context['api'], attachment: AttachmentMeta) {
   const media = await import(new URL('./media.ts', pathToFileURL(CORPORATE_MODULE)).href)
-  const name = corporateDocumentName(attachment.name)
-  const mediaType = media.corporateDocumentType(name)
-  if (!mediaType) throw new Error('document type unsupported')
+  const name = corporateDocumentName(attachment.name) || 'file'
   if (attachment.size != null && attachment.size > media.MAX_DOCUMENT_BYTES) throw new Error('document too large')
   const file = await api.getFile(attachment.file_id, AbortSignal.timeout(TELEGRAM_FETCH_TIMEOUT_MS))
   if (!file.file_path || file.file_path.includes('..') || !/^[A-Za-z0-9_./-]+$/.test(file.file_path)) {
@@ -8739,7 +8739,7 @@ async function downloadCorporateDocumentFile(api: Context['api'], attachment: At
     signal: AbortSignal.timeout(TELEGRAM_FETCH_TIMEOUT_MS), redirect: 'error',
   })
   const bytes = await readTelegramFileResponse(response, file.file_size ?? attachment.size)
-  return media.validateCorporateDocuments([{ name, mediaType, data: bytes.toString('base64') }])[0]
+  return media.validateCorporateDocuments([{ name, mediaType: media.corporateDocumentType(name, bytes), data: bytes.toString('base64') }])[0]
 }
 
 // ── late-bound group documents, photos and voice (2026-09-18, -09-21, -09-22)
@@ -8798,23 +8798,29 @@ const lateBoundVoiceLines = (sender: string, now = Date.now()): string[] =>
 // Late-bound pictures ride the same envelope as an attached one, so they stop
 // at the module's total-image budget instead of failing the whole turn at
 // enqueue. A picture that no longer downloads is skipped, not fatal.
+// A picture the image path cannot take, and every one past the budget, is handed back to come as a file
+// (owner, 18.10.2026: any file; Codex, PR 315: a 4 MB photo before a mention arrived with nothing at all).
 async function downloadLateBoundImages(api: Context['api'], attachments: AttachmentMeta[]) {
-  if (!attachments.length) return []
+  const images = [], rest: AttachmentMeta[] = []
+  if (!attachments.length) return { images, rest }
   const media = await import(new URL('./media.ts', pathToFileURL(CORPORATE_MODULE)).href)
-  const images = []
   let total = 0
-  for (const late of attachments) {
+  for (const [index, late] of attachments.entries()) {
     try {
       const image = await downloadCorporateImageFile(api, late)
       const size = Buffer.from(image.data, 'base64').byteLength
-      if (total + size > media.MAX_TOTAL_IMAGE_BYTES) break
+      if (total + size > media.MAX_TOTAL_IMAGE_BYTES) {
+        rest.push(...attachments.slice(index))
+        break
+      }
       total += size
       images.push(image)
     } catch (err) {
       process.stderr.write(`telegram channel: late-bound photo skipped: ${err}\n`)
+      rest.push(late)
     }
   }
-  return images
+  return { images, rest }
 }
 
 // The uploader picks the name; the module refuses separators, control
@@ -8869,9 +8875,9 @@ async function routeInbound(
     await refuse('unsupported_file', CORPORATE_FILE_INSPECTION_DISABLED)
     return
   }
-  // Telegram hands no bot a file over 20 MB: that is the answer, not "try later". A video too big to open is named to
-  // the worker with its words instead, as before videos opened (Codex K229-P2-1).
-  if (!namedOnly && !video && (attachment?.size ?? 0) > 20 * 1024 * 1024) {
+  // Telegram hands no bot a file over 20 MB: for a recording that is the answer, not "try later". Any other file too
+  // big to open is named to the worker with its words, so the person hears a way round it (owner, 18.10.2026).
+  if ((attachment?.kind === 'voice' || attachment?.kind === 'audio') && (attachment.size ?? 0) > 20 * 1024 * 1024) {
     await replyCorporate(CORPORATE_FILE_TOO_LARGE)
     return
   }
@@ -8896,9 +8902,9 @@ async function routeInbound(
     let documents
     const unopened: AttachmentMeta[] = []
     if (downloadImage != null || attachment?.kind === 'document' || video) {
-      // A photo, or a document that is an image, stays an image; a document of
-      // a kind the corporate module takes (PDF, Office, plain text) becomes a
-      // file in the worker's workspace; anything else is refused before download.
+      // A photo, or a document that is an image, stays an image; any other
+      // document — an archive, a script, a file of any kind — becomes a file in
+      // the worker's workspace, as in the owner's chat (owner, 18.10.2026).
       const incomingDocument = ctx.message?.document
       const imageDocument = attachment?.kind === 'document'
         && (/^image\//.test(incomingDocument?.mime_type ?? attachment.mime ?? '')
@@ -8906,21 +8912,30 @@ async function routeInbound(
       try {
         if (video) documents = [await downloadCorporateVideo(ctx, attachment)]
         else if (attachment?.kind === 'document' && !imageDocument) documents = [await downloadCorporateDocument(ctx, attachment)]
-        else images = [await downloadCorporateImage(ctx, attachment)]
-      } catch {
-        // A video that does not open keeps its words and is named (Codex K229-P2-1); any other file is refused.
-        if (!video) {
-          await refuse('file_unavailable', CORPORATE_FILE_INSPECTION_DISABLED)
-          return
+        else {
+          try { images = [await downloadCorporateImage(ctx, attachment)] }
+          // A picture past the image limits (a 5 MB photo sent as a file) still arrives, as a file.
+          catch (error) {
+            if (!attachment) throw error
+            documents = [await (attachment.kind === 'document' ? downloadCorporateDocument(ctx, attachment)
+              : downloadCorporateDocumentFile(ctx.api, { ...attachment, name: 'photo.jpg' }))]
+          }
         }
-        unopened.push(attachment!)
+      } catch {
+        // A file that still does not open keeps its words and is named, so the worker answers it (Codex K229-P2-1;
+        // owner, 18.10.2026: the receiver no longer refuses files on the worker's behalf).
+        if (attachment) unopened.push(attachment)
       }
     }
     // A reply brings the photo or document it answers, before any late binding.
     const replied = !images && !documents && attachment == null ? repliedAttachment(ctx.message) : undefined
     if (replied) {
       try {
-        if (replied.kind === 'photo' || /^image\//.test(replied.mime ?? '')) images = [await downloadCorporateImageFile(ctx.api, replied)]
+        if (replied.kind === 'photo' || /^image\//.test(replied.mime ?? '')) {
+          try { images = [await downloadCorporateImageFile(ctx.api, replied)] }
+          // A picture past the image limits (a 4 MB photo, a HEIC) still arrives, as a file (owner, 18.10.2026).
+          catch { documents = [await downloadCorporateDocumentFile(ctx.api, replied.kind === 'photo' ? { ...replied, name: 'photo.jpg' } : replied)] }
+        }
         else if (replied.kind === 'document') documents = [await downloadCorporateDocumentFile(ctx.api, replied)]
         else if (replied.kind === 'video' || replied.kind === 'video_note') documents = [await downloadCorporateDocumentFile(ctx.api, corporateVideoFile(replied))]
         else unopened.push(replied)
@@ -8964,8 +8979,22 @@ async function routeInbound(
       // when the conversation left none.
       if (bound.length) documents = bound
       else {
-        const pictures = await downloadLateBoundImages(ctx.api, lateBoundPhotos(lateSender))
-        if (pictures.length) images = pictures
+        const photos = lateBoundPhotos(lateSender)
+        const pictures = await downloadLateBoundImages(ctx.api, photos)
+        if (!pictures.rest.length) {
+          if (pictures.images.length) images = pictures.images
+        } else {
+          // One picture the image path cannot take turns the whole set into files within the turn's file limits, the
+          // rest named: a turn carries pictures or files, never both, so the store's one envelope holds (Codex, PR 315).
+          for (const late of photos) {
+            try { bind(await downloadCorporateDocumentFile(ctx.api, { ...late, name: late.name ?? 'photo.jpg' })) }
+            catch (err) {
+              process.stderr.write(`telegram channel: late-bound photo not taken as a file: ${err}\n`)
+              unopened.push(late)
+            }
+          }
+          if (bound.length) documents = bound
+        }
       }
     }
     if (attachment?.kind === 'voice' || attachment?.kind === 'audio') {

@@ -280,6 +280,7 @@ def require_equivalent(records, args, requested_mode):
             "RUN": "1" if getattr(args, "run", False) else None,
             "RETRY_SAFE": "1" if getattr(args, "retry_safe", False) else None,
             "CHECK": getattr(args, "check", None),
+            "SEND_GATE": getattr(args, "send_gate", None),
             "ACTOR": args.actor,
         }
         if any(record.headers.get(key) != value for key, value in expected.items()):
@@ -297,6 +298,7 @@ def require_equivalent(records, args, requested_mode):
             "RUN": "1" if getattr(args, "run", False) else None,
             "RETRY_SAFE": "1" if getattr(args, "retry_safe", False) else None,
             "CHECK": getattr(args, "check", None),
+            "SEND_GATE": getattr(args, "send_gate", None),
             "REPEAT_SECONDS": str(args.every),
             "TIMEZONE": args.timezone,
             "QUIET_START": args.quiet_start,
@@ -593,6 +595,8 @@ def create_single(rem_dir, args, repeat=False):
         headers.append(("RETRY_SAFE", "1"))
     if getattr(args, "check", None) is not None:
         headers.append(("CHECK", args.check))
+    if getattr(args, "send_gate", None) is not None:
+        headers.append(("SEND_GATE", args.send_gate))
     if repeat:
         headers.extend(
             [
@@ -747,6 +751,13 @@ def check_command(value):
     return value.strip()
 
 
+def send_gate_command(value):
+    # One header line, like --check: a newline would end the header block.
+    if not value.strip() or len(value) > 500 or any(ch in value for ch in "\n\r\0"):
+        raise argparse.ArgumentTypeError("--send-gate must be one line of at most 500 characters")
+    return value.strip()
+
+
 def checkpoint(value):
     try:
         epoch_text, text = value.split("|", 1)
@@ -784,6 +795,10 @@ def parser():
         # reaches the task (Арти, 09.10.2026: a group watch every two minutes spent a Pro plan on nothing new).
         command.add_argument("--check", type=check_command, help="with --run: a shell command run first; empty output or NO_NEW skips the model run. "
                              "It only reads: the task marks what it handled. What it prints is kept and offered again until a run with it finishes")
+        # A look again right before the result is sent, fresh each time (first-day check-ins, review 19.10.2026): nothing
+        # printed, a silence word, a failure or a hang drops a result made earlier instead of sending it late.
+        command.add_argument("--send-gate", type=send_gate_command, help="with --run: a shell command run right before a wholly unsent result "
+                             "is delivered; empty output, NO_NEW, a silence word or a failure drops the result")
 
     one = commands.add_parser("one", help="create one durable reminder")
     message(one)
@@ -841,6 +856,8 @@ def normalize(args):
             args.chat = chat_id(args.chat)
     if getattr(args, "check", None) is not None and not args.run:
         raise TaskError("--check needs --run: only a task the scheduler runs can skip a run")
+    if getattr(args, "send_gate", None) is not None and not args.run:
+        raise TaskError("--send-gate needs --run: only a task's own result can be withheld")
     if getattr(args, "retry_safe", False) and not args.run:
         raise TaskError("--retry-safe needs --run: only a task the scheduler runs can run again")
     if args.command in {"one", "repeat"}:

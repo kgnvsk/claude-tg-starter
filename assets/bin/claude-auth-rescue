@@ -109,6 +109,9 @@ DEBOUNCE_S = 1200         # min gap between rescue attempts
 AUTO_ATTEMPTS_CAP = 1
 ATTEMPTS_FILE = AGENT_ROOT / ".claude/auth-rescue-auto-attempts"
 POLLER_START_TIMEOUT_S = 60
+# A unit that is still running gets this much more time instead of a second restart: a long --resume
+# brings the poller up late, and restarting it again only resets that start (partner, 13.10).
+POLLER_SLOW_START_S = 120
 POLLER_POLL_INTERVAL_S = 1
 TRANSPORT_RESTART_ATTEMPTS = 2
 
@@ -446,9 +449,9 @@ def _canonical_poller_pid() -> int | None:
         return None
 
 
-def wait_for_canonical_poller() -> bool:
+def wait_for_canonical_poller(timeout: float = POLLER_START_TIMEOUT_S) -> bool:
     """Wait a bounded interval for the post-restart Telegram process."""
-    deadline = time.monotonic() + POLLER_START_TIMEOUT_S
+    deadline = time.monotonic() + timeout
     while True:
         if canonical_poller_alive():
             return True
@@ -458,8 +461,24 @@ def wait_for_canonical_poller() -> bool:
         time.sleep(min(POLLER_POLL_INTERVAL_S, remaining))
 
 
+def service_running() -> bool:
+    try:
+        return subprocess.run(
+            ["systemctl", "is-active", "--quiet", SERVICE],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+        ).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
 def restart_and_verify_transport() -> bool:
-    """Restart at most twice and return only after a proven poller."""
+    """Restart at most twice and return only after a proven poller.
+
+    A second restart only follows a unit that is not running; one that runs waits longer, and the result is one
+    last look at the poller, so a slow start is never reported as a failed one.
+    """
     for attempt in range(1, TRANSPORT_RESTART_ATTEMPTS + 1):
         try:
             result = subprocess.run(
@@ -475,8 +494,15 @@ def restart_and_verify_transport() -> bool:
             log(f"service restart attempt {attempt} failed")
         if wait_for_canonical_poller():
             return True
+        if service_running():
+            log(f"service running without the Telegram poller after restart attempt {attempt}; waiting longer")
+            if wait_for_canonical_poller(POLLER_SLOW_START_S):
+                return True
+            if service_running():
+                log(f"service still running without the poller after restart attempt {attempt}; not restarting it again")
+                break
         log(f"Telegram poller absent after service restart attempt {attempt}")
-    return False
+    return canonical_poller_alive()
 
 
 @contextmanager
@@ -656,11 +682,11 @@ def finish_recovery(
         token,
         chat,
         say("auth.transport_failed",
-            "⚠️ Авторизацію Claude відновлено, але Telegram-канал не запустився "
-            "після двох безпечних перезапусків. Відновлення не позначено завершеним — "
+            "⚠️ Авторизацію Claude відновлено, але Telegram-канал не запустився. "
+            "Відновлення не позначено завершеним — "
             "потрібна перевірка каналу."),
     )
-    log("auth restored but Telegram poller failed after two restarts")
+    log("auth restored but the Telegram poller did not come back")
     return 1
 
 

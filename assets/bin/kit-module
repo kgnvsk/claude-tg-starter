@@ -58,6 +58,33 @@ PY
 fi
 
 STATE="$HOME/.claude/product/modules"
+# Paid modules (owner, 19.10.2026): the seller's licence names what this agent bought. A module folder of an
+# unbought module answers with who connects it; an agent without a licence file keeps every module.
+# Fixed root-owned path: no environment variable can point the check elsewhere.
+LICENCE="/etc/claude-premium/modules/$user.json"
+module_blocked() {
+  [ -e "$LICENCE" ] || return 1
+  python3 - "$LICENCE" "$1" "$2" <<'PY'
+import json, sys
+path, mode, folder = sys.argv[1:]
+fallback = "людина, яка встановила агента"
+try:
+    licence = json.loads(open(path, encoding="utf-8").read())
+    if not isinstance(licence, dict) or licence.get("kind") != "novsky-modules-licence":
+        raise ValueError
+except (OSError, ValueError):
+    licence = {"blockedKitModules": [folder], "contact": "", "kitModules": {}, "notBought": []}
+if folder not in licence.get("blockedKitModules", []):
+    raise SystemExit(1)
+owner = (licence.get("kitModules") or {}).get(folder)
+name = next((m.get("name") for m in licence.get("notBought", []) if m.get("id") == owner), owner or folder)
+contact = (licence.get("contact") or "").strip() or fallback
+if mode == "list":
+    print(f"{folder} — окремий модуль «{name}», не входить у комплект; підключає {contact}")
+else:
+    print(f"«{folder}» — частина окремого модуля «{name}», якого немає в комплекті цього агента. Його підключає {contact}.")
+PY
+}
 name_ok() { [[ "$1" =~ ^[a-z][a-z0-9-]{0,40}$ ]]; }
 module_dir() {
   name_ok "$1" || { echo "Назва модуля — малі латинські літери, цифри й дефіс." >&2; return 2; }
@@ -81,7 +108,9 @@ case "${1:-}" in
   list)
     current="$(release)"
     for name in $(available); do
-      if [ -f "$STATE/$name" ]; then
+      if blocked="$(module_blocked list "$name")"; then
+        printf '%s\n' "$blocked"
+      elif [ -f "$STATE/$name" ]; then
         # Запис каже лише, що файли модуля поставлено і з якого випуску; чи підключено акаунт — каже перевірка в скілі.
         recorded="$(cat "$STATE/$name")"
         newer=""
@@ -99,6 +128,10 @@ case "${1:-}" in
     [ "$(id -u)" -ne 0 ] || { echo "Запусти під користувачем агента, не root." >&2; exit 1; }
     dir="$(module_dir "${2:-}")"
     name="$2"
+    if blocked="$(module_blocked setup "$name")"; then
+      printf '%s\n' "$blocked" >&2
+      exit 4
+    fi
     shift 2
     bash "$dir/setup.sh" "$@"
     install -d -m 700 "$STATE"
