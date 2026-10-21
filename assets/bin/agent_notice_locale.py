@@ -47,6 +47,7 @@ RUSSIAN_NOTICES = {
         "⚠️ Работа над этим запросом зависала трижды, поэтому я её остановил, чтобы не задерживать другие сообщения. "
         "Отправь его снова, если он ещё нужен."
     ),
+    "queue.inactivity_warning": "Твой запрос сохранён. Проверяю, почему ответ задерживается; повторять сообщение не нужно.",
     "queue.silent_worker": (
         "Фоновая задача запроса {requests} не отвечает: нет ни результата, ни обновлений. "
         "Она больше не задерживает другие сообщения. Если она зависла, пришли /unstick, и запрос выполнится заново."
@@ -173,6 +174,7 @@ POLISH_NOTICES = {
         "⚠️ Praca nad tym zapytaniem zawiesiła się trzy razy, więc ją zatrzymałem, żeby nie blokować innych wiadomości. "
         "Wyślij je ponownie, jeśli nadal jest potrzebne."
     ),
+    "queue.inactivity_warning": "Twoje zapytanie jest zapisane. Sprawdzam, dlaczego odpowiedź się opóźnia; nie trzeba powtarzać wiadomości.",
     "queue.silent_worker": (
         "Zadanie w tle dla zapytania {requests} nie odpowiada: brak wyniku i aktualizacji. "
         "Nie blokuje już innych wiadomości. Jeśli się zawiesiło, wyślij /unstick, a zapytanie wykona się od nowa."
@@ -295,6 +297,7 @@ ENGLISH_NOTICES = {
         "⚠️ Work on this request hung three times, so I stopped it to keep other messages moving. "
         "Send it again if you still need it."
     ),
+    "queue.inactivity_warning": "Your request is saved. I am checking why the answer is late; there is no need to send it again.",
     "queue.silent_worker": (
         "The background task of request {requests} is not responding: no result and no updates. "
         "It no longer holds up other messages. If it is stuck, send /unstick and the request will run again."

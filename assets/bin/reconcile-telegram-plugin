@@ -31,10 +31,12 @@ UPSTREAM_SERVER_SHA256 = (
 )
 UPSTREAM_PACKAGE_START = "bun install --no-summary 1>&2 && bun server.ts"
 GOLDEN_SERVER_SHA256 = (
-    "d091168a7cdbf9c290f214b6df89e4dad8727b8727c120f961999dbc2a53dd85"
+    "dbcb1c0c96061e5a444100ae9ff3c6097ff0706103d865f0d4ea8c1e9c7f2fe8"
 )
 PREVIOUS_GOLDEN_SERVER_SHA256S = frozenset(
     {
+        # 518a6c7fe577 Одна розмова в групі, крок 1 (#328)
+        "d091168a7cdbf9c290f214b6df89e4dad8727b8727c120f961999dbc2a53dd85",
         # The golden before one chat is one conversation (history, strict company journal).
         "c3ffbe5d4f52cba468a6ed3bc7585267779f8bdab9100f09bd0990046062f369",
         # 147a1594466d Один чат — одна розмова: група бачить усю свою історію

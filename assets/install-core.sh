@@ -431,6 +431,35 @@ validate_starter_foundation() {
 # END Starter foundation preflight
 validate_starter_foundation
 
+# BEGIN skill conflict precheck
+# A skill or subagent conflict stops the update before this installer writes anything (Codex review 21.10.2026,
+# P1-3): found only after the managed resources, it left the bot stopped with new files the rollback could not prove
+# (Кристоф 21.10.2026, recovery-hold). It writes nothing in the agent's home, removes its temporary policy on every
+# path, and on a first install finds nothing to conflict.
+PRECHECK_SKILLS_POLICY="$KIT/assets/product/managed-skills.json"
+if [ "$NOVSKY_MODULES_GATED" = 1 ]; then
+  PRECHECK_SKILLS_POLICY="$(mktemp /tmp/novsky-managed-skills.XXXXXX)"
+  python3 "$KIT/assets/lib/product_modules.py" policy --catalog "$KIT/assets/product/modules.json" \
+    --modules "$NOVSKY_MODULES" --policy "$KIT/assets/product/managed-skills.json" --out "$PRECHECK_SKILLS_POLICY" \
+    || { rm -f "$PRECHECK_SKILLS_POLICY"; exit 2; }
+fi
+precheck_status=0
+env AGENT_NAME="$AGENT_NAME" OWNER_NAME="$OWNER_NAME" \
+  OWNER_TG_USERNAME="$OWNER_TG_USERNAME" OWNER_CHAT_ID="$OWNER_CHAT_ID" \
+  BOT_USERNAME="$BOT_USERNAME" TIMEZONE="$TIMEZONE" \
+  CALENDAR_EMAIL="$CALENDAR_EMAIL" DEPLOY_DATE="$DEPLOY_DATE" \
+  AGENT_HOME="$H" AGENT_SERVICE="$AGENT_SERVICE" AGENT_USER="$AGENT_USER" \
+  python3 "$KIT/assets/lib/reconcile-managed-skills.py" \
+  "$H/.claude/skills" "$PRECHECK_SKILLS_POLICY" "$H/.claude/product/managed-skills.json" \
+  --source "$KIT/assets/skills" --external-source "$KIT/assets/external-skills" \
+  --baseline "$H/.claude/product/managed-skills-baseline.json" --check >/dev/null || precheck_status=$?
+[ "$precheck_status" -ne 0 ] || python3 "$KIT/assets/lib/reconcile-managed-skills.py" agents \
+  "$H/.claude/agents" "$KIT/assets/agents" "$H/.claude/product/managed-agents-baseline.json" \
+  --active-roles "${ACTIVE_ROLES:-}" --check >/dev/null || precheck_status=$?
+case "$PRECHECK_SKILLS_POLICY" in /tmp/novsky-managed-skills.*) rm -f "$PRECHECK_SKILLS_POLICY" ;; esac
+[ "$precheck_status" -eq 0 ] || exit "$precheck_status"
+# END skill conflict precheck
+
 # Declared document tools work in personal and isolated company workspaces.
 # This exports only root-managed package configuration, never an agent's venv.
 python3 "$KIT/assets/lib/install-artifact-tools.py" --install \

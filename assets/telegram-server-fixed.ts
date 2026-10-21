@@ -6115,10 +6115,12 @@ async function warnTurnChats(turn: LadderTurn, idleMs: number): Promise<void> {
      WHERE m.turn_id = ? AND coalesce(CASE WHEN json_valid(r.request_payload)
        THEN json_extract(r.request_payload, '$.params.meta.addressed') END, '') <> 'false'`,
   ).all(turn.turn_id) as Array<{ chat_id: string; thread_id: string | null }>
+  // In the agent's notice language, like the hang cap's line (Арти 21.10: a Russian agent warned in Ukrainian).
+  const warning = addressees.length ? await ownerNotice('queue.inactivity_warning', INACTIVITY_WARNING) : INACTIVITY_WARNING
   for (const { chat_id, thread_id } of addressees) {
     const threadId = thread_id != null && /^[1-9][0-9]*$/.test(thread_id) ? Number(thread_id) : undefined
     try {
-      const sent = await bot.api.sendMessage(chat_id, INACTIVITY_WARNING, {
+      const sent = await bot.api.sendMessage(chat_id, warning, {
         ...(threadId != null ? { message_thread_id: threadId } : {}),
       })
       logMsg({
@@ -6126,7 +6128,7 @@ async function warnTurnChats(turn: LadderTurn, idleMs: number): Promise<void> {
         user_id: '',
         username: botUsername || 'bot',
         direction: 'out',
-        text: INACTIVITY_WARNING,
+        text: warning,
         ts: Date.now(),
         message_id: sent.message_id,
         thread_id: threadId,
