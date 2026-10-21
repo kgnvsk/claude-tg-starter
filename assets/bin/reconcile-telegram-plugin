@@ -31,10 +31,16 @@ UPSTREAM_SERVER_SHA256 = (
 )
 UPSTREAM_PACKAGE_START = "bun install --no-summary 1>&2 && bun server.ts"
 GOLDEN_SERVER_SHA256 = (
-    "a075ed65d000e7adbd449cc59512019c4eacec50f964c9b2bf5d2283537dab20"
+    "d091168a7cdbf9c290f214b6df89e4dad8727b8727c120f961999dbc2a53dd85"
 )
 PREVIOUS_GOLDEN_SERVER_SHA256S = frozenset(
     {
+        # The golden before one chat is one conversation (history, strict company journal).
+        "c3ffbe5d4f52cba468a6ed3bc7585267779f8bdab9100f09bd0990046062f369",
+        # 147a1594466d Один чат — одна розмова: група бачить усю свою історію
+        "348d272ee741e2b30a13739ce76b549ca6ad68db4a17d6d69b3109776f47f6f5",
+        # Release 3 of 20.10.2026 (fcb527aa), before one chat became one visible conversation.
+        "a075ed65d000e7adbd449cc59512019c4eacec50f964c9b2bf5d2283537dab20",
         # The second head of PR 315, before late photos came as all pictures or all files.
         "0384aff0a52144756d7f9d4c6894befbe5358b11939067b4e90a6389aa2591f0",
         # Arti's hotfix of 18.10.2026 as installed: late photos come as all pictures or all files.

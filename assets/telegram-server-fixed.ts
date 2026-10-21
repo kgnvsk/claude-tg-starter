@@ -640,8 +640,8 @@ function ensureAuthoritySchema(): void {
 }
 const msgInsert = MSG_DB.prepare(
   `INSERT OR IGNORE INTO messages
-   (chat_id,user_id,username,direction,text,ts,message_id,attachment_kind,attachment_file_id,thread_id,conversation_key)
-   VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+   (chat_id,user_id,username,direction,text,ts,message_id,attachment_kind,attachment_file_id,thread_id,conversation_key,send_origin)
+   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
 )
 // A failed corporate intake must not hold Telegram's polling offset forever.
 // Save only its address in the existing runtime table: setup input may contain a credential.
@@ -668,6 +668,8 @@ type MessageLogRecord = {
   attachment_file_id?: string
   thread_id?: number
   conversation_key?: string
+  // What kind of bot message this was, so history never reads a notice as the answer (owner, 20.10.2026).
+  send_origin?: 'corporate-answer' | 'corporate-card' | 'corporate-notice'
 }
 function insertMessageLog(r: MessageLogRecord): number {
   return msgInsert.run(
@@ -682,6 +684,7 @@ function insertMessageLog(r: MessageLogRecord): number {
     r.attachment_file_id ?? null,
     r.thread_id ?? null,
     r.conversation_key ?? null,
+    r.send_origin ?? null,
   ).changes
 }
 function logMsgStrict(r: MessageLogRecord): void {
@@ -1805,7 +1808,7 @@ async function sendCorporateText(
     }
     if (!sent) sent = await bot.api.sendMessage(chatId, text, common)
   } else sent = await bot.api.sendMessage(chatId, text, common)
-  logMsg({
+  const record: MessageLogRecord = {
     chat_id: chatId,
     user_id: '',
     username: botUsername || 'bot',
@@ -1817,7 +1820,17 @@ async function sendCorporateText(
     // Mirror the inbound key derivation: without it the agent's own replies
     // stay invisible to corporate memory search (half of every dialog lost).
     conversation_key: corporateConversationKey(chatId, threadId),
-  })
+    send_origin: keyboard ? 'corporate-card' : answer ? 'corporate-answer' : 'corporate-notice',
+  }
+  // The message is published, and the chat's shared history reads this row (owner, 20.10.2026). A failed write goes to
+  // the same write-ahead repair the owner's replies use (Codex 1a P1-2); what Telegram acknowledged is never sent again.
+  try { confirmOutgoingMessageLog(record) } catch (error) {
+    if (!(error instanceof OutgoingReceiptConflict)) {
+      try { saveOutgoingRepair(record) } catch (repair) {
+        process.stderr.write(`telegram channel: company message ${chatId}:${sent.message_id} not journaled: ${repair}\n`)
+      }
+    }
+  }
   return sent.message_id
 }
 
@@ -1866,6 +1879,7 @@ async function loadCorporateRuntime(): Promise<CorporateGatewayRuntime | null> {
       isPrivilegedActor?: (userId: string) => boolean
       sendText: typeof sendCorporateText
       submitOwnerRequest?: (request: { ownerId: string; messageId: number; token: string }) => Promise<void>
+      journalRepair?: () => void
     }) => CorporateGatewayRuntime
   }
   if (shuttingDown) return null
@@ -1879,6 +1893,8 @@ async function loadCorporateRuntime(): Promise<CorporateGatewayRuntime | null> {
     // Re-read per call: revoking an admin must take effect on the next request.
     isPrivilegedActor: (userId: string) => userId === OWNER_CHAT_ID || loadAccess().admins.includes(userId),
     sendText: sendCorporateText,
+    // A company message parked in the write-ahead repair reaches the journal before the next job reads its chat.
+    journalRepair: replayOutgoingMessageRepairs,
     submitOwnerRequest: async request => {
       if (request.ownerId !== OWNER_CHAT_ID || !Number.isSafeInteger(request.messageId) || request.messageId <= 0) throw new Error('invalid access approval')
       const { ownerAccessInstruction } = await import(new URL('./access-requests.ts', pathToFileURL(CORPORATE_MODULE)).href)
@@ -7987,7 +8003,7 @@ bot.command('unstick', async (ctx, next) => {
     return
   }
   const result = corporate
-    ? await corporate.unstick(allowed.conversationKey)
+    ? await corporate.unstick(allowed.conversationKey, allowed.senderId === OWNER_CHAT_ID ? undefined : allowed.senderId)
     : 'idle'
   await ctx.reply(formatCorporateUnstick(result), inboundTopicOptions(ctx))
 })
