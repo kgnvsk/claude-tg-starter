@@ -3,6 +3,20 @@
 # Checks 7 signals + can auto-recover + alerts via Bot API bypass
 set -u
 
+telegram_api_base() {
+  local helper="$(dirname "${BASH_SOURCE[0]}")/telegram-api"
+  [ -f "$helper" ] || helper="$HOME/bin/telegram-api"
+  if [ -f "$helper" ]; then
+    python3 "$helper" base
+    return $?
+  fi
+  if [ -n "${TELEGRAM_API_BASE:-}" ] || grep -Eq '^(export[[:space:]]+)?TELEGRAM_API_BASE=' "${TELEGRAM_STATE_DIR:-$HOME/.claude/channels/telegram}/.env" 2>/dev/null; then
+    echo 'Telegram local API helper is unavailable; no cloud fallback' >&2
+    return 1
+  fi
+  printf '%s\n' 'https://api.telegram.org'
+}
+
 # Instance-aware: on a multi-agent box each bot has its own user, home and unit
 # (claude-telegram@<user>.service); the crontab/unit provide CLAUDE_TELEGRAM_SERVICE.
 H="${HOME:-/home/claude}"
@@ -548,14 +562,15 @@ alert() {
         echo "[$(date -u +%FT%TZ)] ALERT [${key}]: bot token missing or malformed" >> "$LOG"
         recipients=""
     fi
-    local chat_id delivered=0 first=1
+    local chat_id delivered=0 first=1 telegram_base
+    telegram_base=$(telegram_api_base) || { echo "Telegram endpoint configuration unavailable" >> "$LOG"; return 0; }
     while IFS= read -r chat_id; do
         [ -n "$chat_id" ] || continue
         if curl -sS --fail --max-time 10 -X POST -K - \
             --data-urlencode "chat_id=${chat_id}" \
             --data-urlencode "text=🚨 {{AGENT_NAME}}, перевірка стану: ${msg}" \
             --data-urlencode "parse_mode=HTML" >/dev/null 2>&1 \
-            <<<"url = \"https://api.telegram.org/bot${BOT_TOKEN}/sendMessage\""; then
+            <<<"url = \"${telegram_base}/bot${BOT_TOKEN}/sendMessage\""; then
             [ "$first" = 1 ] && delivered=1
         else
             echo "[$(date -u +%FT%TZ)] ALERT [${key}]: delivery failed for one configured recipient" >> "$LOG"

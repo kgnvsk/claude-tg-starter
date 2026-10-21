@@ -7,7 +7,33 @@ import os
 from pathlib import Path
 import re
 import sqlite3
+import stat
 import sys
+
+
+UUID = re.compile(r'[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}')
+
+
+def retired_sessions(state: Path) -> set[str] | None:
+    """Sessions the receiver retired (Anthropic's safety classifier kept stopping them, Арти 21.10.2026).
+
+    None when the list exists but cannot be trusted: the launch then starts fresh rather than resume a session the
+    list may name (Codex review of b2e9d280, W6). Only a missing list means none is retired."""
+    path = state / 'retired-sessions'
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return set()
+    except OSError:
+        return None
+    if not stat.S_ISREG(info.st_mode) or info.st_size > 1024 * 1024:
+        return None
+    try:
+        names = path.read_text(encoding='ascii').split()
+    except (OSError, UnicodeError):
+        return None
+    # An existing list always names a session; an empty one was truncated (Codex review of dfdb5dc7, P1-3).
+    return set(names) if names and all(UUID.fullmatch(name) for name in names) else None
 
 
 def select_session(config: Path, state: Path, workspace: Path) -> str | None:
@@ -27,6 +53,9 @@ def select_session(config: Path, state: Path, workspace: Path) -> str | None:
     ) or not row[1]:
         return None
     session, raw_path = row
+    retired = retired_sessions(state)
+    if retired is None or session in retired:
+        return None
     projects = (config / 'projects').resolve(strict=True)
     transcript = Path(raw_path).resolve(strict=True)
     transcript.relative_to(projects)

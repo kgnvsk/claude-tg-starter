@@ -1,6 +1,20 @@
-import { spawn } from 'node:child_process';
-import { constants, lstatSync, openSync, closeSync, readFileSync, fstatSync } from 'node:fs';
+import { spawn, execFileSync } from 'node:child_process';
+import { constants, lstatSync, openSync, closeSync, readFileSync, fstatSync, existsSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
+
+
+function telegramApiBase(): string {
+  const home = process.env.HOME || homedir()
+  const helper = join(home, 'bin/telegram-api')
+  if (existsSync(helper)) return execFileSync('python3', [helper, 'base'], { encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'pipe'] }).trim()
+  let configured = process.env.TELEGRAM_API_BASE || ''
+  if (!configured) {
+    try { configured = /^(?:export\s+)?TELEGRAM_API_BASE\s*=(.*)$/m.exec(readFileSync(join(process.env.TELEGRAM_STATE_DIR || join(home, '.claude/channels/telegram'), '.env'), 'utf8'))?.[1]?.trim() || '' } catch {}
+  }
+  if (configured && configured !== 'https://api.telegram.org') throw new Error('Telegram local API helper unavailable; no cloud fallback')
+  return 'https://api.telegram.org'
+}
 
 type Message = { message_id: number; text?: string; caption?: string; from?: { id: number }; chat: { id: number; type: string } };
 type Options = { home: string; ownerChatId: string; botToken: string; message: Message; text?: string };
@@ -67,7 +81,7 @@ function run(home: string, name: string, args: string[], value?: unknown, timeou
 }
 
 async function api(token: string, method: string, body: object | FormData): Promise<any> {
-  const response = await fetch('https://api.telegram.org/bot' + token + '/' + method, {
+  const response = await fetch(telegramApiBase() + '/bot' + token + '/' + method, {
     method: 'POST', signal: AbortSignal.timeout(20_000),
     ...(body instanceof FormData ? { body } : { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }),
   });

@@ -17,6 +17,27 @@ except ModuleNotFoundError:
     from assets.bin.ukargparse import ArgumentParser
 
 
+def telegram_api_base():
+    import os, runpy
+    from pathlib import Path
+    candidates = [Path(__file__).resolve().with_name('telegram-api'), Path.home() / 'bin/telegram-api']
+    candidates += [Path(__file__).resolve().parents[3] / 'assets/bin/telegram-api'] if 'telegram-corporate' in str(__file__) else []
+    for helper in candidates:
+        if helper.is_file():
+            return runpy.run_path(str(helper))['api_base']()
+    configured = os.environ.get('TELEGRAM_API_BASE', '')
+    state = Path(os.environ.get('TELEGRAM_STATE_DIR') or Path.home() / '.claude/channels/telegram')
+    if not configured and (state / '.env').is_file():
+        for line in (state / '.env').read_text().splitlines():
+            import re
+            match = re.match(r'^(?:export\s+)?TELEGRAM_API_BASE\s*=(.*)', line.strip())
+            if match:
+                configured = match[1].strip().strip("\"'")
+    if configured and configured.rstrip('/') != 'https://api.telegram.org':
+        raise ValueError('Telegram local API helper is unavailable; no cloud fallback')
+    return 'https://api.telegram.org'
+
+
 def fail(message: str, code: int = 1) -> None:
     print(f"Не вдалося перевірити Telegram: {message}", file=sys.stderr)
     raise SystemExit(code)
@@ -34,7 +55,7 @@ token = sys.stdin.readline().strip()
 if not token:
     fail("вхідний токен порожній", 2)
 
-base = os.environ.get("VERIFY_TELEGRAM_API_BASE", "https://api.telegram.org").rstrip("/")
+base = os.environ.get("VERIFY_TELEGRAM_API_BASE", telegram_api_base()).rstrip("/")
 url = f"{base}/bot{quote(token, safe=':_-')}/getMe"
 request = Request(url, method="GET", headers={"Accept": "application/json"})
 

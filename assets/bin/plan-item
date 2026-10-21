@@ -20,6 +20,28 @@ import urllib.request
 class Refused(Exception): pass
 class Uncertain(Exception): pass
 
+
+def telegram_api_base():
+    import os, runpy
+    from pathlib import Path
+    candidates = [Path(__file__).resolve().with_name('telegram-api'), Path.home() / 'bin/telegram-api']
+    candidates += [Path(__file__).resolve().parents[3] / 'assets/bin/telegram-api'] if 'telegram-corporate' in str(__file__) else []
+    for helper in candidates:
+        if helper.is_file():
+            return runpy.run_path(str(helper))['api_base']()
+    configured = os.environ.get('TELEGRAM_API_BASE', '')
+    state = Path(os.environ.get('TELEGRAM_STATE_DIR') or Path.home() / '.claude/channels/telegram')
+    if not configured and (state / '.env').is_file():
+        for line in (state / '.env').read_text().splitlines():
+            import re
+            match = re.match(r'^(?:export\s+)?TELEGRAM_API_BASE\s*=(.*)', line.strip())
+            if match:
+                configured = match[1].strip().strip("\"'")
+    if configured and configured.rstrip('/') != 'https://api.telegram.org':
+        raise ValueError('Telegram local API helper is unavailable; no cloud fallback')
+    return 'https://api.telegram.org'
+
+
 def sha(data):return hashlib.sha256(data).hexdigest()
 def root():
     folder=Path.home()/'.local/state/plan-items'
@@ -110,7 +132,7 @@ def edit_pin(item):
             if line.startswith('TELEGRAM_BOT_TOKEN='):token=line.split('=',1)[1].strip()
     if not token:raise Refused('Telegram sign-in missing; no pin changed')
     body={'chat_id':item['chat'],'message_id':item['message'],'text':item['text']}
-    request=urllib.request.Request('https://api.telegram.org/bot'+token+'/editMessageText',data=json.dumps(body).encode(),headers={'Content-Type':'application/json'})
+    request=urllib.request.Request(telegram_api_base() + '/bot'+token+'/editMessageText',data=json.dumps(body).encode(),headers={'Content-Type':'application/json'})
     try:
         with urllib.request.urlopen(request,timeout=25) as response:result=json.load(response)
     except urllib.error.HTTPError as exc:

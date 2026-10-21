@@ -31,11 +31,22 @@ UPSTREAM_SERVER_SHA256 = (
 )
 UPSTREAM_PACKAGE_START = "bun install --no-summary 1>&2 && bun server.ts"
 GOLDEN_SERVER_SHA256 = (
-    "dbcb1c0c96061e5a444100ae9ff3c6097ff0706103d865f0d4ea8c1e9c7f2fe8"
+    "73dd9d424855b1738fb6029bb1f6838dd8ec16cd1a6376d6f6bcf7702c580e16"
 )
 PREVIOUS_GOLDEN_SERVER_SHA256S = frozenset(
     {
-        # 518a6c7fe577 Одна розмова в групі, крок 1 (#328)
+        # eed9046c2412 Арти, пакет 2: одна розмова в групі, спільна тека, сторож фільтра безп
+        "261e747aa729b874cadcc9ca07c0d9c7d94d93245585212f6eb2d655461720bf",
+        # 36bfc39bf1ef Merge reviewed corporate recovery into local Bot API candidate
+        "1210ed621b94cf0d967f37cba1b2ae6d3ec76dd620bd6fcc356347328d694ea5",
+        # The golden before combining local Bot API with reviewed corporate recovery.
+        "5256731c1a0e698c915a00bc4fbe40e373c39af3c0c1c56cf032805443a5642b",
+        # Reviewed corporate recovery receiver, retained across local API merge.
+        "dbcb1c0c96061e5a444100ae9ff3c6097ff0706103d865f0d4ea8c1e9c7f2fe8",
+        "5cbdab2dd2333601cc8db93322b449badd2230abbc35d4b44ccdff3056b355d6",
+        # Local Bot API backport on an earlier supported runtime.
+        "1d0ca4b50d0aa5369fe26ee039d0e8c705d4c1b0521e9b379102aca3aa46b551",
+        # The golden before optional local Bot API and disk-backed large attachments.
         "d091168a7cdbf9c290f214b6df89e4dad8727b8727c120f961999dbc2a53dd85",
         # The golden before one chat is one conversation (history, strict company journal).
         "c3ffbe5d4f52cba468a6ed3bc7585267779f8bdab9100f09bd0990046062f369",

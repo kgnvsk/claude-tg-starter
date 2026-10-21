@@ -1581,11 +1581,19 @@ class CapabilityStore {
       }
       return policy;
     }
+    if (actorUserId === this.primaryOwnerId) {
+      const shared = (grant) => this.catalog[grant.capabilityId]?.sharedAllowed === true;
+      const companyOnly = (resource) => resource == null || resource.connector !== "memory" || resource.config.corporateKey === "company";
+      const reach = this.businessResources(actorUserId).filter(companyOnly);
+      const grants = [...policy.grants, ...expandFullAccess(this.catalog, reach)].filter((grant) => shared(grant) && (grant.resourceId == null || companyOnly(this.getResource(grant.resourceId))));
+      const seen = new Set;
+      return { ...policy, version: Math.max(1, policy.version), grants: grants.filter((grant) => {
+        const key = `${grant.capabilityId}\x00${grant.resourceId ?? ""}`;
+        return !seen.has(key) && (seen.add(key), true);
+      }) };
+    }
     if (policy.chatAuthorized)
       return policy;
-    if (actorUserId === this.primaryOwnerId) {
-      return { ...policy, grants: policy.grants.filter((grant) => this.catalog[grant.capabilityId]?.sharedAllowed === true) };
-    }
     const actor = this.resolve(`user:${actorUserId}`);
     return { ...policy, grants: policy.grants.filter((grant) => this.catalog[grant.capabilityId]?.sharedAllowed === true && actor.grants.some((personal) => personal.capabilityId === grant.capabilityId && personal.resourceId === grant.resourceId)) };
   }

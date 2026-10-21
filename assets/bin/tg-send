@@ -31,6 +31,28 @@ from pathlib import Path
 CONTEXT_HELPER = os.path.expanduser('~/bin/answer-context')
 
 
+
+def telegram_api_base():
+    import os, runpy
+    from pathlib import Path
+    candidates = [Path(__file__).resolve().with_name('telegram-api'), Path.home() / 'bin/telegram-api']
+    candidates += [Path(__file__).resolve().parents[3] / 'assets/bin/telegram-api'] if 'telegram-corporate' in str(__file__) else []
+    for helper in candidates:
+        if helper.is_file():
+            return runpy.run_path(str(helper))['api_base']()
+    configured = os.environ.get('TELEGRAM_API_BASE', '')
+    state = Path(os.environ.get('TELEGRAM_STATE_DIR') or Path.home() / '.claude/channels/telegram')
+    if not configured and (state / '.env').is_file():
+        for line in (state / '.env').read_text().splitlines():
+            import re
+            match = re.match(r'^(?:export\s+)?TELEGRAM_API_BASE\s*=(.*)', line.strip())
+            if match:
+                configured = match[1].strip().strip("\"'")
+    if configured and configured.rstrip('/') != 'https://api.telegram.org':
+        raise ValueError('Telegram local API helper is unavailable; no cloud fallback')
+    return 'https://api.telegram.org'
+
+
 def require_answer_context(chat, thread, text, delivery=None, file=False):
     if not os.path.isfile(CONTEXT_HELPER):return  # older/non-Premium installation
     try:
@@ -104,7 +126,7 @@ def destination_status(chat_id, thread_id, general_topic, bot_token):
     if not chat_id.startswith("-") or thread_id is not None or general_topic:
         return True
     request = urllib.request.Request(
-        f"https://api.telegram.org/bot{bot_token}/getChat",
+        f"{telegram_api_base()}/bot{bot_token}/getChat",
         data=urllib.parse.urlencode({"chat_id": chat_id}).encode(),
     )
     try:
@@ -1498,7 +1520,7 @@ def quiet_send_record(path, record):
         if record.get("silent"):
             fields["disable_notification"] = "true"
         request = urllib.request.Request(
-            f"https://api.telegram.org/bot{token()}/sendMessage",
+            f"{telegram_api_base()}/bot{token()}/sendMessage",
             data=urllib.parse.urlencode(fields).encode())
         record["state"] = "sending"
         quiet_write(path, record)
@@ -1674,7 +1696,7 @@ def main(argv):
             fields["disable_notification"] = "true"
         body = urllib.parse.urlencode(fields).encode()
         req = urllib.request.Request(
-            f"https://api.telegram.org/bot{bot_token}/sendMessage", data=body)
+            f"{telegram_api_base()}/bot{bot_token}/sendMessage", data=body)
         try:
             out = urllib.request.urlopen(req, timeout=15).read().decode()
             payload = json.loads(out)

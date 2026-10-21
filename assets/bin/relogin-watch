@@ -33,6 +33,28 @@ RESCUE = AGENT_ROOT / "bin/claude-auth-rescue"
 TRIGGER = re.compile(r"^\s*/?(relogin|релог[іи]н|перевхід)\s*$", re.IGNORECASE)
 
 
+
+def telegram_api_base():
+    import os, runpy
+    from pathlib import Path
+    candidates = [Path(__file__).resolve().with_name('telegram-api'), Path.home() / 'bin/telegram-api']
+    candidates += [Path(__file__).resolve().parents[3] / 'assets/bin/telegram-api'] if 'telegram-corporate' in str(__file__) else []
+    for helper in candidates:
+        if helper.is_file():
+            return runpy.run_path(str(helper))['api_base']()
+    configured = os.environ.get('TELEGRAM_API_BASE', '')
+    state = Path(os.environ.get('TELEGRAM_STATE_DIR') or Path.home() / '.claude/channels/telegram')
+    if not configured and (state / '.env').is_file():
+        for line in (state / '.env').read_text().splitlines():
+            import re
+            match = re.match(r'^(?:export\s+)?TELEGRAM_API_BASE\s*=(.*)', line.strip())
+            if match:
+                configured = match[1].strip().strip("\"'")
+    if configured and configured.rstrip('/') != 'https://api.telegram.org':
+        raise ValueError('Telegram local API helper is unavailable; no cloud fallback')
+    return 'https://api.telegram.org'
+
+
 def env_val(key: str) -> str:
     try:
         for line in ENV_FILE.read_text(encoding="utf-8").splitlines():
@@ -73,7 +95,7 @@ def send(chat: str, text: str) -> None:
     body = urllib.parse.urlencode({"chat_id": chat, "text": text}).encode()
     try:
         urllib.request.urlopen(urllib.request.Request(
-            f"https://api.telegram.org/bot{token}/sendMessage", data=body), timeout=15)
+            f"{telegram_api_base()}/bot{token}/sendMessage", data=body), timeout=15)
     except Exception:
         pass
 

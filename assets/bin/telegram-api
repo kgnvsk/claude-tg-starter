@@ -1,0 +1,17 @@
+#!/usr/bin/env python3
+"""Read the non-secret Telegram endpoint for shell helpers; never print bot credentials."""
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from telegram_api import api_base, is_local, local_file_root, open_local_file
+
+if __name__ == '__main__':
+    try:
+        if sys.argv[1:] == ['base']:
+            print(api_base())
+        elif sys.argv[1:] == ['local-root']:
+            print(local_file_root() or '')
+        else:
+            raise ValueError('usage: telegram-api base|local-root')
+    except (OSError, ValueError):
+        sys.exit('telegram-api: configuration is unavailable or invalid; no cloud fallback')

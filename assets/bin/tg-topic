@@ -24,6 +24,28 @@ COLORS = {7322096, 16766590, 13338331, 9367192, 16749490, 16478047}
 KEY_SHAPE = re.compile(r"\d{5,}:[A-Za-z0-9_-]{30,}")
 
 
+
+def telegram_api_base():
+    import os, runpy
+    from pathlib import Path
+    candidates = [Path(__file__).resolve().with_name('telegram-api'), Path.home() / 'bin/telegram-api']
+    candidates += [Path(__file__).resolve().parents[3] / 'assets/bin/telegram-api'] if 'telegram-corporate' in str(__file__) else []
+    for helper in candidates:
+        if helper.is_file():
+            return runpy.run_path(str(helper))['api_base']()
+    configured = os.environ.get('TELEGRAM_API_BASE', '')
+    state = Path(os.environ.get('TELEGRAM_STATE_DIR') or Path.home() / '.claude/channels/telegram')
+    if not configured and (state / '.env').is_file():
+        for line in (state / '.env').read_text().splitlines():
+            import re
+            match = re.match(r'^(?:export\s+)?TELEGRAM_API_BASE\s*=(.*)', line.strip())
+            if match:
+                configured = match[1].strip().strip("\"'")
+    if configured and configured.rstrip('/') != 'https://api.telegram.org':
+        raise ValueError('Telegram local API helper is unavailable; no cloud fallback')
+    return 'https://api.telegram.org'
+
+
 def token():
     value = os.environ.get("TELEGRAM_BOT_TOKEN")
     if value:
@@ -40,7 +62,7 @@ def token():
 
 def call(method, params):
     data = urllib.parse.urlencode(params).encode()
-    request = urllib.request.Request(f"https://api.telegram.org/bot{token()}/{method}", data=data)
+    request = urllib.request.Request(f"{telegram_api_base()}/bot{token()}/{method}", data=data)
     try:
         with urllib.request.urlopen(request, timeout=30) as response:
             return json.load(response)

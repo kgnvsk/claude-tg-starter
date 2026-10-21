@@ -24,6 +24,74 @@ import urllib.request
 
 
 MAX_BYTES = 49 * 1024 * 1024
+LOCAL_MAX_BYTES = 2000 * 1024 * 1024
+
+
+def max_file_bytes():
+    return LOCAL_MAX_BYTES if telegram_api_base() != 'https://api.telegram.org' else MAX_BYTES
+
+
+def data_sha256(data):
+    return data.sha256 if isinstance(data, VerifiedFile) else hashlib.sha256(data).hexdigest()
+
+
+def data_chunks(data):
+    if isinstance(data, VerifiedFile):
+        yield from data.chunks()
+    else:
+        yield data
+
+
+class VerifiedFile:
+    """A private, unlinked snapshot. Never hand the API an arbitrary local path."""
+    def __init__(self, descriptor, limit):
+        self.stream = tempfile.TemporaryFile(mode='w+b')
+        self.size = 0
+        self.prefix = b''
+        digest = hashlib.sha256()
+        try:
+            while chunk := os.read(descriptor, 1024 * 1024):
+                if not self.prefix: self.prefix = chunk[:16]
+                self.size += len(chunk)
+                if self.size > limit:
+                    raise SendError('tg-send-file: file exceeds the local Telegram limit')
+                self.stream.write(chunk)
+                digest.update(chunk)
+            self.stream.flush()
+            self.sha256 = digest.hexdigest()
+        except BaseException:
+            self.close()
+            raise
+
+    def __len__(self):
+        return self.size
+
+    def chunks(self):
+        self.stream.seek(0)
+        while chunk := self.stream.read(1024 * 1024):
+            yield chunk
+
+    def close(self):
+        if hasattr(self, 'stream'):
+            self.stream.close()
+
+    def __del__(self):
+        self.close()
+
+
+class StreamingMultipart:
+    def __init__(self, prefix, data, suffix):
+        self.prefix, self.data, self.suffix = prefix, data, suffix
+
+    def __len__(self):
+        return len(self.prefix) + len(self.data) + len(self.suffix)
+
+    def __iter__(self):
+        yield self.prefix
+        yield from self.data.chunks()
+        yield self.suffix
+
+
 PHOTO_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp"}
 CHAT_ID = re.compile(r"(?:[1-9][0-9]*|-[1-9][0-9]*)\Z")
 BOT_TOKEN = re.compile(r"[A-Za-z0-9:_-]+\Z")
@@ -35,6 +103,28 @@ class SendError(Exception):
 
 class RejectedSend(SendError):
     """Bot API explicitly rejected this file before accepting it."""
+
+
+
+def telegram_api_base():
+    import os, runpy
+    from pathlib import Path
+    candidates = [Path(__file__).resolve().with_name('telegram-api'), Path.home() / 'bin/telegram-api']
+    candidates += [Path(__file__).resolve().parents[3] / 'assets/bin/telegram-api'] if 'telegram-corporate' in str(__file__) else []
+    for helper in candidates:
+        if helper.is_file():
+            return runpy.run_path(str(helper))['api_base']()
+    configured = os.environ.get('TELEGRAM_API_BASE', '')
+    state = Path(os.environ.get('TELEGRAM_STATE_DIR') or Path.home() / '.claude/channels/telegram')
+    if not configured and (state / '.env').is_file():
+        for line in (state / '.env').read_text().splitlines():
+            import re
+            match = re.match(r'^(?:export\s+)?TELEGRAM_API_BASE\s*=(.*)', line.strip())
+            if match:
+                configured = match[1].strip().strip("\"'")
+    if configured and configured.rstrip('/') != 'https://api.telegram.org':
+        raise ValueError('Telegram local API helper is unavailable; no cloud fallback')
+    return 'https://api.telegram.org'
 
 
 def fail(message: str, *, code: int = 1) -> None:
@@ -161,25 +251,29 @@ def read_outbox_file(argument: str) -> tuple[str, bytes]:
         before = os.fstat(descriptor)
         if not stat.S_ISREG(before.st_mode):
             raise SendError("tg-send-file: file must be regular")
+        limit = max_file_bytes()
+        if before.st_size > limit:
+            raise SendError("tg-send-file: file exceeds " + ('49 MiB' if limit == MAX_BYTES else '2000 MiB'))
         if before.st_size > MAX_BYTES:
-            raise SendError("tg-send-file: file exceeds 49 MiB")
-        chunks: list[bytes] = []
-        remaining = MAX_BYTES + 1
-        while remaining:
-            chunk = os.read(descriptor, min(1024 * 1024, remaining))
-            if not chunk:
-                break
-            chunks.append(chunk)
-            remaining -= len(chunk)
-        data = b"".join(chunks)
+            data = VerifiedFile(descriptor, limit)
+        else:
+            chunks: list[bytes] = []
+            remaining = MAX_BYTES + 1
+            while remaining:
+                chunk = os.read(descriptor, min(1024 * 1024, remaining))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            data = b"".join(chunks)
         after = os.fstat(descriptor)
     except OSError:
         raise SendError("tg-send-file: file could not be read safely") from None
     finally:
         os.close(descriptor)
 
-    if len(data) > MAX_BYTES:
-        raise SendError("tg-send-file: file exceeds 49 MiB")
+    if len(data) > limit:
+        raise SendError("tg-send-file: file exceeds the Telegram limit")
     identity = lambda item: (
         item.st_dev,
         item.st_ino,
@@ -237,6 +331,9 @@ def multipart(
             b"",
         )
     )
+    if isinstance(data, VerifiedFile):
+        return StreamingMultipart(b"\r\n".join(parts[:-3]) + b"\r\n", data,
+                                  b"\r\n" + b"\r\n".join(parts[-2:])), boundary
     return b"\r\n".join(parts), boundary
 
 
@@ -279,26 +376,26 @@ def ensure_destination(chat_id: str, thread_id: int | None, general_topic: bool,
 
 def send(chat_id: str, filename: str, data: bytes, caption: str, thread_id: int | None = None,
          general_topic: bool = False) -> int:
-    photo = Path(filename).suffix.lower() in PHOTO_SUFFIXES
+    photo = Path(filename).suffix.lower() in PHOTO_SUFFIXES and (telegram_api_base() == 'https://api.telegram.org' or len(data) <= 10 * 1024 * 1024)
     method = "sendPhoto" if photo else "sendDocument"
     field = "photo" if photo else "document"
     body, boundary = multipart(
         chat_id, filename, data, caption, file_field=field, thread_id=thread_id
     )
-    base = test_setting("TG_SEND_FILE_API_BASE", "https://api.telegram.org").rstrip("/")
-    timeout_text = test_setting("TG_SEND_FILE_TIMEOUT", "20")
+    base = test_setting("TG_SEND_FILE_API_BASE", telegram_api_base()).rstrip("/")
+    timeout_text = test_setting("TG_SEND_FILE_TIMEOUT", "1800" if base != "https://api.telegram.org" else "20")
     try:
         timeout = float(timeout_text)
-        if not 0 < timeout <= 30:
+        if not 0 < timeout <= (1800 if base != "https://api.telegram.org" else 30):
             raise ValueError
     except ValueError:
-        timeout = 20.0
+        timeout = 1800.0 if base != "https://api.telegram.org" else 20.0
     bot_token = read_token()
     ensure_destination(chat_id, thread_id, general_topic, base, bot_token, timeout)
     request = urllib.request.Request(
         f"{base}/bot{bot_token}/{method}",
         data=body,
-        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}", "Content-Length": str(len(body))},
         method="POST",
     )
     try:
@@ -461,7 +558,7 @@ def quiet_file_load(path: Path) -> dict:
             or record.get("blob") != path.stem + ".blob"
             or not isinstance(record.get("sha256"), str)
             or not isinstance(record.get("size"), int)
-            or not 0 < record["size"] <= MAX_BYTES
+            or not 0 < record["size"] <= max_file_bytes()
             or type(record.get("general_topic", False)) is not bool):
         raise SendError("tg-send-file: invalid quiet file record")
     return record
@@ -471,7 +568,8 @@ def quiet_copy_blob(root: Path, name: str, data: bytes) -> None:
     descriptor, temporary = tempfile.mkstemp(prefix=".quiet-file.", dir=root)
     try:
         with os.fdopen(descriptor, "wb") as stream:
-            stream.write(data)
+            for chunk in data_chunks(data):
+                stream.write(chunk)
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, root / name)
@@ -493,21 +591,26 @@ def quiet_blob(root: Path, record: dict) -> bytes:
     descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     try:
         before = os.fstat(descriptor)
-        chunks = []
-        remaining = MAX_BYTES + 1
-        while remaining:
-            chunk = os.read(descriptor, min(1024 * 1024, remaining))
-            if not chunk:
-                break
-            chunks.append(chunk)
-            remaining -= len(chunk)
-        data = b"".join(chunks)
+        if before.st_size > max_file_bytes():
+            raise SendError('tg-send-file: saved file exceeds the Telegram limit')
+        if before.st_size > MAX_BYTES:
+            data = VerifiedFile(descriptor, max_file_bytes())
+        else:
+            chunks = []
+            remaining = MAX_BYTES + 1
+            while remaining:
+                chunk = os.read(descriptor, min(1024 * 1024, remaining))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            data = b"".join(chunks)
         after = os.fstat(descriptor)
     finally:
         os.close(descriptor)
     identity = lambda item: (item.st_dev, item.st_ino, item.st_size, item.st_mtime_ns)
     if (identity(metadata) != identity(before) or identity(before) != identity(after)
-            or len(data) != record["size"] or hashlib.sha256(data).hexdigest() != record["sha256"]):
+            or len(data) != record["size"] or data_sha256(data) != record["sha256"]):
         raise SendError("tg-send-file: saved file changed")
     return data
 
@@ -528,7 +631,7 @@ def quiet_file_send(root: Path, path: Path, record: dict, helpers: dict) -> str:
         record["state"] = "blocked"
         write(path, record)
         return record["state"]
-    base = test_setting("TG_SEND_FILE_API_BASE", "https://api.telegram.org").rstrip("/")
+    base = test_setting("TG_SEND_FILE_API_BASE", telegram_api_base()).rstrip("/")
     try:
         destination = destination_status(record["chat"], record["thread"],
                                          record.get("general_topic", False), base, read_token(), 20)
@@ -547,18 +650,18 @@ def quiet_file_send(root: Path, path: Path, record: dict, helpers: dict) -> str:
         write(path,record)
         helpers['quiet_file_context_notice'](path.stem,record,fallback)
         return 'blocked'
-    photo = Path(record["filename"]).suffix.lower() in PHOTO_SUFFIXES
+    photo = Path(record["filename"]).suffix.lower() in PHOTO_SUFFIXES and (telegram_api_base() == "https://api.telegram.org" or len(data) <= 10 * 1024 * 1024)
     body, boundary = multipart(record["chat"], record["filename"], data,
                                record["caption"], file_field="photo" if photo else "document",
                                thread_id=record["thread"])
     request = urllib.request.Request(
         f"{base}/bot{read_token()}/{'sendPhoto' if photo else 'sendDocument'}",
-        data=body, headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        data=body, headers={"Content-Type": f"multipart/form-data; boundary={boundary}", "Content-Length": str(len(body))},
         method="POST")
     record["state"] = "sending"
     write(path, record)
     try:
-        with urllib.request.urlopen(request, timeout=20) as response:
+        with urllib.request.urlopen(request, timeout=1800 if base != "https://api.telegram.org" else 20) as response:
             payload = json.loads(response.read())
     except urllib.error.HTTPError as error:
         try:
@@ -646,12 +749,12 @@ def quiet_file_main(argv: list[str]) -> None:
             blob_name = f"{digest}.blob"
             quiet_copy_blob(root, blob_name, data)
             proof=(context or {}).get('proof')
-            if isinstance(proof,dict):proof={**proof,'fileSha256':hashlib.sha256(data).hexdigest()}
+            if isinstance(proof,dict):proof={**proof,'fileSha256':data_sha256(data)}
             record = {"version": 1, "kind": "file", "run_key": run_key, "task": task,
                       "occurrence": occurrence, "chat": chat_id, "thread": thread_id,
                       "general_topic": general_topic,
                       "source": source, "filename": filename, "caption": caption,
-                      "size": len(data), "sha256": hashlib.sha256(data).hexdigest(), 'context_proof':proof,
+                      "size": len(data), "sha256": data_sha256(data), 'context_proof':proof,
                       "blob": blob_name, "state": "ready", "retry_at": 0, "receipt": None}
             helpers["quiet_write"](path, record)
         state = quiet_file_send(root, path, record, helpers)
@@ -671,7 +774,7 @@ def check_video_review(chat_id, thread_id, path, filename, data):
         if not quality['video_required'](chat_id,thread_id,os.environ.get('TG_DELIVERY_ID')):return
         _,receipt=read_outbox_file(path+'.review.json')
         if len(receipt)>64000:raise ValueError('video review receipt too large')
-        verdict=quality['video_receipt'](hashlib.sha256(data).hexdigest(),json.loads(receipt))
+        verdict=quality['video_receipt'](data_sha256(data),json.loads(receipt))
         if not verdict['ok']:raise ValueError(verdict['message'])
     except (ValueError,OSError,sqlite3.Error,SendError):
         raise SendError('tg-send-file: check the exact final video with video-check-overlay before sending; nothing was sent') from None

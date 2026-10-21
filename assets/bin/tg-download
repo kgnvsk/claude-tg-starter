@@ -7,9 +7,12 @@ so a scheduled task or a subagent without the download_attachment tool fetches a
 
   tg-download <file_id>   → {"ok": true, "path": "...", "bytes": N}
 
-Telegram gives bots files up to 20 MB. The file lands in the bot's inbox, as with download_attachment.
+The cloud API gives bots files up to 20 MB. A configured local Bot API copies larger files from its private directory into this bot's inbox.
 """
 import json
+import io
+import runpy
+from pathlib import Path
 import os
 import re
 import secrets
@@ -24,6 +27,28 @@ LIMIT = 20 * 1024 * 1024
 KEY_SHAPE = re.compile(r"\d{5,}:[A-Za-z0-9_-]{30,}")
 
 
+
+def telegram_api_base():
+    import os, runpy
+    from pathlib import Path
+    candidates = [Path(__file__).resolve().with_name('telegram-api'), Path.home() / 'bin/telegram-api']
+    candidates += [Path(__file__).resolve().parents[3] / 'assets/bin/telegram-api'] if 'telegram-corporate' in str(__file__) else []
+    for helper in candidates:
+        if helper.is_file():
+            return runpy.run_path(str(helper))['api_base']()
+    configured = os.environ.get('TELEGRAM_API_BASE', '')
+    state = Path(os.environ.get('TELEGRAM_STATE_DIR') or Path.home() / '.claude/channels/telegram')
+    if not configured and (state / '.env').is_file():
+        for line in (state / '.env').read_text().splitlines():
+            import re
+            match = re.match(r'^(?:export\s+)?TELEGRAM_API_BASE\s*=(.*)', line.strip())
+            if match:
+                configured = match[1].strip().strip("\"'")
+    if configured and configured.rstrip('/') != 'https://api.telegram.org':
+        raise ValueError('Telegram local API helper is unavailable; no cloud fallback')
+    return 'https://api.telegram.org'
+
+
 def state_dir():
     return os.environ.get("TELEGRAM_STATE_DIR") or os.path.expanduser("~/.claude/channels/telegram")
 
@@ -33,18 +58,19 @@ def token():
     if value:
         return value.strip()
     try:
-        for line in open(os.path.join(state_dir(), ".env"), encoding="utf-8"):
-            if line.startswith("TELEGRAM_BOT_TOKEN="):
-                return line.split("=", 1)[1].strip().strip("\"'")
+        with open(os.path.join(state_dir(), ".env"), encoding="utf-8") as handle:
+            for line in handle:
+                if line.startswith("TELEGRAM_BOT_TOKEN="):
+                    return line.split("=", 1)[1].strip().strip("\"'")
     except OSError:
         pass
     sys.exit("tg-download: the bot's key is not configured")
 
 
-def fetch(url, limit):
+def fetch(url, limit, timeout=60):
     """The body, or an error text that never carries the URL (it holds the key)."""
     try:
-        with urllib.request.urlopen(url, timeout=60) as response:
+        with urllib.request.urlopen(url, timeout=timeout) as response:
             body = response.read(limit + 1)
     except urllib.error.HTTPError as error:
         try:
@@ -62,7 +88,12 @@ def main(argv):
     if len(argv) != 2 or not re.fullmatch(r"[A-Za-z0-9_-]{10,256}", argv[1]):
         sys.exit("usage: tg-download <file_id>")
     key = token()
-    body, error = fetch(f"https://api.telegram.org/bot{key}/getFile?" + urllib.parse.urlencode({"file_id": argv[1]}), 64 * 1024)
+    try:
+        base = telegram_api_base()
+    except (OSError, ValueError):
+        print(json.dumps({"ok": False, "error": "Telegram API configuration is invalid"})); return 1
+    body, error = fetch(f"{base}/bot{key}/getFile?" + urllib.parse.urlencode({"file_id": argv[1]}), 64 * 1024,
+                        timeout=1800 if base != "https://api.telegram.org" else 60)
     info = {}
     if body is not None:
         try:
@@ -72,20 +103,42 @@ def main(argv):
     file = info.get("result") or {}
     if error is None and not (info.get("ok") and file.get("file_path")):
         error = str(info.get("description") or "Telegram gave no file: it is over 20 MB or no longer kept")
+    path, size = None, 0
     if error is None:
-        body, error = fetch(f"https://api.telegram.org/file/bot{key}/{file['file_path']}", LIMIT)
-    if error is None:
-        ext = re.sub(r"[^A-Za-z0-9]", "", file["file_path"].rsplit(".", 1)[-1]) if "." in file["file_path"] else ""
-        unique = re.sub(r"[^A-Za-z0-9_-]", "", str(file.get("file_unique_id") or "")) or "dl"
-        path, error = save(body, f"{int(time.time() * 1000)}-{unique}", ext or "bin")
+        ext = re.sub(r"[^A-Za-z0-9]", "", file["file_path"].rsplit(".", 1)[-1])[:10] if "." in file["file_path"] else ""
+        unique = re.sub(r"[^A-Za-z0-9_-]", "", str(file.get("file_unique_id") or ""))[:100] or "dl"
+        stem = f"{int(time.time() * 1000)}-{unique}"
+        if base != "https://api.telegram.org":
+            try:
+                helper = runpy.run_path(str(Path(__file__).resolve().with_name('telegram-api')))
+                with helper['open_local_file'](file['file_path']) as source:
+                    before = os.fstat(source.fileno())
+                    path, size, error = save_stream(source, stem, ext or 'bin')
+                    after = os.fstat(source.fileno())
+                    identity = lambda item: (item.st_dev, item.st_ino, item.st_size, item.st_mtime_ns)
+                    if error is None and (identity(before) != identity(after) or size != before.st_size):
+                        os.unlink(path)
+                        path, size, error = None, 0, 'Telegram local file changed during the copy'
+            except (OSError, ValueError):
+                error = 'Telegram local file is unavailable or outside its private directory'
+        else:
+            body, error = fetch(f"{base}/file/bot{key}/{file['file_path']}", LIMIT)
+            if error is None:
+                path, error = save(body, stem, ext or 'bin')
+                size = len(body)
     if error is not None:
         print(json.dumps({"ok": False, "error": KEY_SHAPE.sub("***", error)}, ensure_ascii=False))
         return 1
-    print(json.dumps({"ok": True, "path": path, "bytes": len(body)}, ensure_ascii=False))
+    print(json.dumps({"ok": True, "path": path, "bytes": size}, ensure_ascii=False))
     return 0
 
 
 def save(body, stem, ext):
+    path, _, error = save_stream(io.BytesIO(body), stem, ext)
+    return path, error
+
+
+def save_stream(source, stem, ext):
     """A new file of this run in the inbox, or an error; nothing already there is followed or overwritten.
 
     Codex, review of a333bb5c: the name of a Telegram file is not the name of one download, and a plain open
@@ -97,7 +150,7 @@ def save(body, stem, ext):
     except OSError:
         pass
     if os.path.islink(inbox) or not os.path.isdir(inbox):
-        return None, "the inbox is not a plain folder"
+        return None, 0, "the inbox is not a plain folder"
     for _ in range(5):
         path = os.path.join(inbox, f"{stem}-{secrets.token_hex(4)}.{ext}")
         try:
@@ -105,15 +158,18 @@ def save(body, stem, ext):
         except FileExistsError:
             continue
         except OSError as error:
-            return None, f"cannot save: {type(error).__name__}"
+            return None, 0, f"cannot save: {type(error).__name__}"
         try:
+            size = 0
             with os.fdopen(descriptor, "wb") as out:
-                out.write(body)
+                while chunk := source.read(1024 * 1024):
+                    out.write(chunk)
+                    size += len(chunk)
         except OSError as error:
             os.unlink(path)
-            return None, f"cannot save: {type(error).__name__}"
-        return path, None
-    return None, "cannot save: no free name"
+            return None, 0, f"cannot save: {type(error).__name__}"
+        return path, size, None
+    return None, 0, "cannot save: no free name"
 
 
 if __name__ == "__main__":

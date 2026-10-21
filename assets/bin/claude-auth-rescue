@@ -77,6 +77,28 @@ STATE_DIR = Path(
 )
 
 
+
+def telegram_api_base():
+    import os, runpy
+    from pathlib import Path
+    candidates = [Path(__file__).resolve().with_name('telegram-api'), Path.home() / 'bin/telegram-api']
+    candidates += [Path(__file__).resolve().parents[3] / 'assets/bin/telegram-api'] if 'telegram-corporate' in str(__file__) else []
+    for helper in candidates:
+        if helper.is_file():
+            return runpy.run_path(str(helper))['api_base']()
+    configured = os.environ.get('TELEGRAM_API_BASE', '')
+    state = Path(os.environ.get('TELEGRAM_STATE_DIR') or Path.home() / '.claude/channels/telegram')
+    if not configured and (state / '.env').is_file():
+        for line in (state / '.env').read_text().splitlines():
+            import re
+            match = re.match(r'^(?:export\s+)?TELEGRAM_API_BASE\s*=(.*)', line.strip())
+            if match:
+                configured = match[1].strip().strip("\"'")
+    if configured and configured.rstrip('/') != 'https://api.telegram.org':
+        raise ValueError('Telegram local API helper is unavailable; no cloud fallback')
+    return 'https://api.telegram.org'
+
+
 def _find_claude() -> Path:
     """The kit installs claude to ~/.local/bin, but custom boxes differ."""
     for candidate in (HOME / ".local/bin/claude",
@@ -373,7 +395,7 @@ def send(token: str, chat: str, text: str) -> str:
     #175 P1-1). The reason is logged; the token never is."""
     body = urllib.parse.urlencode({"chat_id": chat, "text": text}).encode()
     req = urllib.request.Request(
-        f"https://api.telegram.org/bot{token}/sendMessage", data=body
+        f"{telegram_api_base()}/bot{token}/sendMessage", data=body
     )
     try:
         with urllib.request.urlopen(req, timeout=15) as response:

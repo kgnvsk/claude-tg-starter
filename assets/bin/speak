@@ -4,6 +4,23 @@
 # Usage: speak <chat_id> "text"   [env: OPENAI_TTS_VOICE=onyx OPENAI_TTS_SPEED=1.1 OPENAI_TTS_STYLE="..."]
 set -e
 
+# Cron has no bot environment: read the same channel configuration before any send.
+telegram_api_base() {
+  local helper="$(dirname "${BASH_SOURCE[0]}")/telegram-api"
+  [ -f "$helper" ] || helper="$HOME/bin/telegram-api"
+  if [ -f "$helper" ]; then
+    python3 "$helper" base
+    return $?
+  fi
+  # Standalone historical installations are cloud-only. A missing local helper
+  # must never silently log a local bot back into the cloud.
+  if [ -n "${TELEGRAM_API_BASE:-}" ] || grep -Eq '^(export[[:space:]]+)?TELEGRAM_API_BASE=' "${TELEGRAM_STATE_DIR:-$HOME/.claude/channels/telegram}/.env" 2>/dev/null; then
+    echo 'Telegram local API helper is unavailable; no cloud fallback' >&2
+    return 1
+  fi
+  printf '%s\n' 'https://api.telegram.org'
+}
+
 # Re-enter once with the current store value; the parent bot need not restart.
 if [ "${1:-}" = "--novsky-provider-ready" ]; then
   shift
@@ -22,6 +39,7 @@ TEXT="$2"
 
 [ -z "$OPENAI_API_KEY" ] && { echo "No OPENAI_API_KEY" >&2; exit 1; }
 [ -z "$TELEGRAM_BOT_TOKEN" ] && { echo "No TELEGRAM_BOT_TOKEN" >&2; exit 1; }
+[[ "$TELEGRAM_BOT_TOKEN" =~ ^[A-Za-z0-9:_-]+$ ]] || { echo "Invalid TELEGRAM_BOT_TOKEN" >&2; exit 1; }
 
 # OpenAI TTS caps input at 4096 chars — refuse louder texts so the caller
 # shortens instead of sending a voice that cuts off mid-sentence.
@@ -45,10 +63,12 @@ if [ "$HTTP" != "200" ]; then
   exit 1
 fi
 
+telegram_base=$(telegram_api_base) || exit 1
+
 # 2. Send as Telegram voice message
-RESP=$(curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendVoice" \
+RESP=$(curl -sS -X POST -K - \
   -F "chat_id=${CHAT_ID}" \
-  -F "voice=@${OGG}")
+  -F "voice=@${OGG}" <<<"url = \"${telegram_base}/bot${TELEGRAM_BOT_TOKEN}/sendVoice\"")
 if echo "$RESP" | jq -e '.ok' >/dev/null 2>&1; then
   echo "voice sent (message_id: $(echo "$RESP" | jq -r '.result.message_id'))"
 else

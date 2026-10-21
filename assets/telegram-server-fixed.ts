@@ -19,10 +19,12 @@ import { z } from 'zod'
 import { Bot, GrammyError, InlineKeyboard, InputFile, type Context } from 'grammy'
 import type { ReactionTypeEmoji } from 'grammy/types'
 import { randomBytes, createHash, randomUUID, timingSafeEqual } from 'crypto'
-import { accessSync, constants, existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, lstatSync, renameSync, realpathSync, chmodSync, openSync, fsyncSync, closeSync, readSync, readlinkSync } from 'fs'
+import { accessSync, constants, existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, lstatSync, renameSync, realpathSync, chmodSync, openSync, fsyncSync, closeSync, readSync, readlinkSync, fstatSync, createReadStream, createWriteStream } from 'fs'
 import { homedir, tmpdir } from 'os'
+import { pipeline } from 'node:stream/promises'
+import { Transform } from 'node:stream'
 import { execFile, execFileSync, spawnSync } from 'child_process'
-import { join, extname, sep, relative, resolve, basename } from 'path'
+import { join, extname, sep, relative, resolve, basename, isAbsolute } from 'path'
 import { pathToFileURL } from 'node:url'
 import { Database } from 'bun:sqlite'
 
@@ -49,9 +51,34 @@ try {
 } catch {}
 
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN
+// A local Bot API is optional. Refuse a mistyped remote endpoint before sending it the bot key.
+function telegramApiConfig(): { base: string; localRoot?: string } {
+  const base = (process.env.TELEGRAM_API_BASE || 'https://api.telegram.org').replace(/\/$/, '')
+  if (base === 'https://api.telegram.org') return { base }
+  if (!/^http:\/\/(?:127\.0\.0\.1|localhost|\[::1\]):[0-9]{1,5}$/.test(base)) {
+    throw new Error('TELEGRAM_API_BASE must name the local loopback Bot API')
+  }
+  const port = Number(base.slice(base.lastIndexOf(':') + 1))
+  if (port < 1 || port > 65535) throw new Error('Local Bot API port invalid')
+  const root = process.env.TELEGRAM_LOCAL_FILE_ROOT
+  if (!root || !isAbsolute(root) || resolve(root) === sep) throw new Error('Local Bot API requires TELEGRAM_LOCAL_FILE_ROOT')
+  try {
+    const info = lstatSync(root)
+    if (!info.isDirectory() || (info.mode & 0o007)) throw new Error('not private')
+    return { base, localRoot: realpathSync(root) }
+  } catch { throw new Error('Local Bot API file storage unavailable or not private') }
+}
+const TELEGRAM_API = telegramApiConfig()
 const STATIC = process.env.TELEGRAM_ACCESS_MODE === 'static'
 const OWNER_CHAT_ID = process.env.OWNER_CHAT_ID ?? ''
 const CORPORATE_ENABLED = process.env.TG_CORPORATE_SESSIONS === '1'
+// Owner, 21.10.2026: one conversation per group. With the word «group» in this state directory's owner-group-route
+// file (set per agent) his own messages in a group with other people go to that group's company conversation as his
+// turns, with all his working rights there; what only his own session can do is handed to it from there. A group of
+// only him and this bot stays his own chat. Read once at start: a change applies after a restart.
+const OWNER_GROUP_ROUTE = (() => {
+  try { return readFileSync(join(STATE_DIR, 'owner-group-route'), 'utf8').trim() === 'group' } catch { return false }
+})()
 const CORPORATE_MODULE = join(
   homedir(),
   '.local',
@@ -76,7 +103,7 @@ const CORPORATE_FILE_TOO_LARGE =
 const UNOPENED_NAMES: Record<string, string> = { video: 'відео', video_note: 'відеокружок', photo: 'фото', voice: 'запис', audio: 'запис' }
 function unopenedLine(files: { kind: string; name?: string; size?: number }[]): string {
   const names = files.map(file => (UNOPENED_NAMES[file.kind] ?? (file.name ? `файл «${file.name}»` : 'файл'))
-    + ((file.size ?? 0) > 20 * 1024 * 1024 ? ' — більший за 20 МБ, Telegram не передає такі файли ботам' : ''))
+    + ((!process.env.TELEGRAM_API_BASE || process.env.TELEGRAM_API_BASE.replace(/\/$/, '') === 'https://api.telegram.org') && (file.size ?? 0) > 20 * 1024 * 1024 ? ' — більший за 20 МБ, Telegram не передає такі файли ботам' : ''))
   return `(Не відкрито: ${names.join(', ')}.)`
 }
 
@@ -1295,7 +1322,7 @@ async function updateAccess(args: string[]): Promise<void> {
 // Strict: no bare yes/no (conversational), no prefix/suffix chatter.
 const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
 
-const bot = new Bot(TOKEN)
+const bot = new Bot(TOKEN, { client: { apiRoot: TELEGRAM_API.base, ...(TELEGRAM_API.localRoot ? { timeoutSeconds: 1800 } : {}) } })
 // grammY's stop() confirms its last tried update without waiting for middleware.
 // Track the current handler so shutdown cannot acknowledge an update before it
 // reaches durable inbound storage. A rejected handler stays tracked until the
@@ -1556,8 +1583,8 @@ function defaultAccess(): Access {
 }
 
 const MAX_CHUNK_LIMIT = 4096
-const MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
-const TELEGRAM_FETCH_TIMEOUT_MS = 30_000
+const MAX_ATTACHMENT_BYTES = (TELEGRAM_API.localRoot ? 2000 : 50) * 1024 * 1024
+const TELEGRAM_FETCH_TIMEOUT_MS = TELEGRAM_API.localRoot ? 1_800_000 : 30_000
 const MCP_INBOUND_DELIVERY_TIMEOUT_MS = 30_000
 const ATTACHMENT_OUTBOX = resolve(join(homedir(), 'telegram-outbox'))
 const MCP_INBOUND_RESTART_MARKER = join(
@@ -1658,6 +1685,40 @@ function assertSendable(f: string): void {
   if (!lstatSync(lexical).isFile()) {
     throw new Error(`attachment path is not a regular file: ${f}`)
   }
+}
+
+async function snapshotReviewedVideo(file: string): Promise<{path: string; sha256: string; directory: string}> {
+  assertSendable(file)
+  const directory = join(ATTACHMENT_OUTBOX, `.video-send-${randomUUID()}`)
+  mkdirSync(directory, {mode: 0o700})
+  const target = join(directory, basename(file))
+  let fd: number | undefined
+  try {
+    fd = openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
+    const before = fstatSync(fd)
+    if (!before.isFile() || before.size > MAX_ATTACHMENT_BYTES) throw new Error('Video exceeds the attachment limit')
+    const hash = createHash('sha256')
+    let size = 0
+    await pipeline(createReadStream(file, {fd, autoClose: false}), new Transform({
+      transform(chunk: Buffer, _encoding, callback) {
+        size += chunk.length
+        if (size > MAX_ATTACHMENT_BYTES) { callback(new Error('Video grew beyond the attachment limit')); return }
+        hash.update(chunk)
+        callback(null, chunk)
+      },
+    }), createWriteStream(target, {flags: 'wx', mode: 0o600}))
+    const after = fstatSync(fd)
+    const current = lstatSync(file)
+    if (size !== before.size || before.size !== after.size || before.mtimeMs !== after.mtimeMs
+      || before.ctimeMs !== after.ctimeMs || before.ino !== current.ino || before.dev !== current.dev) {
+      throw new Error('Video changed while preparing the reviewed upload')
+    }
+    chmodSync(target, 0o400)
+    return {path: target, sha256: hash.digest('hex'), directory}
+  } catch (error) {
+    rmSync(directory, {recursive: true, force: true})
+    throw error
+  } finally { if (fd !== undefined) closeSync(fd) }
 }
 
 function readAccessFile(): Access {
@@ -1879,6 +1940,7 @@ async function loadCorporateRuntime(): Promise<CorporateGatewayRuntime | null> {
       isPrivilegedActor?: (userId: string) => boolean
       sendText: typeof sendCorporateText
       submitOwnerRequest?: (request: { ownerId: string; messageId: number; token: string }) => Promise<void>
+      delegateToOwnerSession?: (task: { chatId: string; threadId: number | null; messageId: number; text: string; note: string }) => boolean
       journalRepair?: () => void
     }) => CorporateGatewayRuntime
   }
@@ -1895,6 +1957,45 @@ async function loadCorporateRuntime(): Promise<CorporateGatewayRuntime | null> {
     sendText: sendCorporateText,
     // A company message parked in the write-ahead repair reaches the journal before the next job reads its chat.
     journalRepair: replayOutgoingMessageRepairs,
+    // Owner, 21.10.2026: his own turn in a group's company conversation hands over what only his own session can do (his
+    // server tools, logged-in sites, personal mail and messengers, private notes). His own session gets his exact words
+    // from that group as his request there and answers in that chat; the group conversation sees the answer in its journal.
+    delegateToOwnerSession: task => {
+      if (!/^-\d+$/.test(task.chatId) || !Number.isSafeInteger(task.messageId) || task.messageId <= 0) return false
+      if (task.threadId != null && (!Number.isSafeInteger(task.threadId) || task.threadId <= 0)) return false
+      // The owner's own message keeps its delivery id: it went to the group's company conversation, so the main
+      // queue has never seen it, and every receiver check reads exactly «chat:message».
+      const deliveryId = `${task.chatId}:${task.messageId}`
+      const conversationKey = task.threadId == null ? `group:${task.chatId}` : `topic:${task.chatId}:${task.threadId}`
+      const folder = task.threadId == null ? task.chatId : `${task.chatId} ${task.threadId}`
+      // Only his own words go in: the group conversation's note comes from a model other people there can steer.
+      const content = 'Authenticated primary owner request in Telegram '
+        + JSON.stringify({ chatId: task.chatId, ...(task.threadId != null ? { threadId: task.threadId } : {}) })
+        + '. Handed over by this group\'s company conversation: it needs your own tools, accounts or private sources. Do '
+        + 'exactly this request with the same installed owner tools and answer in this chat and topic. Work files for this '
+        + 'group go to its shared folder (`~/bin/group-folder ' + folder + '`). From private sources share only the '
+        + 'result the request asks for.\n\n' + task.text
+      let queued = false
+      MSG_DB.transaction(() => {
+        if (pendingInboundExists.get(deliveryId)) {
+          queued = true // handed over already: his own session has it
+          return
+        }
+        const prior = MSG_DB.query('SELECT state FROM delivery_results WHERE delivery_id=?').get(deliveryId) as { state?: string } | null
+        if (prior) {
+          // Taken before: in progress or answered counts; an ended attempt cannot be handed over again under its id.
+          queued = !['failed', 'blocked', 'cancelled', 'no_reply'].includes(String(prior.state))
+          return
+        }
+        queueInboundDelivery(deliveryId, { method: 'notifications/claude/channel', params: { content,
+          meta: { chat_id: task.chatId, delivery_id: deliveryId, conversation_key: conversationKey,
+            ...(task.threadId != null ? { thread_id: String(task.threadId) } : {}),
+            message_id: String(task.messageId), user: OWNER_CHAT_ID, user_id: OWNER_CHAT_ID, ts: new Date().toISOString() } } })
+        queued = true
+      })()
+      void drainPendingInboundDeliveries().catch(() => {})
+      return queued
+    },
     submitOwnerRequest: async request => {
       if (request.ownerId !== OWNER_CHAT_ID || !Number.isSafeInteger(request.messageId) || request.messageId <= 0) throw new Error('invalid access approval')
       const { ownerAccessInstruction } = await import(new URL('./access-requests.ts', pathToFileURL(CORPORATE_MODULE)).href)
@@ -6601,7 +6702,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           files: {
             type: 'array',
             items: { type: 'string' },
-            description: `Absolute file paths inside ${ATTACHMENT_OUTBOX}. Images send as photos (inline preview); other types as documents. Max 50MB each.`,
+            description: `Absolute file paths inside ${ATTACHMENT_OUTBOX}. ${TELEGRAM_API.localRoot ? 'Images up to 10MB send as photos (inline preview); larger images and other types as documents.' : 'Images send as photos (inline preview); other types as documents.'} Max ${TELEGRAM_API.localRoot ? '2000 MiB' : '50MB'} each.`,
           },
           format: {
             type: 'string',
@@ -6654,7 +6755,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: 'download_attachment',
-      description: 'Download a file attachment from a Telegram message to the local inbox. Use when the inbound <channel> meta shows attachment_file_id. Returns the local file path ready to Read. Telegram caps bot downloads at 20MB.',
+      description: `Download a file attachment from a Telegram message to the local inbox. Use when the inbound <channel> meta shows attachment_file_id. Returns the local file path ready to Read. ${TELEGRAM_API.localRoot ? 'The local Bot API supports downloads up to 2000 MiB.' : 'Telegram caps bot downloads at 20MB.'}`,
       inputSchema: {
         type: 'object',
         properties: {
@@ -6971,7 +7072,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           }
           const st = statSync(f)
           if (st.size > MAX_ATTACHMENT_BYTES) {
-            throw new Error(`file too large: ${f} (${(st.size / 1024 / 1024).toFixed(1)}MB, max 50MB)`)
+            throw new Error(`file too large: ${f} (${(st.size / 1024 / 1024).toFixed(1)}MB, max ${MAX_ATTACHMENT_BYTES / 1024 / 1024}MB)`)
           }
         }
 
@@ -6983,8 +7084,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const sentIds: number[] = []
         const origin = receiptContext(chat_id, threadId != null ? String(threadId) : null, args.delivery_id)
         await requireAnswerContext(chat_id, threadId ?? null, text, args.delivery_id as string | undefined, files.length > 0)
-        // Snapshot reviewed video before any text/send or delivery mutation. The uploaded buffer is exactly the checked one.
-        const reviewedVideos = new Map<string, Buffer>()
+        // Review and upload the same private snapshot without buffering a large video.
+        const reviewedVideos = new Map<string, Awaited<ReturnType<typeof snapshotReviewedVideo>>>()
+        try {
         const qualityHelper = files.some(f => /\.(mp4|mov|webm|mkv)$/i.test(f))
           ? join(homedir(), 'bin/task-review') : null
         if (qualityHelper && existsSync(qualityHelper)) {
@@ -6995,13 +7097,12 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           const quality = spawnSync('python3', [qualityHelper, 'validate'], { input: JSON.stringify({ request, answer: '', review: null }), encoding: 'utf8', timeout: 3000, maxBuffer: 120000 })
           if (![0, 1].includes(quality.status ?? -1)) throw new Error('Video completion review is unavailable; nothing was sent')
           if (JSON.parse(quality.stdout).required?.video_bytes) for (const f of files.filter(f => /\.(mp4|mov|webm|mkv)$/i.test(f))) {
-            const bytes = readFileSync(f)
-            if (bytes.length > MAX_ATTACHMENT_BYTES) throw new Error('Video grew beyond the attachment limit')
+            const snapshot = await snapshotReviewedVideo(f)
+            reviewedVideos.set(f, snapshot)
             const receipt = readFileSync(f + '.review.json')
             if (receipt.length > 64000) throw new Error('Video review receipt is too large')
-            const checked = spawnSync('python3', [qualityHelper, 'video-receipt'], { input: JSON.stringify({ sha256: createHash('sha256').update(bytes).digest('hex'), receipt: JSON.parse(receipt.toString('utf8')) }), encoding: 'utf8', timeout: 3000, maxBuffer: 120000 })
+            const checked = spawnSync('python3', [qualityHelper, 'video-receipt'], { input: JSON.stringify({ sha256: snapshot.sha256, receipt: JSON.parse(receipt.toString('utf8')) }), encoding: 'utf8', timeout: 3000, maxBuffer: 120000 })
             if (checked.status !== 0 || JSON.parse(checked.stdout).ok !== true) throw new Error('Run video-check-overlay on the exact final file before sending, and verify the approved style. Nothing was sent')
-            reviewedVideos.set(f, bytes)
           }
         }
         const completion = resultDelivery(chat_id, threadId != null ? String(threadId) : null,
@@ -7106,13 +7207,13 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           // sendMessage call). Topic routing is independent of the quote setting.
           for (const f of files) {
             const ext = extname(f).toLowerCase()
-            const input = reviewedVideos.has(f) ? new InputFile(reviewedVideos.get(f)!, basename(f)) : new InputFile(f)
+            const input = reviewedVideos.has(f) ? new InputFile(reviewedVideos.get(f)!.path, basename(f)) : new InputFile(f)
             const opts = {
               ...topicParams,
               ...(reply_to != null && replyMode !== 'off'
                 ? { reply_parameters: { message_id: reply_to } } : {}),
             }
-            const kind = PHOTO_EXTS.has(ext) ? 'photo' : 'document'
+            const kind = PHOTO_EXTS.has(ext) && (!TELEGRAM_API.localRoot || statSync(f).size <= 10 * 1024 * 1024) ? 'photo' : 'document'
             beginOutbound()
             rejectedFile = true
             const sent = kind === 'photo'
@@ -7169,6 +7270,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
             ? `sent (id: ${sentIds[0]})`
             : `sent ${sentIds.length} parts (ids: ${sentIds.join(', ')})`
         return { content: [{ type: 'text', text: result }] }
+        } finally {
+          for (const snapshot of reviewedVideos.values()) rmSync(snapshot.directory, {recursive: true, force: true})
+        }
       }
       case 'no_reply': {
         const chat_id = String(args.chat_id ?? '')
@@ -8358,24 +8462,78 @@ async function readTelegramFileResponse(response: Response, expectedSize?: numbe
 }
 // One downloader for every file the model gets by id — the download_attachment
 // tool and the late binding of group photos share it, bounds included.
+type TelegramDownloadFile = { file_path?: string; file_size?: number; file_unique_id?: string }
+
+// --local getFile returns an absolute path, not a cloud download URL. Only files below this
+// installation's configured storage are opened; a copied private inode is what the agent sees.
+function openLocalTelegramFile(file: TelegramDownloadFile): number {
+  const root = TELEGRAM_API.localRoot
+  const path = file.file_path
+  if (!root || !path || !isAbsolute(path)) throw new Error('Local Telegram file path missing')
+  let canonical: string
+  try { canonical = realpathSync(path) } catch { throw new Error('Local Telegram file unavailable') }
+  const rawRoot = resolve(process.env.TELEGRAM_LOCAL_FILE_ROOT!)
+  const raw = resolve(path)
+  const expected = raw.startsWith(rawRoot + sep) ? join(root, relative(rawRoot, raw)) : raw
+  const inside = relative(root, canonical)
+  if (!inside || inside.startsWith('..' + sep) || inside === '..' || isAbsolute(inside)
+    || canonical !== expected) throw new Error('Local Telegram file path outside storage')
+  let fd: number
+  try { fd = openSync(canonical, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK) } catch { throw new Error('Local Telegram file unavailable') }
+  try {
+    const stat = fstatSync(fd)
+    if (process.platform === 'linux' && realpathSync(`/proc/self/fd/${fd}`) !== canonical) throw new Error('Local Telegram file moved outside storage')
+    if (!stat.isFile() || realpathSync(path) !== canonical || (file.file_size != null && stat.size !== file.file_size)) throw new Error('Incomplete local Telegram file')
+    return fd
+  } catch (error) { closeSync(fd); throw error }
+}
+
+async function saveTelegramDownload(file: TelegramDownloadFile, expectedSize = file.file_size): Promise<string> {
+  if (!file.file_path) throw new Error('Telegram returned no file_path — file may have expired')
+  const ext = extname(file.file_path).replace(/[^a-zA-Z0-9]/g, '').slice(0, 12) || 'bin'
+  mkdirSync(INBOX_DIR, { recursive: true, mode: 0o700 })
+  if (lstatSync(INBOX_DIR).isSymbolicLink()) throw new Error('Telegram inbox is not a plain folder')
+  const path = join(realpathSync(INBOX_DIR), `${Date.now()}-${randomBytes(12).toString('hex')}.${ext}`)
+  if (!TELEGRAM_API.localRoot) {
+    const response = await fetch(`${TELEGRAM_API.base}/file/bot${TOKEN}/${file.file_path}`, {
+      signal: AbortSignal.timeout(TELEGRAM_FETCH_TIMEOUT_MS), redirect: 'error',
+    })
+    writeFileSync(path, await readTelegramFileResponse(response, expectedSize), { flag: 'wx', mode: 0o600 })
+    return path
+  }
+  const source = openLocalTelegramFile({ ...file, file_size: expectedSize })
+  let target: number | undefined
+  try {
+    const before = fstatSync(source)
+    target = openSync(path, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600)
+    await pipeline(createReadStream('', { fd: source, autoClose: false }), createWriteStream('', { fd: target, autoClose: false }))
+    const after = fstatSync(source)
+    if (after.size !== before.size || after.mtimeMs !== before.mtimeMs || after.ctimeMs !== before.ctimeMs
+      || fstatSync(target).size !== before.size) throw new Error('Local Telegram file changed during copy')
+    return path
+  } catch (error) { rmSync(path, { force: true }); throw error }
+  finally { closeSync(source); if (target !== undefined) closeSync(target) }
+}
+
+async function telegramImageResponse(file: TelegramDownloadFile, maxBytes: number): Promise<Response> {
+  if (!TELEGRAM_API.localRoot) return fetch(`${TELEGRAM_API.base}/file/bot${TOKEN}/${file.file_path}`, {
+    signal: AbortSignal.timeout(TELEGRAM_FETCH_TIMEOUT_MS), redirect: 'error',
+  })
+  const fd = openLocalTelegramFile(file)
+  try {
+    if (fstatSync(fd).size > maxBytes) throw new Error('image too large')
+    // Images have their own small model limit. Large images take the file route below.
+    const bytes = Buffer.alloc(maxBytes + 1)
+    let size = 0
+    while (size < bytes.length) { const n = readSync(fd, bytes, size, bytes.length - size, null); if (!n) break; size += n }
+    if (size > maxBytes || (file.file_size != null && size !== file.file_size)) throw new Error('image size changed')
+    return new Response(bytes.subarray(0, size), { headers: { 'content-length': String(size) } })
+  } finally { closeSync(fd) }
+}
+
 async function downloadAttachmentById(file_id: string): Promise<string> {
   const file = await bot.api.getFile(file_id, AbortSignal.timeout(TELEGRAM_FETCH_TIMEOUT_MS))
-  if (!file.file_path) throw new Error('Telegram returned no file_path — file may have expired')
-  const url = `https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`
-  const res = await fetch(url, {
-    signal: AbortSignal.timeout(TELEGRAM_FETCH_TIMEOUT_MS),
-  })
-  if (!res.ok) throw new Error(`download failed: HTTP ${res.status}`)
-  const buf = await readTelegramFileResponse(res, file.file_size)
-  // file_path is from Telegram (trusted), but strip to safe chars anyway
-  // so nothing downstream can be tricked by an unexpected extension.
-  const rawExt = file.file_path.includes('.') ? file.file_path.split('.').pop()! : 'bin'
-  const ext = rawExt.replace(/[^a-zA-Z0-9]/g, '') || 'bin'
-  const uniqueId = (file.file_unique_id ?? '').replace(/[^a-zA-Z0-9_-]/g, '') || 'dl'
-  const path = join(INBOX_DIR, `${Date.now()}-${uniqueId}.${ext}`)
-  mkdirSync(INBOX_DIR, { recursive: true })
-  writeFileSync(path, buf)
-  return path
+  return saveTelegramDownload(file)
 }
 // End bounded Telegram download
 
@@ -8392,16 +8550,7 @@ bot.on('message:photo', async ctx => {
     try {
       const file = await ctx.api.getFile(best.file_id, AbortSignal.timeout(TELEGRAM_FETCH_TIMEOUT_MS))
       if (!file.file_path) return undefined
-      const url = `https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`
-      const res = await fetch(url, {
-        signal: AbortSignal.timeout(TELEGRAM_FETCH_TIMEOUT_MS),
-      })
-      const buf = await readTelegramFileResponse(res, file.file_size ?? best.file_size)
-      const ext = file.file_path.split('.').pop() ?? 'jpg'
-      const path = join(INBOX_DIR, `${Date.now()}-${best.file_unique_id}.${ext}`)
-      mkdirSync(INBOX_DIR, { recursive: true })
-      writeFileSync(path, buf)
-      return path
+      return saveTelegramDownload(file, file.file_size ?? best.file_size)
     } catch (err) {
       process.stderr.write(`telegram channel: photo download failed: ${err}\n`)
       return undefined
@@ -8643,17 +8792,7 @@ async function transcribeObservedAttachment(
   try {
     const file = await ctx.api.getFile(attachment.file_id, AbortSignal.timeout(TELEGRAM_FETCH_TIMEOUT_MS))
     if (!file.file_path) throw new Error('Telegram returned no file_path')
-    const url = `https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`
-    const res = await fetch(url, {
-      signal: AbortSignal.timeout(TELEGRAM_FETCH_TIMEOUT_MS),
-    })
-    if (!res.ok) throw new Error(`download failed: HTTP ${res.status}`)
-    const rawExt = file.file_path.includes('.') ? file.file_path.split('.').pop()! : 'ogg'
-    const ext = rawExt.replace(/[^a-zA-Z0-9]/g, '') || 'ogg'
-    const uniqueId = (file.file_unique_id ?? '').replace(/[^a-zA-Z0-9_-]/g, '') || 'voice'
-    localPath = join(INBOX_DIR, `${Date.now()}-${uniqueId}.${ext}`)
-    mkdirSync(INBOX_DIR, { recursive: true })
-    writeFileSync(localPath, await readTelegramFileResponse(res, file.file_size ?? attachment.size))
+    localPath = await saveTelegramDownload(file, file.file_size ?? attachment.size)
 
     const proc = Bun.spawn([
       TRANSCRIBE_TELEGRAM_BIN,
@@ -8701,13 +8840,11 @@ async function downloadCorporateImageFile(api: Context['api'], attachment: Attac
   const media = await import(new URL('./media.ts', pathToFileURL(CORPORATE_MODULE)).href)
   if (attachment.size != null && attachment.size > media.MAX_IMAGE_BYTES) throw new Error('image too large')
   const file = await api.getFile(attachment.file_id, AbortSignal.timeout(TELEGRAM_FETCH_TIMEOUT_MS))
-  if (!file.file_path || file.file_path.includes('..') || !/^[A-Za-z0-9_./-]+$/.test(file.file_path)) {
+  if (!file.file_path || (!TELEGRAM_API.localRoot && (file.file_path.includes('..') || !/^[A-Za-z0-9_./-]+$/.test(file.file_path)))) {
     throw new Error('invalid Telegram file path')
   }
   if (file.file_size != null && file.file_size > media.MAX_IMAGE_BYTES) throw new Error('image too large')
-  const response = await fetch(`https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`, {
-    signal: AbortSignal.timeout(TELEGRAM_FETCH_TIMEOUT_MS), redirect: 'error',
-  })
+  const response = await telegramImageResponse(file, media.MAX_IMAGE_BYTES)
   // A Telegram photo is always JPEG; a document carries its own declared type.
   return media.readImageResponse(
     response,
@@ -8747,13 +8884,18 @@ async function downloadCorporateDocument(ctx: Context, attachment: AttachmentMet
 async function downloadCorporateDocumentFile(api: Context['api'], attachment: AttachmentMeta) {
   const media = await import(new URL('./media.ts', pathToFileURL(CORPORATE_MODULE)).href)
   const name = corporateDocumentName(attachment.name) || 'file'
+  if (TELEGRAM_API.localRoot) {
+    const file = await api.getFile(attachment.file_id, AbortSignal.timeout(TELEGRAM_FETCH_TIMEOUT_MS))
+    const path = await saveTelegramDownload(file, file.file_size ?? attachment.size)
+    return media.corporateDocumentFromFile(path, name || 'file')
+  }
   if (attachment.size != null && attachment.size > media.MAX_DOCUMENT_BYTES) throw new Error('document too large')
   const file = await api.getFile(attachment.file_id, AbortSignal.timeout(TELEGRAM_FETCH_TIMEOUT_MS))
-  if (!file.file_path || file.file_path.includes('..') || !/^[A-Za-z0-9_./-]+$/.test(file.file_path)) {
+  if (!file.file_path || (!TELEGRAM_API.localRoot && (file.file_path.includes('..') || !/^[A-Za-z0-9_./-]+$/.test(file.file_path)))) {
     throw new Error('invalid Telegram file path')
   }
   if (file.file_size != null && file.file_size > media.MAX_DOCUMENT_BYTES) throw new Error('document too large')
-  const response = await fetch(`https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`, {
+  const response = await fetch(`${TELEGRAM_API.base}/file/bot${TOKEN}/${file.file_path}`, {
     signal: AbortSignal.timeout(TELEGRAM_FETCH_TIMEOUT_MS), redirect: 'error',
   })
   const bytes = await readTelegramFileResponse(response, file.file_size ?? attachment.size)
@@ -8855,6 +8997,7 @@ async function routeInbound(
   legacyInbound: (deliveryId: string) => Promise<void>,
   unaddressed = false,
   continues?: number,
+  ownerOwnChat = false,
 ): Promise<void> {
   const from = ctx.from!
   const chat_id = String(ctx.chat!.id)
@@ -8864,7 +9007,8 @@ async function routeInbound(
     : `${chat_id}:${Date.now()}:${randomBytes(6).toString('hex')}`
   const ownerDirect = String(from.id) === OWNER_CHAT_ID && !ctx.message?.sender_chat
     && (ctx.chat?.type === 'private' ? chat_id === OWNER_CHAT_ID
-      : (ctx.chat?.type === 'group' || ctx.chat?.type === 'supergroup') && !unaddressed)
+      : (ctx.chat?.type === 'group' || ctx.chat?.type === 'supergroup') && !unaddressed
+        && (ownerOwnChat || !OWNER_GROUP_ROUTE || !CORPORATE_ENABLED))
   const isolationActivated = readCorporateIsolationActivated()
   const configuredSuperadmins = loadAccess().superadmins
   // An ordinary bot still shares the owner's Claude session. Once a business
@@ -8895,7 +9039,7 @@ async function routeInbound(
   }
   // Telegram hands no bot a file over 20 MB: for a recording that is the answer, not "try later". Any other file too
   // big to open is named to the worker with its words, so the person hears a way round it (owner, 18.10.2026).
-  if ((attachment?.kind === 'voice' || attachment?.kind === 'audio') && (attachment.size ?? 0) > 20 * 1024 * 1024) {
+  if (!TELEGRAM_API.localRoot && (attachment?.kind === 'voice' || attachment?.kind === 'audio') && (attachment.size ?? 0) > 20 * 1024 * 1024) {
     await replyCorporate(CORPORATE_FILE_TOO_LARGE)
     return
   }
@@ -8906,6 +9050,11 @@ async function routeInbound(
 
   const corporate = await corporateRuntimeReady()
   if (!corporate) {
+    // The owner's own group turn only moved here for the group's conversation: without it he keeps his own session.
+    if (String(from.id) === OWNER_CHAT_ID && !ctx.message?.sender_chat && !unaddressed && OWNER_GROUP_ROUTE) {
+      await legacyInbound(deliveryId)
+      return
+    }
     await refuse('runtime_unavailable', CORPORATE_TEMPORARILY_UNAVAILABLE)
     return
   }
@@ -8965,12 +9114,12 @@ async function routeInbound(
     const lateThreadId = ctx.message?.is_topic_message === true ? ctx.message.message_thread_id : undefined
     const lateSender = ctx.message?.sender_chat ? '' : inboundSenderKey(chat_id, lateThreadId, String(from.id))
     if (!images && !documents && ctx.chat?.type !== 'private') {
-      const bound: { data: string }[] = []
+      const bound: Array<{ data?: string; localPath?: string; [key: string]: unknown }> = []
       let boundBytes = 0
       // A turn takes four files and 20 MB in all (media.ts) and refuses a bigger set whole, so a file past that
       // is named instead (09.10.2026: late-bound videos now come with the documents).
-      const bind = (document: { data: string }) => {
-        const bytes = Buffer.byteLength(document.data, 'base64')
+      const bind = (document: { data?: string; localPath?: string }) => {
+        const bytes = document.data ? Buffer.byteLength(document.data, 'base64') : 0
         if (bound.length >= 4 || boundBytes + bytes > 20 * 1024 * 1024) throw new Error('turn file limit reached')
         bound.push(document)
         boundBytes += bytes
@@ -9248,7 +9397,8 @@ async function handleInbound(
       || (result.action === 'deliver' && result.continues != null))
   // Owner 08.10.2026: a group of only the owner and this bot is his own chat, so what the bot answers there is
   // answered with his full access, mentioned or not. Telegram counts the bot too; a failed count keeps the group rules.
-  const ownerAlone = ownerInGroup && !ownerAddressed && (result.action === 'deliver' || result.action === 'observe')
+  // With the group route on, an addressed message needs the count too: only that keeps such a group his own chat.
+  const ownerAlone = ownerInGroup && (!ownerAddressed || OWNER_GROUP_ROUTE) && (result.action === 'deliver' || result.action === 'observe')
     && await bot.api.getChatMemberCount(chat_id).then(count => count === 2, () => false)
   // Owner 10.10.2026: a group of two that waits for a mention still answers him without one (Арти's «Документи»).
   if (ownerAlone && result.action === 'observe') result = { action: 'deliver', access }
@@ -9607,7 +9757,7 @@ async function handleInbound(
         throw new RetryableInboundDeliveryError(err)
       }
     }
-  }), unaddressed, continues)
+  }), unaddressed, continues, ownerAlone)
   await removeIntegrationInput()
 }
 

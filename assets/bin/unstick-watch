@@ -14,7 +14,9 @@ Two things happen on /unstick, in this order:
 
 Never logs message text. Only the owner can trigger it.
 """
+import datetime
 import fcntl
+import importlib.util
 import json
 import math
 import os
@@ -64,6 +66,28 @@ TRIGGER = re.compile(
 )
 
 
+
+def telegram_api_base():
+    import os, runpy
+    from pathlib import Path
+    candidates = [Path(__file__).resolve().with_name('telegram-api'), Path.home() / 'bin/telegram-api']
+    candidates += [Path(__file__).resolve().parents[3] / 'assets/bin/telegram-api'] if 'telegram-corporate' in str(__file__) else []
+    for helper in candidates:
+        if helper.is_file():
+            return runpy.run_path(str(helper))['api_base']()
+    configured = os.environ.get('TELEGRAM_API_BASE', '')
+    state = Path(os.environ.get('TELEGRAM_STATE_DIR') or Path.home() / '.claude/channels/telegram')
+    if not configured and (state / '.env').is_file():
+        for line in (state / '.env').read_text().splitlines():
+            import re
+            match = re.match(r'^(?:export\s+)?TELEGRAM_API_BASE\s*=(.*)', line.strip())
+            if match:
+                configured = match[1].strip().strip("\"'")
+    if configured and configured.rstrip('/') != 'https://api.telegram.org':
+        raise ValueError('Telegram local API helper is unavailable; no cloud fallback')
+    return 'https://api.telegram.org'
+
+
 def env_val(key: str) -> str:
     try:
         for line in ENV_FILE.read_text(encoding="utf-8").splitlines():
@@ -108,7 +132,7 @@ def send(chat: str, text: str, thread_id: str | None = None) -> bool:
     }).encode()
     try:
         with urllib.request.urlopen(urllib.request.Request(
-                f"https://api.telegram.org/bot{token}/sendMessage", data=body),
+                f"{telegram_api_base()}/bot{token}/sendMessage", data=body),
                 timeout=15) as response:
             delivered = json.loads(response.read().decode("utf-8")).get("ok") is True
         if delivered:
@@ -331,6 +355,221 @@ def restart_service(command_name: str) -> tuple[bool, bool]:
 
 UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 
+# Anthropic's safety filter stops a response, and the CLI then stops every later turn of that session: each message
+# hangs until the inactivity ladder gives up, for hours (Арти, 21.10.2026, twice). The stopped session is retired
+# durably first, so the launcher never resumes it (tg-resume-session), and only then is the service restarted once on
+# a fresh session. The receiver offers the interrupted message again; the owner hears once.
+CLASSIFIER_SYSTEM = "safeguards stopped the response"
+CLASSIFIER_NOTE = "Your response above was stopped by a safety classifier"
+CLASSIFIER_GRACE = 60  # seconds the CLI's own «continuing once» gets before the session counts as stopped
+RETIRED_SESSIONS = STATE_DIR / "retired-sessions"
+# The stopped session's restart and the owner's notice stay pending here until both are done (Codex batch 2 P1-14).
+SAFETY_PENDING = STATE_DIR / "safety-restart-pending"
+SAFETY_RESTART_TEXT = ("🔄 Anthropic зупинив мою відповідь фільтром безпеки, і ця сесія більше не могла відповідати. "
+                       "Я перезапустився на чистій сесії; повідомлення, що чекали, обробляю далі.")
+
+
+def latest_turn_session() -> tuple[str, Path] | None:
+    """The session of the newest turn the receiver opened, with its transcript."""
+    try:
+        conn = sqlite3.connect(f"file:{MESSAGES_DB}?mode=ro", uri=True, timeout=2)
+        try:
+            row = conn.execute(
+                "SELECT t.session_id, coalesce(t.transcript_path,s.transcript_path) FROM delivery_turns t "
+                "JOIN delivery_sessions s ON s.session_id=t.session_id "
+                "ORDER BY t.opened_at DESC,t.turn_id DESC LIMIT 1").fetchone()
+        finally:
+            conn.close()
+    except Exception:
+        return None
+    if not row or not isinstance(row[0], str) or not UUID.fullmatch(row[0]) or not isinstance(row[1], str) or not row[1]:
+        return None
+    return row[0], Path(row[1])
+
+
+def retired_sessions() -> set[str] | None:
+    """The retired list as tg-resume-session reads it; None when it exists but cannot be trusted."""
+    try:
+        info = RETIRED_SESSIONS.lstat()
+    except FileNotFoundError:
+        return set()
+    except OSError:
+        return None
+    if not stat.S_ISREG(info.st_mode) or info.st_size > 1024 * 1024:
+        return None
+    try:
+        names = RETIRED_SESSIONS.read_text(encoding="ascii").split()
+    except (OSError, UnicodeError):
+        return None
+    return set(names) if names and all(UUID.fullmatch(name) for name in names) else None
+
+
+def stopped_by_filter(transcript: Path, now: float) -> bool:
+    """The newest turn record is the CLI's note right after the filter's stop, older than the grace."""
+    try:
+        info = transcript.lstat()
+        if not stat.S_ISREG(info.st_mode):
+            return False
+        with transcript.open("rb") as handle:
+            handle.seek(max(0, info.st_size - 256 * 1024))
+            lines = handle.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return False
+    note_at = None
+    for line in reversed(lines):
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(event, dict) or event.get("type") not in ("user", "assistant", "system"):
+            continue
+        message = event.get("message")
+        content = message.get("content") if isinstance(message, dict) else event.get("content")
+        text = content if isinstance(content, str) else "\n".join(
+            item.get("text", "") for item in content if isinstance(item, dict) and isinstance(item.get("text"), str)
+        ) if isinstance(content, list) else ""
+        if note_at is not None:
+            return (event.get("type") == "system" and event.get("subtype") == "informational"
+                    and CLASSIFIER_SYSTEM in text and now - note_at >= CLASSIFIER_GRACE)
+        if event.get("type") == "user" and text.startswith(CLASSIFIER_NOTE):
+            try:
+                note_at = datetime.datetime.fromisoformat(str(event.get("timestamp")).replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                note_at = info.st_mtime
+            continue
+        return False
+    return False
+
+
+def stopped_session() -> str | None:
+    """The live session the filter stopped and nobody retired yet."""
+    found = latest_turn_session()
+    retired = retired_sessions()
+    if found is None or retired is None or found[0] in retired:
+        return None
+    return found[0] if stopped_by_filter(found[1], time.time()) else None
+
+
+def retire_session(session: str) -> bool:
+    """Durable before any restart: written, synced and read back, or nothing restarts into a fresh session."""
+    retired = retired_sessions()
+    if retired is None:
+        note("safety-filter stop: the retired-session list is unreadable; not restarting")
+        return False
+    try:
+        atomic_write_private(RETIRED_SESSIONS, ("\n".join(sorted(retired | {session})) + "\n").encode("ascii"))
+    except OSError:
+        note("safety-filter stop: the retired-session list cannot be written; not restarting")
+        return False
+    if session not in (retired_sessions() or set()):
+        note("safety-filter stop: the retired session did not read back; not restarting")
+        return False
+    note(f"safety-filter stop: session {session[:8]} retired")
+    return True
+
+
+def safety_restart_text() -> str:
+    """The owner's notice in the agent's notice language; Ukrainian without a profile."""
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "agent_notice_locale", Path(__file__).with_name("agent_notice_locale.py"))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module.notice_text("session.safety_restart", SAFETY_RESTART_TEXT, home=AGENT_ROOT)
+    except Exception:  # noqa: BLE001 — a missing helper keeps the kit text, never the restart
+        return SAFETY_RESTART_TEXT
+
+
+def main_pid() -> str | None:
+    """The service's main process now; "0" when it is not running; None when systemd cannot say."""
+    try:
+        shown = subprocess.run(["systemctl", "show", "-p", "MainPID", "--value", SERVICE],
+                               capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    value = shown.stdout.strip()
+    return value if shown.returncode == 0 and value.isdigit() else None
+
+
+def safety_pending() -> dict | None:
+    try:
+        data = json.loads(SAFETY_PENDING.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError):
+        note("safety-filter stop: the pending restart record is unreadable; nothing restarted")
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get("session"), str) or not UUID.fullmatch(data["session"]):
+        note("safety-filter stop: the pending restart record is malformed; nothing restarted")
+        return None
+    return data
+
+
+def begin_safety_restart(session: str) -> None:
+    """The pending restart is recorded before the session is retired, and retired before any restart: a crash in
+    between leaves either a record the next minute finishes or a session the next scan finds again."""
+    try:
+        atomic_write_private(SAFETY_PENDING, json.dumps({"session": session, "pid": main_pid()}).encode("utf-8"))
+    except OSError:
+        note("safety-filter stop: the pending restart cannot be recorded; not restarting")
+        return
+    if not retire_session(session):
+        SAFETY_PENDING.unlink(missing_ok=True)
+
+
+def restart_after_filter() -> bool:
+    """One restart onto a fresh session, inside the update hold and the loop guard the agent's own restart keeps."""
+    if agent_restart_held():
+        note("safety-filter stop: a restart hold is active (an update or /unstick); retried after it")
+        return False
+    now = time.monotonic()
+    boot = boot_id()
+    stamps = None if boot is None else agent_restart_ledger(boot)
+    if stamps is None:
+        note("safety-filter stop: the restart ledger is unreadable; not restarting")
+        return False
+    recent = [s for s in stamps if s > now - 600]
+    if len(recent) >= AGENT_RESTART_LOOP_LIMIT:
+        note(f"safety-filter stop: {len(recent)} restarts in the last 10 minutes; retried later")
+        return False
+    try:
+        atomic_write_private(AGENT_RESTART_LEDGER, json.dumps({"boot": boot, "stamps": recent + [now]}).encode("utf-8"))
+    except OSError:
+        note("safety-filter stop: the restart ledger cannot be written; not restarting")
+        return False
+    stop_ok, start_ok = restart_service("safety-filter stop")
+    return stop_ok and start_ok
+
+
+def finish_safety_restart(chat: str, pending: dict) -> int:
+    """Until the process that ran the stopped session is gone, restart; then tell the owner once."""
+    if pending["session"] not in (retired_sessions() or set()):
+        note("safety-filter stop: the pending session is not retired; no restart")
+        SAFETY_PENDING.unlink(missing_ok=True)
+        return 0
+    if pending.get("restarted") is not True:
+        pid = main_pid()
+        if pid is None:
+            return 0  # systemd cannot say which process runs: the next minute asks again
+        # Another restart (an update, /unstick, the night start) already left the stopped session behind.
+        if pending.get("pid") in (None, pid) or pid == "0":
+            if not restart_after_filter():
+                return 0
+            # A start is proven by a new running process, not by systemctl's answer (Codex batch 2 round 2).
+            started = main_pid()
+            if started in (None, "0") or started == pending.get("pid"):
+                note("safety-filter stop: no new running process after the restart; retried next minute")
+                return 0
+    if send(chat, safety_restart_text()):
+        SAFETY_PENDING.unlink(missing_ok=True)
+    else:
+        try:
+            atomic_write_private(SAFETY_PENDING, json.dumps({**pending, "restarted": True}).encode("utf-8"))
+        except OSError:
+            pass
+        note("safety-filter stop: restarted; the owner's notice did not go and is retried")
+    return 0
+
 
 def boot_id() -> str | None:
     """This boot's id; "" on a host without one (not Linux); None when it cannot be read, which refuses."""
@@ -463,7 +702,14 @@ def main() -> int:
         # so an older scan can never roll a completed /unstick checkpoint back.
         atomic_write_checkpoint(newest)
         agent_request = take_agent_restart_request()
+        # Any restart from here on, the owner's included, must not resume a session the filter stopped.
+        stopped = stopped_session()
+        if stopped is not None:
+            begin_safety_restart(stopped)
+        safety = safety_pending()
         if not triggers:
+            if safety is not None:
+                return finish_safety_restart(chat, safety)
             return restart_for_agent() if agent_request else 0
         authorized = control_chats(owner())
         active: dict[str, bool] = {}
@@ -476,6 +722,8 @@ def main() -> int:
                 active[sender] = all(pending)  # Any unanswered /unstick requests the hold.
         if not active:
             note("/unstick commands already answered or no longer authorized — restart skipped")
+            if safety is not None:
+                return finish_safety_restart(chat, safety)
             return restart_for_agent() if agent_request else 0
         needs_hold = any(not explicit for explicit in active.values())
 

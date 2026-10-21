@@ -34,6 +34,33 @@ def fail() -> int:
     return 1
 
 
+def corporate_inputs(connection: sqlite3.Connection) -> set[str]:
+    """Large local Bot API inputs stay on disk until their durable job is terminal."""
+    if not connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='conversation_jobs'"
+    ).fetchone():
+        return set()
+    paths: set[str] = set()
+    for (raw_prompt,) in connection.execute(
+        "SELECT prompt_json FROM conversation_jobs "
+        "WHERE state IS NULL OR state NOT IN ('delivered', 'failed', 'no_reply')"
+    ):
+        prompt = json.loads(raw_prompt)
+        documents = prompt.get('documents', [])
+        if not isinstance(documents, list):
+            raise ValueError('invalid corporate documents')
+        for document in documents:
+            if not isinstance(document, dict):
+                raise ValueError('invalid corporate document')
+            if 'localPath' not in document:  # Existing inline/base64 documents need no inbox file.
+                continue
+            path = document['localPath']
+            if not isinstance(path, str) or not path or not os.path.isabs(path):
+                raise ValueError('invalid corporate input path')
+            paths.add(os.path.realpath(path))
+    return paths
+
+
 def prune_turn_ledger(database: Path) -> None:
     """Closed turns older than 14 days go with their messages, and so do sessions
     of that age that own no turn. Best-effort and silent without the ledger (an
@@ -151,6 +178,7 @@ def main() -> int:
             return fail()
         connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
         try:
+            connection.execute('BEGIN')
             rows = connection.execute(
                 "SELECT payload FROM pending_inbound_deliveries"
             ).fetchall()
@@ -158,9 +186,10 @@ def main() -> int:
                 raw_payload = request.get('request_payload')
                 if raw_payload:
                     rows.append((raw_payload,))
+            corporate_referenced = corporate_inputs(connection)
         finally:
             connection.close()
-    except (OSError, sqlite3.Error):
+    except (OSError, sqlite3.Error, ValueError, TypeError, AttributeError):
         return fail()
 
     referenced: set[str] = set()
@@ -182,7 +211,7 @@ def main() -> int:
 
     cutoff = time.time() - RETENTION_SECONDS
     for entry, metadata in candidates:
-        if os.path.abspath(entry) in referenced:
+        if os.path.abspath(entry) in referenced or os.path.realpath(entry) in corporate_referenced:
             try:
                 os.utime(entry, None, follow_symlinks=False)
             except OSError:

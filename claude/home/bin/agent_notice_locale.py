@@ -47,6 +47,7 @@ RUSSIAN_NOTICES = {
         "⚠️ Работа над этим запросом зависала трижды, поэтому я её остановил, чтобы не задерживать другие сообщения. "
         "Отправь его снова, если он ещё нужен."
     ),
+    "session.safety_restart": "🔄 Anthropic остановил мой ответ фильтром безопасности, и эта сессия больше не могла отвечать. Я перезапустился на чистой сессии; сообщения, которые ждали, обрабатываю дальше.",
     "queue.inactivity_warning": "Твой запрос сохранён. Проверяю, почему ответ задерживается; повторять сообщение не нужно.",
     "queue.silent_worker": (
         "Фоновая задача запроса {requests} не отвечает: нет ни результата, ни обновлений. "
@@ -174,6 +175,7 @@ POLISH_NOTICES = {
         "⚠️ Praca nad tym zapytaniem zawiesiła się trzy razy, więc ją zatrzymałem, żeby nie blokować innych wiadomości. "
         "Wyślij je ponownie, jeśli nadal jest potrzebne."
     ),
+    "session.safety_restart": "🔄 Anthropic zatrzymał moją odpowiedź filtrem bezpieczeństwa i ta sesja nie mogła już odpowiadać. Uruchomiłem się ponownie w czystej sesji; wiadomości, które czekały, obsługuję dalej.",
     "queue.inactivity_warning": "Twoje zapytanie jest zapisane. Sprawdzam, dlaczego odpowiedź się opóźnia; nie trzeba powtarzać wiadomości.",
     "queue.silent_worker": (
         "Zadanie w tle dla zapytania {requests} nie odpowiada: brak wyniku i aktualizacji. "
@@ -297,6 +299,7 @@ ENGLISH_NOTICES = {
         "⚠️ Work on this request hung three times, so I stopped it to keep other messages moving. "
         "Send it again if you still need it."
     ),
+    "session.safety_restart": "🔄 Anthropic's safety filter stopped my answer, and this session could no longer reply. I restarted on a clean session; the messages that were waiting are being handled.",
     "queue.inactivity_warning": "Your request is saved. I am checking why the answer is late; there is no need to send it again.",
     "queue.silent_worker": (
         "The background task of request {requests} is not responding: no result and no updates. "

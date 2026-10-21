@@ -51,6 +51,28 @@ class BackupError(RuntimeError):
     pass
 
 
+
+def telegram_api_base(state_dir=None):
+    import os, runpy
+    from pathlib import Path
+    candidates = [Path(__file__).resolve().with_name('telegram-api'), Path.home() / 'bin/telegram-api']
+    candidates += [Path(__file__).resolve().parents[3] / 'assets/bin/telegram-api'] if 'telegram-corporate' in str(__file__) else []
+    for helper in candidates:
+        if helper.is_file():
+            return runpy.run_path(str(helper))['api_base'](state_dir)
+    configured = os.environ.get('TELEGRAM_API_BASE', '')
+    state = Path(state_dir or os.environ.get('TELEGRAM_STATE_DIR') or Path.home() / '.claude/channels/telegram')
+    if not configured and (state / '.env').is_file():
+        for line in (state / '.env').read_text().splitlines():
+            import re
+            match = re.match(r'^(?:export\s+)?TELEGRAM_API_BASE\s*=(.*)', line.strip())
+            if match:
+                configured = match[1].strip().strip("\"'")
+    if configured and configured.rstrip('/') != 'https://api.telegram.org':
+        raise ValueError('Telegram local API helper is unavailable; no cloud fallback')
+    return 'https://api.telegram.org'
+
+
 def helper(name):
     path = Path(__file__).resolve().with_name(name)
     loader = importlib.machinery.SourceFileLoader(name.replace("-", "_"), str(path))
@@ -482,7 +504,8 @@ class Backup:
             message = ("Автоматичний повний бекап GitHub не вдалося завершити. " + prior +
                        "Напиши мені «перевір бекап»: перевіримо доступ до приватного репозиторію, строк дії токена та вільне місце.")
             payload = json.dumps({"chat_id": chat_id, "text": message}).encode()
-            req = request.Request("https://api.telegram.org/bot" + token + "/sendMessage", data=payload,
+            endpoint_state = path.parent if not native else self.home / '.claude/channels/telegram'
+            req = request.Request(telegram_api_base(endpoint_state) + '/bot' + token + "/sendMessage", data=payload,
                                   headers={"Content-Type": "application/json"}, method="POST")
             with request.urlopen(req, timeout=20) as response:
                 result = json.loads(response.read(16384))
