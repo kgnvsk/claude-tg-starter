@@ -97,7 +97,7 @@ def build_snapshot(data, page_size=PAGE_SIZE, full=False, host=False):
     topics=[row['id'] for _,row in rules.ranked([{'id':name,'text':agent['words']} for name,agent in agents.items()],request['text'])]
     delivery=binding['requestId'] if data.get('readMode')!='scheduled' and re.fullmatch(r'-?\d+:\d+',binding['requestId']) else None
     routing=('\nWORDS OF THIS REQUEST POINT TO (candidates only; its meaning decides): '
-             +', '.join(f'rules-{name}' for name in topics)+'\n') if topics else ''
+             +', '.join(topics)+'\n') if topics else ''
     # The owner, 22.10.2026: routing goes by meaning, as skills do. The agent decides here, before it answers, which
     # subagent's work this is; the word match above only marks the obvious cases.
     if agents:
@@ -105,10 +105,10 @@ def build_snapshot(data, page_size=PAGE_SIZE, full=False, host=False):
                   ' that work to that one subagent instead of doing it yourself; never the same task to two. Give it everything it'
                   ' needs: the request in full, the files and links from the message or the chat'
                   +(f", and the delivery id {delivery}" if delivery else ', and that this is a scheduled run (it reads with --scheduled)')
-                  +'; it does not see the chat. It reads its topic itself; you check its result against the request and the rules'
-                  ' here before you send it. A question you can answer at once, with no lookup, file or message to anyone, stays'
-                  ' with you.\n'
-                  +'\n'.join(f"- rules-{name}: {agent['description']}" for name,agent in agents.items())+'\n')
+                  +'; it does not see the chat. A rules- subagent reads its topic itself, the others carry their own rules; you'
+                  ' check its result against the request and the rules here before you send it. A question you can answer at'
+                  ' once, with no lookup, file or message to anyone, stays with you.\n'
+                  +'\n'.join(f"- {name}: {agent['description']}" for name,agent in agents.items())+'\n')
     rules_section='\nCURRENT RULES — apply only the scope named on each rule. Preserve every condition and exception.\n'+rule_text
     # Host tools (corporate workers, Codex) keep the full rule set: their reads have no --id, --topic or --full.
     indexed=scope=='owner' and len(rule_text)>RULES_IN_FULL_MAX and not full and not host and not moved
@@ -475,20 +475,64 @@ def save_rules(delivery, change):
     return rules.apply_rules({**change,'source':source},None if data['scope']=='owner' else data['scope'])
 
 
+AGENT_NAME=re.compile(r'[a-z0-9]+(?:-[a-z0-9]+)*')  # the kit's agent grammar (assets/lib/reconcile-managed-skills.py)
+
+
+def managed_agents():
+    """The agent files the kit manages here, from its own record; None when the record is missing or not the kit's."""
+    try:data=json.loads(rules.read_bytes(HOME/'.claude/product/managed-agents-baseline.json'))
+    except (OSError,ValueError,UnicodeError):return None
+    if (not isinstance(data,dict) or set(data)!={'schemaVersion','entries'} or type(data['schemaVersion']) is not int
+        or data['schemaVersion']!=1 or not isinstance(data['entries'],dict)
+        or any(not (k in ('README.md','roles') or re.fullmatch(r'[a-z0-9]+(?:-[a-z0-9]+)*\.md',k))
+               or not isinstance(v,str) or not re.fullmatch(r'[0-9a-f]{64}',v) for k,v in data['entries'].items())):return None
+    return set(data['entries'])
+
+
+def frontmatter(text):
+    """The keys of a leading «---» block written as plain one-line YAML; None for anything else (nested or flow values, a
+    repeated key, a special or typed scalar), so a menu line never names an agent Claude Code reads differently."""
+    lines=[line.rstrip('\r') for line in text.split('\n')]
+    if lines[0]!='---' or '---' not in lines[1:]:return None
+    keys={}
+    for line in lines[1:lines.index('---',1)]:
+        if not line.strip() or line.startswith('#'):continue
+        found=re.fullmatch(r'([A-Za-z][A-Za-z0-9_-]*): (\S.*)',line)
+        if not found or found[1] in keys:return None
+        value=found[2].rstrip();quoted=re.fullmatch(r'"([^"\\]*)"|\'([^\']*)\'',value)
+        if quoted:value=quoted[1] if quoted[1] is not None else quoted[2]
+        # A plain value is taken only when YAML can read it as nothing but this text: it starts with a letter, has no
+        # «:», «#» or tab, and is no YAML 1.1 boolean or null word. Anything else must be quoted.
+        elif (not value or not value[0].isalpha() or any(c in value for c in ':#\t')
+              or value.lower() in ('y','n','yes','no','true','false','on','off','null')):
+            return None
+        keys[found[1]]=value
+    return keys
+
+
 def subagents():
-    """Topic subagents on this host: ~/.claude/agents/rules-TOPIC.md and the words that route work to each."""
-    found={}
-    try:paths=sorted((HOME/'.claude/agents').glob('rules-*.md'))
+    """The subagents the menu offers: the topic subagents ~/.claude/agents/rules-TOPIC.md and the owner's own agents there
+    (any agent file the kit does not manage), each by the name Claude Code calls it and the words that route work to it."""
+    found={};folder=HOME/'.claude/agents'
+    if (HOME/'.claude').is_symlink() or folder.is_symlink():return found  # another folder's files are not this bot's agents
+    try:paths=sorted(folder.glob('*.md'))
     except OSError:return found
+    # Арти, 22.10.2026: his own montazh and leads were left out of a menu of rules-* alone. The kit's own role agents stay
+    # out (Claude Code lists them anyway); without the kit's record of which they are, only rules-* is offered.
+    managed=managed_agents()
     for path in paths:
-        name=path.stem[len('rules-'):]
-        if not re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,40}',name) or path.is_symlink():continue
-        try:head=path.read_text(encoding='utf-8')[:4000]
+        name=path.stem
+        if path.is_symlink():continue
+        if name.startswith('rules-'):
+            if not re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,40}',name[len('rules-'):]):continue
+        elif managed is None or path.name in managed or not AGENT_NAME.fullmatch(name):continue
+        try:front=frontmatter(path.read_text(encoding='utf-8')[:8000])
         except (OSError,UnicodeError):continue
+        # A menu line must call a real agent: Claude Code calls it by its «name:», which must be the file's own name, and
+        # an agent needs its description.
+        if not front or front.get('name')!=name or not front.get('description','').strip():continue
         # «words:» lists the owner's own words for this work; the description is only the menu text.
-        described=re.search(r'(?m)^description:[ \t]*(.+)$',head);words=re.search(r'(?m)^words:[ \t]*(.+)$',head)
-        found[name]={'description':described.group(1).strip() if described else '',
-                     'words':words.group(1).strip() if words else ''}  # no «words:», no lexical candidate
+        found[name]={'description':front['description'].strip(),'words':front.get('words','').strip()}  # no «words:», no lexical candidate
     return found
 
 
