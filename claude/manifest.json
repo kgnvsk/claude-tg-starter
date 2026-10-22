@@ -7,7 +7,7 @@
     "local-foundation-v1"
   ],
   "source": "codex/starter/product.json",
-  "sourceRevision": "de76853ea0d064437f22b70c795c71b998f81bf6",
+  "sourceRevision": "c62f7dad72fb9435004192a187b471a6c3744082",
   "sourceDirty": false,
   "features": [
     "browser"
@@ -170,7 +170,7 @@
     "modules/telegram-corporate/resource-meta-accounts.ts": "92b5678d28236f65c5d68fc5638b97c88a0cda401a86cebfa3abe345c2e5c5a0",
     "modules/telegram-corporate/resource-sheets.ts": "079155f75d48f2aed3d74d8be79a821aac3d976ac05781990b9d72afbbe5c881",
     "modules/telegram-corporate/resource-telegram-groups.ts": "e74423465ed08faa80182266d5d45c73b44f769395f35d3147785a4b7e15d098",
-    "modules/telegram-corporate/runtime.ts": "ad84a531aa3a919ea299100ebb13e62370c52da7f4c5eb7c41116ec55ce89126",
+    "modules/telegram-corporate/runtime.ts": "4265b506e41036c987f4e0483587dae89a1a697f58f95352ec7c064bc844bc8c",
     "modules/telegram-corporate/settings-access.ts": "766520e23f1317105abe876e09c7a99406d786b6b696c1a64218a18e80941720",
     "modules/telegram-corporate/store.ts": "a19ff5b6c5a123941ba8e43a7ae7a4453b2ae8b30419be29b9259fce4e575109",
     "modules/telegram-corporate/task-quality.ts": "1f7b851925901ca564d16e26653427b9fd1f8b77353b6e66e7a76d8a872eddbc",

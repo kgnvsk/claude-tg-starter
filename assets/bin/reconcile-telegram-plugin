@@ -31,10 +31,16 @@ UPSTREAM_SERVER_SHA256 = (
 )
 UPSTREAM_PACKAGE_START = "bun install --no-summary 1>&2 && bun server.ts"
 GOLDEN_SERVER_SHA256 = (
-    "73dd9d424855b1738fb6029bb1f6838dd8ec16cd1a6376d6f6bcf7702c580e16"
+    "06bf5fc622284d1ccb01948b5462d5083e48c6ea01e2561fd77d1e5547eec469"
 )
 PREVIOUS_GOLDEN_SERVER_SHA256S = frozenset(
     {
+        # b7e33a30 read_answer_context with full and strict selectors (null and stray full still accepted)
+        "adb39457f54ddda99a0e131ee46c9d11d702abe3d022fafe9658757c7cf6433c",
+        # 26889902 read_answer_context, first revision of this branch (before the full read and strict selectors)
+        "655f10a6ca2c4e462e6db3ef0eab6150b027e9a1b9bfcc256725063396eb0d31",
+        # de76853ea0d0 Арті, 22.10: правила як навички, меню власних агентів (до інструмента read_answer_context)
+        "73dd9d424855b1738fb6029bb1f6838dd8ec16cd1a6376d6f6bcf7702c580e16",
         # eed9046c2412 Арти, пакет 2: одна розмова в групі, спільна тека, сторож фільтра безп
         "261e747aa729b874cadcc9ca07c0d9c7d94d93245585212f6eb2d655461720bf",
         # 36bfc39bf1ef Merge reviewed corporate recovery into local Bot API candidate

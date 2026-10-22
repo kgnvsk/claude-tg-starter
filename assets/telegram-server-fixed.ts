@@ -6764,6 +6764,25 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ['file_id'],
       },
     },
+    // Owner, 22.10.2026: the main session read its context through a shell command and cut it itself (| head, | tail,
+    // > file); this tool hands a page or a rule back whole and nothing can be added to it.
+    ...(existsSync(join(homedir(), 'bin/answer-context')) ? [{
+      name: 'read_answer_context',
+      description: 'Read the context of the request you answer, whole: the rules that apply and the selected conversation. Pass its delivery_id and page 0, then every remaining page with the snapshot named in page 0. Before saving or changing a rule, read the full rule set the same way with full: true. With topic or rule_id it returns that topic or rule in full instead; when a page ends with MORE, call again with that page and digest.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          delivery_id: { type: 'string', description: 'The exact inbound delivery_id of the request you answer' },
+          page: { type: 'integer', minimum: 0, description: 'Page number, 0 first' },
+          snapshot: { type: 'string', description: 'The snapshot named in page 0, for every later context page' },
+          topic: { type: 'string', description: 'A rule topic from the index, to read the whole topic' },
+          rule_id: { type: 'string', description: 'A rule ID from the index, to read that rule' },
+          digest: { type: 'string', description: 'The digest from a MORE line, for every later rule page' },
+          full: { type: 'boolean', description: 'The full rule set, before saving or changing a rule' },
+        },
+        required: ['delivery_id', 'page'],
+      },
+    }] : []),
     {
       name: 'edit_message',
       description: 'Edit a message the bot previously sent. Useful for interim progress updates. Edits don\'t trigger push notifications — send a new reply when a long task completes so the user\'s device pings.',
@@ -7318,6 +7337,43 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         }
         await bot.api.pinChatMessage(args.chat_id as string, Number(args.message_id), { disable_notification: args.silent === true })
         return { content: [{ type: 'text', text: 'pinned' }] }
+      }
+      case 'read_answer_context': {
+        const helper = join(homedir(), 'bin/answer-context')
+        const deliveryId = String(args.delivery_id ?? '')
+        const page = Number(args.page ?? 0)
+        if (!existsSync(helper) || !/^-?\d{1,20}:\d{1,20}$/.test(deliveryId) || !Number.isSafeInteger(page) || page < 0) {
+          throw new Error('read_answer_context needs the delivery_id of the request you answer and a page number')
+        }
+        // Every supplied selector must be valid: a mistyped topic must never come back as the general context (Codex,
+        // PR 334 round 2). This server answers only this agent's own session; the helper reads only a request that is
+        // active in this receiver generation, as the same session's shell read does.
+        const pick = (name: string, pattern: RegExp): string | null => {
+          const value = args[name]
+          if (value === undefined) return null
+          if (typeof value !== 'string' || !pattern.test(value)) throw new Error(`read_answer_context: invalid ${name}`)
+          return value
+        }
+        const topic = pick('topic', /^[a-z0-9][a-z0-9_-]{0,119}$/), rule = pick('rule_id', /^[A-Za-z0-9:_-]{1,120}$/)
+        const snapshot = pick('snapshot', /^[a-f0-9]{64}$/), digest = pick('digest', /^[a-f0-9]{16}$/)
+        if (args.full !== undefined && typeof args.full !== 'boolean') throw new Error('read_answer_context: invalid full')
+        if (topic && rule) throw new Error('read_answer_context: topic or rule_id, not both')
+        const ruleRead = topic != null || rule != null
+        if (ruleRead ? snapshot != null || args.full !== undefined : digest != null) {
+          throw new Error('read_answer_context: snapshot and full belong to a context read, digest to a rule read')
+        }
+        const argv = ruleRead
+          ? [helper, 'rule', '--delivery', deliveryId, ...(rule ? ['--id', rule] : ['--topic', topic!]), '--page', String(page),
+              ...(digest ? ['--digest', digest] : [])]
+          : [helper, 'read', '--delivery', deliveryId, '--page', String(page), ...(snapshot ? ['--snapshot', snapshot] : []),
+              ...(args.full === true ? ['--full'] : [])]
+        const page_text = await new Promise<string>((resolve, reject) => {
+          execFile('python3', argv, { timeout: 30_000, maxBuffer: 1_000_000 }, (error, stdout, stderr) => {
+            if (error) reject(new Error(String(stderr || error.message).trim().slice(0, 800) || 'answer context unavailable'))
+            else resolve(stdout)
+          })
+        })
+        return { content: [{ type: 'text', text: page_text }] }
       }
       case 'download_attachment': {
         const path = await downloadAttachmentById(args.file_id as string)

@@ -25,6 +25,10 @@ RULES_IN_FULL_MAX=12000
 # complete messages within this budget, never fewer than the newest ten.
 HISTORY_CHARS=6000
 ID_PART=12000  # characters of rule IDs one page header carries
+# Арти, 22.10.2026: a 21 thousand character Cyrillic page was 39–42 KB; the CLI saved it to a file and he cut his reads.
+# A page's text stays within these bytes, so the whole page comes back in one tool answer.
+PAGE_BYTES=17000
+TOOL_READ='mcp__plugin_telegram_telegram__read_answer_context'  # the receiver's own read: whole, nothing can be added
 MAX_CONTEXT=500_000
 MAX_AGE=180
 PREFIX='ANSWER_CONTEXT_V1 '
@@ -134,10 +138,10 @@ def build_snapshot(data, page_size=PAGE_SIZE, full=False, host=False):
                         if len(listed)<len(selected['rules']) else '')
                        +'\nCORE RULES (always in full; every rule applies within its scope):\n'
                        +'\n\n'.join(f"[{r['id']}; scope={r.get('scope','owner')}; subject={r.get('key','legacy')}]\n{r['text']}" for r in core)
-                       +'\n\nRULE INDEX — one line a rule, by topic. Before acting on anything a line covers, read it in full:'
-                       ' ~/bin/answer-context rule --id ID, or the whole topic with --topic NAME, using the same --delivery or'
-                       ' --scheduled as this read; a topic\'s subagent reads its topic itself. To save or change a rule, first read the'
-                       ' full rule set: the same read with --full, every page.\n'
+                       +'\n\nRULE INDEX — one line a rule, by topic. Before acting on anything a line covers, read it in full with the'
+                       ' read_answer_context tool (rule_id ID, or the whole topic with topic NAME, and this delivery_id); in a'
+                       ' scheduled run ~/bin/answer-context rule --scheduled --id ID or --topic NAME. A topic\'s subagent reads its'
+                       ' topic itself. To save or change a rule, first read the full rule set: the same read with --full, every page.\n'
                        +'\n'.join(f"## {name} ({len(rows)})\n"+'\n'.join(line(r) for r in rows) for name,rows in groups.items()))
     body=('CURRENT REQUEST (authenticated by the host; this is what you answer):\n'+canonical(request)
           +'\n\nBEFORE SENDING, hold the answer against this request: everything it names explicitly (sources, sites, people,'
@@ -165,12 +169,25 @@ def build_snapshot(data, page_size=PAGE_SIZE, full=False, host=False):
         for i in ids:
             if parts[-1] and size+len(canonical(i))+1>ID_PART:parts.append([]);size=2
             parts[-1].append(i);size+=len(canonical(i))+1
-    if not indexed:page_size=min(page_size,max(1000,28_500-max(len(canonical(part)) for part in parts)))  # headers carry the IDs
-    pages=[body[i:i+page_size] for i in range(0,len(body),page_size)]
+    if host:
+        page_size=min(page_size,max(1000,28_500-len(canonical(ids))))  # page 0 carries the IDs
+        pages=[body[i:i+page_size] for i in range(0,len(body),page_size)]
+    else:pages=byte_pages(body,PAGE_BYTES-(0 if indexed else max(len(canonical(part).encode()) for part in parts)))
     pages+=['']*(len(parts)-len(pages))  # more parts than text: a page with its header only
     return {'snapshot':digest,'binding':binding,'ruleRevision':selected['revision'],
             'instructionRequired':required,'instructionDisposition':disposition,'indexed':indexed,
             'ruleIds':ids,**({'idParts':parts} if len(parts)>1 else {}),'pages':pages}
+
+
+def byte_pages(text, budget):
+    """Pages of at most budget UTF-8 bytes, never splitting a character."""
+    budget=max(2000,budget);pages,start,size=[],0,0
+    for i,char in enumerate(text):
+        n=len(char.encode())
+        if size+n>budget and i>start:pages.append(text[start:i]);start,size=i,0
+        size+=n
+    pages.append(text[start:])
+    return pages
 
 
 def render_page(snapshot, page, at=None):
@@ -242,6 +259,7 @@ def transcript_read(path, snapshot):
             inp=item.get('input') or {}
             if row.get('type')=='assistant' and item.get('type')=='tool_use':
                 if item.get('name')=='Bash' and direct_read(inp.get('command')):pending[item.get('id')]=('bash',None)
+                if item.get('name')==TOOL_READ:pending[item.get('id')]=('tool',None)
                 if item.get('name')=='Read' and inp.get('file_path') in saved:
                     lines=saved[inp['file_path']]
                     if inp.get('offset',1)==1 and inp.get('limit',2000)>=len(lines):pending[item.get('id')]=('read',inp['file_path'])
@@ -460,7 +478,7 @@ def send_gate(chat, thread, text, delivery=None, file=False):
             # Арти, 21.10.2026: every page went through «2>&1 | head -c 6000», none counted, and he looped for minutes.
             missing=[p for p in verdict.get('missingPages') or [] if type(p) is int]
             pages=f' pages {", ".join(map(str,missing))} of' if missing else ''
-            return {'ok':False,'message':f'Before answering, read{pages} this request’s context, each page with exactly ~/bin/answer-context read --delivery {identity} --page N and nothing around it: a page piped, redirected or cut (2>&1, |, head, tail) is not counted; output saved to a file is read whole with Read. Read the rules and complete selected messages; after a rule change read again. Do not repeat actions. If the sources remain unavailable, send only the fixed fallback for the person’s language.',
+            return {'ok':False,'message':f'Before answering, read{pages} this request’s context with the read_answer_context tool (delivery_id {identity}, page N, the snapshot from page 0): it hands each page back whole. A shell read piped, redirected or cut (2>&1, |, head, tail, > file) is not counted. Read the rules and complete selected messages; after a rule change read again. Do not repeat actions. If the sources remain unavailable, send only the fixed fallback for the person’s language.',
                     'fallback':FALLBACK}
     return {'ok':True}
 
@@ -472,7 +490,71 @@ def save_rules(delivery, change):
     if not transcript_read(transcript_for(data),snapshot)['ok']:raise ValueError('read every current context page before saving a rule')
     if not valid_change(change):raise ValueError('invalid rule change')
     source={'chatId':data['binding']['chatId'],'messageId':data['request']['messageId'],'text':data['request']['text']}
-    return rules.apply_rules({**change,'source':source},None if data['scope']=='owner' else data['scope'])
+    copies=record_copies(rules.snapshot(None)['rules'],change,data['scope'],source)
+    return attach_copies(rules.apply_rules({**change,'source':source},None if data['scope']=='owner' else data['scope']),copies,source,change)
+
+
+def rule_start(text):
+    """The words a copy of a rule keeps: its text without its number («10.2 », «3) »), the first 50 characters; a
+    short rule whole («Не торгуйся.»). A number that is part of the text («360p») stays."""
+    body=re.sub(r'^\s*\d+(?:\.\d+)*(?:[.:)]+\s+|\s+)','',' '.join(text.split()))
+    return body[:50] if len(body)>=8 else None
+
+
+def subagent_copies(before, changes):
+    """The bot's own agents that keep their own copy of a changed rule, and what to do in each (owner, 22.10.2026:
+    when a rule changes, the main agent knows at once where to update it). rules-* subagents read the current rules
+    themselves and the kit's own agents carry none; without the kit's record of its agents nothing is named."""
+    managed=managed_agents();folder=HOME/'.claude/agents'
+    if managed is None or (HOME/'.claude').is_symlink() or folder.is_symlink():return []
+    try:paths=sorted(folder.glob('*.md'))
+    except OSError:return []
+    by_id={r['id']:r for r in before};found=[]
+    for path in paths:
+        name=path.stem
+        if path.is_symlink() or name.startswith('rules-') or path.name in managed or not AGENT_NAME.fullmatch(name):continue
+        try:text=' '.join(path.read_text(encoding='utf-8').split())
+        except (OSError,UnicodeError):continue
+        held=lambda rule:(start:=rule_start(rule['text'])) is not None and start in text
+        todo=[]
+        for change in changes:
+            old=[by_id[i] for i in change.get('replaces',[]) if i in by_id and held(by_id[i])]
+            if old:todo.append({'key':change['key'],'action':'replace' if change['text'].strip() else 'remove',
+                                'old':[rule_start(r['text']) for r in old]})
+            elif change['text'].strip() and not change.get('replaces') and any(
+                    held(r) for r in before if topic_of(r)==topic_of({'key':change['key']})):
+                todo.append({'key':change['key'],'action':'add'})  # a new rule of a topic this agent keeps
+        if todo:found.append({'agent':name,'file':str(path),'changes':todo})
+    return found
+
+
+def copies_path(source, change):
+    # Keyed by the whole edit, not only its message: a losing divergent edit for the same message never overwrites the
+    # list of the one that won (Codex, PR 334 round 3).
+    edit=sha(canonical({'source':source,'changes':change.get('changes'),'disposition':change.get('disposition'),'reason':change.get('reason')}))
+    return rules.DIRECTORY/'copies'/(edit[:32]+'.json')
+
+
+def record_copies(before, change, scope, source):
+    """The own agents holding a copy of a rule this save changes, kept before the rules change: a retried save finds the
+    old wording gone and reads the list back (Codex, PR 334 rounds 1–2). A company chat's save never names them."""
+    if scope!='owner':return None
+    copies=subagent_copies(before,change.get('changes') or [])
+    if copies:
+        path=copies_path(source,change);path.parent.mkdir(mode=0o700,exist_ok=True);rules.atomic(path,canonical(copies).encode())
+    return copies
+
+
+def attach_copies(result, copies, source, change):
+    if copies is None or not isinstance(result,dict) or not result.get('ok'):return result
+    if result.get('replayed'):
+        try:copies=json.loads(rules.read_bytes(copies_path(source,change)))
+        except (OSError,ValueError):copies=[]
+    if not copies:return result
+    return {**result,'subagentCopies':copies,'next':'These of your own subagents keep their own copy of the changed rules: '
+            'update each of these agent files now, the old wording found by its start (replace it with the new rule, add a '
+            'new rule next to its topic, remove a cancelled one), keep everything else in the file as it is, and say in '
+            'your answer which agents you updated. rules- subagents read the current rules themselves.'}
 
 
 AGENT_NAME=re.compile(r'[a-z0-9]+(?:-[a-z0-9]+)*')  # the kit's agent grammar (assets/lib/reconcile-managed-skills.py)
@@ -627,7 +709,8 @@ def main():
             if context.get('editAllowed') is not True:raise ValueError('owner source required')
             if not valid_change(change):raise ValueError('invalid rule change')
             source={'chatId':context['binding']['chatId'],'messageId':context['request']['messageId'],'text':context['request']['text']}
-            print(canonical(rules.apply_rules({**change,'source':source},None if context['scope']=='owner' else context['scope'])))
+            copies=record_copies(rules.snapshot(None)['rules'],change,context['scope'],source)
+            print(canonical(attach_copies(rules.apply_rules({**change,'source':source},None if context['scope']=='owner' else context['scope']),copies,source,change)))
     elif args.action=='read':
         snapshot=build_snapshot(scheduled_input(args.chat,args.thread) if args.scheduled else claude_input(args.delivery),full=args.full)
         if args.snapshot and args.snapshot!=snapshot['snapshot']:raise ValueError('context changed; restart at page 0')
@@ -639,7 +722,7 @@ def main():
         text=read_rule(scheduled_input() if args.scheduled else claude_input(args.delivery),args.id,args.topic)
         digest=sha(text)[:16]
         if args.page and args.digest!=digest:raise ValueError('the rule text changed or its --digest is missing: read it again from --page 0')
-        pages=[text[i:i+PAGE_SIZE] for i in range(0,len(text),PAGE_SIZE)] or ['']
+        pages=byte_pages(text,PAGE_BYTES)
         if not 0<=args.page<len(pages):raise ValueError('invalid rule page')
         source='--scheduled' if args.scheduled else f'--delivery {args.delivery}'
         which=f'--id {args.id}' if args.id is not None else f'--topic {args.topic}'
