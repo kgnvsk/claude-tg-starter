@@ -6768,7 +6768,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     // > file); this tool hands a page or a rule back whole and nothing can be added to it.
     ...(existsSync(join(homedir(), 'bin/answer-context')) ? [{
       name: 'read_answer_context',
-      description: 'Read the context of the request you answer, whole: the rules that apply and the selected conversation. Pass its delivery_id and page 0, then every remaining page with the snapshot named in page 0. Before saving or changing a rule, read the full rule set the same way with full: true. With topic or rule_id it returns that topic or rule in full instead; when a page ends with MORE, call again with that page and digest.',
+      description: 'Read the context of the request you answer, whole: the rules that apply and the selected conversation. Pass its delivery_id and page 0, then every remaining page with the snapshot named in page 0; what you already read in this conversation is named there, not repeated. With topic or rule_id it returns that topic or rule in full instead: before saving or changing a rule, read every rule it replaces (rule_id) and the whole topic of the rule you save (topic). When a page ends with MORE, call again with that page and digest.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -6778,7 +6778,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           topic: { type: 'string', description: 'A rule topic from the index, to read the whole topic' },
           rule_id: { type: 'string', description: 'A rule ID from the index, to read that rule' },
           digest: { type: 'string', description: 'The digest from a MORE line, for every later rule page' },
-          full: { type: 'boolean', description: 'The full rule set, before saving or changing a rule' },
+          full: { type: 'boolean', description: 'Every rule in full; a save needs only the rules it replaces and its topic' },
         },
         required: ['delivery_id', 'page'],
       },
