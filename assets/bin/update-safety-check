@@ -245,7 +245,7 @@ def command_main(argv: list[str]) -> int:
 def profile_value_main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--home", type=pathlib.Path, required=True)
-    parser.add_argument("name", choices=("AGENT_NAME",))
+    parser.add_argument("name", choices=("AGENT_NAME", "AGENT_GENDER"))
     args = parser.parse_args(argv)
     module = load_update_module()
     values = module.render_context(args.home, include_environment=False)

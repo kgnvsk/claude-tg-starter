@@ -220,7 +220,14 @@ def main():
     q=sub.add_parser('record-scheduled');q.add_argument('--answer-file',type=Path,required=True);q.add_argument('--review-file',type=Path,required=True)
     q=sub.add_parser('inspect');q.add_argument('delivery_id')
     q=sub.add_parser('record');q.add_argument('--delivery-id',required=True);q.add_argument('--answer-file',type=Path,required=True);q.add_argument('--review-file',type=Path,required=True)
-    args=p.parse_args()
+    # Арти, 22.10.2026: a group's delivery id starts with «-» («-1004315004305:2446») and Python 3.12 takes it for an option.
+    argv=[]
+    for arg in sys.argv[1:]:
+        group=re.fullmatch(r'-\d[\d:-]*',arg)
+        if group and argv and argv[-1]=='--delivery-id':argv[-1]+='='+arg
+        elif group and argv==['inspect']:argv+=['--',arg]
+        else:argv.append(arg)
+    args=p.parse_args(argv)
     if args.action=='video-receipt':
         raw=sys.stdin.read(MAX+1)
         if len(raw)>MAX:raise ValueError('receipt too large')

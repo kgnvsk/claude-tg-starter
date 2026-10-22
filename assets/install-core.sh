@@ -379,6 +379,14 @@ NOVSKY_LICENSE_KEY="${NOVSKY_LICENSE_KEY:-$(python3 "$KIT/assets/lib/merge-env.p
 # starts inherits it: package installs run third-party scripts, and the key is reusable.
 export -n NOVSKY_LICENSE_KEY
 NOVSKY_LICENSE_KEY="$NOVSKY_LICENSE_KEY" python3 "$KIT/assets/lib/agent-license.py" --saved-env "$CONFIG_FILE"
+# Арти, 22.10.2026: company workers say the agent's grammatical gender (male|female) from the profile. Saved settings do
+# not carry it (their export refuses unknown names), so an update keeps the profile's own value, read by the update
+# checker's profile reader; an explicit empty value clears it, anything else is dropped.
+AGENT_GENDER="${AGENT_GENDER-$(python3 "$KIT/assets/bin/update-safety-check" profile-value --home "$H" AGENT_GENDER 2>/dev/null || true)}"
+case "$AGENT_GENDER" in
+  ''|male|female) ;;
+  *) echo "WARN: AGENT_GENDER має бути male або female; значення не збережено" >&2; AGENT_GENDER= ;;
+esac
 # The late corporate-module check also guards a restart during installation;
 # this early check prevents partial overwrites even for non-corporate kits.
 if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "$AGENT_SERVICE" 2>/dev/null; then
@@ -1127,7 +1135,7 @@ python3 "$KIT/assets/lib/agent-license.py" --scrub-backups "$AGENT_USER" >/dev/n
 
 PROFILE_FILE="$H/.agent-profile.env"
 : > "$PROFILE_FILE"
-for name in AGENT_NAME OWNER_NAME OWNER_TG_USERNAME OWNER_CHAT_ID ADDITIONAL_ADMIN_CHAT_IDS ALERT_COPY_CHAT_IDS \
+for name in AGENT_NAME AGENT_GENDER OWNER_NAME OWNER_TG_USERNAME OWNER_CHAT_ID ADDITIONAL_ADMIN_CHAT_IDS ALERT_COPY_CHAT_IDS \
   OWNER_EMAIL BOT_USERNAME TIMEZONE CALENDAR_EMAIL VAULT_LOCALE OWNER_NOTICE_LOCALE \
   TG_DROP_PENDING_ON_BOOT TG_CORPORATE_SESSIONS; do
   write_shell_value "$PROFILE_FILE" "$name"
