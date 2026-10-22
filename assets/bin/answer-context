@@ -884,7 +884,13 @@ def main():
     p=sub.add_parser('read');group=p.add_mutually_exclusive_group(required=True);group.add_argument('--delivery');group.add_argument('--scheduled',action='store_true');p.add_argument('--chat');p.add_argument('--thread',type=int);p.add_argument('--page',type=int,default=0);p.add_argument('--snapshot');p.add_argument('--full',action='store_true')
     p=sub.add_parser('rule');group=p.add_mutually_exclusive_group(required=True);group.add_argument('--delivery');group.add_argument('--scheduled',action='store_true');which=p.add_mutually_exclusive_group(required=True);which.add_argument('--id');which.add_argument('--topic');p.add_argument('--page',type=int,default=0);p.add_argument('--digest')
     p=sub.add_parser('save');p.add_argument('--delivery',required=True);p.add_argument('--file',type=Path,required=True)
-    args=parser.parse_args()
+    # Арти, 22.10.2026: a group's delivery id starts with «-» («-1004315004305:2446»); Python 3.12 takes it for an option,
+    # so every read, rule read and save in a group failed («expected one argument»). The id goes with its option.
+    argv=[]
+    for arg in sys.argv[1:]:
+        if argv and argv[-1]=='--delivery' and re.fullmatch(r'-\d[\d:-]*',arg):argv[-1]+='='+arg
+        else:argv.append(arg)
+    args=parser.parse_args(argv)
     if args.action=='fallback':
         print(fallback_text());return
     if args.action=='scheduled-seal':
