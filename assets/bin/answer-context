@@ -30,6 +30,7 @@ ID_PART=12000  # characters of rule IDs one page header carries
 PAGE_BYTES=17000
 TOOL_READ='mcp__plugin_telegram_telegram__read_answer_context'  # the receiver's own read: whole, nothing can be added
 MAX_CONTEXT=500_000
+SCHEDULED_REQUEST_CHARS=16_000
 MAX_AGE=180
 # The owner, 22.10.2026: every answer read the same 160 rules and the same messages again (43 thousand tokens a turn,
 # compaction every dozen answers). What this conversation read whole since its last compaction is named, not repeated;
@@ -544,7 +545,10 @@ def prepare_scheduled(folder, chat, thread, task, occurrence):
     folder=Path(folder)
     if folder.is_symlink() or not folder.is_dir():raise ValueError('invalid scheduled run')
     if hasattr(os,'getuid') and folder.stat().st_uid!=os.getuid():raise ValueError('foreign scheduled run directory')
-    request=rules.read_bytes(folder/'request.txt',maximum=100_000).decode()
+    # Арти, 22.10.2026: his own runner put the task with its whole check output (~112 KB) in request.txt; over 100 KB every
+    # run failed here and delivered the fallback line. The full text stays in the run's prompt; the snapshot keeps its start.
+    request=rules.read_bytes(folder/'request.txt',maximum=2_000_000).decode()
+    if len(request)>SCHEDULED_REQUEST_CHARS:request=request[:SCHEDULED_REQUEST_CHARS]+'\n[… the rest of this task is in the run\'s own prompt]'
     if not re.fullmatch(r'-?[1-9]\d{0,19}',chat) or not str(occurrence).isdigit():raise ValueError('invalid scheduled identity')
     value={'chat':chat,'thread':None if thread is None else int(thread),'request':request,
            'requestId':str(task)+':'+str(occurrence),'generation':sha(str(folder.resolve()))}
