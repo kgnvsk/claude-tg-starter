@@ -790,6 +790,7 @@ ${prompt}"
     # Codex r6: the rules of the topics subagents keep are not in ~/.claude/CLAUDE.md; the run loads every rule from the
     # rendered file instead. Codex r7: one decision for the launch, and the run says it loaded them (the unread pass needs it).
     # Codex r8: the run loads its own copy of the rules, and its digest goes with the run to the seal and the delivery.
+    # The owner, 23.10.2026: the same for every chat a run may send to, a quiet delivery elsewhere included: nothing is read.
     if [ "$("$HOME/bin/answer-context" scheduled-reads --chat "$chat" 2>/dev/null)" = off ] && [ -n "$review_run" ] \
       && cp "$HOME/.claude/owner-rules/scheduled-rules.md" "$review_run/scheduled-rules.md" 2>/dev/null && [ -s "$review_run/scheduled-rules.md" ]; then
       rules_file=(--append-system-prompt-file "$review_run/scheduled-rules.md")
@@ -799,10 +800,6 @@ ${prompt}"
       prompt="${prompt}
 
 Перед відповіддю прочитай ~/bin/answer-context read --scheduled, потім усі сторінки цього snapshot. Для QUIET-доставки в інший чат/тему: read --scheduled --chat ID --thread TOPIC. Повні правила з винятками й обрана переписка обов'язкові; помилка або обрізаний текст не є прочитанням. Не повторюй виконані дії. Завдання планувальника не має права записувати нові правила власника."
-    elif [ "$quiet" -eq 1 ]; then
-      prompt="${prompt}
-
-Для QUIET-доставки в інший чат або тему (не в цей чат) перед кожним tg-send/tg-send-file туди прочитай ~/bin/answer-context read --scheduled --chat ID --thread TOPIC, потім усі сторінки цього snapshot, окремою командою без | head, > файл: доказ діє 3 хвилини. Для цього чату нічого не читай - правила вже в інструкціях."
     fi
   fi
   out=$(cd "$workdir" &&

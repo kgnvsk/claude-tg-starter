@@ -640,14 +640,13 @@ def scheduled_context(saved, session, chat=None, thread=None):
 
 
 def unread_destination(chat=None, thread=None):
-    """With reads off a run for the owner reads nothing; its destination is still checked (Codex r2), and a missing
-    session record, which only a read needs, never turns its answer into the service line. None: this run reads."""
+    """With reads off a run reads nothing, whatever chat it answers (the owner, 23.10.2026: «мы же убрали эти проверки
+    контекста» — a run for a group read 15 pages, ~200 000 characters of rules and history, and its report became the
+    service line); its destination is still checked (Codex r2), and a missing session record, which only a read needs,
+    never turns its answer into the service line. None: this run reads."""
     folder=Path(os.environ['ANSWER_CONTEXT_RUN_DIR'])
     if folder.is_symlink():raise ValueError('invalid scheduled run')
     saved=json.loads(rules.read_bytes(folder/'context.json'))
-    try:own=str(saved['chat'] if chat is None else chat)==owner_id()
-    except ValueError:own=False
-    if not own:return None
     if reads_before_answer() or not rules_in_instructions():return None  # the run started with the file its tick wrote
     # Codex r7, r8: only a run whose launcher appended every rule answers unread, and only while those are still the rules:
     # the launcher names the digest of the file it appended; any other run, or a rule change since its start, reads first.
@@ -695,8 +694,7 @@ def validate_scheduled(proof, text, chat, thread, task, occurrence, file_sha256=
             return False
         current=scheduled_context(proof['scheduled'],proof['sessionId'],str(chat),thread)  # still an allowed destination
         # unread only while reads stay off and the rules are still those its run started with (Codex r8)
-        if proof.get('reads')=='off':return (not reads_before_answer() and str(chat)==owner_id()
-                                             and proof.get('rulesDigest')==scheduled_rules_digest())
+        if proof.get('reads')=='off':return not reads_before_answer() and proof.get('rulesDigest')==scheduled_rules_digest()
         return build_snapshot(current)['snapshot']==proof['snapshot']
     except (OSError,ValueError,KeyError,TypeError,sqlite3.Error):return False
 
@@ -939,11 +937,9 @@ def rules_current():
 
 
 def scheduled_reads(chat):
-    """A scheduled run reads before it answers unless it answers the owner himself with every current rule in its
-    instructions: a run for a group reads that chat's own rules, as before (Codex r2)."""
-    try:own=str(chat)==owner_id()
-    except ValueError:own=False
-    return not (own and rules_current())
+    """A scheduled run reads before it answers unless every current rule is in its instructions, for every chat it may
+    answer (the owner, 23.10.2026); where it may send is still checked at the send."""
+    return not rules_current()
 
 
 def send_gate(chat, thread, text, delivery=None, file=False):
