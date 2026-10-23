@@ -48,7 +48,8 @@ TOKEN_RE = re.compile(
     r'|(?P<underline>(?<!\w)__[^_\n]+?__(?!\w))'
     r'|(?P<italic>(?<!\w)_[^_\n]+?_(?!\w))'
     r'|(?P<spoiler>\|\|[^|\n]+?\|\|)'
-    r'|(?P<strike>~[^~\n]+?~)',
+    # «~750 м», «~1,4 км» is «about», not strikethrough (Арти, 22.10.2026: prices went out struck through).
+    r'|(?P<strike>~(?![\d\s])[^~\n]+?(?<!\s)~)',
     re.DOTALL,
 )
 

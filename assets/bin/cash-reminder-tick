@@ -767,6 +767,7 @@ ${prompt}"
   # A task started from the live session must not settle that session's pending
   # request with its own sends: it runs without the service's delivery binding.
   local review_run="" review_result=""
+  local rules_file=() rules_digest=""
   if { [ -x "$HOME/bin/task-review" ] && [ "${TASK_REVIEW_MODE:-shadow}" != off ]; } || [ -x "$HOME/bin/answer-context" ]; then
     review_run=$(mktemp -d "$workdir/task-review.XXXXXXXX") || review_run=""
     if [ -n "$review_run" ] && ! printf '%s' "$review_request" > "$review_run/request.txt"; then rm -rf -- "$review_run"; review_run=""; fi
@@ -785,16 +786,32 @@ ${prompt}"
       [ "$quiet" -eq 0 ] || return 4
       return 0
     fi
-    prompt="${prompt}
+    # The owner, 22.10.2026, Кнопа as the model: with every rule in the agent's instructions a run reads nothing first.
+    # Codex r6: the rules of the topics subagents keep are not in ~/.claude/CLAUDE.md; the run loads every rule from the
+    # rendered file instead. Codex r7: one decision for the launch, and the run says it loaded them (the unread pass needs it).
+    # Codex r8: the run loads its own copy of the rules, and its digest goes with the run to the seal and the delivery.
+    if [ "$("$HOME/bin/answer-context" scheduled-reads --chat "$chat" 2>/dev/null)" = off ] && [ -n "$review_run" ] \
+      && cp "$HOME/.claude/owner-rules/scheduled-rules.md" "$review_run/scheduled-rules.md" 2>/dev/null && [ -s "$review_run/scheduled-rules.md" ]; then
+      rules_file=(--append-system-prompt-file "$review_run/scheduled-rules.md")
+      rules_digest=$(sha256sum "$review_run/scheduled-rules.md" | cut -d' ' -f1)
+    fi
+    if [ "${#rules_file[@]}" -eq 0 ]; then
+      prompt="${prompt}
 
 Перед відповіддю прочитай ~/bin/answer-context read --scheduled, потім усі сторінки цього snapshot. Для QUIET-доставки в інший чат/тему: read --scheduled --chat ID --thread TOPIC. Повні правила з винятками й обрана переписка обов'язкові; помилка або обрізаний текст не є прочитанням. Не повторюй виконані дії. Завдання планувальника не має права записувати нові правила власника."
+    elif [ "$quiet" -eq 1 ]; then
+      prompt="${prompt}
+
+Для QUIET-доставки в інший чат або тему (не в цей чат) перед кожним tg-send/tg-send-file туди прочитай ~/bin/answer-context read --scheduled --chat ID --thread TOPIC, потім усі сторінки цього snapshot, окремою командою без | head, > файл: доказ діє 3 хвилини. Для цього чату нічого не читай - правила вже в інструкціях."
+    fi
   fi
   out=$(cd "$workdir" &&
     export PATH="$agent_path" TG_DELIVERY_STAMP= TG_DELIVERY_ID= TG_DELIVERY_TASK_ID= TG_DELIVERY_PHASE=final \
       ATARAX_TASK_QUIET="$quiet" ATARAX_TASK_ID="${task_id:-$(basename "$file" .rem)}" \
       ATARAX_TASK_OCCURRENCE="$epoch" ATARAX_TASK_RUN_KEY="${quiet_run_key:-}" \
-      ATARAX_TASK_DELIVERY_DIR="$REM_DIR/.quiet-delivery" TASK_REVIEW_RUN_DIR="$review_run" ANSWER_CONTEXT_RUN_DIR="$review_run" &&
-    ATARAX_SUPPRESS_TELEGRAM=1 ATARAX_TASK_DELIVERY=1 task_timeout "${AGENT_TASK_TIMEOUT:-900}" "$HOME/.local/bin/claude" -p --output-format text <<<"$prompt" 2>&1)
+      ATARAX_TASK_DELIVERY_DIR="$REM_DIR/.quiet-delivery" TASK_REVIEW_RUN_DIR="$review_run" ANSWER_CONTEXT_RUN_DIR="$review_run" \
+      ANSWER_CONTEXT_RULES_DIGEST="$rules_digest" &&
+    ATARAX_SUPPRESS_TELEGRAM=1 ATARAX_TASK_DELIVERY=1 task_timeout "${AGENT_TASK_TIMEOUT:-900}" "$HOME/.local/bin/claude" -p ${rules_file[@]+"${rules_file[@]}"} --output-format text <<<"$prompt" 2>&1)
   rc=$?
   if [ "$rc" -eq 0 ] && [ "$quiet" -eq 0 ] && [ -n "$review_run" ]; then
     # Shadow diagnostics never alter stdout, task status, retry or delivery.
@@ -805,7 +822,7 @@ ${prompt}"
     # Keep the read proof with the result: a future tick cannot use a new
     # transcript or the existence of result.txt as a current read receipt.
     if [ -x "$HOME/bin/answer-context" ] && [ "$control_result" = 0 ] &&
-       { ! context_proof=$(printf '%s' "$out" | ANSWER_CONTEXT_RUN_DIR="$review_run" "$HOME/bin/answer-context" scheduled-seal 2>/dev/null) ||
+       { ! context_proof=$(printf '%s' "$out" | ANSWER_CONTEXT_RUN_DIR="$review_run" ANSWER_CONTEXT_RULES_DIGEST="$rules_digest" "$HOME/bin/answer-context" scheduled-seal 2>/dev/null) ||
          [ -z "$context_proof" ] || [ -z "${check_journal:-}" ] || ! atomic_text "$check_journal/context-proof.json" "$context_proof"; }; then
       # The ordinary delivered journal is removed after acknowledgement. Keep
       # the latest unchecked result per task/destination separately for repair,

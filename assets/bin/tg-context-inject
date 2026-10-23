@@ -26,10 +26,35 @@ RULES_LINE_CAP = 130
 RULES_LINE_MIN = 48  # past the cap every rule still shows at least its first words
 
 
+RULES_FILE_MARK = b"<!-- kit: every owner rule, rewritten on each save; change rules through the agent, not here -->"
+_rules_current: bool | None = None
+_session_id = ""
+
+
+def rules_in_instructions() -> bool:
+    """Owner, 22.10.2026, Кнопа as the model: with every current rule in the kit's ~/.claude/CLAUDE.md the rules are in the
+    agent's instructions; repeating them with each message only grew the conversation. answer-context decides whether THIS
+    session loaded the current rules (Codex r3): a file brought up to date after it started is not in its instructions."""
+    global _rules_current
+    if _rules_current is None:
+        helper = Path(os.environ.get("AGENT_ROOT") or Path.home()) / "bin/answer-context"
+        try:
+            with open(Path.home() / ".claude/CLAUDE.md", "rb") as handle:
+                marked = handle.read(len(RULES_FILE_MARK)) == RULES_FILE_MARK
+            result = subprocess.run([str(helper), "rules-current", "--session", _session_id], capture_output=True, text=True,
+                                    timeout=3, check=False) if marked and _session_id else None
+            _rules_current = bool(result and result.returncode == 0 and result.stdout.strip() == "current")
+        except (OSError, subprocess.TimeoutExpired):
+            _rules_current = False
+    return _rules_current
+
+
 def owner_rules(path: Path | None = None, cap: int = RULES_CAP) -> str:
     """The owner's own section of ~/CLAUDE.md, put in front of the model on every turn. Арти, 09.10.2026: 24 rules
     at the end of ~100 KB of instructions were followed only after the owner reminded. Whole when short; past `cap`,
     the first words of every rule, so none drops out of view (the full text stays in CLAUDE.md)."""
+    if path is None and rules_in_instructions():
+        return ""
     try:
         lines = (path or Path.home() / "CLAUDE.md").read_text(encoding="utf-8").splitlines()
     except (OSError, UnicodeError):
@@ -80,6 +105,8 @@ def owner_rules(path: Path | None = None, cap: int = RULES_CAP) -> str:
 
 
 def owner_rule_library(query: str) -> str:
+    if rules_in_instructions():
+        return ""
     helper = Path(os.environ.get("AGENT_ROOT") or Path.home()) / "bin/owner-rules"
     if not helper.is_file() or not (Path.home() / ".claude/owner-rules/index.json").is_file():
         return ""
@@ -101,6 +128,7 @@ if os.environ.get("ATARAX_SUPPRESS_TELEGRAM") == "1":
     if os.environ.get("ATARAX_TASK_DELIVERY") == "1":
         try:
             event = json.loads(sys.stdin.read() or "{}")
+            _session_id = str(event.get("session_id") or "")
             if event.get("hook_event_name") == "UserPromptSubmit":
                 rules = "\n".join(x for x in (owner_rules(), owner_rule_library(str(event.get("prompt") or ""))) if x)
         except Exception:
@@ -894,6 +922,17 @@ def _agent_env_tz() -> str:
     return ""
 
 
+def _profile_value(name: str) -> str:
+    # Владелець, 22.10.2026: READ_CONTEXT_BEFORE_ANSWER=off — the main session keeps its context, no read per answer.
+    try:
+        for line in (Path.home() / ".agent-profile.env").read_text().splitlines():
+            if line.startswith(name + "="):
+                return line.split("=", 1)[1].strip().strip("\"'")
+    except Exception:
+        pass
+    return ""
+
+
 def current_moment() -> str:
     tz_name = os.environ.get("TIMEZONE") or os.environ.get("TZ") or _agent_env_tz()
     now = None
@@ -1307,10 +1346,12 @@ def work_tools_context(prompt: str) -> str:
 
 
 def main() -> None:
+    global _session_id
     try:
         data = json.loads(sys.stdin.read() or "{}")
     except Exception:
         data = {}
+    _session_id = str(data.get("session_id") or "") if isinstance(data, dict) else ""
     hook_event = data.get("hook_event_name")
     prompt = data.get("prompt") or ""
     completed_tasks = []
@@ -1331,7 +1372,17 @@ def main() -> None:
 
     parts = [current_moment()]
     if os.path.isfile(os.path.expanduser('~/bin/answer-context')):
-        parts.append('Before every answer or file, read this request\u2019s context with the read_answer_context tool: its delivery_id and page 0, then every remaining page with the snapshot from page 0. The tool hands each page back whole; never read the context through a shell command (|, head, tail, > file): a clipped/error output is not a read. Re-read after rules, conversation, or turn change. Save explicit permanent owner instructions with answer-context save --delivery DELIVERY_ID --file CHANGE.json (revision and changes of key/scope/text/replaces). First read in full every rule it replaces (rule_id) and the whole topic of the rule you save (topic), replace superseded IDs, preserve exceptions and unrelated rules, then read the new snapshot. Never append a contradictory rule to CLAUDE.md. A one-off task, quoted message or another participant is not a new owner rule. Do not repeat actions to repair a missing read. This does not grant access.')
+        if _profile_value("READ_CONTEXT_BEFORE_ANSWER") != "off" or not rules_in_instructions():
+            parts.append('Before every answer or file, read this request\u2019s context with the read_answer_context tool: its delivery_id and page 0, then every remaining page with the snapshot from page 0. The tool hands each page back whole; never read the context through a shell command (|, head, tail, > file): a clipped/error output is not a read. Re-read after rules, conversation, or turn change. Save explicit permanent owner instructions with answer-context save --delivery DELIVERY_ID --file CHANGE.json (revision and changes of key/scope/text/replaces). First read in full every rule it replaces (rule_id) and the whole topic of the rule you save (topic), replace superseded IDs, preserve exceptions and unrelated rules, then read the new snapshot. Never append a contradictory rule to CLAUDE.md. A one-off task, quoted message or another participant is not a new owner rule. Do not repeat actions to repair a missing read. This does not grant access.')
+        else:
+            # Владелець, 22.10.2026: no read before every answer, but saving an owner rule still reads first.
+            parts.append('To save an explicit permanent owner instruction as a rule: first read this request\u2019s context '
+                         'with the read_answer_context tool (its delivery_id and page 0, then every remaining page with the '
+                         'snapshot from page 0), then answer-context save --delivery DELIVERY_ID --file CHANGE.json (revision '
+                         'and changes of key/scope/text/replaces). First read in full every rule it replaces (rule_id) and the '
+                         'whole topic of the rule you save (topic), replace superseded IDs, preserve exceptions and unrelated '
+                         'rules. Never append a contradictory rule to CLAUDE.md. A one-off task, quoted message or another '
+                         'participant is not a new owner rule. This does not grant access.')
     library_position = None
     rules = owner_rules()
     if rules:

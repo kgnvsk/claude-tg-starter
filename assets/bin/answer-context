@@ -18,6 +18,9 @@ import time
 HOME=Path(os.environ.get('ANSWER_CONTEXT_HOME') or Path.home())
 PAGE_SIZE=26000  # the receiver's own Bash read: a rendered page stays under the CLI's 30 000-character inline limit
 HOST_PAGE_SIZE=6000  # host tools (corporate, Codex) count a page when they serve it: smaller pages, less to lose in transport
+# Арті, 22.10.2026: a Claude company worker read 4.7 pages a request, each a model call over ~210K tokens. Its transport is the
+# CLI's MCP result, which keeps 30 000 characters inline as the main session's does; the JSON around a page stays under it.
+CLAUDE_HOST_PAGE_SIZE=24000
 # Owner 21.10.2026: Артур's 162 rules (108 thousand characters) made 28 pages before every answer. Above this size an
 # owner's rules read like skills: the rules a request touches in full, every other rule as one index line.
 RULES_IN_FULL_MAX=12000
@@ -46,7 +49,7 @@ END='\nEND_ANSWER_CONTEXT'
 # source-bound disposition for these direct imperatives, including one-off or
 # ambiguous cases. Quoted/forwarded text never obtains owner authority.
 RULE_INSTRUCTION=re.compile(r'(?im)^\s*(?:(?:пожалуйста|будь ласка|please|proszę)[, :]+)?(?:запомни|запам[’\'ʼ]?ятай|пам[’\'ʼ]?ятай|отныне|відтепер|впредь|надалі|всегда|завжди|никогда|ніколи|remember|from now on|always|never|zawsze|nigdy|zapamiętaj|запиши.{0,30}(?:правил\w*|постійн\w*)|збережи.{0,30}правил\w*)\b')
-RULE_SAVED=re.compile(r'(?i)(?:правил.{0,50}(?:сохран|запис|онов|обнов)|(?:сохран|запис|онов|обнов).{0,50}правил|запомнил|запам[’\'ʼ]?ятав|(?:saved|updated).{0,40}rule|zapis.{0,40}zasad)')
+RULE_SAVED=re.compile(r'(?i)(?:правил.{0,50}(?:сохран|запис|онов|обнов|збереж|зберіг|зберег)|(?:сохран|запис|онов|обнов|збереж|зберіг|зберег).{0,50}правил|запомнил|запам[’\'ʼ]?ятав|(?:saved|updated).{0,40}rule|zapis.{0,40}zasad)')
 FALLBACK={
  'uk':'Перевірка правил і переписки ще не завершена. Виконання не підтверджую; уже зроблених дій не повторюю.',
  'ru':'Проверка правил и переписки ещё не завершена. Выполнение не подтверждаю; уже сделанные действия не повторяю.',
@@ -68,6 +71,18 @@ rules=load_rules()
 
 def canonical(value):return json.dumps(value,ensure_ascii=False,sort_keys=True,separators=(',',':'))
 def sha(value):return hashlib.sha256(value.encode()).hexdigest()
+
+
+def json_pages(text, budget):
+    """Cut text so that every piece stays within `budget` characters once JSON-escaped, counted as the CLI counts them:
+    in UTF-16 units, where a character past U+FFFF (an emoji) is two (Codex, worker pages r2)."""
+    pages=[];start=0;cost=0
+    for i,ch in enumerate(text):
+        c=2 if ch in '"\\\n\r\t\b\f' or ord(ch)>0xFFFF else 6 if ord(ch)<0x20 else 1
+        if cost+c>budget and i>start:pages.append(text[start:i]);start=i;cost=0
+        cost+=c
+    if start<len(text) or not pages:pages.append(text[start:])
+    return pages
 
 
 def build_snapshot(data, page_size=PAGE_SIZE, full=False, host=False, seen=()):
@@ -94,13 +109,18 @@ def build_snapshot(data, page_size=PAGE_SIZE, full=False, host=False, seen=()):
     for i,row in enumerate(reversed(history)):
         if not host and i>=10 and size+len(row['text'])>HISTORY_CHARS:break
         kept.append(row);size+=len(row['text'])
-    messages=[canonical(row) for row in reversed(kept)]
+    # Арти, 22.10.2026: a bare millisecond stamp was read as UTC (19:39 in Lisbon told as 18:39); the agent's own time is named.
+    messages=[canonical({**row,'time':time.strftime('%Y-%m-%d %H:%M %Z',time.localtime(row['at']/1000))}
+                        if isinstance(row.get('at'),int) and row['at']>10**11 else row) for row in reversed(kept)]
     if not host:coverage={**coverage,'selected':len(kept),'of':len(history),'charBudget':HISTORY_CHARS}
     # Арти, 17.10.2026: with every rule read in full before the answer, the agent still sent one shop for «all shops
     # and Amazon» — reading is not applying. The request, the check against it and the rules it touches come first.
     # An owner snapshot holds every scope; only this request's scope and «all» touch it (Codex, PR 315 R2).
     touched=rules.ranked([r for r in selected['rules'] if r.get('scope','owner') in (scope,'all')],request['text'])[:5]
-    in_prompt=lambda r:binding['engine']=='claude' and r.get('origin')=='core'
+    # A «core» rule is in a Claude agent's instructions only while its text is still in ~/CLAUDE.md: Арти's 60 had moved
+    # to the library and were skipped as if they were there (22.10.2026).
+    live_core=set(rules.core_rules(rules.read_bytes(rules.core_path(),True))[0]) if binding['engine']=='claude' else set()
+    in_prompt=lambda r:r.get('origin')=='core' and r['text'].strip() in live_core
     legacy=selected.get('legacyContext')
     # A topic subagent's own word list routes the work to it: rules share common words across topics (a car rule names
     # clients, a client rule names cars), and «разбери BMW X5» shares no word with «разбор машины».
@@ -179,7 +199,7 @@ def build_snapshot(data, page_size=PAGE_SIZE, full=False, host=False, seen=()):
           +(f"(The other {coverage['alreadyRead']} selected messages of this chat are as you read them earlier in this conversation.)\n" if coverage.get('alreadyRead') else '')
           +'\n'.join(messages)+'\n\nCOVERAGE: '+canonical(coverage)
           +'\nOWNER INSTRUCTION: '+canonical({'requiresDisposition':required,'recordedDisposition':disposition})
-          +'\nFor a standing owner instruction save its full rule with scope, subject and superseded IDs. If it is a one-off task or unclear, save changes:[] with disposition:not_rule|clarify and a concrete reason; clarification belongs in the answer. Never say a rule was saved unless the receipt says applied. A cancelled rule uses text:"" and its replaces IDs. Read the revised context after any save.\n'
+          +'\nFor a standing owner instruction save its full rule with scope, subject and superseded IDs. Scope owner is only the owner\'s personal dialog with you (his plan, his own affairs); a rule on how you work, write, keep safety or do any task is scope all: it holds in every chat, employees\' sessions included; chat:ID:THREAD is one chat. If it is a one-off task or unclear, save changes:[] with disposition:not_rule|clarify and a concrete reason; clarification belongs in the answer. Never say a rule was saved unless the receipt says applied. A cancelled rule uses text:"" and its replaces IDs. Read the revised context after any save.\n'
           +'This is the stated selection, not a claim that all historical messages were read. For older decisions, links or completion claims, open the relevant original source before relying on it. A failed source is not evidence of absence. Do not repeat external actions.\n')
     if len(body.encode())>MAX_CONTEXT:raise ValueError('context selection too large; narrow history explicitly, never mark a clipped selection complete')
     digest=sha(canonical({'binding':binding,'ruleRevision':selected['revision'],'body':body}))
@@ -193,12 +213,52 @@ def build_snapshot(data, page_size=PAGE_SIZE, full=False, host=False, seen=()):
             parts[-1].append(i);size+=len(canonical(i))+1
     if host:
         page_size=min(page_size,max(1000,28_500-len(canonical(ids))))  # page 0 carries the IDs
-        pages=[body[i:i+page_size] for i in range(0,len(body),page_size)]
+        # A large Claude-host page is measured as it travels: JSON-escaped inside the MCP result, which the CLI keeps inline
+        # only up to 30 000 characters; quotes, backslashes and newlines take two (Codex, worker pages r1).
+        pages=json_pages(body,page_size) if page_size>HOST_PAGE_SIZE else [body[i:i+page_size] for i in range(0,len(body),page_size)]
     else:pages=byte_pages(body,PAGE_BYTES-(0 if indexed else max(len(canonical(part).encode()) for part in parts)))
     pages+=['']*(len(parts)-len(pages))  # more parts than text: a page with its header only
     return {'snapshot':digest,'binding':binding,'ruleRevision':selected['revision'],
             'instructionRequired':required,'instructionDisposition':disposition,'indexed':indexed,
             'ruleIds':ids,**({'idParts':parts} if len(parts)>1 else {}),'pages':pages}
+
+
+def host_rules(data):
+    """Owner, 22.10.2026: a company worker holds the rules of its chat in its session, as the main agent holds its own, and
+    gets them again only when they change or its conversation is compacted; no read before every answer."""
+    scope=data.get('scope') if isinstance(data,dict) else None
+    if not isinstance(scope,str) or not re.fullmatch(r'owner|chat:-?\d+:\d+',scope):raise ValueError('invalid context scope')
+    selected=rules.snapshot(None if scope=='owner' else scope)
+    request=data.get('request') if isinstance(data.get('request'),dict) else {}
+    required=bool(data.get('editAllowed') and isinstance(request.get('text'),str) and RULE_INSTRUCTION.search(request['text']))
+    # The owner, 22.10.2026: an employee's session hands work to the subagent that keeps its rules and checks (Ira's reel
+    # was edited in her own session, without the editor's rules and checks, four rounds of the same defects).
+    # The owner, 23.10.2026: it is the same orchestrator as the main agent, only with its own rights: the owner's rules
+    # of a topic a subagent keeps live with that subagent, here only the chat's own rules stay whole.
+    agents=subagents() if not reads_before_answer() else {}
+    # Арти, 23.10.2026: a company session knows the worker plugin's copies only, by the plugin's name («company-kit:montazh»);
+    # a bare «montazh» found no agent there. An agent without a copy keeps nothing here: its topics stay in these rules.
+    names={name:worker_agent_name(name) for name in agents}
+    # Codex r7: only a copy that carries its current block keeps work here; otherwise those rules stay in this text.
+    def copy_current(name,topics):
+        text=(HOME/WORKER_AGENTS/f'{name}.md').read_text(encoding='utf-8',errors='replace')
+        return text==with_agent_block(text,agent_rules_block([r for r in selected['rules'] if r.get('scope','owner')=='all'
+                                                               and topic_of(r) in topics],topics))
+    kept={name:topics for name,topics in agent_topics(agents).items() if names[name] and copy_current(name,topics)}
+    owned={t for topics in kept.values() for t in topics}
+    rows=[r for r in selected['rules'] if r.get('scope','owner')==scope or topic_of(r) not in owned]
+    rule_text='\n\n'.join(f"[{r['id']}; scope={r.get('scope','owner')}; subject={r.get('key','legacy')}]\n{r['text']}" for r in rows) or '(No saved rules in this scope.)'
+    routing=('\n\nYOUR SUBAGENTS — work of the kind a subagent below keeps goes to it (Agent tool): it holds the owner\'s rules'
+             ' and checks for that work. Give it the request in full with every file and link, and the rules above that'
+             ' concern the work, this chat\'s own and the general ones (they are not in its instructions); check its result'
+             ' against the request and these rules before you send it.\n'+'\n'.join(f"- {names[name]}: {agents[name]['description']} Keeps the rules of: {', '.join(topics)}."
+                                         for name,topics in sorted(kept.items()))) if kept else ''
+    text=('CURRENT RULES — apply only the scope named on each rule. Preserve every condition and exception.'
+          +(' The owner\'s rules of the work your subagents keep are in their instructions, not here.' if kept else '')
+          +'\n'+rule_text+routing)
+    # Codex r7: the revision covers which work goes to which copy too, not only the stored rules.
+    return {'ok':True,'ruleRevision':sha(canonical({'rules':selected['revision'],'text':text})),'instructionRequired':required,
+            'text':text}
 
 
 def byte_pages(text, budget):
@@ -579,12 +639,39 @@ def scheduled_context(saved, session, chat=None, thread=None):
             'readMode':'scheduled','rebound':(chat,thread)!=(str(saved['chat']),saved['thread'])}
 
 
+def unread_destination(chat=None, thread=None):
+    """With reads off a run for the owner reads nothing; its destination is still checked (Codex r2), and a missing
+    session record, which only a read needs, never turns its answer into the service line. None: this run reads."""
+    folder=Path(os.environ['ANSWER_CONTEXT_RUN_DIR'])
+    if folder.is_symlink():raise ValueError('invalid scheduled run')
+    saved=json.loads(rules.read_bytes(folder/'context.json'))
+    try:own=str(saved['chat'] if chat is None else chat)==owner_id()
+    except ValueError:own=False
+    if not own:return None
+    if reads_before_answer() or not rules_in_instructions():return None  # the run started with the file its tick wrote
+    # Codex r7, r8: only a run whose launcher appended every rule answers unread, and only while those are still the rules:
+    # the launcher names the digest of the file it appended; any other run, or a rule change since its start, reads first.
+    if not re.fullmatch(r'[a-f0-9]{64}',os.environ.get('ANSWER_CONTEXT_RULES_DIGEST','')) \
+            or os.environ['ANSWER_CONTEXT_RULES_DIGEST']!=scheduled_rules_digest():return None
+    try:session=json.loads(rules.read_bytes(folder/'session.json'))['sessionId']
+    except (OSError,ValueError,KeyError,TypeError):session=''
+    return saved,scheduled_context(saved,session,chat,thread)
+
+
 def check_scheduled(chat=None, thread=None):
+    if unread_destination(chat,thread):return {'ok':True}
     data=scheduled_input(chat,thread);snapshot=build_snapshot(data)
     return transcript_read(transcript_for(data),snapshot)
 
 
 def seal_scheduled(text, chat=None, thread=None):
+    unread=unread_destination(chat,thread)
+    if unread:
+        # Nothing was read: the proof binds the answer, its run and its destination (Codex r2).
+        saved,data=unread
+        return {'version':1,'reads':'off','readAt':time.time(),'textDigest':sha(text),'resultDigest':sha(text),'scheduled':saved,
+                'sessionId':data['binding']['sessionId'],'chat':data['binding']['chatId'],'thread':data['binding']['threadId'],
+                'rulesDigest':os.environ['ANSWER_CONTEXT_RULES_DIGEST']}
     data=scheduled_input(chat,thread);snapshot=build_snapshot(data)
     read=transcript_read(transcript_for(data),snapshot)
     if not read['ok']:raise ValueError('complete current context read required')
@@ -606,8 +693,11 @@ def validate_scheduled(proof, text, chat, thread, task, occurrence, file_sha256=
             proof.get('chat')!=str(chat) or proof.get('thread')!=thread or
             proof['scheduled']['requestId']!=str(task)+':'+str(occurrence)):
             return False
-        current=build_snapshot(scheduled_context(proof['scheduled'],proof['sessionId'],str(chat),thread))
-        return current['snapshot']==proof['snapshot']
+        current=scheduled_context(proof['scheduled'],proof['sessionId'],str(chat),thread)  # still an allowed destination
+        # unread only while reads stay off and the rules are still those its run started with (Codex r8)
+        if proof.get('reads')=='off':return (not reads_before_answer() and str(chat)==owner_id()
+                                             and proof.get('rulesDigest')==scheduled_rules_digest())
+        return build_snapshot(current)['snapshot']==proof['snapshot']
     except (OSError,ValueError,KeyError,TypeError,sqlite3.Error):return False
 
 
@@ -617,6 +707,243 @@ def fallback_text():
         locale=owner_notice_locale(HOME)
     except (ImportError,OSError,ValueError,TypeError):locale='uk'
     return FALLBACK.get(locale,FALLBACK['uk'])
+
+
+def reads_before_answer():
+    """Владелець, 22.10.2026: «зачем каждый раз перечитывать переписку? Агент же и так имеет контекст». The main session
+    keeps its own context, its rules come with each turn; READ_CONTEXT_BEFORE_ANSWER=off in the profile ends the fresh
+    read before each of its answers. Scheduled runs start without context and still read."""
+    try:
+        for line in (HOME/'.agent-profile.env').read_text().splitlines():
+            if line.startswith('READ_CONTEXT_BEFORE_ANSWER='):return line.split('=',1)[1].strip().strip("\"'")!='off'
+    except OSError:pass
+    return True
+
+
+RULES_FILE_MARK='<!-- kit: every owner rule, rewritten on each save; change rules through the agent, not here -->'
+RULES_FILE_END='<!-- kit: end of owner rules, {} -->'
+
+
+AGENT_RULES_START='<!-- kit: the rules of your topics, whole; rewritten on every rule save -->'
+AGENT_RULES_END='<!-- kit: end of topic rules -->'
+
+
+def rule_block(r):return f"[{r['id']}; scope={r.get('scope','owner')}; subject={r.get('key','legacy')}]\n{r['text']}"
+
+
+def agent_topics(agents):
+    """The owner, 22.10.2026: the main agent orchestrates and each subagent keeps the rules of its own work. rules-TOPIC
+    keeps TOPIC; any other agent of the owner names the topics it keeps on its «topics:» line; a topic may be kept by
+    several subagents (the editor and the marketing helper both keep marketing). Subagent -> its topics."""
+    kept={}
+    for name,agent in agents.items():
+        topics=[name[len('rules-'):]] if name.startswith('rules-') else [t.strip() for t in agent.get('topics','').split(',') if t.strip()]
+        if topics:kept[name]=sorted(set(topics))
+    return kept
+
+
+def owner_rows(selected):
+    """The owner's own rules and his rules for every chat (scope owner and all). A chat's own rules stay with that chat:
+    its worker has them in its instructions, a scheduled run for it reads them (Codex r2)."""
+    return [r for r in selected['rules'] if r.get('scope','owner') in ('owner','all')]
+
+
+def rules_file_text(selected, agents=None):
+    """The main agent's instructions: the rules no subagent keeps (its dialog with the owner, style, safety, plan) and
+    which subagent keeps which work."""
+    agents=subagents() if agents is None else agents;kept=agent_topics(agents)
+    owned={t for topics in kept.values() for t in topics}
+    rows=[r for r in owner_rows(selected) if topic_of(r) not in owned]
+    legacy=(selected.get('legacyContext') or {}).get('ownerContext')
+    held=lambda name:kept.get(name,[])
+    routing=('\n\n## Your subagents\nYou orchestrate. Decide by the meaning of each request which subagent\'s work it is and'
+             ' hand that work to that one subagent instead of doing it yourself; never the same task to two. A subagent that'
+             ' keeps a topic has the owner\'s rules of that topic in its own instructions, whole; they are not here. Give it'
+             ' everything it needs: the request in full, the files and links from the message or the chat, and this request\'s'
+             ' delivery id; it does not see the chat. You check its result against the request and these rules before you send'
+             ' it. A question you can answer at once, with no lookup, file or message to anyone, stays with you.\n'
+             +'\n'.join(f"- {name}: {agent['description']}"+(f" Keeps the rules of: {', '.join(held(name))}." if held(name) else '')
+                         for name,agent in agents.items())) if agents else ''
+    body=(RULES_FILE_MARK+'\n# Owner rules\n'
+          'The owner\'s rules for you (scope owner) and for every chat (scope all), in full, except the topics your subagents'
+          ' keep; a chat\'s own rules come with that chat. Preserve every condition and exception. A rule saved later in this'
+          ' conversation replaces the one it names. Scope owner is only your personal dialog with the owner; a rule on'
+          ' how you work, write, keep safety or do any task is scope all, so employees\' sessions have it too.\n\n'
+          +('\n\n'.join(rule_block(r) for r in rows) or '(No saved rules.)')
+          +('\n\nOWNER CONTEXT:\n'+legacy if legacy and legacy.strip() else '')+routing+'\n\n')
+    return (body+RULES_FILE_END.format(sha(body))+'\n').encode()
+
+
+SCHEDULED_RULES=Path('.claude/owner-rules/scheduled-rules.md')
+# The owner, 23.10.2026: ~/CLAUDE.md, loaded by every session, told Арти to read the rules before every answer. With the
+# rules in the instructions its one kit line says so instead; it keeps owner-rules' prefix, so a save never takes it for a rule.
+REFERENCE_LOADED=('Правила збережено без скорочень у ~/.claude/owner-rules/index.json. Кожне правило власника вже у твоїх '
+                  'інструкціях, цілком (~/.claude/CLAUDE.md; правила тем - в інструкціях субагентів, що ведуть ці теми): '
+                  'перед відповіддю нічого не читай. Зміни правил зберігай через owner-rules з джерелом, областю дії та явною '
+                  'заміною старого правила.\n')
+
+
+def render_reference(loaded):
+    """Only the kit's own line in the agent's ~/CLAUDE.md changes with the switch; the rest of that file stays as it is."""
+    path=rules.core_path()
+    if path.is_symlink() or not path.is_file():return
+    raw=path.read_bytes();text=raw.decode('utf-8')
+    old,new=(rules.REFERENCE,REFERENCE_LOADED) if loaded else (REFERENCE_LOADED,rules.REFERENCE)
+    if old in text:rules.atomic(path,text.replace(old,new).encode())
+
+
+def scheduled_rules_text(selected):
+    """Арти, 23.10.2026: his background tasks run with a slim launcher that loads no CLAUDE.md (Артур, 20.10, to save the
+    limit) and read every rule before each send. They get every rule of the owner, every topic, whole, from this file once
+    per run instead (the launcher appends it); a run delegates nothing, so no topic is left to a subagent here."""
+    legacy=(selected.get('legacyContext') or {}).get('ownerContext')
+    body=(RULES_FILE_MARK+'\n# Owner rules\nEvery rule of the owner for you (scope owner) and for every chat (scope all), in'
+          ' full. Preserve every condition and exception.\n\n'+('\n\n'.join(rule_block(r) for r in owner_rows(selected)) or '(No saved rules.)')
+          +('\n\nOWNER CONTEXT:\n'+legacy if legacy and legacy.strip() else '')+'\n\n')
+    return (body+RULES_FILE_END.format(sha(body))+'\n').encode()
+
+
+def scheduled_rules_digest():
+    """The digest of every current rule as the background tasks' file holds them (None if it cannot be rendered)."""
+    try:return hashlib.sha256(scheduled_rules_text(rules.snapshot(None))).hexdigest()
+    except (OSError,ValueError,KeyError,TypeError):return None
+
+
+def agent_rules_block(rows, topics):
+    return (AGENT_RULES_START+'\n# The rules of your work: '+', '.join(topics)+'\nThe owner\'s rules for this work, in full, with'
+            ' every condition and exception. You keep them here: nothing to read for them.\n\n'
+            +('\n\n'.join(rule_block(r) for r in rows) or '(No saved rules of these topics yet.)')+'\n'+AGENT_RULES_END)
+
+
+def with_agent_block(text, block):
+    """The agent's own text stays as it is; only the kit's block between its marks is written (or taken out)."""
+    if AGENT_RULES_START in text and AGENT_RULES_END in text.split(AGENT_RULES_START,1)[1]:
+        head,_,rest=text.partition(AGENT_RULES_START);_,_,tail=rest.partition(AGENT_RULES_END)
+        return (head.rstrip('\n')+('\n\n'+block if block else '')+tail).rstrip('\n')+'\n'
+    return text.rstrip('\n')+'\n\n'+block+'\n' if block else text
+
+
+WORKER_AGENTS=Path('.local/share/claude-telegram-corporate/worker-plugin/agents')
+
+
+def worker_agent_name(name):
+    """The name a company session calls an agent by: the worker plugin's name and the agent's (Claude Code names a
+    plugin's agents «plugin:agent»); None when the plugin has no copy of it."""
+    copy=HOME/WORKER_AGENTS/f'{name}.md'
+    try:plugin=json.loads((HOME/WORKER_AGENTS.parent/'.claude-plugin/plugin.json').read_text(encoding='utf-8')).get('name')
+    except (OSError,ValueError,AttributeError):return None
+    if not isinstance(plugin,str) or not re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,63}',plugin):return None
+    return f'{plugin}:{name}' if copy.is_file() and not copy.is_symlink() else None
+
+
+def agent_files(name):
+    """The agent's own file and the company sessions' copy of it (the worker plugin is built from these agents at install
+    time; the rules block is kept current in both), each with whether it is the company copy."""
+    for path,copy in ((HOME/'.claude/agents'/f'{name}.md',False),(HOME/WORKER_AGENTS/f'{name}.md',True)):
+        if not path.is_symlink() and path.is_file():yield path,copy
+
+
+def agent_blocks(selected, agents):
+    """Agent file -> the kit block it carries. The owner's own copy has the topics' rules for him and for every chat; the
+    company sessions' copy only those for every chat (Codex r6: his personal rules never reach an employee). An agent that
+    keeps no topic, or is gone, or whose copy is left over, carries none (Codex r5, r6)."""
+    rows=owner_rows(selected);kept=agent_topics(agents);blocks={}
+    leftovers={path.stem for folder in (HOME/'.claude/agents',HOME/WORKER_AGENTS) if folder.is_dir()
+               for path in folder.glob('*.md') if not path.is_symlink() and path.is_file()
+               and AGENT_RULES_START in path.read_text(encoding='utf-8',errors='replace')}
+    for name in sorted(set(agents)|leftovers):
+        for path,copy in agent_files(name):
+            topics=kept.get(name) if name in agents else None
+            blocks[path]=agent_rules_block([r for r in rows if topic_of(r) in topics and (not copy or r.get('scope','owner')=='all')],
+                                           topics) if topics else ''
+    return blocks
+
+
+def replace_if_unchanged(path, before, current, text):
+    """Write the agent's file only over the version just read (Codex r5–r7). The replaced version stays pinned by a link
+    for a moment: an edit that landed after the read is put back, and the next render writes the block again.
+    ponytail: one system call between the check and the swap stays open; closing it needs the editor's own lock, or the
+    block in a file the kit owns."""
+    import tempfile
+    fd,name=tempfile.mkstemp(dir=path.parent,prefix='.rules-');pinned=None
+    try:
+        with os.fdopen(fd,'wb') as out:out.write(text.encode());out.flush();os.fsync(out.fileno())
+        now=path.stat();os.chmod(name,stat.S_IMODE(now.st_mode))
+        if (now.st_ino,now.st_mtime_ns,now.st_size)!=before:return False
+        pinned=name+'.prev';os.link(path,pinned)
+        os.replace(name,path);name=None
+        if open(pinned,'rb').read()!=current.encode():os.replace(pinned,path);pinned=None;return False
+        return True
+    finally:
+        for left in (name,pinned):
+            if left and os.path.exists(left):os.unlink(left)
+
+
+def render_agent_rules(selected, agents):
+    """Each subagent that keeps topics gets their rules in its own file (Claude Code takes an edited agent file at its next
+    call). With reads on, the blocks come out again."""
+    for path,block in agent_blocks(selected,agents).items():
+        for _ in range(3):
+            before=path.stat();current=path.read_text(encoding='utf-8')
+            text=with_agent_block(current,'' if reads_before_answer() else block)
+            if text==current or replace_if_unchanged(path,(before.st_ino,before.st_mtime_ns,before.st_size),current,text):break
+
+
+def render_rules():
+    """The owner, 22.10.2026, Кнопа as the model: her rules are in her instructions, she reads nothing before an answer.
+    With reads off the owner's rules go whole into ~/.claude/CLAUDE.md: Claude Code loads it at the start of every session
+    of the agent and again after a compaction, scheduled runs included; company workers load no instructions file."""
+    path=HOME/'.claude/CLAUDE.md'
+    if path.is_symlink() or path.exists() and not path.is_file():return False
+    with rules.locked():  # one writer at a time: a slower refresh never puts an older rule set back (Codex r2)
+        current=path.read_bytes() if path.exists() else None
+        if current is not None and not current.startswith(RULES_FILE_MARK.encode()):return False  # the agent's own file
+        selected=rules._snapshot(None)[0];agents=subagents()
+        render_agent_rules(selected,agents)
+        scheduled=HOME/SCHEDULED_RULES
+        if reads_before_answer():
+            if current is not None:path.unlink()
+            if scheduled.is_file() and not scheduled.is_symlink():scheduled.unlink()
+            render_reference(False)
+            return False
+        render_reference(True)
+        text=rules_file_text(selected,agents)
+        if current!=text:rules.safe_directory(path.parent);rules.atomic(path,text)
+        text=scheduled_rules_text(selected)
+        if not scheduled.is_file() or scheduled.read_bytes()!=text:rules.atomic(scheduled,text)
+    return True
+
+
+def rules_in_instructions():
+    """The main file and every subagent's block are the current rules, byte for byte: a stale or cut one is not (Codex r2)."""
+    try:
+        selected=rules.snapshot(None);agents=subagents()
+        if (HOME/'.claude/CLAUDE.md').read_bytes()!=rules_file_text(selected,agents):return False
+        if (HOME/SCHEDULED_RULES).read_bytes()!=scheduled_rules_text(selected):return False
+        for path,block in agent_blocks(selected,agents).items():
+            text=path.read_text(encoding='utf-8')
+            if text!=with_agent_block(text,block):return False
+        return True
+    except (OSError,ValueError,KeyError,TypeError,UnicodeError):return False
+
+
+def refresh_rules():
+    """After a save or at a session start; never stops what called it."""
+    try:return render_rules()
+    except (OSError,ValueError,KeyError,TypeError):return False
+
+
+def rules_current():
+    """Reads are off and the agent's instructions hold every current rule; a stale file is written again first."""
+    return not reads_before_answer() and (rules_in_instructions() or refresh_rules() and rules_in_instructions())
+
+
+def scheduled_reads(chat):
+    """A scheduled run reads before it answers unless it answers the owner himself with every current rule in its
+    instructions: a run for a group reads that chat's own rules, as before (Codex r2)."""
+    try:own=str(chat)==owner_id()
+    except ValueError:own=False
+    return not (own and rules_current())
 
 
 def send_gate(chat, thread, text, delivery=None, file=False):
@@ -647,6 +974,7 @@ def send_gate(chat, thread, text, delivery=None, file=False):
     for identity in ids:
         verdict={}
         try:
+            if unread_answer(identity,text):continue
             verdict=check_delivery(identity);complete=verdict['ok']
             if verdict.get('instructionRequired') and RULE_SAVED.search(text) and verdict.get('instructionDisposition')!='applied':complete=False
         except (OSError,ValueError,KeyError,TypeError,sqlite3.Error):complete=False
@@ -656,6 +984,40 @@ def send_gate(chat, thread, text, delivery=None, file=False):
             pages=f' pages {", ".join(map(str,missing))} of' if missing else ''
             return {'ok':False,'message':f'Before answering, read{pages} this request’s context with the read_answer_context tool (delivery_id {identity}, page N, the snapshot from page 0): it hands each page back whole. A shell read piped, redirected or cut (2>&1, |, head, tail, > file) is not counted. Read the rules and complete selected messages; after a rule change read again. Do not repeat actions. If the sources remain unavailable, send only the fixed fallback for the person’s language.',
                     'fallback':FALLBACK}
+    return {'ok':True}
+
+
+def unread_answer(delivery, text):
+    """The owner, 22.10.2026: an answer to the owner in his own private chat needs no read while the session giving it
+    holds every current rule. Any other chat reads its own rules, and a standing instruction is saved, or its disposition
+    recorded, before the answer (Codex r3)."""
+    if reads_before_answer():return False
+    data=claude_input(delivery);binding=data['binding'];owner=owner_id()
+    if binding['chatId']!=owner or binding['threadId'] is not None or binding['actorId']!=owner:return False
+    # The owner's rules have one writer, his own conversation: its sessions load the file at their start and after a
+    # compaction, and know their own saves (the owner, 22.10.2026: Кнопа's way, no per-answer proof). A file found stale
+    # is written again; this answer reads once, so the session holds the rules from that read.
+    if not rules_in_instructions():
+        refresh_rules();return False
+    if data['editAllowed'] and RULE_INSTRUCTION.search(data['request']['text']):
+        disposition=rules.instruction_receipt({'chatId':binding['chatId'],'messageId':data['request']['messageId'],
+                                               'text':data['request']['text']})
+        if disposition is None or RULE_SAVED.search(text) and disposition!='applied':return False
+    return True
+
+
+def silence_check(delivery):
+    """Артур, 22.10.2026 («За галочки ставить не надо»): the owner's own private message closes in silence only when
+    nothing in it waits to be saved. A standing instruction is saved, or recorded as a one-off, first; one inside a burst,
+    a forward or an album, which cannot be saved from here as one, is answered instead (Codex K2 r1)."""
+    data=claude_input(delivery);binding=data['binding'];owner=owner_id()
+    if binding['chatId']!=owner or binding['threadId'] is not None or binding['actorId']!=owner:
+        return {'ok':False,'message':'Only the owner\'s own private message closes in silence; answer it with reply.'}
+    if not data['editAllowed']:  # a burst may hide an instruction in a message not checked here: fail closed
+        return {'ok':False,'message':'A burst, forward or album is answered with reply, not closed in silence.'}
+    if RULE_INSTRUCTION.search(data['request']['text']) and rules.instruction_receipt(
+            {'chatId':binding['chatId'],'messageId':data['request']['messageId'],'text':data['request']['text']}) is None:
+        return {'ok':False,'message':'Save the standing instruction, or record it as a one-off, before closing it in silence.'}
     return {'ok':True}
 
 
@@ -675,7 +1037,8 @@ def save_rules(delivery, change):
     if missing:raise ValueError('before saving, read in full with the read_answer_context tool and this delivery_id: '+'; '.join(missing))
     source={'chatId':data['binding']['chatId'],'messageId':data['request']['messageId'],'text':data['request']['text']}
     copies=record_copies(rules.snapshot(None)['rules'],change,data['scope'],source)
-    return attach_copies(rules.apply_rules({**change,'source':source},None if data['scope']=='owner' else data['scope']),copies,source,change)
+    result=attach_copies(rules.apply_rules({**change,'source':source},None if data['scope']=='owner' else data['scope']),copies,source,change)
+    refresh_rules();return result
 
 
 def unread_for_save(data, change, texts):
@@ -818,7 +1181,8 @@ def subagents():
         # an agent needs its description.
         if not front or front.get('name')!=name or not front.get('description','').strip():continue
         # «words:» lists the owner's own words for this work; the description is only the menu text.
-        found[name]={'description':front['description'].strip(),'words':front.get('words','').strip()}  # no «words:», no lexical candidate
+        found[name]={'description':front['description'].strip(),'words':front.get('words','').strip(),  # no «words:», no lexical candidate
+                     'topics':front.get('topics','').strip()}
     return found
 
 
@@ -875,8 +1239,10 @@ def valid_change(change):
 def main():
     parser=argparse.ArgumentParser(description=__doc__);sub=parser.add_subparsers(dest='action',required=True)
     sub.add_parser('host-snapshot')
+    sub.add_parser('host-rules')
     sub.add_parser('host-apply')
     sub.add_parser('send-check')
+    sub.add_parser('silence-check')
     sub.add_parser('scheduled-hook')
     sub.add_parser('scheduled-check')
     sub.add_parser('scheduled-seal')
@@ -884,6 +1250,9 @@ def main():
     p=sub.add_parser('scheduled-rebind');p.add_argument('--proof',type=Path,required=True);p.add_argument('--result',type=Path,required=True)
     p=sub.add_parser('scheduled-delivery-check');p.add_argument('--proof',type=Path,required=True);p.add_argument('--result',type=Path,required=True);p.add_argument('--chat',required=True);p.add_argument('--thread');p.add_argument('--task',required=True);p.add_argument('--occurrence',required=True)
     sub.add_parser('fallback')
+    p=sub.add_parser('scheduled-reads');p.add_argument('--chat',required=True)
+    p=sub.add_parser('rules-current');p.add_argument('--session')
+    sub.add_parser('render-rules')
     p=sub.add_parser('prepare-scheduled');p.add_argument('--run',type=Path,required=True);p.add_argument('--chat',required=True);p.add_argument('--thread',type=int);p.add_argument('--task',required=True);p.add_argument('--occurrence',required=True)
     p=sub.add_parser('read');group=p.add_mutually_exclusive_group(required=True);group.add_argument('--delivery');group.add_argument('--scheduled',action='store_true');p.add_argument('--chat');p.add_argument('--thread',type=int);p.add_argument('--page',type=int,default=0);p.add_argument('--snapshot');p.add_argument('--full',action='store_true')
     p=sub.add_parser('rule');group=p.add_mutually_exclusive_group(required=True);group.add_argument('--delivery');group.add_argument('--scheduled',action='store_true');which=p.add_mutually_exclusive_group(required=True);which.add_argument('--id');which.add_argument('--topic');p.add_argument('--page',type=int,default=0);p.add_argument('--digest')
@@ -897,6 +1266,15 @@ def main():
     args=parser.parse_args(argv)
     if args.action=='fallback':
         print(fallback_text());return
+    if args.action=='scheduled-reads':
+        print('on' if scheduled_reads(args.chat) else 'off');return
+    if args.action=='rules-current':
+        current=rules_in_instructions() if args.session else rules_current()  # a live session: check only, no repair
+        print('current' if current else 'not current')
+        if not current:sys.exit(3)
+        return
+    if args.action=='render-rules':
+        print('written' if render_rules() else 'not written');return
     if args.action=='scheduled-seal':
         text=sys.stdin.read(MAX_CONTEXT+1)
         if len(text)>MAX_CONTEXT:raise ValueError('result too large')
@@ -914,8 +1292,11 @@ def main():
         if not validate_scheduled(proof,text,args.chat,args.thread,args.task,args.occurrence):sys.exit(3)
         return
     if args.action=='scheduled-hook':
+        try:data=json.load(sys.stdin)
+        except ValueError:data={}
+        session=data.get('session_id') if isinstance(data,dict) else None
+        refresh_rules()  # every session start, a compaction's too: the file the next load takes is the current one
         if not os.environ.get('ANSWER_CONTEXT_RUN_DIR'):return
-        data=json.load(sys.stdin);session=data.get('session_id')
         if not isinstance(session,str) or not re.fullmatch(r'[a-zA-Z0-9_-]{1,100}',session):raise ValueError('scheduled session identity unavailable')
         rules.atomic(Path(os.environ['ANSWER_CONTEXT_RUN_DIR'])/'session.json',canonical({'sessionId':session}).encode())
         return
@@ -925,7 +1306,7 @@ def main():
         verdict=check_scheduled();print(canonical(verdict))
         if not verdict['ok']:sys.exit(3)
         return
-    if args.action in ('host-snapshot','host-apply','send-check','delivery-check'):
+    if args.action in ('host-snapshot','host-rules','host-apply','send-check','delivery-check','silence-check'):
         raw=sys.stdin.buffer.read(2_000_001)
         if len(raw)>2_000_000:raise ValueError('context input too large')
         data=json.loads(raw)
@@ -933,11 +1314,15 @@ def main():
             verdict={'ok':validate_scheduled(data.get('proof'),data['text'],data['chat'],data.get('thread'),data['task'],data['occurrence'],data.get('file_sha256')),'fallback':fallback_text()}
             print(canonical(verdict))
             if not verdict['ok']:sys.exit(3)
+        elif args.action=='silence-check':
+            verdict=silence_check(data['delivery']);print(canonical(verdict))
+            if not verdict['ok']:sys.exit(3)
         elif args.action=='send-check':
             verdict=send_gate(data['chat'],data.get('thread'),data.get('text',''),data.get('delivery'),data.get('file',False))
             print(canonical(verdict))
             if not verdict['ok']:sys.exit(3)
-        elif args.action=='host-snapshot':print(canonical(build_snapshot(data,HOST_PAGE_SIZE,host=True)))
+        elif args.action=='host-rules':print(canonical(host_rules(data)))
+        elif args.action=='host-snapshot':print(canonical(build_snapshot(data,CLAUDE_HOST_PAGE_SIZE if (data.get('binding') or {}).get('engine')=='claude' else HOST_PAGE_SIZE,host=True)))
         else:
             context=data['context']
             try:
@@ -946,7 +1331,8 @@ def main():
                 if not valid_change(change):raise ValueError('invalid rule change')
                 source={'chatId':context['binding']['chatId'],'messageId':context['request']['messageId'],'text':context['request']['text']}
                 copies=record_copies(rules.snapshot(None)['rules'],change,context['scope'],source)
-                print(canonical(attach_copies(rules.apply_rules({**change,'source':source},None if context['scope']=='owner' else context['scope']),copies,source,change)))
+                result=attach_copies(rules.apply_rules({**change,'source':source},None if context['scope']=='owner' else context['scope']),copies,source,change)
+                refresh_rules();print(canonical(result))
             except ValueError as error:
                 # The worker learns why (Арти, 22.10.2026: «source, scope or revision changed» left him guessing twice).
                 print(canonical({'ok':False,'message':'Rule not saved: '+str(error)}))

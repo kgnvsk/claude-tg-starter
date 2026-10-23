@@ -387,6 +387,24 @@ case "$AGENT_GENDER" in
   ''|male|female) ;;
   *) echo "WARN: AGENT_GENDER має бути male або female; значення не збережено" >&2; AGENT_GENDER= ;;
 esac
+# Артур, 22.10.2026: OWNER_PROGRESS_NOTICES=off (no interim line on the owner's own company requests) and
+# SECURITY_NOTICE_CHAT (a group id that gets privacy alerts instead of his private chat) live only in the profile too;
+# an update keeps them the same way, an explicit empty value clears them, anything else is dropped.
+OWNER_PROGRESS_NOTICES="${OWNER_PROGRESS_NOTICES-$(python3 "$KIT/assets/bin/update-safety-check" profile-value --home "$H" OWNER_PROGRESS_NOTICES 2>/dev/null || true)}"
+SECURITY_NOTICE_CHAT="${SECURITY_NOTICE_CHAT-$(python3 "$KIT/assets/bin/update-safety-check" profile-value --home "$H" SECURITY_NOTICE_CHAT 2>/dev/null || true)}"
+# Владелець, 22.10.2026: READ_CONTEXT_BEFORE_ANSWER=off — the main session answers from its own context, no read per answer.
+READ_CONTEXT_BEFORE_ANSWER="${READ_CONTEXT_BEFORE_ANSWER-$(python3 "$KIT/assets/bin/update-safety-check" profile-value --home "$H" READ_CONTEXT_BEFORE_ANSWER 2>/dev/null || true)}"
+case "$OWNER_PROGRESS_NOTICES" in
+  ''|off) ;;
+  *) echo "WARN: OWNER_PROGRESS_NOTICES може бути лише off; значення не збережено" >&2; OWNER_PROGRESS_NOTICES= ;;
+esac
+case "$READ_CONTEXT_BEFORE_ANSWER" in
+  ''|off) ;;
+  *) echo "WARN: READ_CONTEXT_BEFORE_ANSWER може бути лише off; значення не збережено" >&2; READ_CONTEXT_BEFORE_ANSWER= ;;
+esac
+if [ -n "$SECURITY_NOTICE_CHAT" ] && ! [[ "$SECURITY_NOTICE_CHAT" =~ ^-[1-9][0-9]{0,19}$ ]]; then
+  echo "WARN: SECURITY_NOTICE_CHAT має бути id групи (від'ємне число); значення не збережено" >&2; SECURITY_NOTICE_CHAT=
+fi
 # The late corporate-module check also guards a restart during installation;
 # this early check prevents partial overwrites even for non-corporate kits.
 if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "$AGENT_SERVICE" 2>/dev/null; then
@@ -1137,11 +1155,18 @@ PROFILE_FILE="$H/.agent-profile.env"
 : > "$PROFILE_FILE"
 for name in AGENT_NAME AGENT_GENDER OWNER_NAME OWNER_TG_USERNAME OWNER_CHAT_ID ADDITIONAL_ADMIN_CHAT_IDS ALERT_COPY_CHAT_IDS \
   OWNER_EMAIL BOT_USERNAME TIMEZONE CALENDAR_EMAIL VAULT_LOCALE OWNER_NOTICE_LOCALE \
-  TG_DROP_PENDING_ON_BOOT TG_CORPORATE_SESSIONS; do
+  TG_DROP_PENDING_ON_BOOT TG_CORPORATE_SESSIONS OWNER_PROGRESS_NOTICES SECURITY_NOTICE_CHAT READ_CONTEXT_BEFORE_ANSWER; do
   write_shell_value "$PROFILE_FILE" "$name"
 done
 chown "$AGENT_USER:$AGENT_USER" "$PROFILE_FILE"
 chmod 600 "$PROFILE_FILE"
+# The owner, 22.10.2026, Кнопа as the model: with READ_CONTEXT_BEFORE_ANSWER=off every owner rule is in the agent's own
+# instructions file before its service starts, so the first session after this install already has them; written after the profile,
+# which holds the switch on a fresh install (Codex r2).
+if [ -x "$H/bin/answer-context" ]; then
+  runuser -u "$AGENT_USER" -- env HOME="$H" python3 "$H/bin/answer-context" render-rules >/dev/null 2>&1 \
+    || echo "  ⚠ owner rules file not written: the agent keeps reading its rules before answers"
+fi
 umask "${secrets_umask:-022}"
 if [ "$AGENT_USER" = claude ]; then
   rm -f /home/claude/.cash-agent.env
@@ -1500,6 +1525,12 @@ if product_has_feature telegram-corporate-sessions && [ "$MODULE_TELEGRAM_CORPOR
   fi
   AGENT_USER="$AGENT_USER" H="$H" KIT="$KIT" \
     bash "$KIT/modules/telegram-corporate/install.sh"
+  # Codex r7: the module's sync copied the owner's agents into the company plugin without his rules; their own blocks
+  # (the rules for every chat) are written before the service starts.
+  if [ -x "$H/bin/answer-context" ]; then
+    runuser -u "$AGENT_USER" -- env HOME="$H" python3 "$H/bin/answer-context" render-rules >/dev/null 2>&1 \
+      || echo "  ⚠ owner rules file not written: the agent keeps reading its rules before answers"
+  fi
   # Parallel sessions are as capable as the owner's: same skills, same
   # subagents, rendered copies. A trimmed worker package stops the install.
   runuser -u "$AGENT_USER" -- env HOME="$H" \
