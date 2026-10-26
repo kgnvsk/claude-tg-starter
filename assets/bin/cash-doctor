@@ -20,8 +20,17 @@ else
   bad "служба ${SVC%.service} НЕАКТИВНА → sudo systemctl start $SVC"
 fi
 
-# 2. telegram poller (bun MCP) — свой юзер, чтобы соседний инстанс не маскировал смерть
-if pgrep -u "$(id -u)" -f "bun.*plugins-official.*telegram" >/dev/null 2>&1; then
+# 2. telegram poller (bun MCP) — свой юзер, чтобы соседний инстанс не маскировал смерть. The live owner engine starts
+# it from the plugin folder as `bun server.ts` (claude-telegram-bot): there the folder is its working directory.
+telegram_poller() {
+  pgrep -u "$(id -u)" -f "bun.*plugins-official.*telegram" >/dev/null 2>&1 && return 0
+  local pid
+  for pid in $(pgrep -u "$(id -u)" -f "bun.*server\.ts" 2>/dev/null); do
+    case "$(readlink "/proc/$pid/cwd" 2>/dev/null)" in *plugins-official*telegram*) return 0 ;; esac
+  done
+  return 1
+}
+if telegram_poller; then
   ok "Telegram-полер (bun) працює"
 else
   warn "Telegram-полер не знайдено — якщо щойно був перезапуск, зачекай 1–2 хв"

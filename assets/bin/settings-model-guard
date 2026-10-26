@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
-"""Let a new `model` into settings.json only after the installed CLI accepted it."""
+"""Validate model changes and preserve the installed runtime mechanics.
+
+This tool-call guard prevents accidental self-modification; it is not an OS
+sandbox against arbitrary programs. Operator maintenance runs outside it.
+"""
 
 from pathlib import Path
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -13,6 +18,8 @@ import sys
 HOME = Path(os.environ.get("HOME") or "/home/claude").expanduser().resolve()
 SETTINGS_PATH = (HOME / ".claude/settings.json").resolve()
 PROBE_TIMEOUT_SECONDS = 75
+COMPACTION_KEYS = {"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
+                   "DISABLE_AUTO_COMPACT", "DISABLE_COMPACT"}
 # A one-shot headless run with the Telegram plugin inert: the same shape the
 # healthcheck uses, so the poller is never disturbed. The API answers with the
 # provider's own words when this CLI build does not know the identifier.
@@ -20,7 +27,7 @@ PROBE_ENV_INERT = "ATARAX_SUPPRESS_TELEGRAM"
 MODEL_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:\-\[\]]{0,79}")
 SHELL_MUTATION_RE = re.compile(
     r"(?<![0-9&])>>?(?!&)|"
-    r"\b(?:tee|truncate|rm|mv|cp|ln|link|unlink|install|touch|dd|sponge|shred)\b|"
+    r"\b(?:tee|truncate|rm|mv|cp|ln|link|unlink|install|touch|dd|sponge|shred|chmod|chown|chgrp|setfacl)\b|"
     r"\bsed\s+(?:-[A-Za-z]*i|--in-place)\b|"
     r"\bperl\s+-[A-Za-z]*i\b|"
     r"\bjq\b|\bpython3?\b",
@@ -72,7 +79,7 @@ def probe(model: str) -> tuple[bool, str]:
         return False, f"the probe could not start: {error}"
     if run.returncode == 0:
         return True, ""
-    detail = " ".join((run.stderr or run.stdout or "").split())[-240:]
+    detail = " ".join((run.stderr or run.stdout or "").split())  # whole (owner, 23.10.2026)
     return False, detail or f"exit {run.returncode}"
 
 
@@ -106,6 +113,47 @@ def model_of(text: str) -> tuple[bool, object]:
     return True, data.get("model") if isinstance(data, dict) else None
 
 
+def protected_files(settings: dict) -> set[Path]:
+    files = {HOME / "bin" / name for name in (
+        "claude-telegram-bot", "settings-model-guard", "no-nested-claude-guard",
+    )}
+    files.add(HOME / ".claude/state/no-nested-claude-guard.bypass")
+    hooks = settings.get("hooks") or {}
+    if isinstance(hooks, dict):
+        for groups in hooks.values():
+            for group in groups if isinstance(groups, list) else []:
+                for hook in group.get("hooks", []) if isinstance(group, dict) else []:
+                    if not isinstance(hook, dict) or hook.get("type") != "command":
+                        continue
+                    try:
+                        tokens = shlex.split(hook.get("command", ""))
+                    except (ValueError, TypeError):
+                        continue
+                    for token in tokens:
+                        path = normalize_path(token)
+                        if path and path.is_relative_to(HOME / "bin"):
+                            files.add(path)
+    return {path.resolve() for path in files}
+
+
+def mechanics_error(old: dict, new: dict) -> str | None:
+    if new.get("disableAllHooks") and not old.get("disableAllHooks"):
+        return "Installed hooks must remain enabled."
+    before, after = old.get("hooks") or {}, new.get("hooks") or {}
+    if not isinstance(after, dict) or not isinstance(before, dict):
+        return "Hooks must remain an object."
+    for event, groups in before.items():
+        proposed = after.get(event, [])
+        if not isinstance(proposed, list) or any(group not in proposed for group in groups):
+            return "Installed hooks cannot be removed or rewritten from an agent turn."
+    before_env, after_env = old.get("env") or {}, new.get("env") or {}
+    if not isinstance(after_env, dict) or not isinstance(before_env, dict):
+        return "Settings env must remain an object."
+    if any(before_env.get(key) != after_env.get(key) for key in COMPACTION_KEYS):
+        return "Compaction settings are maintained by the installer, not agent turns."
+    return None
+
+
 def main() -> None:
     try:
         payload = json.load(sys.stdin)
@@ -116,6 +164,15 @@ def main() -> None:
     tool_input = payload.get("tool_input") or {}
     if not isinstance(tool_input, dict):
         return
+
+    try:
+        current = SETTINGS_PATH.read_text(encoding="utf-8")
+        settings = json.loads(current)
+        if not isinstance(settings, dict):
+            settings = {}
+    except (OSError, ValueError):
+        current, settings = "", {}
+    protected = protected_files(settings)
 
     if tool_name == "Bash":
         command = str(tool_input.get("command") or "")
@@ -128,6 +185,13 @@ def main() -> None:
             normalize_path(token) == SETTINGS_PATH
             for token in re.findall(r"[\w./~$-]*\.claude/settings\.json\b", normalized)
         )
+        references_runtime = any(
+            normalize_path(token) in protected
+            for token in re.findall(r"[\w./~$-]+", normalized)
+        )
+        if references_runtime and SHELL_MUTATION_RE.search(normalized):
+            block("Runtime launchers and installed hooks require operator maintenance; an agent turn cannot rewrite or disable them.")
+            return
         if references_settings and SHELL_MUTATION_RE.search(normalized):
             block(
                 "Shell mutation of settings.json is disabled. Change it with the Edit "
@@ -138,19 +202,26 @@ def main() -> None:
 
     if tool_name not in {"Edit", "Write", "MultiEdit"}:
         return
-    if normalize_path(tool_input.get("file_path") or tool_input.get("path")) != SETTINGS_PATH:
+    target = normalize_path(tool_input.get("file_path") or tool_input.get("path"))
+    if target in protected:
+        block("Runtime launchers and installed hooks require operator maintenance; an agent turn cannot rewrite or disable them.")
         return
-
-    try:
-        current = SETTINGS_PATH.read_text(encoding="utf-8")
-    except OSError:
-        current = ""
+    if target != SETTINGS_PATH:
+        return
     text = proposed_text(tool_name, tool_input, current)
     if text is None:
         return
     valid, new_model = model_of(text)
     if not valid:
         block(f"settings.json must remain valid JSON after the change: {new_model}")
+        return
+    proposed = json.loads(text)
+    if not isinstance(proposed, dict):
+        block("settings.json must remain a JSON object.")
+        return
+    error = mechanics_error(settings, proposed)
+    if error:
+        block(error)
         return
     _, old_model = model_of(current) if current else (True, None)
     if new_model is None or new_model == old_model:

@@ -1,0 +1,989 @@
+{
+  "schemaVersion": 1,
+  "source": "canonical origin release tags reachable from origin/main",
+  "releases": [
+    {
+      "tag": "release/2026-08-15.9c7da51afd24",
+      "revision": "9c7da51afd24c2602b06902477a9791f7ce3efd2"
+    },
+    {
+      "tag": "release/2026-08-16.f5345b66361d",
+      "revision": "f5345b66361d35164fc7b2a29ee29d44c0151d82"
+    },
+    {
+      "tag": "release/2026-08-17.127b582d5ecd",
+      "revision": "127b582d5ecdec73f619e7883f17ef2b8949baac"
+    },
+    {
+      "tag": "release/2026-08-17.13e42e681369",
+      "revision": "13e42e681369e68679965c195ebb7a16444d1a96"
+    },
+    {
+      "tag": "release/2026-08-17.2e3ace63722e",
+      "revision": "2e3ace63722e5a19bb3450f6c5ab510bf7f2dc7e"
+    },
+    {
+      "tag": "release/2026-08-17.6aa6848fefb9",
+      "revision": "6aa6848fefb93845323a9b4c588659b77c6c0829"
+    },
+    {
+      "tag": "release/2026-08-17.a83a7a34790b",
+      "revision": "a83a7a34790bc9830431e1f5d16632f52d1b3dc3"
+    },
+    {
+      "tag": "release/2026-08-17.aabfb1d4aa30",
+      "revision": "aabfb1d4aa30ab2926f9d37c4074c7a18ef3fc02"
+    },
+    {
+      "tag": "release/2026-08-17.ee86d5b78858",
+      "revision": "ee86d5b78858e36d621d10c64a2945ebb377b0cb"
+    },
+    {
+      "tag": "release/2026-08-17.f5fedcdc4bf5",
+      "revision": "f5fedcdc4bf53898b6acd6b374d0d634b3331228"
+    },
+    {
+      "tag": "release/2026-08-18.1be619aa607a",
+      "revision": "1be619aa607af2ee56f4eb7639071f788991901b"
+    },
+    {
+      "tag": "release/2026-08-18.54bf66808640",
+      "revision": "54bf6680864005bae9fbfbe3bf00fc52a51882ef"
+    },
+    {
+      "tag": "release/2026-08-18.d1b5c02cf634",
+      "revision": "d1b5c02cf634ece0dc49a309020f184225498f80"
+    },
+    {
+      "tag": "release/2026-08-19.4f5079119fd7",
+      "revision": "4f5079119fd7262dda4502b67891ccae62ec46cd"
+    },
+    {
+      "tag": "release/2026-08-19.9ee8ed27d561",
+      "revision": "9ee8ed27d561d44a169c03a14a3016b118317c08"
+    },
+    {
+      "tag": "release/2026-08-19.a5da069a9c55",
+      "revision": "a5da069a9c555d9298127a5198a8b3bd701288dc"
+    },
+    {
+      "tag": "release/2026-08-19.b75850ab42d6",
+      "revision": "b75850ab42d67d42b96ea369e702f5b98a539db2"
+    },
+    {
+      "tag": "release/2026-08-19.bb0c9b2fb730",
+      "revision": "bb0c9b2fb730f6c340f77ae73b27e9f0e7b65c6e"
+    },
+    {
+      "tag": "release/2026-08-19.c0449df9717d",
+      "revision": "c0449df9717d6e465f73dcdeb9d0387b212f33f2"
+    },
+    {
+      "tag": "release/2026-08-20.1e330e2c7367",
+      "revision": "1e330e2c73673035637dc762f24dbb2a76898456"
+    },
+    {
+      "tag": "release/2026-08-20.2253defffec9",
+      "revision": "2253defffec96d7ed8b3ca545b9fd4b374573d6b"
+    },
+    {
+      "tag": "release/2026-08-20.24a57fb75fe5",
+      "revision": "24a57fb75fe547824c0f7dd74f86902b81bc9c6e"
+    },
+    {
+      "tag": "release/2026-08-20.9c2520d94c92",
+      "revision": "9c2520d94c92f8a13a865f7a3f04790426a41d42"
+    },
+    {
+      "tag": "release/2026-08-20.dc62cd092663",
+      "revision": "dc62cd0926631dc21100126073878d13aeaf4538"
+    },
+    {
+      "tag": "release/2026-08-21.6c9b82d031ce",
+      "revision": "6c9b82d031cee6a3dbac9fc4413afbec4e69751b"
+    },
+    {
+      "tag": "release/2026-08-21.b03dc51f2fc1",
+      "revision": "b03dc51f2fc18d350b872c5d894528123690affc"
+    },
+    {
+      "tag": "release/2026-08-22.5cff0a7dfb44",
+      "revision": "5cff0a7dfb4440260d431cf6703ac8f9adea7bca"
+    },
+    {
+      "tag": "release/2026-08-24.cd9a9e18a977",
+      "revision": "cd9a9e18a9777bbfd9ce3dc2fd96316614dae8a9"
+    },
+    {
+      "tag": "release/2026-08-25.f5e8add775e7",
+      "revision": "f5e8add775e7ad4b00977268cc76e0bf559e87d6"
+    },
+    {
+      "tag": "release/2026-08-26.a2996bf8842d",
+      "revision": "a2996bf8842d0313ecd74f61de1f93fc86e57799"
+    },
+    {
+      "tag": "release/2026-08-27.1197e8115e61",
+      "revision": "1197e8115e61c669ab5e439094d9264c22569899"
+    },
+    {
+      "tag": "release/2026-08-27.134375d501b6",
+      "revision": "134375d501b68e67727acd140e2d87cd1367c3d5"
+    },
+    {
+      "tag": "release/2026-08-27.36b79154b7a9",
+      "revision": "36b79154b7a93f2b01d4b8aec96b4a7b6b789ccc"
+    },
+    {
+      "tag": "release/2026-08-27.75f4be19f9cb",
+      "revision": "75f4be19f9cbac7596768afd15651d90ab0c62da"
+    },
+    {
+      "tag": "release/2026-08-27.7ca0637ebe47",
+      "revision": "7ca0637ebe4797b7d31ac66abad3647692905493"
+    },
+    {
+      "tag": "release/2026-08-27.9c7c76c95e61",
+      "revision": "9c7c76c95e6183bfa3e45d517abd7506453c867d"
+    },
+    {
+      "tag": "release/2026-08-27.a0277813fa0d",
+      "revision": "a0277813fa0d412cb9713e410eda253c3b31cf17"
+    },
+    {
+      "tag": "release/2026-08-27.aa48903ef82e",
+      "revision": "aa48903ef82e997aa801d92c32fe0fa0862506c7"
+    },
+    {
+      "tag": "release/2026-08-27.f09374a441fb",
+      "revision": "f09374a441fb31d27e22d9cd5543148fc90e90ca"
+    },
+    {
+      "tag": "release/2026-08-29.521a3aaa9156",
+      "revision": "521a3aaa915663a6f322c841e23cb10ad80d9d93"
+    },
+    {
+      "tag": "release/2026-08-29.a28c8e5fc944",
+      "revision": "a28c8e5fc94488a5b9f1ac094a2e5b8960a6b229"
+    },
+    {
+      "tag": "release/2026-08-30.078734186d1f",
+      "revision": "078734186d1f99db433b9b2598cdbd442d13fed7"
+    },
+    {
+      "tag": "release/2026-08-30.3dd908cd4e1e",
+      "revision": "3dd908cd4e1e167fe5a033e8c134a4b7c6f15c01"
+    },
+    {
+      "tag": "release/2026-08-30.77916e6d16da",
+      "revision": "77916e6d16da6674c0882ee7d33e5b5977491599"
+    },
+    {
+      "tag": "release/2026-08-30.a990b0dfcdfb",
+      "revision": "a990b0dfcdfbcd44a7280ec9fdac8601f6c9db9b"
+    },
+    {
+      "tag": "release/2026-08-31.a5a9aadd0f99",
+      "revision": "a5a9aadd0f991245b13dc1e42de18d528f890165"
+    },
+    {
+      "tag": "release/2026-09-01.50b53dc44c0e",
+      "revision": "50b53dc44c0edb46f0ae3f65d331515fea4dad52"
+    },
+    {
+      "tag": "release/2026-09-01.592ff8480bfc",
+      "revision": "592ff8480bfcc7dd40aa03d42383418cf64fa614"
+    },
+    {
+      "tag": "release/2026-09-01.9155a49d122d",
+      "revision": "9155a49d122dea8f8c1b828124e281d61c7961a8"
+    },
+    {
+      "tag": "release/2026-09-01.96aae1d07de2",
+      "revision": "96aae1d07de244be4f9d400182ac1cebdad85f21"
+    },
+    {
+      "tag": "release/2026-09-01.c0ae75703ac5",
+      "revision": "c0ae75703ac563848fd3214e97b4e6a911938060"
+    },
+    {
+      "tag": "release/2026-09-01.e66f335067ac",
+      "revision": "e66f335067ac59908e4dd84b6f1edd1eead17325"
+    },
+    {
+      "tag": "release/2026-09-02.4578e275653c",
+      "revision": "4578e275653c627e1402294dc629db9bf4ff63be"
+    },
+    {
+      "tag": "release/2026-09-02.4aee11a2bbb2",
+      "revision": "4aee11a2bbb2fe798f3955b4ae75b4c843826885"
+    },
+    {
+      "tag": "release/2026-09-02.4eaac1f77d0c",
+      "revision": "4eaac1f77d0ca1de8d47e38118aedbf8a9586ada"
+    },
+    {
+      "tag": "release/2026-09-02.547a0b76dd74",
+      "revision": "547a0b76dd748e5e54db94f20a6336914c392ab3"
+    },
+    {
+      "tag": "release/2026-09-02.565ec30a1f13",
+      "revision": "565ec30a1f131b3b70b845c90dc04399ee04cc94"
+    },
+    {
+      "tag": "release/2026-09-03.95a9589a800a",
+      "revision": "95a9589a800a15651a80b6e63d5fb7c6a8fe6bd7"
+    },
+    {
+      "tag": "release/2026-09-04.3cec55693227",
+      "revision": "3cec556932273b52d9e8b1fe59842ab8fc2c0332"
+    },
+    {
+      "tag": "release/2026-09-05.0ad613b97af6",
+      "revision": "0ad613b97af610369983dab64d6c483b5f805dec"
+    },
+    {
+      "tag": "release/2026-09-05.38f83e150bc8",
+      "revision": "38f83e150bc8901331f52af66adfba50f978aa36"
+    },
+    {
+      "tag": "release/2026-09-05.5835516801e8",
+      "revision": "5835516801e8e1ff86b9ae4e751c519bb0d5b8db"
+    },
+    {
+      "tag": "release/2026-09-05.5cba9fa36f80",
+      "revision": "5cba9fa36f80fbc0eb7d2822ccaab923bb6c73bc"
+    },
+    {
+      "tag": "release/2026-09-05.86ce34babf22",
+      "revision": "86ce34babf221081e5ec7fa94a4f813451bc5c39"
+    },
+    {
+      "tag": "release/2026-09-05.99ea25f7a8c7",
+      "revision": "99ea25f7a8c7d97b58ad49272e1479c0e94fe737"
+    },
+    {
+      "tag": "release/2026-09-05.cb4348270e9a",
+      "revision": "cb4348270e9a3a2269c94aaa524e3fc5e1dc90a0"
+    },
+    {
+      "tag": "release/2026-09-05.f641bd0b0cf3",
+      "revision": "f641bd0b0cf3962d81361eaafce810a3c7a98460"
+    },
+    {
+      "tag": "release/2026-09-06.5acdc95b081a",
+      "revision": "5acdc95b081af007e249428dfca86dfe4895be92"
+    },
+    {
+      "tag": "release/2026-09-06.7b2ee7576258",
+      "revision": "7b2ee757625859758e82dded46f97aede51fd682"
+    },
+    {
+      "tag": "release/2026-09-06.aea7eb7c4e55",
+      "revision": "aea7eb7c4e55468f33c97668133cc7b4c7ca5d49"
+    },
+    {
+      "tag": "release/2026-09-06.fcc6bcef3b04",
+      "revision": "fcc6bcef3b04df7462c562626e2c1680fcdcb5a2"
+    },
+    {
+      "tag": "release/2026-09-07.274439d062fa",
+      "revision": "274439d062fa667b5abaf5b38b155df3bfee9d82"
+    },
+    {
+      "tag": "release/2026-09-07.cf3e7a1712e5",
+      "revision": "cf3e7a1712e509ccdf7ce066ed9c85238087a2b3"
+    },
+    {
+      "tag": "release/2026-09-07.e448ffa328ee",
+      "revision": "e448ffa328ee5ce64b435b9a9b5a1cbdab0e2db9"
+    },
+    {
+      "tag": "release/2026-09-07.edc69754f9f2",
+      "revision": "edc69754f9f204220290c8589bfbe6deb4cbfdb1"
+    },
+    {
+      "tag": "release/2026-09-07.f23ffc1c4f9f",
+      "revision": "f23ffc1c4f9fb009863d7bc4eb0fe170334b6120"
+    },
+    {
+      "tag": "release/2026-09-08.c7fa3b9e2616",
+      "revision": "c7fa3b9e26160792235eb59e4f272c3414bf761d"
+    },
+    {
+      "tag": "release/2026-09-09.c9803b088655",
+      "revision": "c9803b0886554cf741b7d3099aab04b559605422"
+    },
+    {
+      "tag": "release/2026-09-10.17b2b6e27fd5",
+      "revision": "17b2b6e27fd512cece894b25e42b236f8d24cd3b"
+    },
+    {
+      "tag": "release/2026-09-10.bdf5de7af86e",
+      "revision": "bdf5de7af86e6fe6e979f1aef2ef6feb1b34f4e8"
+    },
+    {
+      "tag": "release/2026-09-10.f76f6dbccf8d",
+      "revision": "f76f6dbccf8d53d86ab7d28d657e0b470936deac"
+    },
+    {
+      "tag": "release/2026-09-11.54c59b7191e2",
+      "revision": "54c59b7191e2b1303f025534f6be62b605d91962"
+    },
+    {
+      "tag": "release/2026-09-12.12047fa16636",
+      "revision": "12047fa166368b7a28c33db75a527ae95a1d534b"
+    },
+    {
+      "tag": "release/2026-09-12.4cf9282f659d",
+      "revision": "4cf9282f659d0e107061ff98007e15a177c28e91"
+    },
+    {
+      "tag": "release/2026-09-12.4da752c3b354",
+      "revision": "4da752c3b354c86785fbf08541d5ddc6dfb264d6"
+    },
+    {
+      "tag": "release/2026-09-12.64ad5ed5e246",
+      "revision": "64ad5ed5e246667c6ed27954a41ec9cd3e306df9"
+    },
+    {
+      "tag": "release/2026-09-12.937691f7f300",
+      "revision": "937691f7f3000c0c38ec71dbf8189e48fe2e3242"
+    },
+    {
+      "tag": "release/2026-09-13.074a96b4ced5",
+      "revision": "074a96b4ced5bbb80bf3122ac2061e9993791c42"
+    },
+    {
+      "tag": "release/2026-09-13.23b78d03e2b9",
+      "revision": "23b78d03e2b97012bd37a33d521033dbfb5280e3"
+    },
+    {
+      "tag": "release/2026-09-13.4abd5b2e0721",
+      "revision": "4abd5b2e07214f4a5dfceb6df25305b2f056cfd0"
+    },
+    {
+      "tag": "release/2026-09-13.fbe9016f409f",
+      "revision": "fbe9016f409f87e841255713ce059fa28d786658"
+    },
+    {
+      "tag": "release/2026-09-14.0be9250daccb",
+      "revision": "0be9250daccbf1b8bf88f082fc2f73e6d6d25788"
+    },
+    {
+      "tag": "release/2026-09-14.782db45f006b",
+      "revision": "782db45f006bf01329a92626436c3e25ce6c777b"
+    },
+    {
+      "tag": "release/2026-09-14.d279ed561df8",
+      "revision": "d279ed561df8feca49ce5c2e675ab1ba28ff2ca1"
+    },
+    {
+      "tag": "release/2026-09-15.72167a7b740c",
+      "revision": "72167a7b740c48629c3e7bcb1e3414de88caaaae"
+    },
+    {
+      "tag": "release/2026-09-15.77eec4e165c6",
+      "revision": "77eec4e165c65c45e4536d86448459cbc9957f86"
+    },
+    {
+      "tag": "release/2026-09-15.da164ee196ea",
+      "revision": "da164ee196ea34107bd3569a430f599f4bdae3ac"
+    },
+    {
+      "tag": "release/2026-09-15.e85de62f44dd",
+      "revision": "e85de62f44dd3087051c76692063090279b879c4"
+    },
+    {
+      "tag": "release/2026-09-16.1a506af77ba1",
+      "revision": "1a506af77ba1440b43f11849c70c647456be4f3d"
+    },
+    {
+      "tag": "release/2026-09-16.4477ab50e425",
+      "revision": "4477ab50e42576912d65a76685010723f15cbae1"
+    },
+    {
+      "tag": "release/2026-09-16.4d220dad8827",
+      "revision": "4d220dad8827b8e17e4b48fd3f409c4ec0aed340"
+    },
+    {
+      "tag": "release/2026-09-16.6d9cf0a14e2c",
+      "revision": "6d9cf0a14e2c750e6aac85f89ead6ebf62e6cc1d"
+    },
+    {
+      "tag": "release/2026-09-16.82adaaf0c9c2",
+      "revision": "82adaaf0c9c2345d7510ffff603001f7f87250a5"
+    },
+    {
+      "tag": "release/2026-09-16.c7464a3ed6ae",
+      "revision": "c7464a3ed6ae3a9a959d11e81ffc31699dfa98ca"
+    },
+    {
+      "tag": "release/2026-09-16.f25b62439b77",
+      "revision": "f25b62439b7780397c05a76c89f9ae7832403abb"
+    },
+    {
+      "tag": "release/2026-09-18.0d54f16ae520",
+      "revision": "0d54f16ae520a04663344f13e0c5d812ec08d52a"
+    },
+    {
+      "tag": "release/2026-09-18.bc4c61246d04",
+      "revision": "bc4c61246d042b87287eec2c483801b60645d37e"
+    },
+    {
+      "tag": "release/2026-09-19.099f2f489c1d",
+      "revision": "099f2f489c1ddb7d415ad00d6f9860e61cc4cf00"
+    },
+    {
+      "tag": "release/2026-09-19.1fa5eed0031e",
+      "revision": "1fa5eed0031efd1cc85ca382968fd14f4b4e75c9"
+    },
+    {
+      "tag": "release/2026-09-19.bc72fb4002e9",
+      "revision": "bc72fb4002e9470b93d05d634c857e42d093d945"
+    },
+    {
+      "tag": "release/2026-09-20.4e4592616fd3",
+      "revision": "4e4592616fd347e32415c729dd4a7181effab1f7"
+    },
+    {
+      "tag": "release/2026-09-20.f0758027af58",
+      "revision": "f0758027af58cb9625f373b829d0e47e94abffd8"
+    },
+    {
+      "tag": "release/2026-09-21.09b90a60fcee",
+      "revision": "09b90a60fcee66f670462f1a68a60b7b092c7441"
+    },
+    {
+      "tag": "release/2026-09-21.1abdf0eabb82",
+      "revision": "1abdf0eabb8279fafc5dc30c7be1f7014ada5978"
+    },
+    {
+      "tag": "release/2026-09-21.24aa21785302",
+      "revision": "24aa21785302ef8aa3acacbf61268c3d90de4fe7"
+    },
+    {
+      "tag": "release/2026-09-21.467fdbc78269",
+      "revision": "467fdbc782698aacece21baef4bf71a73b9af523"
+    },
+    {
+      "tag": "release/2026-09-21.46bd4fef8112",
+      "revision": "46bd4fef8112f5798a8bbee646888fbe9e2a2e1d"
+    },
+    {
+      "tag": "release/2026-09-21.82dc54db28f0",
+      "revision": "82dc54db28f00208bc925be781a9b44af91712b4"
+    },
+    {
+      "tag": "release/2026-09-21.8dfeb4eb2ab2",
+      "revision": "8dfeb4eb2ab2e70171a7ce6e72ccbfe136768557"
+    },
+    {
+      "tag": "release/2026-09-22.07fbc6c6bbf3",
+      "revision": "07fbc6c6bbf3da0ac09643d869a155f687f75fd4"
+    },
+    {
+      "tag": "release/2026-09-23.0f238690421d",
+      "revision": "0f238690421d766eb3a2634526f6dcc68fcd22b3"
+    },
+    {
+      "tag": "release/2026-09-23.2aaa8bf3ba36",
+      "revision": "2aaa8bf3ba36e07451948809be998be2ff75fba9"
+    },
+    {
+      "tag": "release/2026-09-23.49301bd8c62e",
+      "revision": "49301bd8c62ed1bbec94ae015da4047bf9d21f5e"
+    },
+    {
+      "tag": "release/2026-09-23.a94284836293",
+      "revision": "a942848362931350d3bc5c968008ba42cc3d457e"
+    },
+    {
+      "tag": "release/2026-09-23.c4fa5a862f27",
+      "revision": "c4fa5a862f27ef5d2463e198d9ab500d547a40fe"
+    },
+    {
+      "tag": "release/2026-09-23.e419629a9de0",
+      "revision": "e419629a9de0a92524802916fcdfb81d0c15f1ce"
+    },
+    {
+      "tag": "release/2026-09-23.ea8c78e6ac14",
+      "revision": "ea8c78e6ac14431a5b5c5bbfdfa18a2363c121d2"
+    },
+    {
+      "tag": "release/2026-09-30.5ebe8232a381",
+      "revision": "5ebe8232a3814ae7328dfa0879bac545af7bc9a4"
+    },
+    {
+      "tag": "release/2026-10-01.03f6e71697c7",
+      "revision": "03f6e71697c7ec7e11e6c2c78fb80c155976172a"
+    },
+    {
+      "tag": "release/2026-10-01.82c9478a66b6",
+      "revision": "82c9478a66b636e788c63cba3a6b3725becddfdd"
+    },
+    {
+      "tag": "release/2026-10-01.fd2d207295c7",
+      "revision": "fd2d207295c70c6af0c2340c6f31db0ee410bec5"
+    },
+    {
+      "tag": "release/2026-10-02.49ca2217008b",
+      "revision": "49ca2217008b6865cbd960895f728e36860f5617"
+    },
+    {
+      "tag": "release/2026-10-02.6d47f4ebd938",
+      "revision": "6d47f4ebd938c6a63815c198c9c3d69c6ebcab51"
+    },
+    {
+      "tag": "release/2026-10-02.6d90af302382",
+      "revision": "6d90af3023821eac20325c379f5ccb1c16531420"
+    },
+    {
+      "tag": "release/2026-10-02.d5de77b64edd",
+      "revision": "d5de77b64eddb45ba58fcb6c9f6adcae91ceefd0"
+    },
+    {
+      "tag": "release/2026-10-03.0934bd65c639",
+      "revision": "0934bd65c6390a98e4519810f8b951733e5457fc"
+    },
+    {
+      "tag": "release/2026-10-03.0eb968c7e098",
+      "revision": "0eb968c7e098d3d76834997410a7b4031bed1f00"
+    },
+    {
+      "tag": "release/2026-10-03.24a99e9132d0",
+      "revision": "24a99e9132d0423fba455e26d1eadd6c3ee005e4"
+    },
+    {
+      "tag": "release/2026-10-03.5915a8958b0a",
+      "revision": "5915a8958b0a46c8708fb8b67b370cf24583c376"
+    },
+    {
+      "tag": "release/2026-10-03.ac5451dc50a1",
+      "revision": "ac5451dc50a1fd5e10d8109c6deef8655f3a9ef1"
+    },
+    {
+      "tag": "release/2026-10-03.bf3ac4233ee6",
+      "revision": "bf3ac4233ee6593de7a68e97cac8c8a712dbe901"
+    },
+    {
+      "tag": "release/2026-10-04.14f33c3b979d",
+      "revision": "14f33c3b979df828d2904b2fba656c4091ac24e8"
+    },
+    {
+      "tag": "release/2026-10-04.838821dd6c27",
+      "revision": "838821dd6c27223c5b608cb9016d63712f164b1f"
+    },
+    {
+      "tag": "release/2026-10-04.9f21f91661d7",
+      "revision": "9f21f91661d75fc5eef438c1f3fad97bee8f921c"
+    },
+    {
+      "tag": "release/2026-10-04.c03ffa290b23",
+      "revision": "c03ffa290b23022311cb80f545e667456bd57209"
+    },
+    {
+      "tag": "release/2026-10-05.ba472c164c50",
+      "revision": "ba472c164c5006b586a95f63e5aa679814eb953c"
+    },
+    {
+      "tag": "release/2026-10-05.e713d8c1e164",
+      "revision": "e713d8c1e164752f2ac56c1b5eaf36f833d23419"
+    },
+    {
+      "tag": "release/2026-10-06.10810bdc1c59",
+      "revision": "10810bdc1c59a25cb63f7c55cec2182b6603d24a"
+    },
+    {
+      "tag": "release/2026-10-06.1c1f9410fc43",
+      "revision": "1c1f9410fc43fd9b42ec443d80dcf62df108054c"
+    },
+    {
+      "tag": "release/2026-10-06.6a4a6ea373a2",
+      "revision": "6a4a6ea373a248d4eebc7dc5a7402d26497ca9e6"
+    },
+    {
+      "tag": "release/2026-10-06.77953fb2c023",
+      "revision": "77953fb2c0236da91222e698484bd6eb14667384"
+    },
+    {
+      "tag": "release/2026-10-06.77a4f4bb6c4f",
+      "revision": "77a4f4bb6c4fec6a6365d4d8cdcc5a87107e8006"
+    },
+    {
+      "tag": "release/2026-10-06.7dc1ca7fa710",
+      "revision": "7dc1ca7fa710f55aac7cbe61f9a30739d2934d92"
+    },
+    {
+      "tag": "release/2026-10-06.db3c2ca44015",
+      "revision": "db3c2ca440153785d8fd74515075765368416aa5"
+    },
+    {
+      "tag": "release/2026-10-06.db82be104338",
+      "revision": "db82be104338d9d908ec51f454f2138741e7929b"
+    },
+    {
+      "tag": "release/2026-10-06.f9af9160536a",
+      "revision": "f9af9160536ae24aef497ddc27a1a98883b8ce16"
+    },
+    {
+      "tag": "release/2026-10-07.1a7e11fc5517",
+      "revision": "1a7e11fc5517a21b21e7a545b88537dead136564"
+    },
+    {
+      "tag": "release/2026-10-07.614e32c5aef2",
+      "revision": "614e32c5aef2bcc2ceb32ea9149660b5ee0a5c62"
+    },
+    {
+      "tag": "release/2026-10-07.6fc0cf685384",
+      "revision": "6fc0cf68538478a760510826dc51682ba24b2458"
+    },
+    {
+      "tag": "release/2026-10-07.8b4e3d76c596",
+      "revision": "8b4e3d76c59671a41c59761d2ac0ed9ac04b2df8"
+    },
+    {
+      "tag": "release/2026-10-08.0969047fe7ab",
+      "revision": "0969047fe7ab94841902cb888133a9e70cfa4438"
+    },
+    {
+      "tag": "release/2026-10-08.1d016e42b046",
+      "revision": "1d016e42b046d1c4bd1c1bbf5c8c406eff89107d"
+    },
+    {
+      "tag": "release/2026-10-08.5fe5f57b6271",
+      "revision": "5fe5f57b6271b7b677ad1a1091e761b80216b365"
+    },
+    {
+      "tag": "release/2026-10-08.75e83b57ae1b",
+      "revision": "75e83b57ae1b2d31eafce588dadc69e1aacf4520"
+    },
+    {
+      "tag": "release/2026-10-08.d775015fb74e",
+      "revision": "d775015fb74ec0f3ee566393592ae53f7c1d0c57"
+    },
+    {
+      "tag": "release/2026-10-09.2b411fa683e6",
+      "revision": "2b411fa683e677f3fc00575d75e37f67a8c92478"
+    },
+    {
+      "tag": "release/2026-10-09.2fd10ccb4bba",
+      "revision": "2fd10ccb4bbad81206acf1489bf05acfcb78a27f"
+    },
+    {
+      "tag": "release/2026-10-09.9b5bf855a234",
+      "revision": "9b5bf855a2347f6b37581171b24d0ce733487ae6"
+    },
+    {
+      "tag": "release/2026-10-09.a3ac0b7d9429",
+      "revision": "a3ac0b7d942935d25a4322e53c3493ac2ebd8620"
+    },
+    {
+      "tag": "release/2026-10-10.049421c380c6",
+      "revision": "049421c380c669f2d9ccf7ecb36b45b838126f6f"
+    },
+    {
+      "tag": "release/2026-10-10.13657129c525",
+      "revision": "13657129c5258e50aaa78d2c354d7ecf2039cbc4"
+    },
+    {
+      "tag": "release/2026-10-10.3472e3d12bc7",
+      "revision": "3472e3d12bc7f80e9fa7157462027acf7e179232"
+    },
+    {
+      "tag": "release/2026-10-10.4457ad65d39c",
+      "revision": "4457ad65d39c06c20537f27062973513e23f494b"
+    },
+    {
+      "tag": "release/2026-10-10.56f00363199f",
+      "revision": "56f00363199f7ea3dcc56fcb06a08e760c677044"
+    },
+    {
+      "tag": "release/2026-10-10.5737e67c27e8",
+      "revision": "5737e67c27e8ff119c62d1fdd1a63c9f4b481fc8"
+    },
+    {
+      "tag": "release/2026-10-10.6d188dc952f5",
+      "revision": "6d188dc952f54a9a397ed5dbefbd32f5c23d9596"
+    },
+    {
+      "tag": "release/2026-10-10.9942ee19e2be",
+      "revision": "9942ee19e2be1019f5c703c9cd45d16d5182d8b2"
+    },
+    {
+      "tag": "release/2026-10-10.e18fe95ad6c1",
+      "revision": "e18fe95ad6c1981443371a90bb324226bd0236ef"
+    },
+    {
+      "tag": "release/2026-10-11.2cad19513301",
+      "revision": "2cad19513301dff76a63b5b10434fde732bcbbb4"
+    },
+    {
+      "tag": "release/2026-10-11.49ce47eb3d67",
+      "revision": "49ce47eb3d67f343f20f505a1891ee9b82096226"
+    },
+    {
+      "tag": "release/2026-10-11.4f3aba435983",
+      "revision": "4f3aba435983f453ee98fa778768c69467db7fc8"
+    },
+    {
+      "tag": "release/2026-10-11.570e87a90bba",
+      "revision": "570e87a90bbae2ce4a86b8d2af0c31132cb090c7"
+    },
+    {
+      "tag": "release/2026-10-11.693ecd3cab63",
+      "revision": "693ecd3cab63ea39225e82f24703973a94a842c1"
+    },
+    {
+      "tag": "release/2026-10-11.6fc7d3f10200",
+      "revision": "6fc7d3f102001ccf7497d00fabd204b87f7f468a"
+    },
+    {
+      "tag": "release/2026-10-11.77d99ccdfe12",
+      "revision": "77d99ccdfe120f0fb01444730eecbf31c3c023f7"
+    },
+    {
+      "tag": "release/2026-10-11.7cadae00dbce",
+      "revision": "7cadae00dbce45ea0d51c635dfe6445170ca97bd"
+    },
+    {
+      "tag": "release/2026-10-11.a4f4fe5d4c28",
+      "revision": "a4f4fe5d4c28e21102919d3cf6af3c6c63217f67"
+    },
+    {
+      "tag": "release/2026-10-11.be88bf4ca37c",
+      "revision": "be88bf4ca37cc9ebce683c76c22aa115c1d93802"
+    },
+    {
+      "tag": "release/2026-10-12.04b70f623f9a",
+      "revision": "04b70f623f9a1b6afd812518856ac770331d47ab"
+    },
+    {
+      "tag": "release/2026-10-12.14ef26b00b8e",
+      "revision": "14ef26b00b8ec27955111265be3822009b7dc512"
+    },
+    {
+      "tag": "release/2026-10-12.5231fff9ab05",
+      "revision": "5231fff9ab0521df0d022162544f0ada8b2fafc5"
+    },
+    {
+      "tag": "release/2026-10-12.9a6f57f9ef85",
+      "revision": "9a6f57f9ef8567e52a6da8398928b855604fd43b"
+    },
+    {
+      "tag": "release/2026-10-12.c569e83d8f8c",
+      "revision": "c569e83d8f8c714326f51825141d69a1bf22b239"
+    },
+    {
+      "tag": "release/2026-10-12.e146b6df34cf",
+      "revision": "e146b6df34cfc795fe1b1eae09521849a0bbcc68"
+    },
+    {
+      "tag": "release/2026-10-12.eb55e085a7ce",
+      "revision": "eb55e085a7ce37197373b0e337730f6a60c2e8fa"
+    },
+    {
+      "tag": "release/2026-10-13.1c8f18876153",
+      "revision": "1c8f18876153186d0ac62581cdaa46b9fe880b37"
+    },
+    {
+      "tag": "release/2026-10-13.5e887f226a61",
+      "revision": "5e887f226a617de4de2420aa978038838878691c"
+    },
+    {
+      "tag": "release/2026-10-13.954aa21ac111",
+      "revision": "954aa21ac111f1de62890f3f0ac180770bb315c0"
+    },
+    {
+      "tag": "release/2026-10-13.b0615d401774",
+      "revision": "b0615d40177419490e901f17dfbe7c415ddafc9e"
+    },
+    {
+      "tag": "release/2026-10-13.c2940bbeb450",
+      "revision": "c2940bbeb45067135704506483cd9b4eb33f898b"
+    },
+    {
+      "tag": "release/2026-10-13.cdf6201aa5ce",
+      "revision": "cdf6201aa5cee0993232adf8b2aebdb0d18b1433"
+    },
+    {
+      "tag": "release/2026-10-13.d43cffa358e6",
+      "revision": "d43cffa358e6b6259f06e380cdda4540e480c34f"
+    },
+    {
+      "tag": "release/2026-10-13.ea8928fb3995",
+      "revision": "ea8928fb399557aacfa47cb3330c347e13229bf2"
+    },
+    {
+      "tag": "release/2026-10-14.2e6733696561",
+      "revision": "2e6733696561a9daccc8a2b87a8545728963d6b3"
+    },
+    {
+      "tag": "release/2026-10-14.d0394f6cc835",
+      "revision": "d0394f6cc83554d8878bef03a28ae13a8a17e1ca"
+    },
+    {
+      "tag": "release/2026-10-14.d521386d1498",
+      "revision": "d521386d14980226bb426c103b78ddf934f29b20"
+    },
+    {
+      "tag": "release/2026-10-15.0c5c8ef155d3",
+      "revision": "0c5c8ef155d3b3f2b7578fde5d7254be0010ff66"
+    },
+    {
+      "tag": "release/2026-10-15.43e64facfff8",
+      "revision": "43e64facfff8753c37ebac017ff26c5d718b4a7d"
+    },
+    {
+      "tag": "release/2026-10-15.55b01e69bdb9",
+      "revision": "55b01e69bdb960e0bfa3efaebe442f11e8d2377b"
+    },
+    {
+      "tag": "release/2026-10-15.59193f281082",
+      "revision": "59193f281082705d09c271a92730dcbed38e0c96"
+    },
+    {
+      "tag": "release/2026-10-15.61dc662f238a",
+      "revision": "61dc662f238a5c5799bb4ca3f311ca8fd18a2a4b"
+    },
+    {
+      "tag": "release/2026-10-15.66d15e2fed0b",
+      "revision": "66d15e2fed0b643a650211bfdfb661628de3ade9"
+    },
+    {
+      "tag": "release/2026-10-15.67657c6b627d",
+      "revision": "67657c6b627d4ae0165b7e2b449e022460eee955"
+    },
+    {
+      "tag": "release/2026-10-15.f719a9512fdf",
+      "revision": "f719a9512fdfc777e2a7b307090b4eca178c2d45"
+    },
+    {
+      "tag": "release/2026-10-16.2f7e52acce2b",
+      "revision": "2f7e52acce2b818b4c41cf5c68a924480fa29e47"
+    },
+    {
+      "tag": "release/2026-10-16.407d4fc9ae8b",
+      "revision": "407d4fc9ae8b854ab0f6679bac4c07dd5d2c6aec"
+    },
+    {
+      "tag": "release/2026-10-16.839694ccacb7",
+      "revision": "839694ccacb776b66b322e72c10ba343e42465d9"
+    },
+    {
+      "tag": "release/2026-10-16.841949b880e6",
+      "revision": "841949b880e615f7746245cc3f7f1e82abca062b"
+    },
+    {
+      "tag": "release/2026-10-16.c6d874fe27af",
+      "revision": "c6d874fe27af3889c508e44f436046b8544fb9fe"
+    },
+    {
+      "tag": "release/2026-10-17.0d91093b7602",
+      "revision": "0d91093b76022159184c380eabe99d7636775eef"
+    },
+    {
+      "tag": "release/2026-10-17.7824553f2b29",
+      "revision": "7824553f2b294a2cf489021f7ee7e70ed990b5b7"
+    },
+    {
+      "tag": "release/2026-10-17.8b71fb6e7c5d",
+      "revision": "8b71fb6e7c5d352b8445640231aa225b44965bdc"
+    },
+    {
+      "tag": "release/2026-10-17.e2b4045662d2",
+      "revision": "e2b4045662d200252a3bc611b290c694a14a6313"
+    },
+    {
+      "tag": "release/2026-10-18.037296330d40",
+      "revision": "037296330d40dd8e776e6cf258519209383e3658"
+    },
+    {
+      "tag": "release/2026-10-18.49b2330c591d",
+      "revision": "49b2330c591dca9819be07e303141c38890890f8"
+    },
+    {
+      "tag": "release/2026-10-18.5619e7f0e3a0",
+      "revision": "5619e7f0e3a048ba50f7e602a6f2e01ed5c886d0"
+    },
+    {
+      "tag": "release/2026-10-18.ec5859a04415",
+      "revision": "ec5859a0441546da5ada6d179717772b92140de9"
+    },
+    {
+      "tag": "release/2026-10-19.b4f564d7c74b",
+      "revision": "b4f564d7c74b197e537844ac550a8229962d1f0a"
+    },
+    {
+      "tag": "release/2026-10-20.233c5f23845e",
+      "revision": "233c5f23845e787a282ec712126b152fab1b43d2"
+    },
+    {
+      "tag": "release/2026-10-20.bebdcf1a32cf",
+      "revision": "bebdcf1a32cfd8a6911eec3f1cccb7e39ce84862"
+    },
+    {
+      "tag": "release/2026-10-20.fcb527aab951",
+      "revision": "fcb527aab951ef384418b343b21b29200b53e0c1"
+    },
+    {
+      "tag": "release/2026-10-21.518a6c7fe577",
+      "revision": "518a6c7fe577e8530cc9c94962799524b4700236"
+    },
+    {
+      "tag": "release/2026-10-21.a8a197713229",
+      "revision": "a8a1977132296a3e250a18dc0fcadb0e17f9531e"
+    },
+    {
+      "tag": "release/2026-10-21.aeb525f5ec73",
+      "revision": "aeb525f5ec73f64bd8e797fd53b5108f2eff4780"
+    },
+    {
+      "tag": "release/2026-10-21.d72bac34496d",
+      "revision": "d72bac34496ddb9e14c1533558b576349b89aa10"
+    },
+    {
+      "tag": "release/2026-10-22.1740399352cf",
+      "revision": "1740399352cfd9fd31c5451dc55a3fa0ef0b4c5d"
+    },
+    {
+      "tag": "release/2026-10-22.1cf89bec8f6a",
+      "revision": "1cf89bec8f6abb029d93076586847b44435998cc"
+    },
+    {
+      "tag": "release/2026-10-22.25c55480c9c7",
+      "revision": "25c55480c9c7e3d63f269189d31eeec7b01020f2"
+    },
+    {
+      "tag": "release/2026-10-22.96e953548c6c",
+      "revision": "96e953548c6c44446d178f80469de7e6a2874ee9"
+    },
+    {
+      "tag": "release/2026-10-22.c62f7dad72fb",
+      "revision": "c62f7dad72fb9435004192a187b471a6c3744082"
+    },
+    {
+      "tag": "release/2026-10-22.d6bb1c15804e",
+      "revision": "d6bb1c15804e2599b58fb46a31a471408a026d33"
+    },
+    {
+      "tag": "release/2026-10-22.de76853ea0d0",
+      "revision": "de76853ea0d064437f22b70c795c71b998f81bf6"
+    },
+    {
+      "tag": "release/2026-10-22.fdde5c55d90e",
+      "revision": "fdde5c55d90ef40b770266f4b6e081fbb218d032"
+    },
+    {
+      "tag": "release/2026-10-23.83b9f17c4397",
+      "revision": "83b9f17c4397cf808daf64330271f9bc37d74eb2"
+    },
+    {
+      "tag": "release/2026-10-23.a8edb898ce62",
+      "revision": "a8edb898ce6285ca40de34d8169cb7735b25ec6f"
+    }
+  ],
+  "paths": 134,
+  "variants": 637,
+  "catalogSha256": "fda564a4fa10643621b3e38460ad3c7ce8856eb10e1fe62b063f8af445b77c7a"
+}

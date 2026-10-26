@@ -19,6 +19,47 @@ PACKAGES=(
   python3 python3-pip python3-venv python3-numpy pipx unzip sudo cron
 )
 
+# Exact shared-library prerequisites of pinned Playwright Chromium. This is the
+# fresh-host stage, before agent services; selected browser setup never runs apt.
+browser_prerequisite_packages() {
+  BROWSER_PACKAGES=(nftables socat fonts-liberation fonts-noto-color-emoji
+    libcairo2 libdbus-1-3 libdrm2 libgbm1 libnspr4 libnss3 libpango-1.0-0
+    libx11-6 libxcb1 libxcomposite1 libxdamage1 libxext6 libxfixes3 libxkbcommon0 libxrandr2)
+  case "$1:$2" in
+    ubuntu:24.04|ubuntu:26.04) BROWSER_PACKAGES+=(libasound2t64 libatk-bridge2.0-0t64 libatk1.0-0t64
+      libatspi2.0-0t64 libcups2t64 libglib2.0-0t64) ;;
+    ubuntu:22.04) BROWSER_PACKAGES+=(libasound2 libatk-bridge2.0-0 libatk1.0-0
+      libatspi2.0-0 libcups2 libglib2.0-0 libwayland-client0) ;;
+    *) echo 'FATAL: browser prerequisites support Ubuntu 22.04/24.04/26.04 only' >&2; return 1 ;;
+  esac
+}
+
+host_has_agent_units() {
+  local unit
+  for unit in /etc/systemd/system/claude-telegram*.service /usr/lib/systemd/system/claude-telegram*.service \
+              /lib/systemd/system/claude-telegram*.service /run/systemd/system/claude-telegram*.service; do
+    if [ -e "$unit" ] || [ -L "$unit" ]; then return 0; fi
+  done
+  return 1
+}
+
+check_browser_host_prerequisites() {
+  local package
+  if host_has_agent_units; then
+    for package in "${BROWSER_PACKAGES[@]}"; do
+      if ! dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -q '^install ok installed$'; then
+        echo 'FATAL: browser host prerequisites are missing on a host with agents; use separate host maintenance, not selected-agent setup' >&2
+        return 1
+      fi
+    done
+  fi
+}
+
+. /etc/os-release
+browser_prerequisite_packages "${ID:-}" "${VERSION_ID:-}"
+check_browser_host_prerequisites
+PACKAGES+=("${BROWSER_PACKAGES[@]}")
+
 packages_to_install=()
 for package in "${PACKAGES[@]}"; do
   dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -q '^install ok installed$' \

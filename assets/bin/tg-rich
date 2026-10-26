@@ -129,7 +129,7 @@ def main(argv):
         except OSError:
             pass
     out = r.stdout.strip()
-    print(out[:2000])
+    print(out)  # whole (owner, 23.10.2026): Telegram's answer, cut at 2 000, lost its end
     try:
         response = json.loads(out)
     except (ValueError, UnicodeError):

@@ -49,7 +49,22 @@ END='\nEND_ANSWER_CONTEXT'
 # source-bound disposition for these direct imperatives, including one-off or
 # ambiguous cases. Quoted/forwarded text never obtains owner authority.
 RULE_INSTRUCTION=re.compile(r'(?im)^\s*(?:(?:пожалуйста|будь ласка|please|proszę)[, :]+)?(?:запомни|запам[’\'ʼ]?ятай|пам[’\'ʼ]?ятай|отныне|відтепер|впредь|надалі|всегда|завжди|никогда|ніколи|remember|from now on|always|never|zawsze|nigdy|zapamiętaj|запиши.{0,30}(?:правил\w*|постійн\w*)|збережи.{0,30}правил\w*)\b')
-RULE_SAVED=re.compile(r'(?i)(?:правил.{0,50}(?:сохран|запис|онов|обнов|збереж|зберіг|зберег)|(?:сохран|запис|онов|обнов|збереж|зберіг|зберег).{0,50}правил|запомнил|запам[’\'ʼ]?ятав|(?:saved|updated).{0,40}rule|zapis.{0,40}zasad)')
+# An answer saying a standing rule was saved needs an applied receipt. «Запомнил» alone also confirms a fact kept in memory
+# (root, natural memory 24.10.2026: a fact saved and recorded not_rule could never be confirmed): it claims a rule only
+# beside a rule word or a «from now on».
+REMEMBERED=r'(?:запомн(?:ил|ен|ю)|запам[’\'ʼ]?ят(?:ав|ал|аю|ован))'
+SAVED=r'(?:сохран|запис|онов|обнов|збереж|зберіг|зберег|'+REMEMBERED+')'
+RULE_SAVED=re.compile(r'(?i)(?:правил.{0,50}'+SAVED+'|'+SAVED+r'.{0,50}правил|'+REMEMBERED
+                      +r'.{0,50}(?:отныне|впредь|відтепер|надалі|(?:всегда|завжди) буду|буду (?:всегда|завжди))'
+                      r'|(?:saved|updated|remembered).{0,40}rule|rule.{0,40}(?:saved|updated|remembered)|zapis.{0,40}zasad|zasad.{0,40}zapis)')
+# «Запомнил как факт, а не как правило», «правило не сохранено», «not saved as a rule» deny a rule save: a negation on the
+# rule word or on its save verb takes that clause out of the claim check; any other «не» leaves it whole (root's review
+# of 8a13a58c).
+RULE_WORD=r'(?:правил|rule|zasad)\w*'
+AS_RULE=r'(?:(?:как|як|в виде|у вигляді|в качестве|у якості|as|a|an|jako)\s+)*(?:(?:постоянн|постійн|standing|permanent|stał)\w*\s+)?'+RULE_WORD
+NOT_RULE=re.compile(r'(?i)(?:'+RULE_WORD+r'\s+(?:(?:было|було|был|був|була|was|is|has|have|had|пока|поки|ещё|еще|ще|yet|still)\s*)*)?'
+                    r'(?:(?<![\w-])(?:не|ні|not|nie)|n[’\']t)\s+(?:'+AS_RULE+r'|(?:(?:было|було|был|був|була|been|została|zostało|został)\s+)?'
+                    r'(?:'+SAVED+r'|saved|updated|remembered|zapis)\w*(?:\s+'+AS_RULE+')?)')
 FALLBACK={
  'uk':'Перевірка правил і переписки ще не завершена. Виконання не підтверджую; уже зроблених дій не повторюю.',
  'ru':'Проверка правил и переписки ещё не завершена. Выполнение не подтверждаю; уже сделанные действия не повторяю.',
@@ -71,6 +86,26 @@ rules=load_rules()
 
 def canonical(value):return json.dumps(value,ensure_ascii=False,sort_keys=True,separators=(',',':'))
 def sha(value):return hashlib.sha256(value.encode()).hexdigest()
+
+
+def owner_dm_rule_projection(data, selected):
+    """Only the authenticated primary owner's DM can reuse a read; group membership epochs are not proved here."""
+    binding=data.get('binding') or {}
+    if (data.get('scope')!='owner' or data.get('readMode')=='scheduled' or binding.get('engine')!='claude'
+        or binding.get('threadId') is not None or not all(isinstance(binding.get(k),str) and binding[k]
+            for k in ('sessionId','generation','policyVersion','chatId','actorId'))):return None
+    try:owner=owner_id()
+    except (OSError,ValueError):return None
+    if binding['chatId']!=owner or binding['actorId']!=owner:return None
+    scope=f'chat:{owner}:0'
+    rows=[{k:r[k] for k in ('id','key','scope','text') if k in r} for r in selected['rules'] if r.get('scope')==scope]
+    return {'version':1,'scope':scope,'digest':sha(canonical(rows))} if rows else None
+
+
+def snapshot_digest(binding, revision, body, owner_chat_rules=None):
+    value={'binding':binding,'ruleRevision':revision,'body':body}
+    if owner_chat_rules is not None:value['ownerChatRules']=owner_chat_rules
+    return sha(canonical(value))
 
 
 def json_pages(text, budget):
@@ -161,7 +196,10 @@ def build_snapshot(data, page_size=PAGE_SIZE, full=False, host=False, seen=()):
             text=' '.join(r['text'].split());title=re.split(r' \(|: |«',text,maxsplit=1)[0]
             title=title if len(title)>=8 else text
             where='' if r.get('scope','owner')=='owner' else f"; scope={r.get('scope')}"
-            return f"[{r['id']}{where}] {title[:60]}"+('…' if len(title)>60 or len(title)<len(text) else '')
+            # A heading whole, or the rule's subject when the heading is long; never cut (owner, 23.10.2026). «…» marks
+            # that the rule goes on: read it by its ID.
+            shown=title if len(title)<=60 else (r.get('key') or r['id'])
+            return f"[{r['id']}{where}] {shown}"+('…' if shown!=text else '')
         groups={}
         for r in rest:groups.setdefault(topic_of(r),[]).append(r)
         if binding['engine']=='claude' and legacy:legacy={'ownerContext':legacy['ownerContext']} if legacy.get('ownerContext') else None
@@ -175,10 +213,16 @@ def build_snapshot(data, page_size=PAGE_SIZE, full=False, host=False, seen=()):
                        ' topic itself. '+SAVE_HOW+'\n'
                        +'\n'.join(f"## {name} ({len(rows)})\n"+'\n'.join(line(r) for r in rows) for name,rows in groups.items()))
     stable=rules_section+('\n\nOWNER CORE AND CONFIRMED CONTEXT (complete legacy text):\n'+canonical(legacy)+'\nKeep unrelated context. If an older conflicting rule lives outside the indexed section, reconcile that exact legacy text before saving the replacement, then re-read; never leave both versions active.\n' if legacy else '')
+    # A receipt is minted only by a self-contained full read, never an index or a reference to a previous read.
+    owner_chat_rules=owner_dm_rule_projection(data,selected) if not host and not indexed else None
     # The owner, 22.10.2026: the rules and messages an earlier turn read whole since the last compaction are still in
     # front of the agent; they are named here, not repeated. A changed rule set or a compaction brings them back in full.
     if seen and not host and not full:
-        if any(stable in text for text in seen):
+        # An old generation/policy read may still be visible but cannot authorize scoped reuse. Deliver the rules
+        # whole once to seed a current receipt. This turn's own read must not change its remaining pages/check digest.
+        if (any(stable in text for text in seen) and (owner_chat_rules is None or reads_before_answer()
+            or owner_dm_rules_read(data,earlier_only=True))):
+            owner_chat_rules=None
             stable=('\nRULES: the '+('core rules and the rule index' if indexed else 'current rules')+' you read earlier in this'
                     ' conversation are unchanged (revision '+selected['revision'][:16]+') and apply exactly as you read them; they'
                     ' are not repeated here.'+(' Before acting on anything an index line covers, read it in full with the'
@@ -199,10 +243,10 @@ def build_snapshot(data, page_size=PAGE_SIZE, full=False, host=False, seen=()):
           +(f"(The other {coverage['alreadyRead']} selected messages of this chat are as you read them earlier in this conversation.)\n" if coverage.get('alreadyRead') else '')
           +'\n'.join(messages)+'\n\nCOVERAGE: '+canonical(coverage)
           +'\nOWNER INSTRUCTION: '+canonical({'requiresDisposition':required,'recordedDisposition':disposition})
-          +'\nFor a standing owner instruction save its full rule with scope, subject and superseded IDs. Scope owner is only the owner\'s personal dialog with you (his plan, his own affairs); a rule on how you work, write, keep safety or do any task is scope all: it holds in every chat, employees\' sessions included; chat:ID:THREAD is one chat. If it is a one-off task or unclear, save changes:[] with disposition:not_rule|clarify and a concrete reason; clarification belongs in the answer. Never say a rule was saved unless the receipt says applied. A cancelled rule uses text:"" and its replaces IDs. Read the revised context after any save.\n'
+          +'\nFor a standing owner instruction save its full rule with scope, subject and superseded IDs. Scope owner is only the owner\'s personal dialog with you (his plan, his own affairs); a rule on how you work, write, keep safety or do any task is scope all: it holds in every chat, employees\' sessions included; chat:ID:THREAD is one chat. If it is a one-off task or unclear, save changes:[] with disposition:not_rule|clarify and a concrete reason; clarification belongs in the answer. Never say a rule was saved unless the receipt says applied. A cancelled rule uses text:"" and its replaces IDs. After a save that adds, replaces or cancels a rule, read the revised context in its normal pages. A not_rule or clarify recorded with changes:[] changes no rule: answer from its receipt with the context you have, with no new read and no full:true.\n'
           +'This is the stated selection, not a claim that all historical messages were read. For older decisions, links or completion claims, open the relevant original source before relying on it. A failed source is not evidence of absence. Do not repeat external actions.\n')
     if len(body.encode())>MAX_CONTEXT:raise ValueError('context selection too large; narrow history explicitly, never mark a clipped selection complete')
-    digest=sha(canonical({'binding':binding,'ruleRevision':selected['revision'],'body':body}))
+    digest=snapshot_digest(binding,selected['revision'],body,owner_chat_rules)
     ids=[r['id'] for r in selected['rules']];parts=[ids]
     if not indexed and not host and len(canonical(ids))>ID_PART:
         # 1 100 IDs on page 0 alone passed the CLI's 30 000-character inline limit (Codex, round 4): past ID_PART
@@ -216,11 +260,13 @@ def build_snapshot(data, page_size=PAGE_SIZE, full=False, host=False, seen=()):
         # A large Claude-host page is measured as it travels: JSON-escaped inside the MCP result, which the CLI keeps inline
         # only up to 30 000 characters; quotes, backslashes and newlines take two (Codex, worker pages r1).
         pages=json_pages(body,page_size) if page_size>HOST_PAGE_SIZE else [body[i:i+page_size] for i in range(0,len(body),page_size)]
-    else:pages=byte_pages(body,PAGE_BYTES-(0 if indexed else max(len(canonical(part).encode()) for part in parts)))
+    else:pages=byte_pages(body,PAGE_BYTES-(0 if indexed else max(len(canonical(part).encode()) for part in parts))
+                         -(len(canonical(owner_chat_rules).encode())+32 if owner_chat_rules else 0))
     pages+=['']*(len(parts)-len(pages))  # more parts than text: a page with its header only
     return {'snapshot':digest,'binding':binding,'ruleRevision':selected['revision'],
             'instructionRequired':required,'instructionDisposition':disposition,'indexed':indexed,
-            'ruleIds':ids,**({'idParts':parts} if len(parts)>1 else {}),'pages':pages}
+            'ruleIds':ids,**({'idParts':parts} if len(parts)>1 else {}),'pages':pages,
+            **({'ownerChatRules':owner_chat_rules} if owner_chat_rules else {})}
 
 
 def host_rules(data):
@@ -276,6 +322,7 @@ def render_page(snapshot, page, at=None):
     if type(page) is not int or not 0<=page<len(snapshot['pages']):raise ValueError('invalid context page')
     meta={'snapshot':snapshot['snapshot'],'binding':snapshot['binding'],'page':page,'length':len(snapshot['pages'][page]),
           'ruleRevision':snapshot['ruleRevision'],'pages':len(snapshot['pages']),'at':time.time() if at is None else at}
+    if snapshot.get('ownerChatRules') is not None:meta['ownerChatRules']=snapshot['ownerChatRules']
     parts=[] if snapshot.get('indexed') else snapshot.get('idParts') or [snapshot['ruleIds']]  # an index names every ID; 162 IDs were 7 thousand characters a page
     if page<len(parts):
         meta['ruleIds']=parts[page]
@@ -375,7 +422,7 @@ def same_row(first, copy):
     return json.dumps(a,sort_keys=True)==json.dumps(b,sort_keys=True)
 
 
-def active_rows(path, tail):
+def active_rows(path, tail, strict=False):
     """The rows of the conversation the agent is in now, oldest first: from the newest assistant row (the tool call being
     checked) back along parentUuid, never past a boundary. A rewound or abandoned branch, a late result on one, and a
     subagent's rows are not on it; a row identity reused with other content, or a cycle, leaves nothing to count (Codex,
@@ -387,7 +434,10 @@ def active_rows(path, tail):
     rows=[]
     for line in raw.splitlines():
         try:row=json.loads(line)
-        except (ValueError,UnicodeError):continue
+        except (ValueError,UnicodeError):
+            if strict:return []
+            continue
+        if strict and not isinstance(row,dict):return []
         if isinstance(row,dict) and row.get('isSidechain') is not True:rows.append(row)
     by_uuid={}
     for row in rows:
@@ -512,7 +562,7 @@ def seen_reads(path):
             meta=next(iter(pages.values()))[0];count=meta['pages']
             if len(pages)!=count or any(m['pages']!=count for m,_ in pages.values()):continue
             body=''.join(pages[i][1] for i in range(count))
-            if sha(canonical({'binding':meta.get('binding'),'ruleRevision':meta.get('ruleRevision'),'body':body}))==digest:yield body
+            if snapshot_digest(meta.get('binding'),meta.get('ruleRevision'),body,meta.get('ownerChatRules'))==digest:yield body
     texts=[*bodies(earlier),*bodies(current)]
     for digest,pages in ruled.items():
         count=next(iter(pages.values()))[0]
@@ -520,6 +570,59 @@ def seen_reads(path):
             text=''.join(pages[i][1] for i in range(1,count+1))
             if sha(text)[:16]==digest:texts.append(text)
     return {'earlier':list(bodies(earlier)),'texts':texts}
+
+
+def owner_dm_rules_read(data,earlier_only=False):
+    """Reuse complete native read results still in this owner's active context, without weakening the send's other gates."""
+    try:
+        expected=owner_dm_rule_projection(data,rules.snapshot(None))
+        if expected is None:return False
+        binding=data['binding'];pending={};groups={}
+        identity=('engine','sessionId','generation','chatId','threadId','actorId','policyVersion')
+        for row in active_rows(transcript_for(data),SEEN_TAIL,strict=True):
+            if boundary(row):pending.clear();groups.clear()
+            message=row.get('message') if isinstance(row.get('message'),dict) else {}
+            content=message.get('content')
+            if not isinstance(content,list):continue
+            for item in content:
+                if not isinstance(item,dict):continue
+                if row.get('type')=='assistant' and item.get('type')=='tool_use' and item.get('name')==TOOL_READ:
+                    inp=item.get('input')
+                    if isinstance(inp,dict):pending[item.get('id')]=inp
+                    continue
+                if row.get('type')!='user' or item.get('type')!='tool_result' or item.get('tool_use_id') not in pending:continue
+                inp=pending.pop(item['tool_use_id'])
+                if item.get('is_error'):continue
+                text=result_text(item.get('content')).rstrip();blocks=page_blocks(text)
+                if len(blocks)!=1 or blocks[0]!=text:continue
+                first,body=text.split('\n',1);meta=json.loads(first[len(PREFIX):]);body=body[:-len(END)]
+                prior=meta.get('binding');page=meta.get('page');count=meta.get('pages');at=meta.get('at')
+                if (not isinstance(prior,dict) or any(prior.get(k)!=binding.get(k) for k in identity)
+                    or earlier_only and prior.get('requestId')==binding.get('requestId')
+                    or meta.get('ownerChatRules')!=expected or type(page) is not int or type(count) is not int
+                    or not 0<=page<count<=MAX_PAGES or meta.get('length')!=len(body)
+                    or type(at) not in (int,float) or not 0<at<=time.time()
+                    or inp.get('delivery_id')!=prior.get('requestId') or inp.get('page')!=page
+                    or not re.fullmatch(re.escape(binding['chatId'])+r':[1-9]\d{0,19}',str(prior.get('requestId','')))
+                    or inp.get('topic') is not None or inp.get('rule_id') is not None
+                    or page>0 and inp.get('snapshot')!=meta.get('snapshot')):continue
+                digest=meta.get('snapshot')
+                if not isinstance(digest,str) or not re.fullmatch(r'[0-9a-f]{64}',digest):continue
+                header={k:meta.get(k) for k in ('binding','ruleRevision','pages','ownerChatRules')}
+                if digest not in groups:
+                    if len(groups)>=128:return False
+                    groups[digest]=(header,{})
+                saved,pages=groups[digest]
+                if saved!=header or page in pages and pages[page]!=body:return False
+                pages[page]=body
+        for digest,(header,pages) in groups.items():
+            if set(pages)!=set(range(header['pages'])):continue
+            body=''.join(pages[i] for i in range(header['pages']))
+            if snapshot_digest(header['binding'],header['ruleRevision'],body,header['ownerChatRules'])!=digest:continue
+            # A concurrent save while reading the transcript cannot certify the old projection as current.
+            return owner_dm_rule_projection(data,rules.snapshot(None))==expected
+    except (OSError,ValueError,KeyError,TypeError,UnicodeError,OverflowError):return False
+    return False
 
 
 def channel():
@@ -576,10 +679,16 @@ def claude_input(delivery):
         history,coverage=history_rows(db,chat,thread,incoming[0])
     actor=str(meta['user_id']);edit=(actor==owner and meta.get('forward_from') is None and meta.get('sender_chat_id') is None
         and str(meta.get('coalesced_messages','1'))=='1' and not meta.get('coalesced_delivery_ids') and not meta.get('media_group_id'))
-    access=rules.read_bytes(channel()/'access.json')
-    if not isinstance(json.loads(access),dict):raise ValueError('invalid access policy')
+    access=json.loads(rules.read_bytes(channel()/'access.json'))
+    if not isinstance(access,dict):raise ValueError('invalid access policy')
+    # A receiver observation refreshes this clock even when membership is unchanged.
+    # Keep every access field, including the membership epoch and history boundary.
+    membership=access.get('ownerGroupMembership')
+    if isinstance(membership,dict):
+        for state in membership.values():
+            if isinstance(state,dict):state.pop('observedAt',None)
     return {'binding':{'engine':'claude','requestId':delivery,'generation':stamp,'chatId':chat,'threadId':thread,
-             'actorId':actor,'policyVersion':sha(access.decode()),'turnId':str(turn),'sessionId':session,'resultGeneration':result_generation},
+             'actorId':actor,'policyVersion':sha(canonical(access)),'turnId':str(turn),'sessionId':session,'resultGeneration':result_generation},
             'scope':'owner' if chat==owner and actor==owner else f'chat:{chat}:{thread or 0}',
             'request':{'messageId':message,'text':incoming[0]},'history':history,'coverage':coverage,'editAllowed':edit,'turnOpen':closed is None}
 
@@ -606,9 +715,10 @@ def prepare_scheduled(folder, chat, thread, task, occurrence):
     if folder.is_symlink() or not folder.is_dir():raise ValueError('invalid scheduled run')
     if hasattr(os,'getuid') and folder.stat().st_uid!=os.getuid():raise ValueError('foreign scheduled run directory')
     # Арти, 22.10.2026: his own runner put the task with its whole check output (~112 KB) in request.txt; over 100 KB every
-    # run failed here and delivered the fallback line. The full text stays in the run's prompt; the snapshot keeps its start.
+    # run failed here and delivered the fallback line. The full text is in the run's own prompt: past this size the snapshot
+    # names it there instead of repeating its start (owner, 23.10.2026: nothing is cut).
     request=rules.read_bytes(folder/'request.txt',maximum=2_000_000).decode()
-    if len(request)>SCHEDULED_REQUEST_CHARS:request=request[:SCHEDULED_REQUEST_CHARS]+'\n[… the rest of this task is in the run\'s own prompt]'
+    if len(request)>SCHEDULED_REQUEST_CHARS:request=f'[This task, {len(request)} characters, is whole in the run\'s own prompt; it is not repeated here.]'
     if not re.fullmatch(r'-?[1-9]\d{0,19}',chat) or not str(occurrence).isdigit():raise ValueError('invalid scheduled identity')
     value={'chat':chat,'thread':None if thread is None else int(thread),'request':request,
            'requestId':str(task)+':'+str(occurrence),'generation':sha(str(folder.resolve()))}
@@ -648,6 +758,7 @@ def unread_destination(chat=None, thread=None):
     if folder.is_symlink():raise ValueError('invalid scheduled run')
     saved=json.loads(rules.read_bytes(folder/'context.json'))
     if reads_before_answer() or not rules_in_instructions():return None  # the run started with the file its tick wrote
+    if own_chat_rules(saved['chat'] if chat is None else chat, saved['thread'] if chat is None else thread):return None
     # Codex r7, r8: only a run whose launcher appended every rule answers unread, and only while those are still the rules:
     # the launcher names the digest of the file it appended; any other run, or a rule change since its start, reads first.
     if not re.fullmatch(r'[a-f0-9]{64}',os.environ.get('ANSWER_CONTEXT_RULES_DIGEST','')) \
@@ -694,7 +805,8 @@ def validate_scheduled(proof, text, chat, thread, task, occurrence, file_sha256=
             return False
         current=scheduled_context(proof['scheduled'],proof['sessionId'],str(chat),thread)  # still an allowed destination
         # unread only while reads stay off and the rules are still those its run started with (Codex r8)
-        if proof.get('reads')=='off':return not reads_before_answer() and proof.get('rulesDigest')==scheduled_rules_digest()
+        if proof.get('reads')=='off':return (not reads_before_answer() and not own_chat_rules(chat,thread)
+                                             and proof.get('rulesDigest')==scheduled_rules_digest())
         return build_snapshot(current)['snapshot']==proof['snapshot']
     except (OSError,ValueError,KeyError,TypeError,sqlite3.Error):return False
 
@@ -751,12 +863,13 @@ def rules_file_text(selected, agents=None):
     which subagent keeps which work."""
     agents=subagents() if agents is None else agents;kept=agent_topics(agents)
     owned={t for topics in kept.values() for t in topics}
-    rows=[r for r in owner_rows(selected) if topic_of(r) not in owned]
+    rows=[r for r in owner_rows(selected) if topic_of(r)=='core' or topic_of(r) not in owned]
     legacy=(selected.get('legacyContext') or {}).get('ownerContext')
     held=lambda name:kept.get(name,[])
     routing=('\n\n## Your subagents\nYou orchestrate. Decide by the meaning of each request which subagent\'s work it is and'
              ' hand that work to that one subagent instead of doing it yourself; never the same task to two. A subagent that'
-             ' keeps a topic has the owner\'s rules of that topic in its own instructions, whole; they are not here. Give it'
+             ' keeps a topic has the owner\'s rules of that topic in its own instructions, whole; common core rules also'
+             ' stay here. Give it'
              ' everything it needs: the request in full, the files and links from the message or the chat, and this request\'s'
              ' delivery id; it does not see the chat. You check its result against the request and these rules before you send'
              ' it. A question you can answer at once, with no lookup, file or message to anyone, stays with you.\n'
@@ -764,7 +877,7 @@ def rules_file_text(selected, agents=None):
                          for name,agent in agents.items())) if agents else ''
     body=(RULES_FILE_MARK+'\n# Owner rules\n'
           'The owner\'s rules for you (scope owner) and for every chat (scope all), in full, except the topics your subagents'
-          ' keep; a chat\'s own rules come with that chat. Preserve every condition and exception. A rule saved later in this'
+          ' keep, with common core rules always retained here; a chat\'s own rules come with that chat. Preserve every condition and exception. A rule saved later in this'
           ' conversation replaces the one it names. Scope owner is only your personal dialog with the owner; a rule on'
           ' how you work, write, keep safety or do any task is scope all, so employees\' sessions have it too.\n\n'
           +('\n\n'.join(rule_block(r) for r in rows) or '(No saved rules.)')
@@ -774,20 +887,30 @@ def rules_file_text(selected, agents=None):
 
 SCHEDULED_RULES=Path('.claude/owner-rules/scheduled-rules.md')
 # The owner, 23.10.2026: ~/CLAUDE.md, loaded by every session, told Арти to read the rules before every answer. With the
-# rules in the instructions its one kit line says so instead; it keeps owner-rules' prefix, so a save never takes it for a rule.
+# rules in the instructions its one kit line says where they are instead; it keeps owner-rules' prefix, so a save never takes
+# it for a rule. It forbids nothing either (owner, 23.10): an agent told nothing about reading reads nothing.
 REFERENCE_LOADED=('Правила збережено без скорочень у ~/.claude/owner-rules/index.json. Кожне правило власника вже у твоїх '
-                  'інструкціях, цілком (~/.claude/CLAUDE.md; правила тем - в інструкціях субагентів, що ведуть ці теми): '
-                  'перед відповіддю нічого не читай. Зміни правил зберігай через owner-rules з джерелом, областю дії та явною '
-                  'заміною старого правила.\n')
+                  'інструкціях, цілком (~/.claude/CLAUDE.md; правила тем - в інструкціях субагентів, що ведуть ці теми). '
+                  'Зміни правил зберігай через owner-rules з джерелом, областю дії та явною заміною старого правила.\n')
+# The line of kit a8edb898 (23.10.2026), with «перед відповіддю нічого не читай»; a render puts the current line in its place.
+REFERENCE_LOADED_BEFORE=('Правила збережено без скорочень у ~/.claude/owner-rules/index.json. Кожне правило власника вже у '
+                         'твоїх інструкціях, цілком (~/.claude/CLAUDE.md; правила тем - в інструкціях субагентів, що ведуть ці '
+                         'теми): перед відповіддю нічого не читай. Зміни правил зберігай через owner-rules з джерелом, областю '
+                         'дії та явною заміною старого правила.\n')
 
 
 def render_reference(loaded):
-    """Only the kit's own line in the agent's ~/CLAUDE.md changes with the switch; the rest of that file stays as it is."""
+    """Only the kit's own line in the agent's ~/CLAUDE.md changes with the switch; the rest of that file stays as it is.
+    That line is the one right under its «# Правила власника» heading (owner-rules puts it there); a copy anywhere else
+    stays as written, and two such places change nothing (Codex r1, 23.10.2026)."""
     path=rules.core_path()
     if path.is_symlink() or not path.is_file():return
-    raw=path.read_bytes();text=raw.decode('utf-8')
-    old,new=(rules.REFERENCE,REFERENCE_LOADED) if loaded else (REFERENCE_LOADED,rules.REFERENCE)
-    if old in text:rules.atomic(path,text.replace(old,new).encode())
+    text=path.read_bytes().decode('utf-8');new=REFERENCE_LOADED if loaded else rules.REFERENCE
+    slots=[(m.end(1),old) for old in (rules.REFERENCE,REFERENCE_LOADED,REFERENCE_LOADED_BEFORE)
+           for m in re.finditer(r'(?m)(^# Правила власника[ \t]*\r?\n)'+re.escape(old),text)]
+    if len(slots)!=1 or slots[0][1]==new:return
+    start,old=slots[0]
+    rules.atomic(path,(text[:start]+new+text[start+len(old):]).encode())
 
 
 def scheduled_rules_text(selected):
@@ -936,10 +1059,280 @@ def rules_current():
     return not reads_before_answer() and (rules_in_instructions() or refresh_rules() and rules_in_instructions())
 
 
-def scheduled_reads(chat):
+def own_chat_rules(chat, thread=None):
+    """A chat's own rules (scope chat:ID:TOPIC) are in no instructions file (Codex r2): they come with a read of that chat."""
+    scope=f'chat:{chat}:{int(thread or 0)}'
+    return any(r.get('scope','owner')==scope for r in rules.snapshot(None)['rules'])
+
+
+def scheduled_reads(chat, thread=None):
     """A scheduled run reads before it answers unless every current rule is in its instructions, for every chat it may
-    answer (the owner, 23.10.2026); where it may send is still checked at the send."""
-    return not rules_current()
+    answer (the owner, 23.10.2026); a chat with rules of its own still reads them. Where it may send is checked at the send."""
+    return not rules_current() or own_chat_rules(chat,thread)
+
+
+# A send imperative. «пришли», «перешли», «post» and «forward» also read as statements («документы пришли в группу»):
+# they count only where a clause starts.
+SEND_COMMAND=re.compile(r'(?:^|[;:]\s*|\s)(?:отправь(?:те)?|отправляй|пришлите|скинь(?:те)?|перешлите|продублируй(?:те)?'
+                        r'|над[іи]шл[іи](?:ть)?|в[іи]дправ(?:те)?|перешл[іи]ть|продублюй(?:те)?|send|wy[śs]lij|prze[śs]lij)\b'
+                        r'|(?:^\s*|[;:,]\s*|\s(?:и|і|й|та|а|and)\s+)(?:пришли|перешли|post|forward)\b',re.I)
+SEND_NEGATED=re.compile(r'\b(?:не|not|don.t|nie)\b.{0,25}\b(?:отправ|присл|пришл|скин|перешл|пересл|продубл|над[іи]ш'
+                        r'|в[іи]дправ|send|post|forward|wy[śs]l|prze[śs]l)',re.I)
+
+
+# Root's review of 1ff8426c: «…в тему B группы «Beta», нет, лучше сюда» still granted B. A correction after a send command
+# («нет, лучше…», «хотя нет», «no, here instead») withdraws what was named before it. A bare нет/не/ні/no/nie corrects only
+# standing alone, so «если нет подписи», «не забудь подпись» or «no caption» corrects nothing.
+CORRECTION=re.compile(r'(?i)(?<![\w-])(?:(?:нет|не|ні|no|nie)(?=\s*(?:[,.!?;:—–\n-]|$))|лучше|краще|вместо|замість|instead'
+                      r'|rather|точнее|вернее|точніше|вірніше|lepiej|zamiast|raczej|передумал\w*|передумав\w*)(?![\w-])')
+
+
+# L21 (root, 24.10.2026): after the update the host had not seen the topic's name yet, so «в тему A» named nothing. A link
+# to the topic or to a message in it (Telegram's «Copy link»: https://t.me/c/<id>/<topic>[/<message>]), written in the
+# owner's own sentence, names that group and topic as exactly as their numeric IDs; /1 is the group's General. Never a
+# public username link, and never one inside code or a quoted line.
+TOPIC_LINK=re.compile(r'https?://t\.me/c/([1-9]\d{0,15})/([1-9]\d{0,9})(?:/[1-9]\d{0,9})?(?![\w/])')
+# Root's review (C12-P1-3): a link names a destination only as the object of a direction: «в эту тему: LINK», «у групу
+# LINK», «to topic LINK», «в LINK». A link the answer is about or carries («справку о теме LINK», «добавь в текст ссылку
+# LINK») names nothing.
+LINK_DESTINATION=re.compile(r'(?i)(?:^|[\s,;:(])(?P<route>(?:в|во|у|до|to|into|in)\s+(?:(?:\S+\s+)?(?:тему|теми|тема|топик|топика|топік|топіку'
+                            r'|гілку|гілки|ветку|ветки|группу|группы|групу|групи|чат|чата|чату|topic|thread|group|chat)\s*[:—–-]?\s*)?)$')
+# Root's review at c9e9e306 (C12-P1-3 again): a destination belongs to the send instruction itself. Between the send
+# command and a destination's direction there may be only what is sent (a few words, «о/для/с…» included) and the
+# send's other destinations joined to this one («сюда и в…», «…, а в тему B»). A direction after the send's own
+# recipient with no «и/а/and» («мне текст приглашения в чат…»), inside a subordinate clause («как войти в чат…») or
+# after another direction is part of what is asked for, not where it goes. Closed grammar words, never phrases.
+RECIPIENT=re.compile(r'(?i)(?:сюда|сюди|туда|туди|тут|здесь|мне|мені|нам|here|me|\x02)')
+ROUTE_WORD=re.compile(r'(?i)(?:в|во|у|до|на|к|ко|do|to|into|in|onto)')
+SUBORDINATE=re.compile(r'(?i)(?:как|что|чтобы|где|куда|когда|если|который|которая|которое|які|який|яка|яке|як|що|щоб|де|куди|коли|якщо'
+                       r'|if|how|that|which|where|when|who|whose)')
+JOIN=re.compile(r'(?i)(?:и|і|й|та|а|and|also|plus|также|ещё|еще|також|тоже|too|потом|затем|потім|then)')
+SENT_OBJECT_WORDS=6
+# Root's reviews at 3ead1dc1 and a9e2989c: what is asked for may own the direction after it («текст приглашения в чат…»,
+# «справку о регистрации и входе в чат…», «приглашение в чат…»), and no word list can tell «файл в чат» from
+# «приглашение в чат». Root's decision: such a place is asked about once, never sent to by itself. A direction is the
+# send's own only right after the command (function words and pronouns aside: «пришли, пожалуйста, в…», «пришли его
+# в…»), or joined to the send's other destination («сюда и в…», «…, а в тему B»). Closed function words, never phrases.
+FUNCTION=re.compile(r'(?i)(?:the|a|an|this|that|these|those|my|our|your|its|it|them|please|его|её|ее|их|його|її|їх|это|этот|эту|эти'
+                    r'|то|тот|ту|те|цей|цю|це|ці|той|мой|мою|мои|моё|мое|мій|мої|моє|наш|нашу|наши|наше|наші|свой|свою|свои|своё'
+                    r'|свое|свій|свої|своє|сам|саму|сами|самі|само|весь|всю|все|всё|увесь|усю|усе|пожалуйста|будь|ласка|плиз|срочно'
+                    r'|сразу|теперь|сейчас|зараз|now|о|об|обо|про|для|с|со|з|із|зі|по|за|от|від|из|без|при|about|for|with|of|from)')
+
+
+def sent_there(before):
+    """Whether a destination whose direction follows `before` (the clause from the send command on, the same send's
+    earlier destinations written as \x02) is a destination of that send."""
+    command=None
+    for command in SEND_COMMAND.finditer(before):pass
+    if command:before=before[command.end():]  # «…, а потом отправь в тему…»: that command's own direction
+    before=re.sub(r'(?i)(?<![\w-])(?:в|у)\s+(?:личку|лс|личные|приват\w*|особист\w*)(?![\w-])',' \x02 ',before)
+    recipient=content=False;last='';words=0
+    for word in re.findall(r'\x02|[,;:]|[^\s,;:]+',before):
+        bare=word.strip('«»"“”()[]').casefold()
+        if not bare:continue
+        if RECIPIENT.fullmatch(bare):recipient,last=True,'recipient';continue
+        # A join or comma adds a destination only right after one («сюда, в тему…», «сюда и в…»); inside what is asked
+        # for («справку о регистрации и входе…») it joins its words.
+        if bare in (',',';',':') or JOIN.fullmatch(bare):last='join' if last in ('recipient','join') else last;continue
+        if ROUTE_WORD.fullmatch(bare) or SUBORDINATE.fullmatch(bare) or words>=SENT_OBJECT_WORDS:return False
+        words+=1
+        if not FUNCTION.fullmatch(bare):content,last=True,'word'
+    return last=='join' or (not recipient and not content)
+
+
+def masked(text, spans):
+    """The text with the send's destinations found so far written as \x02."""
+    for start,end in sorted(spans,reverse=True):text=text[:start]+' \x02 '+text[end:]
+    return text
+
+
+class DestinationRefused(ValueError):
+    """A copy to a chat the owner did not name: said to the sender plainly, never as an unavailable check."""
+
+
+def folded(text):
+    return ' '.join(str(text).split()).casefold()
+
+
+def host_destination_names(access):
+    """Root, 24.10.2026: what each admitted group and its topics are called, by Telegram itself (the receiver records
+    chat_names from incoming updates) and by the owner's own access.json group name. Never the model's words."""
+    names={}
+    for chat,policy in access.get('groups',{}).items():
+        if isinstance(policy,dict) and isinstance(policy.get('name'),str) and policy['name'].strip():
+            names.setdefault(str(chat),{}).setdefault(0,set()).add(policy['name'])
+    with closing(sqlite3.connect(f'file:{channel()/"messages.db"}?mode=ro',uri=True,timeout=1)) as db:
+        if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='chat_names'").fetchone():
+            for chat,thread,name in db.execute('SELECT chat_id,thread_id,name FROM chat_names'):
+                if str(chat) in access.get('groups',{}) and type(thread) is int and isinstance(name,str) and name.strip():
+                    names.setdefault(str(chat),{}).setdefault(thread,set()).add(name)
+    return names
+
+
+def destination_pairs(clause, quoted, names, groups, inside=None):
+    """Root's review, 24.10.2026: only a destination phrase names a destination, as one exact group and topic.
+    It starts with a direction (в/во/у/до/to/into/do) followed by «тему NAME» with its group («группы TITLE», «of TITLE»,
+    «в группе TITLE») or by «группу TITLE» / TITLE with an optional «, тема NAME». A title or topic mentioned any other way
+    («справку о теме A», «что было в теме A») names nothing; each phrase is its own pair, never a cross-product of two.
+    A named topic the host does not know, a title two admitted groups share, or a topic name two topics share gives no
+    pair, so it can never fall back to the group's General. Names are a whole quoted span or a host-known name written out.
+    A phrase right after a negation («но не в тему B…») excludes its pair; a sentence that holds more than one pair and
+    another negation cannot be bound with confidence and grants nothing. A correction («нет, лучше…») never reaches here:
+    additional_destination refuses it first, whatever it names."""
+    text=clause.casefold()  # the quote placeholders \x00N\x00 are unchanged
+    titles={}
+    for chat in groups:
+        for title in names.get(chat,{}).get(0,()):titles.setdefault(folded(title),set()).add(chat)
+    topic_names={folded(n) for chat in groups for thread,found in names.get(chat,{}).items() if thread!=0 for n in found}
+    def name_at(pos, known):
+        span=re.match(r'\s*\x00(\d+)\x00',text[pos:])
+        if span:return folded(quoted[int(span.group(1))]),pos+span.end()
+        for name in sorted(known,key=len,reverse=True):
+            written=re.match(r'\s*'+r'\s+'.join(map(re.escape,name.split()))+r'(?![\w-])',text[pos:])
+            if written:return name,pos+written.end()
+        return None,pos
+    pairs=[];excluded=[];bound=[];spans=[]
+    for direction in re.finditer(r'(?:^|(?<=[\s,;:]))(?:в|во|у|до|to|into|do)\s+',text):
+        negation=re.search(r'(?:^|(?<=[\s,;:(]))(?:не|ні|not|nie|no)\s+$',text[:direction.start()])
+        if negation:bound.append(negation.start())
+        found=excluded if negation else pairs
+        pos=direction.end();topic=group=None;topic_named=False
+        lead=re.match(r'(?:тему|топик|топік|гілку|ветку|topic|thread)\s+',text[pos:])
+        if lead:
+            topic_named=True;topic,pos=name_at(pos+lead.end(),topic_names)
+            if topic is None:continue  # a topic named but not known here: no destination, and never General
+            of=re.match(r'\s*,?\s*(?:группы|групи|чата|чату|of(?:\s+the)?(?:\s+group)?|(?:в|у)\s+(?:группе|групі|чате|чаті))\s+',text[pos:])
+            if not of:continue
+            group,pos=name_at(pos+of.end(),titles)
+        else:
+            word=re.match(r'(?:(?:группу|групу|чат|group|chat)\s+)?',text[pos:])
+            group,pos=name_at(pos+word.end(),titles)
+            if group is None:continue
+            after=re.match(r'\s*,?\s*(?:(?:и|і|та|and)\s+)?(?:(?:в|у|во)\s+)?(?:тему|тема|топик|топік|гілку|гілка|ветку|ветка|topic|thread)\s+',text[pos:])
+            if after:
+                topic_named=True;topic,pos=name_at(pos+after.end(),topic_names)
+                if topic is None:continue
+        chats=titles.get(group,set()) if group else set()
+        if len(chats)!=1:continue
+        chat=next(iter(chats))
+        threads=[t for t,known in names.get(chat,{}).items() if t!=0 and topic in {folded(n) for n in known}] if topic_named else [None]
+        pair=(chat,threads[0]) if len(threads)==1 else None
+        if not negation and not sent_there(masked(text[:direction.start()],spans)):
+            if inside is not None and pair:inside.append(pair)
+            continue
+        spans.append((direction.start(),pos))
+        if pair:found.append(pair)
+    kept=[pair for pair in pairs if pair not in excluded]
+    unbound=[m for m in re.finditer(r'(?<![\w-])(?:не|ні|нет|not|no|nie|лучше|краще|instead|вместо|замість)(?![\w-])',text)
+             if m.start() not in bound]
+    return [] if unbound and len(set(kept))>1 else kept
+
+
+def named_in(source, chat, thread, names, groups, inside):
+    """Whether the owner's own text names (chat, thread) as a copy destination: (allowed, corrected). Quotes, code, URLs
+    and forwarded text cannot authorize a destination: a send imperative inside them does not count. Be conservative:
+    the imperative and this exact destination must occur in one sentence, with an explicit thread for a topic. A quoted
+    span stays only as a possible name (a group's title in «…»)."""
+    quoted=[]
+    def hold(match):
+        quoted.append(next(group for group in match.groups() if group is not None))
+        return f'\x00{len(quoted)-1}\x00'
+    links=[]
+    def link(match):
+        links.append((f'-100{match.group(1)}',None if match.group(2)=='1' else int(match.group(2))))
+        return f'\x01{len(links)-1}\x01'
+    plain=re.sub(r'```.*?```|`[^`]*`', ' ', source, flags=re.S)
+    plain=re.sub(r'https?://\S+', ' ', TOPIC_LINK.sub(link, plain))
+    plain=re.sub(r'«([^»]*)»|“([^”]*)”|"([^"\n]*)"',hold,plain)
+    plain='\n'.join(line for line in plain.splitlines() if not line.lstrip().startswith('>'))
+    corrected=False
+    for found in re.finditer(r'[^.!?\n]+',plain):
+        raw=found.group()
+        sentence=re.sub(r'\x00\d+\x00',lambda span:' '*len(span.group()),raw)  # the same offsets, no quoted words
+        if SEND_NEGATED.search(sentence):continue
+        command=SEND_COMMAND.search(sentence)
+        if not command:continue
+        # A correction anywhere after the command, in this sentence or a later one, binds no destination named here.
+        if CORRECTION.search(re.sub(r'\x00\d+\x00',' ',plain[found.start()+command.end():])):corrected=True;continue
+        clause=sentence[command.end():]
+        if names and (chat,thread) in destination_pairs(raw[command.end():],quoted,names,groups,inside):return True,corrected
+        spans=[]
+        for at in re.finditer(r'\x01(\d+)\x01',clause):
+            route=LINK_DESTINATION.search(clause[:at.start()])
+            if not route or re.search(r'(?:^|[\s,;:(])(?:не|ні|not|nie|no)\s+(?:\S+\s+){0,3}$',clause[:at.start()]):continue
+            if not sent_there(masked(clause[:route.start('route')],spans)):inside.append(links[int(at.group(1))]);continue
+            spans.append((route.start('route'),at.end()))
+            if links[int(at.group(1))]==(chat,thread):return True,corrected
+        target=re.search(r'(?<![\w\d-])'+re.escape(chat)+r'(?!\d)',clause)
+        if not target:continue
+        tail=clause[target.end():]
+        # The next destination starts a new recipient; a thread never spills across it.
+        tail=re.split(r'(?<!\w)-?\d{5,20}(?!\d)',tail,maxsplit=1)[0]
+        topic=re.search(r'(?i)\b(?:thread_id|topic_id|thread|topic|тема|тем[ауі])\s*[=:]?\s*(\d+)\b',tail)
+        if (int(topic[1]) if topic else None)==thread:return True,corrected
+    return False,corrected
+
+
+def additional_destination(delivery, chat, thread):
+    """An exact extra recipient in this direct owner's request, never a model-supplied grant.
+
+    Employee outbound remains the typed corporate action with its own resource and approval.
+    This escape is only for an owner's concrete instruction naming the destination: by its numeric ID, or (root,
+    24.10.2026) an admitted group and topic by the names Telegram and the owner's access file give them.
+    """
+    data=claude_input(delivery);binding=data['binding']
+    if not data['editAllowed'] or not data['turnOpen'] or binding['actorId']!=owner_id():
+        raise DestinationRefused('additional destination requires the current direct owner request')
+    access=json.loads(rules.read_bytes(channel()/'access.json'))
+    if (access.get('dmPolicy')=='disabled' or not re.fullmatch(r'-?[1-9]\d{0,19}',str(chat))
+        or (str(chat).startswith('-') and str(chat) not in access.get('groups',{}))
+        or (not str(chat).startswith('-') and str(chat)!=owner_id() and str(chat) not in access.get('allowFrom',[]))):
+        raise DestinationRefused('additional destination is not currently admitted')
+    if thread is not None and (not str(chat).startswith('-') or type(thread) is not int or thread<1):
+        raise DestinationRefused('invalid additional topic')
+    try:names=host_destination_names(access) if str(chat).startswith('-') else {}
+    except sqlite3.Error:names={}  # no recorded names: only a numeric destination can be named
+    source=data['request']['text'];inside=[]
+    allowed,corrected=named_in(source,str(chat),thread,names,access.get('groups',{}),inside)
+    if not allowed:
+        if corrected:raise DestinationRefused('the owner corrected a destination in this request («нет», «лучше», «instead»…), so'
+                                              ' nothing he named before the correction is used; ask him where the copy goes')
+        known=names.get(str(chat),{})
+        if (str(chat),thread) in inside:
+            called=sorted(known.get(thread if thread is not None else 0,()))
+            raise DestinationRefused('this place is named in his request after what is to be sent, so it may be part of what he'
+                                     ' asked for (an invitation, an instruction, a link to it) rather than where the copy goes; ask him'
+                                     ' once whether the copy goes'+(f' to «{called[0]}» (its name in Telegram)' if called else ' to the link he gave')
+                                     +' and, if so, to say it in his own words with the place right after the verb, e.g. «Надішли це в'
+                                     ' тему «…» групи «…»» or «Надішли це в <посилання>»; a bare «так» to a question sends nothing')
+        topics=sorted({name for topic,found in known.items() if topic not in (0,thread) for name in found})
+        # What the host knows and what the owner can do, so the model asks him the one thing that works.
+        hint='' if not str(chat).startswith('-') else ''.join((
+            '; the host knows no Telegram title of this group yet' if not known.get(0) else '',
+            (f'; this topic is called «{sorted(known[thread])[0]}» in Telegram' if known.get(thread)
+             else "; the host has not seen this topic's name since its update: it learns it from the next message written"
+                  ' in that topic (not a reply)') if thread is not None else '',
+            f'; other topics it knows there: {", ".join("«"+name+"»" for name in topics[:12])}' if topics and thread is not None else '',
+            '; to name it, the owner writes the topic or group exactly as Telegram shows it, or pastes its link'
+            ' (Copy link in Telegram) in his request'))
+        raise DestinationRefused('this chat and topic are not a destination the owner named in this request'+hint)
+    return {'requestId':delivery,'generation':binding['generation'],'sourceChatId':binding['chatId'],
+            'sourceThreadId':binding['threadId'],'requestDigest':sha(source),
+            'destination':{'chatId':str(chat),'threadId':thread}}
+
+
+def additional_context(delivery, chat, thread):
+    authorization=additional_destination(delivery,str(chat),thread)
+    data=claude_input(delivery)
+    data['binding']={**data['binding'],'chatId':str(chat),'threadId':thread,
+                     'additionalDestination':authorization}
+    data['scope']=f'chat:{chat}:{thread or 0}'
+    data['editAllowed']=False
+    # Delivering a copy needs destination rules, not unrelated conversation history.
+    data['history']=[]
+    data['coverage']={'recentLimit':0,'olderLimit':0,'search':[],
+                      'access':'additional delivery destination rules only; conversation history not requested'}
+    return data
 
 
 def send_gate(chat, thread, text, delivery=None, file=False):
@@ -963,16 +1356,18 @@ def send_gate(chat, thread, text, delivery=None, file=False):
             "AND (r.state IN ('started','pending','deferred') OR (r.state='complete' AND t.closed_at IS NULL "
             "AND t.turn_id=(SELECT max(open.turn_id) FROM delivery_turns open WHERE open.session_id=r.session_id AND open.closed_at IS NULL)))",
             (stamp,str(chat),thread,thread))]
+    delegated=None
     if delivery:
-        if delivery not in ids:raise ValueError('answer destination does not match the current request')
+        if delivery not in ids:delegated=additional_destination(delivery,str(chat),thread)
         ids=[delivery]
     if not ids:return {'ok':False,'message':'No current request proves this model answer. Use only a fixed service fallback.','fallback':FALLBACK}
     for identity in ids:
         verdict={}
         try:
+            refusal=instruction_refusal(identity,text)
+            if refusal:return refusal
             if unread_answer(identity,text):continue
             verdict=check_delivery(identity);complete=verdict['ok']
-            if verdict.get('instructionRequired') and RULE_SAVED.search(text) and verdict.get('instructionDisposition')!='applied':complete=False
         except (OSError,ValueError,KeyError,TypeError,sqlite3.Error):complete=False
         if not complete:
             # Арти, 21.10.2026: every page went through «2>&1 | head -c 6000», none counted, and he looped for minutes.
@@ -980,16 +1375,49 @@ def send_gate(chat, thread, text, delivery=None, file=False):
             pages=f' pages {", ".join(map(str,missing))} of' if missing else ''
             return {'ok':False,'message':f'Before answering, read{pages} this request’s context with the read_answer_context tool (delivery_id {identity}, page N, the snapshot from page 0): it hands each page back whole. A shell read piped, redirected or cut (2>&1, |, head, tail, > file) is not counted. Read the rules and complete selected messages; after a rule change read again. Do not repeat actions. If the sources remain unavailable, send only the fixed fallback for the person’s language.',
                     'fallback':FALLBACK}
-    return {'ok':True}
+    if delegated and own_chat_rules(str(chat),thread):
+        data=additional_context(delivery,str(chat),thread)
+        try:complete=transcript_read(transcript_for(data),build_snapshot(data))['ok']
+        except (OSError,ValueError,KeyError,TypeError):complete=False
+        if not complete:
+            topic='' if thread is None else f' --thread {thread}'
+            return {'ok':False,'message':f'Read ~/bin/answer-context read --delivery={delivery} --chat={chat}{topic} and every remaining page for this additional destination; do not repeat actions.','fallback':FALLBACK}
+    return {'ok':True,**({'additionalDestination':delegated} if delegated else {})}
+
+
+def claims_rule(text):
+    return bool(RULE_SAVED.search(NOT_RULE.sub(' ',text)))
+
+
+def instruction_refusal(delivery, text):
+    """Why an answer to a standing instruction may not go yet, when no read would change it (root, natural memory
+    24.10.2026: a fact saved and recorded not_rule, then «Запомнил», was refused six times as unread; twelve reads later
+    the model sent the fixed fallback)."""
+    data=claude_input(delivery)
+    if not (data['editAllowed'] and RULE_INSTRUCTION.search(data['request']['text'])):return None
+    disposition=rules.instruction_receipt({'chatId':data['binding']['chatId'],'messageId':data['request']['messageId'],
+                                           'text':data['request']['text']})
+    if disposition is None:
+        return {'ok':False,'message':'Not sent: the owner\'s message reads as a standing instruction and no disposition is'
+                f' recorded for it. Record it with answer-context save --delivery {delivery} --file CHANGE.json after reading'
+                ' this request\'s context: the rule, or changes:[] with disposition not_rule or clarify and a concrete reason'
+                ' (a fact to remember, a one-off task, an unclear request). Then answer. Do not repeat actions.',
+                'fallback':FALLBACK}
+    if disposition!='applied' and claims_rule(text):
+        return {'ok':False,'message':'Not sent: this answer says a standing rule was saved, but none was: this request\'s'
+                f' recorded disposition is {disposition}, and no read changes that. Answer without claiming a saved rule and'
+                ' say what you did; a fact kept in memory is confirmed as that. If it should be a standing rule, save it'
+                ' first: its receipt must say applied. Do not repeat actions.'}
+    return None
 
 
 def unread_answer(delivery, text):
-    """The owner, 22.10.2026: an answer to the owner in his own private chat needs no read while the session giving it
-    holds every current rule. Any other chat reads its own rules, and a standing instruction is saved, or its disposition
-    recorded, before the answer (Codex r3)."""
+    """The owner, 22.10.2026: an answer needs no read while the session giving it holds every current rule; 23.10.2026
+    («мы же убрали эти проверки контекста») in any chat, not only his own private one. A chat with rules of its own reads
+    them, and a standing instruction is saved, or its disposition recorded, before the answer (Codex r3)."""
     if reads_before_answer():return False
-    data=claude_input(delivery);binding=data['binding'];owner=owner_id()
-    if binding['chatId']!=owner or binding['threadId'] is not None or binding['actorId']!=owner:return False
+    data=claude_input(delivery);binding=data['binding']
+    if own_chat_rules(binding['chatId'],binding['threadId']) and not owner_dm_rules_read(data):return False
     # The owner's rules have one writer, his own conversation: its sessions load the file at their start and after a
     # compaction, and know their own saves (the owner, 22.10.2026: Кнопа's way, no per-answer proof). A file found stale
     # is written again; this answer reads once, so the session holds the rules from that read.
@@ -998,7 +1426,7 @@ def unread_answer(delivery, text):
     if data['editAllowed'] and RULE_INSTRUCTION.search(data['request']['text']):
         disposition=rules.instruction_receipt({'chatId':binding['chatId'],'messageId':data['request']['messageId'],
                                                'text':data['request']['text']})
-        if disposition is None or RULE_SAVED.search(text) and disposition!='applied':return False
+        if disposition is None or claims_rule(text) and disposition!='applied':return False
     return True
 
 
@@ -1083,7 +1511,7 @@ def subagent_copies(before, changes):
         for change in changes:
             old=[by_id[i] for i in change.get('replaces',[]) if i in by_id and held(by_id[i])]
             if old:todo.append({'key':change['key'],'action':'replace' if change['text'].strip() else 'remove',
-                                'old':[rule_start(r['text']) for r in old]})
+                                'old':[' '.join(r['text'].split()) for r in old]})  # whole (owner, 23.10.2026: 50)
             elif change['text'].strip() and not change.get('replaces') and any(
                     held(r) for r in before if topic_of(r)==topic_of({'key':change['key']})):
                 todo.append({'key':change['key'],'action':'add'})  # a new rule of a topic this agent keeps
@@ -1204,25 +1632,74 @@ def read_rule(data, identifier=None, topic=None):
     return '\n\n'.join(f"[{r['id']}; scope={r.get('scope','owner')}; subject={r.get('key','legacy')}]\n{r['text']}" for r in rows)
 
 
+def owner_rule_authority(context):
+    """Only the host-bound current owner can widen an explicit rule edit, in any chat."""
+    try:
+        return (context.get('editAllowed') is True
+                and context.get('binding',{}).get('actorId')==owner_id()
+                and type(context.get('request',{}).get('messageId')) is int
+                and context['request']['messageId']>0)
+    except (ValueError,KeyError,TypeError):return False
+
+
+def host_rule_snapshot(context):
+    """An explicit owner rule edit reads one target scope, without history, provenance or legacy context."""
+    if not owner_rule_authority(context):raise ValueError('a direct authenticated owner instruction is required')
+    target=context.get('rulesScope')
+    if not isinstance(target,str) or not re.fullmatch(r'owner|all|chat:-?\d+:\d+',target):raise ValueError('invalid target rule scope')
+    selected=[{k:r[k] for k in ('id','key','scope','text') if k in r}
+              for r in rules.snapshot(None)['rules'] if r.get('scope','owner')==target]
+    revision=sha(canonical(selected));binding=context['binding']
+    body=('RULES FOR EXPLICIT OWNER EDIT: '+target+'\n'
+          +'\n\n'.join(f"[{r['id']}; scope={r['scope']}; subject={r.get('key','legacy')}]\n{r['text']}" for r in selected))
+    if len(body.encode())>MAX_CONTEXT:raise ValueError('target rule scope too large')
+    ids=[r['id'] for r in selected]
+    budget=min(CLAUDE_HOST_PAGE_SIZE,max(1000,28_500-len(canonical(ids))))
+    return {'snapshot':sha(canonical({'binding':binding,'request':context['request'],'scope':target,'revision':revision})),
+            'binding':binding,'ruleRevision':revision,'ruleIds':ids,'pages':json_pages(body,budget),
+            'instructionRequired':False,'instructionDisposition':None}
+
+
+def owner_review_change(context, change):
+    """Validate the host's complete targeted read; storage repeats the union CAS under its own lock."""
+    receipt=context.get('rulesRead')
+    if receipt is None:return change,()
+    if not isinstance(receipt,dict):raise ValueError('invalid targeted rule read')
+    target=receipt.get('scope');scope=None if context['scope']=='owner' else context['scope']
+    # Capture the union before verifying both read projections. A change after
+    # either verification is then refused by apply_rules' locked union CAS.
+    union=rules.snapshot(scope,review_scopes=(target,))
+    fresh=host_rule_snapshot({**context,'rulesScope':target})
+    if any(receipt.get(key)!=fresh[field] for key,field in (('snapshot','snapshot'),('revision','ruleRevision'),('ruleIds','ruleIds'))):
+        raise ValueError('targeted rule read changed; read the target scope again')
+    if change.get('revision')!=rules.snapshot(scope)['revision']:raise ValueError('rules changed; read current rules before saving')
+    return {**change,'revision':union['revision'],'reviewedIds':[r['id'] for r in union['rules']]},(target,)
+
+
 def host_change(context, change):
-    """A host save (corporate worker, Codex): the host let it through only after every page of the full host snapshot was
-    read, so its review list is that rule set. In a chat a rule is that chat's own whatever words the model put in its
-    scope; one for all chats or another chat is refused with the reason (Арти, 22.10.2026: «this chat only (group
-    MARKETING, chat -100…)» and «group:-100…» were refused twice with no reason)."""
+    """Default to the current topic; an authenticated owner may explicitly name a wider scope.
+
+    Write authority does not expand the read snapshot or expose private history.
+    Unread replacement IDs and duplicate subjects remain refused by storage.
+    """
     if not isinstance(change,dict):raise ValueError('invalid rule change')
     scope=context.get('scope')
     if not isinstance(scope,str) or not re.fullmatch(r'owner|chat:-?\d+:\d+',scope):raise ValueError('invalid context scope')
     items=change.get('changes')
     if scope!='owner' and isinstance(items,list):
-        chat=scope.split(':')[1].lstrip('-');fixed=[]
+        chat=scope.split(':')[1].lstrip('-');fixed=[];owner=owner_rule_authority(context)
         for c in items:
-            if isinstance(c,dict) and isinstance(c.get('scope'),str) and c['scope']!=scope:
-                # Only words that name this chat by its number become its scope; a scope in the store's own form for another
-                # chat or topic, «all», «owner» or no number at all is refused with the scope to use (Codex, round 4).
-                given=c['scope'].strip();numbers=re.findall(r'\d{4,}',given)
-                if re.fullmatch(r'(?i)owner|all|chat:-?\d+:\d+',given) or not numbers or any(n!=chat for n in numbers):
-                    raise ValueError(f'in this chat a rule is saved only for this chat: use scope {scope}; a rule for all chats or another chat is saved in the owner\'s private chat')
-                c={**c,'scope':scope}
+            if isinstance(c,dict):
+                c={**c,'scope':c.get('scope',scope)}
+                if isinstance(c['scope'],str) and c['scope']!=scope:
+                    given=c['scope'].strip()
+                    if owner and re.fullmatch(r'owner|all|core|chat:-?\d+:\d+',given):
+                        c={**c,'scope':'owner' if given=='core' else given}
+                    else:
+                        numbers=re.findall(r'\d{4,}',given)
+                        if re.fullmatch(r'(?i)owner|all|core|chat:-?\d+:\d+',given) or not numbers or any(n!=chat for n in numbers):
+                            raise ValueError(f'use scope {scope}; a wider rule scope requires a direct authenticated owner instruction')
+                        c={**c,'scope':scope}
             fixed.append(c)
         change={**change,'changes':fixed}
     return {**change,'reviewedIds':[r['id'] for r in rules.snapshot(None if scope=='owner' else scope)['rules']]}
@@ -1235,6 +1712,7 @@ def valid_change(change):
 def main():
     parser=argparse.ArgumentParser(description=__doc__);sub=parser.add_subparsers(dest='action',required=True)
     sub.add_parser('host-snapshot')
+    sub.add_parser('host-rule-snapshot')
     sub.add_parser('host-rules')
     sub.add_parser('host-apply')
     sub.add_parser('send-check')
@@ -1246,7 +1724,7 @@ def main():
     p=sub.add_parser('scheduled-rebind');p.add_argument('--proof',type=Path,required=True);p.add_argument('--result',type=Path,required=True)
     p=sub.add_parser('scheduled-delivery-check');p.add_argument('--proof',type=Path,required=True);p.add_argument('--result',type=Path,required=True);p.add_argument('--chat',required=True);p.add_argument('--thread');p.add_argument('--task',required=True);p.add_argument('--occurrence',required=True)
     sub.add_parser('fallback')
-    p=sub.add_parser('scheduled-reads');p.add_argument('--chat',required=True)
+    p=sub.add_parser('scheduled-reads');p.add_argument('--chat',required=True);p.add_argument('--thread',type=int)
     p=sub.add_parser('rules-current');p.add_argument('--session')
     sub.add_parser('render-rules')
     p=sub.add_parser('prepare-scheduled');p.add_argument('--run',type=Path,required=True);p.add_argument('--chat',required=True);p.add_argument('--thread',type=int);p.add_argument('--task',required=True);p.add_argument('--occurrence',required=True)
@@ -1263,7 +1741,7 @@ def main():
     if args.action=='fallback':
         print(fallback_text());return
     if args.action=='scheduled-reads':
-        print('on' if scheduled_reads(args.chat) else 'off');return
+        print('on' if scheduled_reads(args.chat,args.thread) else 'off');return
     if args.action=='rules-current':
         current=rules_in_instructions() if args.session else rules_current()  # a live session: check only, no repair
         print('current' if current else 'not current')
@@ -1302,7 +1780,7 @@ def main():
         verdict=check_scheduled();print(canonical(verdict))
         if not verdict['ok']:sys.exit(3)
         return
-    if args.action in ('host-snapshot','host-rules','host-apply','send-check','delivery-check','silence-check'):
+    if args.action in ('host-snapshot','host-rule-snapshot','host-rules','host-apply','send-check','delivery-check','silence-check'):
         raw=sys.stdin.buffer.read(2_000_001)
         if len(raw)>2_000_000:raise ValueError('context input too large')
         data=json.loads(raw)
@@ -1314,9 +1792,12 @@ def main():
             verdict=silence_check(data['delivery']);print(canonical(verdict))
             if not verdict['ok']:sys.exit(3)
         elif args.action=='send-check':
-            verdict=send_gate(data['chat'],data.get('thread'),data.get('text',''),data.get('delivery'),data.get('file',False))
+            try:verdict=send_gate(data['chat'],data.get('thread'),data.get('text',''),data.get('delivery'),data.get('file',False))
+            except DestinationRefused as error:
+                verdict={'ok':False,'message':f'Not sent to this chat: {error}. Nothing was sent there; tell the owner plainly which copy did not go and why.'}
             print(canonical(verdict))
             if not verdict['ok']:sys.exit(3)
+        elif args.action=='host-rule-snapshot':print(canonical(host_rule_snapshot(data)))
         elif args.action=='host-rules':print(canonical(host_rules(data)))
         elif args.action=='host-snapshot':print(canonical(build_snapshot(data,CLAUDE_HOST_PAGE_SIZE if (data.get('binding') or {}).get('engine')=='claude' else HOST_PAGE_SIZE,host=True)))
         else:
@@ -1325,16 +1806,17 @@ def main():
                 if context.get('editAllowed') is not True:raise ValueError('owner source required')
                 change=host_change(context,data['change'])
                 if not valid_change(change):raise ValueError('invalid rule change')
+                change,review_scopes=owner_review_change(context,change)
                 source={'chatId':context['binding']['chatId'],'messageId':context['request']['messageId'],'text':context['request']['text']}
                 copies=record_copies(rules.snapshot(None)['rules'],change,context['scope'],source)
-                result=attach_copies(rules.apply_rules({**change,'source':source},None if context['scope']=='owner' else context['scope']),copies,source,change)
+                result=attach_copies(rules.apply_rules({**change,'source':source},None if context['scope']=='owner' else context['scope'],allow_owner_scopes=owner_rule_authority(context),review_scopes=review_scopes),copies,source,change)
                 refresh_rules();print(canonical(result))
             except ValueError as error:
                 # The worker learns why (Арти, 22.10.2026: «source, scope or revision changed» left him guessing twice).
                 print(canonical({'ok':False,'message':'Rule not saved: '+str(error)}))
     elif args.action=='read':
-        data=scheduled_input(args.chat,args.thread) if args.scheduled else claude_input(args.delivery)
-        snapshot=build_snapshot(data,full=args.full,seen=() if args.scheduled or args.full else seen_reads(transcript_for(data))['earlier'])
+        data=scheduled_input(args.chat,args.thread) if args.scheduled else additional_context(args.delivery,args.chat,args.thread) if args.chat else claude_input(args.delivery)
+        snapshot=build_snapshot(data,full=args.full,seen=() if args.scheduled or args.full or args.chat else seen_reads(transcript_for(data))['earlier'])
         if args.snapshot and args.snapshot!=snapshot['snapshot']:raise ValueError('context changed; restart at page 0')
         print(render_page(snapshot,args.page))
     # A scheduled run reads only inside the destination it was saved with: no --chat or --thread can move its scope.

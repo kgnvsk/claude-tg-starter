@@ -3,6 +3,7 @@
 
   module-setup.py install НАЗВА КАТАЛОГ   поставити підготовлені файли в дім агента — усі або жодного
   module-setup.py check НАЗВА КАТАЛОГ     те саме порівняння без запису: чи стане install, перш ніж щось качати
+  module-setup.py refresh НАЗВА КАТАЛОГ   звичайне оновлення комплекту: лише файли, які досі такі, як їх поставив комплект
   module-setup.py crontab ВИРАЗ           замінити власні рядки модуля в розкладі агента (нові — зі stdin)
   module-setup.py env-add КОНФІГ ШАБЛОН   додати в наявний конфіг налаштування шаблону, яких у ньому немає
 
@@ -102,6 +103,52 @@ def install(name: str, staged: Path, check: bool = False) -> int:
     return 0
 
 
+def refresh(name: str, staged: Path) -> int:
+    """A normal kit update of a module this agent set up (kit-module refresh), by install's own rule: a file missing,
+    already the same or still the bytes the kit put there takes the kit's current bytes. A file the owner changed stays
+    as he left it and is named, its kit version kept beside the record; once he removes it, the next update puts the
+    kit's back. Without a record nothing is touched: an update never sets a module up. 0: every file current; 3: an
+    owner's file stayed."""
+    home = Path.home()
+    record = STATE / f"{name}.files.json"
+    try:
+        accepted = json.loads(record.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        accepted = None
+    if not isinstance(accepted, dict) or not accepted:
+        print(f"Модуль «{name}» тут не ставили (немає запису його файлів), тому оновлення його не чіпає.", file=sys.stderr)
+        return 3
+    kept = []
+    for source in sorted(path for path in staged.rglob("*") if path.is_file() and not path.is_symlink()):
+        relative = source.relative_to(staged).as_posix()
+        target = home / relative
+        new = digest(source)
+        if target.is_symlink() or (target.exists() and not target.is_file()):
+            kept.append(relative)
+            continue
+        if target.exists():
+            current = digest(target)
+            if current == new:
+                accepted[relative] = new
+                continue
+            if current != accepted.get(relative):
+                kept.append(relative)  # the owner's own version
+                continue
+        write(target, source.read_bytes(), stat.S_IMODE(source.stat().st_mode))
+        accepted[relative] = new
+    write(record, (json.dumps(accepted, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode(), 0o600)
+    shutil.rmtree(STATE / f"{name}.planned", ignore_errors=True)
+    if not kept:
+        return 0
+    planned = STATE / f"{name}.planned"
+    for relative in kept:
+        write(planned / relative, (staged / relative).read_bytes(), 0o600)
+    print(f"Модуль «{name}» оновлено, крім файлів, які змінив власник, — вони лишилися як є:", file=sys.stderr)
+    for relative in kept:
+        print(f"  ~/{relative}  — версія комплекту для порівняння: {planned / relative}", file=sys.stderr)
+    return 3
+
+
 def crontab(own: str) -> int:
     pattern = re.compile(own)
     wanted = [line for line in sys.stdin.read().splitlines() if line.strip()]
@@ -169,6 +216,8 @@ def main() -> int:
     arguments = sys.argv[1:]
     if len(arguments) == 3 and arguments[0] in ("install", "check") and re.fullmatch(r"[a-z][a-z0-9-]{0,40}", arguments[1]):
         return install(arguments[1], Path(arguments[2]), check=arguments[0] == "check")
+    if len(arguments) == 3 and arguments[0] == "refresh" and re.fullmatch(r"[a-z][a-z0-9-]{0,40}", arguments[1]):
+        return refresh(arguments[1], Path(arguments[2]))
     if len(arguments) == 2 and arguments[0] == "crontab":
         return crontab(arguments[1])
     if len(arguments) == 3 and arguments[0] == "env-add":

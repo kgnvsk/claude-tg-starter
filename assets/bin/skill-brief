@@ -207,7 +207,7 @@ def report(project_root: Path) -> int:
     print(f"уміщується: {used} символів")
     if lost:
         print(f"НЕ ВМІЩУЮТЬСЯ ({len(lost)}) — агент побачить лише назву без опису:")
-        print("  " + ", ".join(lost[:20]) + (" …" if len(lost) > 20 else ""))
+        print("  " + ", ".join(lost))  # every name (owner, 23.10.2026: it named the first 20)
         return 1
     if any(not show_description for _, _, show_description in rows):
         print("усі видимі навички потрапляють до списку")

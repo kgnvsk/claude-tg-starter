@@ -64,6 +64,16 @@ DEPRECATED_DENY_RULES = (
 )
 DEPRECATED_MARKETPLACES = ("lazyweb",)
 DEPRECATED_PLUGINS = ("lazyweb@lazyweb",)
+# Owner, 23.10.2026: «зачем физически обрезать?» The kit's own listing cut is retired: descriptions at 240 (03.09) and 18
+# video skills by name only (25.08). Skills are written short at the source (skill-doctor holds the kit's at 200) and
+# the listing carries every description whole. An install still on these old kit values gets the template's.
+RETIRED_LISTING_VALUES = {"skillListingBudgetFraction": 0.08, "skillListingMaxDescChars": 240}
+RETIRED_NAME_ONLY = frozenset((
+    "embedded-captions", "faceless-explainer", "figma", "general-video", "hyperframes-animation", "hyperframes-cli",
+    "hyperframes-core", "hyperframes-creative", "hyperframes-keyframes", "hyperframes-registry", "media-use",
+    "motion-graphics", "music-to-video", "pr-to-video", "product-launch-video", "remotion-to-hyperframes", "slideshow",
+    "talking-head-recut",
+))
 SKILL_OVERRIDE_STATES = frozenset(
     ("on", "name-only", "user-invocable-only", "off")
 )
@@ -277,6 +287,9 @@ def migrate(
 
         if "model" not in data and "model" in template:
             data["model"] = template["model"]
+        for key, old in RETIRED_LISTING_VALUES.items():
+            if key in template and data.get(key) == old:
+                data[key] = template[key]
         if "skillListingBudgetFraction" in template:
             # The kit default keeps the complete active skill catalog visible.
             # Preserve an owner's explicit budget choice.
@@ -291,6 +304,9 @@ def migrate(
                 "skillListingMaxDescChars",
                 template["skillListingMaxDescChars"],
             )
+        if "bashOutputMaxChars" in template:
+            # Newer CLIs size inline command output only from this key (the env above then sizes the saved read-back).
+            data.setdefault("bashOutputMaxChars", template["bashOutputMaxChars"])
         if "skillOverrides" in template:
             managed_skill_overrides = skill_overrides(template["skillOverrides"])
             live_skill_overrides = data.get("skillOverrides")
@@ -299,6 +315,8 @@ def migrate(
                 data["skillOverrides"] = live_skill_overrides
             live_skill_overrides = skill_overrides(live_skill_overrides)
             for name, state in managed_skill_overrides.items():
+                if name in RETIRED_NAME_ONLY and state == "on" and live_skill_overrides.get(name) == "name-only":
+                    live_skill_overrides[name] = state
                 live_skill_overrides.setdefault(name, state)
 
     permissions = data.setdefault("permissions", {})
@@ -327,6 +345,9 @@ def migrate(
         # Owner, 03.10.2026: the CLI updates only when we roll a version out (first Кеш and Кнопа, then
         # the rest by hand); 2.1.288 arrived overnight by itself. An operator's own value is kept.
         env.setdefault("DISABLE_AUTOUPDATER", "1")
+        # Owner, 23.10.2026: nothing the model is shown may be cut. Command output over 30 000 characters reached
+        # Арти cut (a full context check printed ~35 000); CLI 2.1.288 reads this when bashOutputMaxChars is unset.
+        env.setdefault("BASH_MAX_OUTPUT_LENGTH", "128000")
 
     rendered = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
     fd, temporary = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)

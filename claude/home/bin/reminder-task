@@ -220,6 +220,61 @@ def infer_mode(records, task):
     return "sequence", epochs
 
 
+LIST_PAGE_SIZE = 50
+
+
+def list_tasks(rem_dir, prefix, actor, chat, page=1, attempts=3):
+    """Every queued task of this actor in this chat under the gateway's namespace; another actor's or chat's never shows.
+
+    Codex r2, 23.10.2026: the gateway captures at most 256 KiB, so a long list comes whole in pages of LIST_PAGE_SIZE.
+    A file replaced while it was read makes the whole look again; a task that still cannot be read or verified is an
+    error, never a quiet omission or «none».
+    Codex r3: the namespace is the hash of this actor and chat, so a file under it that cannot be read as theirs is damage
+    and an error, never another person's. Pages are cut from the visible list, read from the queue in one pass.
+    """
+    # Every TASK name TASK_RE allows (Codex r4: «.» and «_» were taken for another namespace's files).
+    owned = re.compile(r"\d+-" + re.escape(prefix) + r"[a-z0-9._-]+\.rem")
+    for attempt in range(attempts):
+        try:
+            files = {}
+            for path in rem_dir.glob("*.rem"):
+                if not path.is_file():
+                    continue
+                mine = owned.fullmatch(path.name)
+                try:
+                    task = peek_task(path)
+                except TaskError:
+                    if mine:
+                        raise
+                    continue  # another namespace's damaged file is not this list's
+                if mine and not (task or "").startswith(prefix):
+                    raise TaskError(f"queue file {path.name} has no task of this namespace")
+                if task and task.startswith(prefix):
+                    files.setdefault(task, []).append(split_file(path))
+            journals = {}
+            for journal in delivery_journals(rem_dir, None):
+                journals.setdefault(saved_run_headers(journal / "source.rem").get("TASK"), []).append(journal)
+            # Every task of the namespace is checked, one being cancelled too, so damage is never hidden behind a
+            # cancellation (Codex r4); a cancelled one is then left out of the list.
+            lines = []
+            for task, records in sorted(files.items()):
+                line = status_line(records, task, actor, chat)
+                if not any(small_text(journal / "state") == "cancelled" for journal in journals.get(task, [])):
+                    lines.append(line)
+            break
+        except TaskError as exc:
+            if attempt == attempts - 1:
+                raise TaskError(f"the reminder list could not be read whole: {exc}") from exc
+            time.sleep(0.05)
+    pages = max(1, -(-len(lines) // LIST_PAGE_SIZE))
+    if page > pages:
+        raise TaskError(f"page {page} does not exist: the list has {pages}")
+    shown = lines[(page - 1) * LIST_PAGE_SIZE:page * LIST_PAGE_SIZE]
+    if not shown:
+        return "VERIFIED none"
+    return "\n".join(shown + ([f"PAGE {page}/{pages}"] if pages > 1 else []))
+
+
 def task_records(rem_dir, task):
     records = []
     for path in sorted(rem_dir.glob("*.rem")):
@@ -337,7 +392,10 @@ def verified_status(rem_dir, task, actor=None, chat=None, legacy_prefix=None):
     if any(small_text(journal / "state") == "cancelled"
            for journal in delivery_journals(rem_dir, task)):
         raise TaskError(f"cancellation in progress for {task}; retry cancel")
-    records = task_records(rem_dir, task)
+    return status_line(task_records(rem_dir, task), task, actor, chat, legacy_prefix)
+
+
+def status_line(records, task, actor=None, chat=None, legacy_prefix=None):
     mode, epochs = infer_mode(records, task)
     require_scope(records, actor, chat, legacy_prefix)
     records.sort(key=lambda record: (int(record.headers["EPOCH"]), record.path.name))
@@ -406,7 +464,7 @@ def delivery_journals(rem_dir, task):
     return [journal for journal in sorted(root.iterdir())
             if DELIVERY_KEY_RE.fullmatch(journal.name)
             and not journal.is_symlink() and journal.is_dir()
-            and saved_run_headers(journal / "source.rem").get("TASK") == task]
+            and (task is None or saved_run_headers(journal / "source.rem").get("TASK") == task)]
 
 
 def replace_text(path, value):
@@ -826,6 +884,11 @@ def parser():
     delivery = commands.add_parser("delivery-status", help="show one task's unresolved result delivery")
     identity(delivery)
     delivery.add_argument("--chat", help="filter by the corporate chat ID")
+    listing = commands.add_parser("list", help="every queued task of one actor in one chat under a gateway namespace")
+    listing.add_argument("--prefix", required=True)
+    listing.add_argument("--actor", required=True)
+    listing.add_argument("--chat", required=True)
+    listing.add_argument("--page", type=int, default=1)
     cancel = commands.add_parser("cancel", help="remove every queued file for a task")
     identity(cancel)
     cancel.add_argument("--chat")
@@ -835,6 +898,13 @@ def parser():
 
 
 def normalize(args):
+    if args.command == "list":
+        if not re.fullmatch(r"corp-[a-f0-9]{16}-", args.prefix):
+            raise TaskError("invalid task namespace")
+        if not 1 <= args.page <= 10_000:
+            raise TaskError("invalid list page")
+        args.actor, args.chat = actor_id(args.actor), chat_id(args.chat)
+        return args
     args.task = task_id(args.task)
     if args.actor is not None:
         args.actor = actor_id(args.actor)
@@ -894,6 +964,15 @@ def main():
             # A headless task can hold the queue lock for minutes. Journal fields
             # are published atomically, so this read-only view never waits for it.
             print(delivery_status(rem_dir, args.task, args.actor, args.chat))
+            return 0
+        # Арти, 23.10.2026: a check and a list waited for that lock too, and the gateway gave up after 20 s while the tick
+        # ran a task. They only read queued files, which are replaced atomically, so they do not wait either.
+        if args.command == "list":
+            print(list_tasks(rem_dir, args.prefix, args.actor, args.chat, args.page))
+            return 0
+        if args.command == "status":
+            resolve_legacy_task(rem_dir, args)
+            print(verified_status(rem_dir, args.task, args.actor, args.chat, args.legacy_prefix))
             return 0
         lock_file = Path(
             os.environ.get("LOCK_FILE", f"{rem_dir_value}.worker.lock")

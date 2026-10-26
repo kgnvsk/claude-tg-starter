@@ -422,11 +422,21 @@ def main() -> int:
     event, tool = data.get("hook_event_name"), data.get("tool_name")
     arguments = data.get("tool_input") if isinstance(data.get("tool_input"), dict) else {}
     response = data.get("tool_response") if isinstance(data.get("tool_response"), dict) else {}
+    # A main Telegram session must stay available while delegated work runs.
+    # The live montage probe reproduced an explicit false despite the persona's
+    # background rule. Enforce scheduling at the existing launch boundary, only
+    # with receiver authority; workers/cron/non-Telegram sessions exit above.
+    managed_agent = tool == "Agent" and AUTHORITY == "receiver" and bool(os.environ.get("TG_DELIVERY_STAMP"))
+    background_input = None
+    if managed_agent and event == "PreToolUse" and arguments.get("run_in_background") is not True:
+        arguments = {**arguments, "run_in_background": True}
+        background_input = arguments
     if event == "PostToolBatch":
         listed = data.get("tool_calls")
         calls = [item for item in (listed if isinstance(listed, list) else []) if isinstance(item, dict)
-                 and launch_capable(item.get("tool_name"), item.get("tool_input") if isinstance(
-                     item.get("tool_input"), dict) else {})]
+                 and (launch_capable(item.get("tool_name"), item.get("tool_input") if isinstance(
+                     item.get("tool_input"), dict) else {})
+                     or (AUTHORITY == "receiver" and item.get("tool_name") == "Agent"))]
         session = data.get("session_id")
         if calls and os.environ.get("TG_DELIVERY_STAMP") and isinstance(session, str) and session:
             try:
@@ -438,7 +448,7 @@ def main() -> int:
         return 0
     if tool == "TaskStop" and event != "PostToolUse":
         return 0  # a failed or batched stop closes nothing
-    if tool != "TaskStop" and not launch_capable(tool, arguments) and not (
+    if tool != "TaskStop" and not managed_agent and not launch_capable(tool, arguments) and not (
             event == "PostToolUse" and tool in ("Bash", "Agent")
             and (response.get("backgroundTaskId") or response.get("isAsync") is True)):
         return 0  # Pre goes by the input; a Post also takes a call that went to the background anyway
@@ -456,11 +466,31 @@ def main() -> int:
             raise NotRecorded("the hook input has no tool_use_id")
         if event == "PreToolUse":
             record_intent(session, stamp, call, tool)
+            if background_input is not None:
+                # updatedInput changes scheduling, not permission. Omit allow:
+                # all normal deny/ask checks still decide whether it can run.
+                print(json.dumps({"hookSpecificOutput": {
+                    "hookEventName": "PreToolUse", "updatedInput": background_input,
+                    "additionalContext": (
+                        "Delegated Telegram work runs in the background so the owner can keep chatting. "
+                        "After a successful launch, register its actual task_id in progress for the original "
+                        "delivery_id and end this turn. Forward later corrections to that worker; verify "
+                        "and deliver its result on completion. Do not poll or wait synchronously."),
+                }}))
         else:
             resolve_intent(session, stamp, call, tool, arguments, response, event == "PostToolUseFailure")
     except Exception as error:  # every failure here means the ledger holds nothing new
         log(f"{event} {tool} {call}: {error!r}")
         missing = ledger_missing()
+        if background_input is not None:
+            print(json.dumps({"hookSpecificOutput": {
+                "hookEventName": "PreToolUse", "permissionDecision": "deny",
+                "permissionDecisionReason": (
+                    "The delegated task was not started because its durable Telegram launch record "
+                    "could not be saved. Preserve the task and report this concrete blocker; do not "
+                    "silently run it in the foreground or claim that background work is running."),
+            }}))
+            return 0
         if missing or AUTHORITY != "receiver":
             # Only the receiver's gates read this record: outside it, and with no
             # ledger at all, the call goes on as it would without this hook.
@@ -472,8 +502,8 @@ def main() -> int:
                 "hookEventName": "PreToolUse", "permissionDecision": "deny",
                 "permissionDecisionReason": (
                     f"The Telegram launch ledger could not record this background launch ({error}), "
-                    "so it was not started. Run the work in the foreground, or start it again after "
-                    "the Telegram service restarts."),
+                    "so it was not started. Preserve the task and report this concrete blocker; "
+                    "do not claim it is running or bypass the launch record."),
             }}))
             return 0
         consequence = ("" if tool == "TaskStop" else " Its request does not wait for it."

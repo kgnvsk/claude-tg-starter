@@ -32,8 +32,9 @@
     ]
   },
   "model": "claude-opus-5-5[1m]",
-  "skillListingBudgetFraction": 0.08,
-  "skillListingMaxDescChars": 240,
+  "skillListingBudgetFraction": 0.25,
+  "skillListingMaxDescChars": 10000,
+  "bashOutputMaxChars": 128000,
   "hooks": {
     "PermissionRequest": [
       {
@@ -239,6 +240,7 @@
   "skipDangerousModePermissionPrompt": true,
   "env": {
     "MCP_TOOL_TIMEOUT": "180000",
-    "CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT": "120000"
+    "CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT": "120000",
+    "BASH_MAX_OUTPUT_LENGTH": "128000"
   }
 }

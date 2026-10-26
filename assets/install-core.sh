@@ -307,48 +307,7 @@ fi
 # END shared browser helper preflight
 
 # BEGIN instance system context preflight
-SYSTEMD_DIR=/etc/systemd/system
-INSTANCE_UNIT_TARGET="$SYSTEMD_DIR/$AGENT_SERVICE"
-INSTANCE_LOGROTATE_TARGET="/etc/logrotate.d/cash-$AGENT_USER"
-# The template the kit shipped before, byte for byte and never edited: an update may move past it. Only this
-# instance's concrete unit is written afterwards; the shared template, its drop-ins and its neighbours stay as they
-# are. 7d6b3d80 (22.07.2026) up to OOMPolicy=continue (10.10.2026).
-STOCK_INSTANCE_UNIT_SHA256="ba1286760bd4cf6119ec3c00f41a4aaccc68411567535c5599c313e07de434d7"
-stock_instance_unit() {
-  local sum
-  [ -f "$1" ] && [ ! -L "$1" ] || return 1
-  cmp -s "$KIT/assets/systemd/claude-telegram@.service" "$1" && return 0
-  sum="$(sha256sum "$1" 2>/dev/null)" || return 1
-  case " $STOCK_INSTANCE_UNIT_SHA256 " in *" ${sum%% *} "*) return 0 ;; esac
-  return 1
-}
-verify_instance_system_context() {
-  [ "$CLAUDE_UPDATE_MAINTENANCE" = 1 ] && [ "$AGENT_USER" != claude ] || return 0
-  local fragment
-  fragment="$(systemctl show "$AGENT_SERVICE" --property=FragmentPath --value --no-pager 2>/dev/null)" || return 1
-  case "$fragment" in
-    "$SYSTEMD_DIR/claude-telegram@.service"|"$INSTANCE_UNIT_TARGET") ;;
-    *) echo "FATAL: служба instance має неочікуване джерело" >&2; return 1 ;;
-  esac
-  if ! stock_instance_unit "$fragment"; then
-    echo "FATAL: unit instance відрізняється від комплекту; потрібне ручне узгодження" >&2
-    return 1
-  fi
-  if [ -e "$INSTANCE_UNIT_TARGET" ] || [ -L "$INSTANCE_UNIT_TARGET" ]; then
-    if ! stock_instance_unit "$INSTANCE_UNIT_TARGET"; then
-      echo "FATAL: налаштування unit instance змінено; перезапис заборонено" >&2
-      return 1
-    fi
-  fi
-  if [ -e "$INSTANCE_LOGROTATE_TARGET" ] || [ -L "$INSTANCE_LOGROTATE_TARGET" ]; then
-    if [ ! -f "$INSTANCE_LOGROTATE_TARGET" ] || [ -L "$INSTANCE_LOGROTATE_TARGET" ] \
-        || ! sed "s|/home/claude|$H|g" "$KIT/assets/systemd/logrotate-cash" \
-             | cmp -s - "$INSTANCE_LOGROTATE_TARGET"; then
-      echo "FATAL: налаштування logrotate instance змінено; перезапис заборонено" >&2
-      return 1
-    fi
-  fi
-}
+source "$KIT/assets/lib/install-system-context.sh"
 verify_instance_system_context
 # END instance system context preflight
 
@@ -393,14 +352,16 @@ esac
 OWNER_PROGRESS_NOTICES="${OWNER_PROGRESS_NOTICES-$(python3 "$KIT/assets/bin/update-safety-check" profile-value --home "$H" OWNER_PROGRESS_NOTICES 2>/dev/null || true)}"
 SECURITY_NOTICE_CHAT="${SECURITY_NOTICE_CHAT-$(python3 "$KIT/assets/bin/update-safety-check" profile-value --home "$H" SECURITY_NOTICE_CHAT 2>/dev/null || true)}"
 # Владелець, 22.10.2026: READ_CONTEXT_BEFORE_ANSWER=off — the main session answers from its own context, no read per answer.
-READ_CONTEXT_BEFORE_ANSWER="${READ_CONTEXT_BEFORE_ANSWER-$(python3 "$KIT/assets/bin/update-safety-check" profile-value --home "$H" READ_CONTEXT_BEFORE_ANSWER 2>/dev/null || true)}"
+# Novsky Agent defaults to no per-answer reread, including old profiles without an explicit choice.
+# A saved empty/on/off value and an explicit installer override remain authoritative.
+READ_CONTEXT_BEFORE_ANSWER="${READ_CONTEXT_BEFORE_ANSWER-$(python3 "$KIT/assets/bin/update-safety-check" profile-value --home "$H" --default off READ_CONTEXT_BEFORE_ANSWER 2>/dev/null || true)}"
 case "$OWNER_PROGRESS_NOTICES" in
   ''|off) ;;
   *) echo "WARN: OWNER_PROGRESS_NOTICES може бути лише off; значення не збережено" >&2; OWNER_PROGRESS_NOTICES= ;;
 esac
 case "$READ_CONTEXT_BEFORE_ANSWER" in
-  ''|off) ;;
-  *) echo "WARN: READ_CONTEXT_BEFORE_ANSWER може бути лише off; значення не збережено" >&2; READ_CONTEXT_BEFORE_ANSWER= ;;
+  ''|off|on) ;;
+  *) echo "WARN: READ_CONTEXT_BEFORE_ANSWER може бути лише on або off; значення не збережено" >&2; READ_CONTEXT_BEFORE_ANSWER= ;;
 esac
 if [ -n "$SECURITY_NOTICE_CHAT" ] && ! [[ "$SECURITY_NOTICE_CHAT" =~ ^-[1-9][0-9]{0,19}$ ]]; then
   echo "WARN: SECURITY_NOTICE_CHAT має бути id групи (від'ємне число); значення не збережено" >&2; SECURITY_NOTICE_CHAT=
@@ -564,8 +525,16 @@ fi
 }
 
 write_shell_value() {
-  local file="$1" name="$2"
-  printf '%s=%q\n' "$name" "${!name-}" >> "$file"
+  local file="$1" name="$2" value
+  value="${!name-}"
+  # %q under LC_ALL=C emits ANSI-C octal for Unicode, which the data-only
+  # channel/profile reader rightly refuses. Keep literal UTF-8 in POSIX quotes.
+  if [[ "$value" == *$'\n'* || "$value" == *$'\r'* ]]; then
+    echo "FATAL: $name містить недопустимий перенос рядка" >&2
+    return 1
+  fi
+  printf '%s' "$value" | python3 -c \
+    'import shlex,sys; print(sys.argv[1]+"="+shlex.quote(sys.stdin.read()))' "$name" >> "$file"
 }
 
 read_channel_value() {
@@ -615,8 +584,10 @@ initialize_limit_recovery_mode() {
 }
 
 initialize_limit_recovery_state() {
-  initialize_limit_recovery_mode --initialize || return $?
-  initialize_limit_recovery_mode --initialize-notices
+  # Existing provider deadlines, transcript checkpoints and notice latches
+  # survive upgrades. Explicit --initialize remains an operator repair/reset.
+  initialize_limit_recovery_mode --ensure || return $?
+  initialize_limit_recovery_mode --ensure-notices
 }
 # END limit recovery initialization helpers
 
@@ -703,8 +674,15 @@ python3 "$KIT/assets/bin/update-safety-check" apply \
   --defer-baseline
 # BEGIN browser helper install
 if product_has_feature browser; then
+  # Refresh only this agent's existing private browser. No onboarding/download,
+  # no migration or restart of the legacy host-wide browser during an update.
+  browser_config="/etc/claude-browser-private/$(id -u "$AGENT_USER").json"
+  if [ -e "$browser_config" ] || [ -L "$browser_config" ]; then
+    python3 "$KIT/assets/browser/private-browser.py" refresh --kit "$KIT" --agent "$AGENT_USER"
+  fi
   # Only the primary writes the shared helper; another bot keeps its sudoers line.
-  if [ "$AGENT_USER" = claude ]; then
+  if [ "$AGENT_USER" = claude ] && [ "$CLAUDE_UPDATE_MAINTENANCE" != 1 ] \
+    && [ ! -e "$browser_config" ] && [ ! -L "$browser_config" ]; then
     install -d -m 700 -o root -g root /var/lib/claude-browser/recovery
     install -m 755 -o root -g root "${KIT}/assets/bin/claude-browser-recover" /usr/local/sbin/claude-browser-recover
     # An installed browser takes the kit's network deny and limits in an update too, not only from install-browser.sh.
@@ -718,12 +696,9 @@ fi
 python3 "$KIT/assets/lib/reconcile-managed-runtime.py" \
   "$H" "$KIT/assets/product/managed-runtime.json" \
   "$H/.claude/product/managed-runtime.json"
-rm -f "$H/bin/cash-thread-capture" \
-  "$H/bin/tg-thread-snapshot" \
-  "$H/bin/vault-index" \
-  "$H/bin/cash-research-deep" \
-  "$H/bin/cash-health-evening" \
-  "$H/bin/pm-digest"
+# Removed helpers without a verified baseline may contain owner changes.
+# reconcile-managed-runtime handles proven managed retirements; do not delete
+# unclassified paths after the update plan has preserved them.
 
 # Retire the removed optional graph-memory extension from existing installs.
 # A maintenance update must never purge an existing owner's graph data;
@@ -807,6 +782,9 @@ env AGENT_NAME="$AGENT_NAME" OWNER_NAME="$OWNER_NAME" \
   --baseline "$H/.claude/product/managed-skills-baseline.json"
 case "${MANAGED_SKILLS_POLICY:-}" in /tmp/novsky-managed-skills.*) rm -f "$MANAGED_SKILLS_POLICY" ;; esac
 # END managed skill installation
+# Codex r1, 23.10.2026: a first install that stops after this point leaves runtime.json or CLAUDE.md behind, and its retry
+# would no longer count as new; this marker keeps it new until the profile holds the read switch.
+[ "${NEW_AGENT:-0}" = 1 ] && install -m 600 -o "$AGENT_USER" -g "$AGENT_USER" /dev/null "$H/.claude/product/new-agent-pending"
 install -m 600 -o "$AGENT_USER" -g "$AGENT_USER" \
   "$KIT/assets/product/runtime.json" "$H/.claude/product/runtime.json"
 if [ "$NOVSKY_MODULES_GATED" = 1 ]; then
@@ -937,6 +915,11 @@ for memory_file in MEMORY.md USER.md; do
 done
 
 copy_tree_no_clobber "$KIT/assets/vault-skeleton" "$H/obsidian-vault"
+# Only exact published stock guidance is migrated; custom notes stay untouched.
+python3 "$KIT/assets/lib/migrate-access-guide.py" \
+  "$KIT/assets/vault-skeleton/wiki/concepts/access-security.md" "$H" \
+  --user "$AGENT_USER" --engine claude \
+  || echo "WARN: міграцію довідника доступу не підтверджено; установка продовжується" >&2
 if [ ! -e "$H/.claude/onboarding-state.json" ]; then
   install -m 600 -o "$AGENT_USER" -g "$AGENT_USER" "$KIT/assets/templates/onboarding-state.json" "$H/.claude/onboarding-state.json"
   # The reminder helper spaces its first nudge from this stamp.
@@ -1160,11 +1143,14 @@ for name in AGENT_NAME AGENT_GENDER OWNER_NAME OWNER_TG_USERNAME OWNER_CHAT_ID A
 done
 chown "$AGENT_USER:$AGENT_USER" "$PROFILE_FILE"
 chmod 600 "$PROFILE_FILE"
+rm -f "$H/.claude/product/new-agent-pending"
 # The owner, 22.10.2026, Кнопа as the model: with READ_CONTEXT_BEFORE_ANSWER=off every owner rule is in the agent's own
 # instructions file before its service starts, so the first session after this install already has them; written after the profile,
 # which holds the switch on a fresh install (Codex r2).
+# render-rules also says «not written» while reads are on, so only an agent switched off warns (Codex r1 P2).
 if [ -x "$H/bin/answer-context" ]; then
-  runuser -u "$AGENT_USER" -- env HOME="$H" python3 "$H/bin/answer-context" render-rules >/dev/null 2>&1 \
+  rendered="$(runuser -u "$AGENT_USER" -- env HOME="$H" python3 "$H/bin/answer-context" render-rules 2>/dev/null || true)"
+  [ "$READ_CONTEXT_BEFORE_ANSWER" != off ] || [ "$rendered" = written ] \
     || echo "  ⚠ owner rules file not written: the agent keeps reading its rules before answers"
 fi
 umask "${secrets_umask:-022}"
@@ -1559,6 +1545,14 @@ if [ "$MODULE_YOUTUBE_COMMENTS" = 1 ]; then
   OWNER_CHAT_ID="$OWNER_CHAT_ID" OWNER_NAME="$OWNER_NAME" TIMEZONE="$TIMEZONE" \
     CLAUDE_UPDATE_MAINTENANCE="$CLAUDE_UPDATE_MAINTENANCE" \
     bash "$KIT/modules/youtube-comments/install.sh"
+fi
+
+# Root's C14 acceptance (24.10.2026): modules this agent set up itself (kit-module setup) record the files they placed,
+# and an update had never refreshed them. Those still holding the kit's own bytes now follow the kit; what the owner
+# changed stays and is named. Only files: no dependency, setting, schedule, account or listener.
+if [ -d "$H/.claude/product/modules" ] && [ -x "$H/bin/kit-module" ]; then
+  runuser -u "$AGENT_USER" -- env HOME="$H" PATH="$H/.local/bin:/usr/local/bin:/usr/bin:/bin" KIT_MODULE_KIT="$KIT" \
+    "$H/bin/kit-module" refresh || echo "  ⚠ файли модулів оновлено не повністю (див. вище); модулі працюють далі" >&2
 fi
 
 echo "[7/7] контрольна перевірка"

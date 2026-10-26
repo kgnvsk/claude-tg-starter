@@ -4,6 +4,7 @@
 #   kit-module list                  які модулі є в комплекті й файли яких уже поставлено тут
 #   kit-module setup <назва> [арг]   запустити власне налаштування модуля (можна повторювати)
 #   kit-module path <назва>          каталог модуля в комплекті — там його SETUP.md / README.md
+#   kit-module refresh               оновлення комплекту: файли вже поставлених тут модулів, які ніхто не правив
 #
 # Комплект належить root і лише читається. Налаштування пише тільки в дім цього користувача:
 # помічники в ~/bin, стан, власний crontab. Що потрібно від власника — у скілі модуля.
@@ -138,8 +139,33 @@ case "${1:-}" in
     current="$(release)"
     printf '%s\n' "${current:-невідомий випуск} · $(date -u +%Y-%m-%dT%H:%MZ)" > "$STATE/$name"
     ;;
+  refresh)
+    # Root's C14 acceptance (24.10.2026): an update never refreshed what a module set up here had placed. Every module
+    # with a record of its files, and still licensed, gets the kit's current files where it still has the kit's own
+    # bytes. Only files: no dependency, setting, schedule, account or listener; a module never set up is not touched.
+    [ "$(id -u)" -ne 0 ] || { echo "Запусти під користувачем агента, не root." >&2; exit 1; }
+    current="$(release)"
+    refresh_status=0
+    for name in $(available); do
+      [ -f "$STATE/$name.files.json" ] || continue
+      module_blocked setup "$name" >/dev/null && continue
+      if ! grep -q 'KIT_MODULE_REFRESH' "$KIT/modules/$name/setup.sh"; then
+        echo "$name — його файли оновлює лише повторне налаштування: kit-module setup $name …"
+        continue
+      fi
+      if KIT_MODULE_REFRESH=1 bash "$KIT/modules/$name/setup.sh"; then
+        printf '%s\n' "${current:-невідомий випуск} · $(date -u +%Y-%m-%dT%H:%MZ)" > "$STATE/$name"
+        echo "$name — файли оновлено до ${current:-поточного випуску}"
+      else
+        failed_status=$?
+        refresh_status=1
+        echo "$name — оновлення файлів не завершено (код $failed_status); подробиці вище" >&2
+      fi
+    done
+    exit "$refresh_status"
+    ;;
   *)
-    sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'
     exit 2
     ;;
 esac

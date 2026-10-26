@@ -31,10 +31,67 @@ UPSTREAM_SERVER_SHA256 = (
 )
 UPSTREAM_PACKAGE_START = "bun install --no-summary 1>&2 && bun server.ts"
 GOLDEN_SERVER_SHA256 = (
-    "d5e1eda1114fb473579b555a2e1b7b4dc4c1259f54ad66468eb3a499c72b778b"
+    "1826a3524794f2ac9eceba5743a263dccca734a56d9cca1bf15c5ae8d06636c9"
 )
 PREVIOUS_GOLDEN_SERVER_SHA256S = frozenset(
     {
+        # The golden before download failures retain their HTTP status.
+        "17405e1ec0135c295d5726e511f3db04dfd2787f9984b392eb3905a4386238f6",
+        # The golden before forum text continuations avoid repeated earlier files and speech.
+        "4939b88d79e10305462d4a337e032979c8dd68bff47c4cc85cab34bbd7052d54",
+        # The golden before an admitted audio rejected after membership changes avoids ambient retranscription.
+        "1ef3c4b2e516963941867aebb83e55ebc9eb18b896428165a3b4937b801151c0",
+        # The golden before brief plain group continuations retain the original mention arrival window.
+        "d8cf24fc5f9efb9d52ee4e6b768776a2fd95270190e39441f07a18878e1a07a8",
+        # The golden before observed audio joins an admitted corporate album with original bytes and transcription.
+        "9f751f61194963664c1fe497f5e1f2a809d22804b4323e03b1bf0cc13c63fe28",
+        # Unreleased ingress candidate before durable restart holds and cleanup isolation.
+        "6c8ec6f7e1446037c6ee114776d247c2cf43ec59c5c6f5155b3b1e66908db57d",
+        # Unreleased ingress candidate before accounting for the recording transcription budget.
+        "9eb8f4ce2c3f23f38aec1ff781e84aa048cd6dbca78d36202dc893ff94e7dfe6",
+        # The golden before original audio files, album file fallback and bounded arriving album parts.
+        "ef9aae2015c02f302c0fab28c5c707a5268a7aa1b957c917378341fb1ce66e08",
+        # The golden before truthful credential failure reasons.
+        "2b29fce2c14e388cd5668fc9316596c0ca5edf4c35c5f4bcc32c6cb2f67ce4c5",
+        # The golden before bound corporate approval continuations.
+        "fa4f6a0b410a29474c98a1ffc909e55b698f028d022665878c73e6df7d29bd4b",
+        # 389c700d6953 Telegram bot as a sales channel: a stranger's private message is an ex
+        "d622a9346a8e8c00fc6e2dbec6465210a1fd36cf28192f6a776a73810dd8d108",
+        # 375272fd77bc A later correction or cancellation retires the earlier approval card i
+        "ccb6f3035cb73be119c5971ff89233327fd4b2670c55321be29a568246926f3e",
+        # c9e9e306, unreleased candidate: a card a later correction or cancellation retired answered its press with the
+        # generic «Запит недоступний або не виконаний».
+        "d37321a1328012a4b4a1bb70ee7f0e06755af63e09361aac57409d4da0ac25c9",
+        # 8abadb5c, unreleased candidate C12: a refused owner policy preview said only «rejected».
+        "0449257bdf9b062ff3eb36d45d2218232416b9966c68c2dfcfd45c1078d0cb3e",
+        # 9a6bf611, unreleased candidate: policy cards went out with the generic confirm/cancel buttons and no request origin.
+        "4a23ea547a55dda3f37abec164d03cc45555b1426f9bfa1b890d5fd3b1ce96d4",
+        # 206f2a21, unreleased candidate: a corporate button answered «Застосовую…» before its decision checked who
+        # pressed it.
+        "44ed39df5e87ed00b4ebc8cef5db6368114c1e4a8f6779b6efd106818bb5569e",
+        # 0b0e055a, unreleased candidate: an early holding line queued for background work was sent after a progress
+        # or over a final in flight (root's review P2).
+        "16f077fa0da372b2766dd60e0f88a2c2fee032330a78b47450d3ec6247857091",
+        # 2265c2ef, unreleased candidate: a video sent without its review receipt failed on a bare ENOENT.
+        "1180fe408fc3f532c89b1bb5dafdcfffed663cc71c911210ebab873b879c1898",
+        # 0236c411, unreleased candidate: a turn that started background work could close without a word to its chat.
+        "703847777226e2048c504a636542037307041473a6bb882a71acf32e8e77aaae",
+        # 7a8e6bbc, unreleased candidate: a mentioned group or topic still counted as the owner's destination.
+        "8bd217ba416fa67b523344501d03fcd061a08764a58849dfd8999c25529cb378",
+        # The golden before host-known group and topic names and owner-named copies to another chat.
+        "427ff7903d5d633111660ccc4ecaac5fab0e075707688e65777bbb30b5cb0e14",
+        # The golden before structured provider reset recovery.
+        "c80edd5d46d534f050b842e1705ea962bdf9d989972f827c9e8096866ae206a0",
+        # The golden before native stop receipt settlement and bounded observations.
+        "23facde4c4f26e50bc056c322a037e911da2ae6478179ea0527c2bfdd1ae393b",
+        # d71c3f84 / 888133f9: authorized test candidate before the owner HTTP bridge correction.
+        "8e181511cd12f68ed8d85e09df9807c4062f75baa079d015601355afdba2e3b8",
+        # The golden before Novsky Agent owner groups, media completeness and durable upload receipts.
+        "68c898e8027e9f32fc19d48f86efe3a6759cae87c0f427c18f1eef62d8a079ef",
+        # 4495d638 23.10: приймач без обрізань — цитата відповіді, усі файли серії, сповіщення власнику, довгі картки частинами
+        "08b881acb63e35901fd4e8d57202f3fe98da244b8678b6f835d2f539a40c5101",
+        # 0c569763 Арті, 23.10: особистий чат власника закривається мовчки, коли він нічого не просить; інструкції приймача до 2048 знаків
+        "d5e1eda1114fb473579b555a2e1b7b4dc4c1259f54ad66468eb3a499c72b778b",
         # 91dea36b Арті, 22.10: інструкції каналу до 2048 знаків ще не обрізані; no_reply в особистому чаті власника заборонений
         "ef3b4172813d3eaeae0bc603d042378479ea846b46ea20daa90450920046a565",
         # c62f7dad72fb Арті, 22.10: контекст цілим через read_answer_context (до читання без повторів і збереження за темою)

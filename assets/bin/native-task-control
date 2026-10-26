@@ -1,0 +1,252 @@
+#!/usr/bin/env python3
+"""List or stop this Claude instance's exactly observed native task; no model prompt."""
+import argparse
+import base64
+from contextlib import contextmanager
+import json
+import os
+from pathlib import Path
+import re
+import sqlite3
+import stat
+import sys
+import time
+import uuid
+
+SCHEMA = 'novsky.native-task-control.v1'
+FIELDS = ('session_id', 'stamp', 'generation', 'task_id', 'run_id', 'tool_use_id', 'occurrence', 'launch_ref')
+OPEN = ('queued', 'sent', 'acknowledged', 'unconfirmed')
+SAFE_ID = re.compile(r'[A-Za-z0-9_-]{1,160}')
+
+
+class Refused(Exception):
+    pass
+
+
+def now():
+    return int(time.time() * 1000)
+
+
+def valid_binding(b):
+    return (isinstance(b, dict) and set(b) == set(FIELDS)
+            and all(isinstance(b[k], str) and SAFE_ID.fullmatch(b[k]) for k in
+                    ('session_id', 'stamp', 'task_id', 'tool_use_id', 'launch_ref'))
+            and (b['run_id'] is None or isinstance(b['run_id'], str) and SAFE_ID.fullmatch(b['run_id']))
+            and all(type(b[k]) is int and 0 < b[k] < 2**53 for k in ('generation', 'occurrence'))
+            and b['tool_use_id'] == b['launch_ref'])
+
+
+def runtime(db):
+    r = db.execute('SELECT * FROM native_control_runtime WHERE singleton=1').fetchone()
+    if not r or r['ready'] != 1 or not 0 <= now() - r['heartbeat_at'] <= 10000:
+        raise Refused('runtime_unavailable')
+    return dict(r)
+
+
+def same_runtime(b, r):
+    return all(b[k] == r[k] for k in ('session_id', 'stamp', 'generation'))
+
+
+def request_result(db, row):
+    b = json.loads(row['binding_json'])
+    status, reason = row['status'], row['reason']
+    if status in OPEN:
+        try:
+            if not same_runtime(b, runtime(db)):
+                raise Refused('runtime_generation_changed')
+        except Refused as error:
+            status, reason = 'unconfirmed', str(error)
+        except sqlite3.Error:
+            # This request already exists durably; a later read failure cannot undo it.
+            # Preserve its id/binding so callers inspect the same request, never resubmit.
+            status, reason = 'unconfirmed', 'runtime_read_unavailable'
+    return dict(schema=SCHEMA, request_id=row['request_id'], status=status,
+                confirmed=status == 'stopped', reason=reason, binding=b, updated_at=row['updated_at'])
+
+
+def latest(db, b):
+    return db.execute('SELECT * FROM native_control_tasks WHERE session_id=? AND stamp=? AND generation=? '
+                      'AND task_id=? ORDER BY id DESC LIMIT 1',
+                      tuple(b[k] for k in ('session_id', 'stamp', 'generation', 'task_id'))).fetchone()
+
+
+def binding_for(db, t, r):
+    owner = db.execute('SELECT occurrence,launch_ref,state FROM delivery_task_owners '
+                       'WHERE session_id=? AND stamp=? AND task_id=?',
+                       (r['session_id'], r['stamp'], t['task_id'])).fetchone()
+    if not owner:
+        return None, 'no_exact_native_obligation'
+    b = {k: r[k] for k in ('session_id', 'stamp', 'generation')}
+    b.update(task_id=t['task_id'], run_id=t['run_key'] or None, tool_use_id=t['tool_use_id'],
+             occurrence=owner['occurrence'], launch_ref=owner['launch_ref'])
+    if not valid_binding(b):
+        return None, 'no_exact_tool_use_link'
+    if owner['state'] not in ('owned', 'unowned'):
+        return b, 'obligation_not_open'
+    return b, None
+
+
+def list_tasks(db, limit, cursor):
+    r = runtime(db)
+    after = 0
+    if cursor:
+        if len(cursor) > 1024:
+            raise Refused('invalid_cursor')
+        try:
+            c = json.loads(base64.urlsafe_b64decode(cursor + '=' * (-len(cursor) % 4)))
+            if set(c) != {'session_id','stamp','generation','after'} or not same_runtime(c, r) or type(c['after']) is not int or c['after'] < 0:
+                raise ValueError()
+            after = c['after']
+        except (ValueError, TypeError):
+            raise Refused('stale_or_invalid_cursor')
+    rows = db.execute('SELECT t.* FROM native_control_tasks t WHERE session_id=? AND stamp=? AND generation=? '
+                      'AND id>? AND id=(SELECT max(n.id) FROM native_control_tasks n WHERE n.session_id=t.session_id '
+                      'AND n.stamp=t.stamp AND n.generation=t.generation AND n.task_id=t.task_id) ORDER BY id LIMIT ?',
+                      (r['session_id'],r['stamp'],r['generation'],after,limit+1)).fetchall()
+    tasks = []
+    for t in rows[:limit]:
+        b, reason = binding_for(db, t, r)
+        if t['state'] != 'running':
+            reason = 'already_terminal'
+        elif r['support'] == 'unsupported':
+            reason = 'protocol_unsupported'
+        tasks.append(dict(task_id=t['task_id'], binding=b, state=t['state'], observed_at=t['observed_at'],
+                          controllable=reason is None, reason=reason))
+    next_cursor = None
+    if len(rows) > limit:
+        c = {k:r[k] for k in ('session_id','stamp','generation')}
+        c['after'] = rows[limit-1]['id']
+        next_cursor = base64.urlsafe_b64encode(json.dumps(c,separators=(',',':')).encode()).decode().rstrip('=')
+    return dict(schema=SCHEMA,status='ok',runtime={k:r[k] for k in ('session_id','stamp','generation')},
+                tasks=tasks,next_cursor=next_cursor,incomplete=bool(r['observations_limited']))
+
+
+def stop(db, request, b):
+    if not valid_binding(b):
+        raise Refused('invalid_binding')
+    db.execute('BEGIN IMMEDIATE')
+    try:
+        existing = db.execute('SELECT * FROM native_control_requests WHERE request_id=?', (request,)).fetchone()
+        if existing:
+            if json.loads(existing['binding_json']) != b:
+                raise Refused('request_binding_conflict')
+            db.commit()
+            return request_result(db, existing)
+        r = runtime(db)
+        if not same_runtime(b, r):
+            raise Refused('runtime_generation_changed')
+        t = latest(db, b)
+        if not t or t['run_key'] != (b['run_id'] or '') or t['tool_use_id'] != b['tool_use_id']:
+            raise Refused('lifecycle_not_current')
+        actual, reason = binding_for(db, t, r)
+        if actual != b or reason is not None and t['state'] == 'running':
+            raise Refused(reason or 'obligation_changed')
+        if db.execute('SELECT count(*) FROM native_control_requests').fetchone()[0] >= 10000:
+            raise Refused('request_history_capacity')
+        current = db.execute("SELECT binding_json FROM native_control_requests WHERE session_id=? AND stamp=? AND generation=? "
+                             "AND status IN ('queued','sent','acknowledged','unconfirmed') LIMIT 65",
+                             (r['session_id'],r['stamp'],r['generation'])).fetchall()
+        if len(current) >= 32:
+            raise Refused('stop_queue_capacity')
+        for prior in current:
+            p = json.loads(prior['binding_json'])
+            if all(p[k] == b[k] for k in ('task_id','run_id','tool_use_id')):
+                raise Refused('prior_stop_unconfirmed')
+        status, why = ('already_terminal',t['state']) if t['state'] != 'running' else (
+            ('unsupported','protocol_unsupported') if r['support'] == 'unsupported' else ('queued',None))
+        timestamp = now()
+        db.execute('INSERT INTO native_control_requests(request_id,binding_json,session_id,stamp,generation,status,reason,created_at,updated_at) '
+                   'VALUES(?,?,?,?,?,?,?,?,?)', (request,json.dumps(b,sort_keys=True,separators=(',',':')),
+                   b['session_id'],b['stamp'],b['generation'],status,why,timestamp,timestamp))
+        row = db.execute('SELECT * FROM native_control_requests WHERE request_id=?', (request,)).fetchone()
+        db.commit()
+        return request_result(db,row)
+    except BaseException:
+        db.rollback()
+        raise
+
+
+@contextmanager
+def connection():
+    uid = os.geteuid()
+    if uid == 0 or os.getuid() != uid:
+        raise Refused('run_as_selected_agent_user')
+    home = Path.home()
+    if not home.is_absolute() or '..' in home.parts:
+        raise Refused('invalid_home')
+    parent = guard = None
+    db = None
+    try:
+        parent = os.open('/', os.O_RDONLY|os.O_DIRECTORY)
+        current = Path('/')
+        folder = home / '.claude/channels/telegram'
+        for part in folder.parts[1:]:
+            following = os.open(part, os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW, dir_fd=parent)
+            os.close(parent); parent = following; current /= part
+            info = os.fstat(parent)
+            sticky_ancestor = current != home and current in home.parents and info.st_uid == 0 and info.st_mode & stat.S_ISVTX
+            if (info.st_uid not in (0,uid) or info.st_mode & 0o022 and not sticky_ancestor
+                    or current == home and info.st_uid != uid):
+                raise Refused('unsafe_state_directory')
+        guard = os.open('messages.db',os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=parent)
+        before = os.fstat(guard)
+        for name in ('messages.db','messages.db-wal','messages.db-shm','messages.db-journal'):
+            try: info = os.stat(name,dir_fd=parent,follow_symlinks=False)
+            except FileNotFoundError:
+                if name == 'messages.db': raise
+                continue
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != uid or info.st_nlink != 1 or info.st_mode & 0o022:
+                raise Refused('unsafe_state_file')
+        path = f'/proc/self/fd/{parent}/messages.db' if sys.platform.startswith('linux') else str(folder/'messages.db')
+        db = sqlite3.connect('file:'+path+'?mode=rw',uri=True,timeout=3)
+        db.row_factory = sqlite3.Row
+        if hasattr(db,'setlimit'): db.setlimit(sqlite3.SQLITE_LIMIT_LENGTH,65536)
+        after = os.stat('messages.db',dir_fd=parent,follow_symlinks=False)
+        if (before.st_dev,before.st_ino)!=(after.st_dev,after.st_ino):
+            raise Refused('state_file_changed')
+        db.execute('PRAGMA trusted_schema=OFF')
+        db.execute('PRAGMA foreign_keys=OFF')
+        deadline=time.monotonic()+5
+        db.set_progress_handler(lambda:int(time.monotonic()>deadline),1000)
+        yield db
+    finally:
+        if db is not None: db.close()
+        if guard is not None: os.close(guard)
+        if parent is not None: os.close(parent)
+
+
+def main():
+    p=argparse.ArgumentParser(description=__doc__)
+    sub=p.add_subparsers(dest='action',required=True)
+    for name in ('list','stop','status'):
+        command=sub.add_parser(name);command.add_argument('--json',action='store_true')
+        if name=='list':
+            command.add_argument('--limit',type=int,default=20);command.add_argument('--cursor')
+        else:
+            command.add_argument('--request',required=True)
+        if name=='stop': command.add_argument('--binding-json',required=True)
+    a=p.parse_args()
+    try:
+        if a.action!='list' and str(uuid.UUID(a.request))!=a.request:
+            raise Refused('invalid_request_id')
+        if a.action=='list' and not 1<=a.limit<=50: raise Refused('invalid_limit')
+        if a.action=='stop' and len(a.binding_json)>4096: raise Refused('invalid_binding')
+        with connection() as db:
+            if a.action=='list': result=list_tasks(db,a.limit,a.cursor)
+            elif a.action=='stop': result=stop(db,a.request,json.loads(a.binding_json))
+            else:
+                row=db.execute('SELECT * FROM native_control_requests WHERE request_id=?',(a.request,)).fetchone()
+                if row is None: raise Refused('request_not_found')
+                result=request_result(db,row)
+        text=json.dumps(result,separators=(',',':'))
+        if len(text.encode())>65536: raise Refused('output_capacity')
+        print(text)
+    except (Refused,OSError,ValueError,sqlite3.Error) as error:
+        reason=str(error) if isinstance(error,Refused) else 'runtime_unavailable'
+        print(json.dumps(dict(schema=SCHEMA,status='unavailable' if a.action=='list' else 'rejected',reason=reason,confirmed=False)))
+        return 1
+    return 0
+
+
+if __name__=='__main__':
+    sys.exit(main())

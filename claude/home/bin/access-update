@@ -84,6 +84,82 @@ def locked_update(path: Path, update: Callable[[dict], str]) -> str:
         os.close(lock_fd)
 
 
+def sync_pending(data: dict, change: dict) -> str:
+    """Receiver-only compare-and-swap: never write its stale access snapshot."""
+    if not isinstance(change, dict) or set(change) != {"before", "after"}:
+        raise SystemExit("access-update: invalid pending change")
+    before, after = change["before"], change["after"]
+    if not isinstance(before, dict) or not isinstance(after, dict):
+        raise SystemExit("access-update: invalid pending entries")
+    pending = data.get("pending", {})
+    if not isinstance(pending, dict):
+        raise SystemExit("access-update: invalid current pending entries")
+    keys = {key for key in before.keys() | after.keys() if before.get(key) != after.get(key)}
+    proposed = dict(pending)
+    for key in keys:
+        if not re.fullmatch(r"[a-f0-9]{6}", key):
+            raise SystemExit("access-update: invalid pairing code")
+        if pending.get(key) == after.get(key):
+            continue  # Another receiver already applied this exact change.
+        if pending.get(key) != before.get(key):
+            return json.dumps({"applied": False})
+        if key not in after:
+            proposed.pop(key, None)
+            continue
+        entry = after[key]
+        if (not isinstance(entry, dict) or not APPROVER.fullmatch(str(entry.get("senderId", "")))
+                or str(entry.get("chatId")) != str(entry.get("senderId"))
+                or not isinstance(entry.get("expiresAt"), (int, float))
+                or entry.get("replies", 1) not in (1, 2)):
+            raise SystemExit("access-update: invalid pairing entry")
+        if data.get("dmPolicy", "pairing") != "pairing" or str(entry["senderId"]) in unique(data.get("allowFrom", [])):
+            return json.dumps({"applied": False})
+        if any(other != key and value.get("senderId") == entry["senderId"] for other, value in proposed.items()):
+            return json.dumps({"applied": False})
+        proposed[key] = entry
+    if len(proposed) > 3 and len(proposed) > len(pending):
+        return json.dumps({"applied": False})
+    data["pending"] = proposed
+    return json.dumps({"applied": True})
+
+
+def owner_group_state(data: dict, chat: str, owner: str, bot: str, change: dict) -> str:
+    """Receiver-only observation, under the same lock as role/policy writers.
+
+    CAS rejects an API observation started before a membership event. The epoch
+    changes even when two membership events leave the same final member count.
+    """
+    if (not re.fullmatch(r"-[1-9]\d{0,19}", chat) or not APPROVER.fullmatch(owner)
+            or not APPROVER.fullmatch(bot) or owner == bot):
+        raise SystemExit("access-update: invalid owner-group identity")
+    if (not isinstance(change, dict) or set(change) != {"mode", "expectedEpoch", "private"}
+            or change["mode"] not in ("observe", "invalidate") or type(change["private"]) is not bool
+            or not isinstance(change["expectedEpoch"], str)
+            or (change["expectedEpoch"] and not re.fullmatch(r"[a-f0-9]{32}", change["expectedEpoch"]))):
+        raise SystemExit("access-update: invalid owner-group observation")
+    states = data.setdefault("ownerGroupMembership", {})
+    if not isinstance(states, dict):
+        raise SystemExit("access-update: invalid owner-group state")
+    previous = states.get(chat)
+    valid = (isinstance(previous, dict) and previous.get("ownerId") == owner and previous.get("botId") == bot
+             and isinstance(previous.get("epoch"), str) and re.fullmatch(r"[a-f0-9]{32}", previous["epoch"])
+             and type(previous.get("private")) is bool and type(previous.get("since")) is int and previous["since"] > 0)
+    epoch = previous["epoch"] if valid else ""
+    stale = change["mode"] == "observe" and change["expectedEpoch"] != epoch
+    if stale and valid:
+        # Returning a fail-closed snapshot does not overwrite a newer observation.
+        return json.dumps({"epoch": epoch, "private": False, "since": previous["since"]})
+    private = change["mode"] == "observe" and not stale and change["private"]
+    now = int(time.time() * 1000)
+    changed = not valid or change["mode"] == "invalidate" or previous["private"] != private
+    if changed:
+        epoch = uuid.uuid4().hex
+    since = now if changed else previous["since"]
+    states[chat] = {"epoch": epoch, "private": private, "since": since, "ownerId": owner, "botId": bot,
+                    "observedAt": now}
+    return json.dumps({"epoch": epoch, "private": private, "since": since})
+
+
 def locked_inspect(path: Path, inspect: Callable[[dict], str]) -> str:
     path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = path.with_name(path.name + ".lock")
@@ -133,7 +209,16 @@ def set_superadmins(data: dict, owner: str, csv: str) -> str:
 
 
 def team_fingerprint(data: dict) -> str:
-    return hashlib.sha256(json.dumps(data, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+    # Receiver observations refresh this clock without changing permissions.
+    # Match answer-context: retain every other field, including unknown fields,
+    # membership identity, epoch, privacy and history boundary. Do not mutate data.
+    access = json.loads(json.dumps(data))
+    membership = access.get("ownerGroupMembership")
+    if isinstance(membership, dict):
+        for state in membership.values():
+            if isinstance(state, dict):
+                state.pop("observedAt", None)
+    return hashlib.sha256(json.dumps(access, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
 
 
 def cleanup_access_previews(db: sqlite3.Connection, table: str, now: int) -> None:
@@ -538,12 +623,8 @@ def apply_settings(data: dict, owner: str, actor: str, change: dict) -> str:
             policy["admissionMode"] = "allowlist"
         else:
             raise SystemExit("Invalid group setting or value")
-        summary = f"Налаштування групи {group_id} {setting}: {json.dumps(value, ensure_ascii=False)}"
-        if len(summary.encode("utf-8")) > 3500 and setting == "allowFrom":
-            digest = hashlib.sha256(json.dumps(value, ensure_ascii=False).encode("utf-8")).hexdigest()
-            return (f"Налаштування групи {group_id} {setting}: {len(value)} ID; "
-                    f"перші {json.dumps(value[:10])}; останні {json.dumps(value[-5:])}; SHA-256 {digest}")
-        return summary
+        # Every ID (owner, 23.10.2026: a long list showed its first 10 and last 5); a long card goes as several messages.
+        return f"Налаштування групи {group_id} {setting}: {json.dumps(value, ensure_ascii=False)}"
     raise SystemExit("Invalid setting request")
 
 
@@ -1129,7 +1210,13 @@ def main(argv: list[str]) -> int:
         )
         return 2
     command, path = argv[1], Path(argv[2])
-    if command == "reconcile-admins" and len(argv) in (4, 5):
+    if command == "owner-group-state" and len(argv) == 6:
+        change = json.loads(sys.stdin.read(4097))
+        message = locked_update(path, lambda data: owner_group_state(data, *argv[3:], change))
+    elif command == "pending-sync" and len(argv) == 3:
+        change = json.loads(sys.stdin.read(65537))
+        message = locked_update(path, lambda data: sync_pending(data, change))
+    elif command == "reconcile-admins" and len(argv) in (4, 5):
         message = locked_update(
             path, lambda data: reconcile_admins(data, argv[3], argv[4] if len(argv) == 5 else "")
         )

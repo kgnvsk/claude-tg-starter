@@ -348,7 +348,7 @@ def load_legacy_templates(kit: Path) -> dict[str, dict[str, bytes]]:
     if (
         not stat.S_ISREG(metadata.st_mode)
         or metadata.st_nlink != 1
-        or metadata.st_size > 512 * 1024
+        or metadata.st_size > 16 * 1024 * 1024
     ):
         raise UpdateError("legacy template bridge is unsafe")
     try:
@@ -364,12 +364,13 @@ def load_legacy_templates(kit: Path) -> dict[str, dict[str, bytes]]:
         raise UpdateError("legacy template bridge has an invalid schema")
 
     decoded: dict[str, dict[str, bytes]] = {}
+    decoded_bytes = 0
     for relative, variants in document["templates"].items():
         if (
             not isinstance(relative, str)
             or not MANAGED_PATH.fullmatch(relative)
             or not isinstance(variants, dict)
-            or len(variants) > 16
+            or len(variants) > 256
         ):
             raise UpdateError("legacy template bridge has an invalid path")
         decoded_variants: dict[str, bytes] = {}
@@ -400,6 +401,9 @@ def load_legacy_templates(kit: Path) -> dict[str, dict[str, bytes]]:
                 or hashlib.sha256(payload).hexdigest() != digest
             ):
                 raise UpdateError("legacy template bridge is corrupt")
+            decoded_bytes += len(payload)
+            if decoded_bytes > 128 * 1024 * 1024:
+                raise UpdateError("legacy template bridge expands beyond its total budget")
             decoded_variants[digest] = payload
         decoded[relative] = decoded_variants
     return decoded

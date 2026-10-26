@@ -60,6 +60,9 @@ function fixedScope(resource, current, labelKey, allowed, derived = []) {
   }
   return resource;
 }
+function renameOnly(input) {
+  return !!input && typeof input === "object" && !Array.isArray(input) && exactFields(input, ["action", "id", "label"]);
+}
 function resourceFromControl(input, current, businessMcp) {
   if (!input || typeof input !== "object" || Array.isArray(input) || typeof input.id !== "string" || !/^[a-z0-9][a-z0-9._-]{0,63}$/.test(input.id))
     throw new Error("invalid resource id");
@@ -71,6 +74,8 @@ function resourceFromControl(input, current, businessMcp) {
   if (input.action !== "register" || typeof input.label !== "string" || !input.label.trim() || input.label.trim().length > 120 || LABEL_CONTROLS.test(input.label))
     throw new Error("invalid business resource");
   const label = input.label.trim();
+  if (current && renameOnly(input))
+    return { ...current, label };
   if (input.connector === "google" && ["analytics_property", "search_site"].includes(input.kind)) {
     const metric = input;
     const target = metric.kind === "analytics_property" ? "propertyId" : "siteUrl";
@@ -555,7 +560,7 @@ function createdGoogleFiles(db, resourceId, capability, kind) {
     try {
       title = JSON.parse(row.argumentsJson).title;
     } catch {}
-    files.set(row.id, { id: row.id, kind, label: typeof title === "string" ? title.slice(0, 120) : row.id });
+    files.set(row.id, { id: row.id, kind, label: typeof title === "string" ? title : row.id });
   }
   return [...files.values()];
 }
@@ -574,7 +579,7 @@ function allowedGoogleFiles(resource, kind) {
     const id = match[2];
     if (files.has(id))
       continue;
-    const label = typeof value === "string" && value.trim().length > 0 ? value.trim().slice(0, 120) : id;
+    const label = typeof value === "string" && value.trim().length > 0 ? value.trim() : id;
     files.set(id, { id, label, kind: match[1] });
   }
   return [...files.values()].sort((left, right) => left.label.localeCompare(right.label) || left.id.localeCompare(right.id));
@@ -1029,8 +1034,12 @@ function isInstalledAgentSubject(subject) {
   const match = /^agent:installed:[A-Za-z0-9_-]{1,100}:([1-9]\d{0,18})$/.exec(subject);
   return match !== null && BigInt(match[1]) <= 9223372036854775807n;
 }
+function memberSubject(subject) {
+  const match = /^member:(group:-?\d+|topic:-?\d+:\d+):(\d+)$/.exec(subject);
+  return match ? { conversation: match[1], userId: match[2] } : null;
+}
 function isValidSubject(subject) {
-  return subject === AGENT_DEFAULT_SUBJECT || isInstalledAgentSubject(subject) || /^user:\d+$/.test(subject) || /^group:-?\d+$/.test(subject) || /^topic:-?\d+:\d+$/.test(subject);
+  return subject === AGENT_DEFAULT_SUBJECT || isInstalledAgentSubject(subject) || /^user:\d+$/.test(subject) || /^group:-?\d+$/.test(subject) || /^topic:-?\d+:\d+$/.test(subject) || memberSubject(subject) != null;
 }
 function expandFullAccess(catalog, resources) {
   const grants = [];
@@ -1128,12 +1137,36 @@ function groupActionJson(value) {
 function groupActionDeliveryId(sourceJobId, request) {
   return `corporate-group-action:${sourceJobId}:${createHash3("sha256").update(groupActionJson(request)).digest("hex")}`;
 }
+function readGroupSource(db, jobId) {
+  const row = db.query(`SELECT job_id AS sourceJobId,conversation_key AS conversationKey,
+    actor_user_id AS actorUserId,chat_id AS chatId,thread_id AS threadId,message_id AS messageId,
+    album_key AS albumKey,prompt_json AS prompt FROM conversation_jobs WHERE job_id=?`).get(jobId);
+  if (!row)
+    return null;
+  const { albumKey, prompt, ...origin } = row;
+  try {
+    const album = JSON.parse(prompt).album;
+    if (album?.continuation === true && album.sourceMessageId !== origin.messageId) {
+      if (!albumKey || !Number.isSafeInteger(album.sourceMessageId) || album.sourceMessageId <= 0 || !Array.isArray(album.messageIds) || !album.messageIds.includes(origin.messageId) || !album.messageIds.includes(album.sourceMessageId))
+        return null;
+      const first = db.query(`SELECT 1 FROM conversation_jobs WHERE album_key=? AND message_id=?
+        AND actor_user_id=? AND chat_id=? AND thread_id IS ? AND conversation_key=?
+        AND json_extract(prompt_json,'$.album.sourceMessageId')=message_id`).get(albumKey, album.sourceMessageId, origin.actorUserId, origin.chatId, origin.threadId, origin.conversationKey);
+      if (!first)
+        return null;
+      origin.messageId = album.sourceMessageId;
+    }
+    return origin;
+  } catch {
+    return null;
+  }
+}
 function readQueuedGroupAction(db, jobId) {
   try {
     const row = db.query(`SELECT delivery_id AS deliveryId,conversation_key AS conversationKey,
       actor_user_id AS actorUserId,chat_id AS chatId,thread_id AS threadId,
-      message_id AS messageId,prompt_json AS promptJson FROM conversation_jobs WHERE job_id=?`).get(jobId);
-    if (row == null || row.chatId !== row.actorUserId || row.conversationKey !== `user:${row.actorUserId}` || row.threadId !== null || row.messageId >= 0)
+      message_id AS messageId,prompt_json AS promptJson,failure_class AS failureClass FROM conversation_jobs WHERE job_id=?`).get(jobId);
+    if (row == null || row.chatId !== row.actorUserId || row.conversationKey !== `user:${row.actorUserId}` || row.threadId !== null || row.messageId >= 0 || row.failureClass === "group_action_retired")
       return null;
     const queued = JSON.parse(row.promptJson)?.groupAction;
     if (queued?.groupOrigin == null || queued.request == null)
@@ -1141,9 +1174,7 @@ function readQueuedGroupAction(db, jobId) {
     const request = parseWorkerEnvelope(JSON.stringify(queued.request));
     if (!("kind" in request) || request.kind !== "action_request")
       return null;
-    const source = db.query(`SELECT job_id AS sourceJobId,conversation_key AS conversationKey,
-      actor_user_id AS actorUserId,chat_id AS chatId,thread_id AS threadId,message_id AS messageId
-      FROM conversation_jobs WHERE job_id=?`).get(queued.groupOrigin.sourceJobId);
+    const source = readGroupSource(db, queued.groupOrigin.sourceJobId);
     if (source == null || !/^-\d+$/.test(source.chatId) || !/^\d+$/.test(source.actorUserId) || source.messageId <= 0 || source.actorUserId !== row.actorUserId || source.conversationKey !== `group:${source.chatId}` && !(source.threadId != null && source.conversationKey === `topic:${source.chatId}:${source.threadId}`) || groupActionJson(queued.groupOrigin) !== groupActionJson(source) || row.deliveryId !== groupActionDeliveryId(source.sourceJobId, request))
       return null;
     return { request, groupOrigin: source };
@@ -1153,6 +1184,7 @@ function readQueuedGroupAction(db, jobId) {
 }
 
 // modules/telegram-corporate/capability-store.ts
+var RETIRED_ACTION = new Set(["superseded", "cancelled_by_request"]);
 var MANAGERS_ABOVE_DIR = "/etc/novsky/managers";
 var AGENT_ID = /^[A-Za-z0-9_.:-]{1,128}$/;
 var APPROVER = /^[1-9]\d{0,19}$/;
@@ -1313,6 +1345,29 @@ function canonicalValue(value) {
 function canonicalJson(value) {
   return safeJson(canonicalValue(value));
 }
+function resourceStorageAuthority(resource) {
+  if (!resource)
+    return ["missing"];
+  const config = { ...resource.config };
+  const sheets = [];
+  if (resource.connector === "google")
+    for (const key of Object.keys(config)) {
+      if (/^sheet\.[A-Za-z0-9_-]{10,256}$/.test(key)) {
+        sheets.push(key);
+        delete config[key];
+      }
+    }
+  const base = {
+    connector: resource.connector,
+    config,
+    ...resource.connector === "google" ? { sheets: sheets.length ? "listed" : "legacy-unrestricted" } : {}
+  };
+  return [
+    `binding:${createHash4("sha256").update(canonicalJson(base)).digest("hex")}`,
+    ...resource.capabilityIds.map((id) => `capability:${id}`),
+    ...sheets.map((id) => `scope:${id}`)
+  ].sort();
+}
 
 class CapabilityStore {
   db;
@@ -1333,7 +1388,7 @@ class CapabilityStore {
     this.db.exec(SCHEMA2);
     this.db.transaction(() => {
       const columns = new Set(this.db.query("PRAGMA table_info(corporate_policy_previews)").all().map((c) => c.name));
-      for (const name of ["resource_versions_json", "agent_request_id", "agent_request_json", "agent_message_json", "conversation_json", "branch_json"]) {
+      for (const name of ["base_policy_key", "resource_versions_json", "agent_request_id", "agent_request_json", "agent_message_json", "conversation_json", "branch_json"]) {
         if (!columns.has(name))
           this.db.exec(`ALTER TABLE corporate_policy_previews ADD COLUMN ${name} TEXT`);
       }
@@ -1403,7 +1458,16 @@ class CapabilityStore {
            revision=corporate_resources.revision+1,
            updated_at=excluded.updated_at`).run(resource.id, resource.label.trim(), resource.connector, safeJson(capabilityIds), safeJson(resource.config), now, now);
       if (before && (before.label !== resource.label.trim() || before.connector !== resource.connector || before.active !== 1 || before.capabilityIdsJson !== safeJson(capabilityIds) || before.configJson !== safeJson(resource.config))) {
-        this.logNarrowing(`resource:${resource.id}`);
+        const previous = resourceStorageAuthority({
+          id: resource.id,
+          label: before.label,
+          connector: before.connector,
+          capabilityIds: JSON.parse(before.capabilityIdsJson),
+          config: JSON.parse(before.configJson)
+        });
+        const current = resourceStorageAuthority(resource);
+        if (before.active !== 1 || !previous.every((entry) => current.includes(entry)))
+          this.logNarrowing(`resource:${resource.id}`);
         this.db.query("UPDATE corporate_actions SET state='cancelled',failure_code='resource_changed',updated_at=?,completed_at=? WHERE resource_id=? AND state='previewed'").run(now, now, resource.id);
       }
       this.audit("resource", actorUserId, "resource_registered", {
@@ -1429,6 +1493,9 @@ class CapabilityStore {
       const current = typeof input?.id === "string" ? this.resourceForControl(input.id) : null;
       if (current && !this.businessResourceVisible(actorUserId, current))
         throw new Error("owner private resource");
+      if (renameOnly(input) && !this.getResource(input.id)) {
+        throw new Error("only a registered resource is renamed: a revoked or unknown one is registered again with all its details");
+      }
       const resource = resourceFromControl(input, current, (alias) => this.businessMcp?.binding(alias) ?? null);
       if (resource && !this.businessResourceVisible(actorUserId, resource))
         throw new Error("owner private resource");
@@ -1548,7 +1615,7 @@ class CapabilityStore {
     const row = this.policyRow(subject);
     if (row != null)
       return { subject, version: row.version, grants: this.activeGrants(row), ...row.chatAuthorized === 1 ? { chatAuthorized: true } : {} };
-    const fallback = subject === AGENT_DEFAULT_SUBJECT || isInstalledAgentSubject(subject) ? null : this.policyRow(AGENT_DEFAULT_SUBJECT);
+    const fallback = subject === AGENT_DEFAULT_SUBJECT || isInstalledAgentSubject(subject) || memberSubject(subject) ? null : this.policyRow(AGENT_DEFAULT_SUBJECT);
     if (fallback == null)
       return { subject, version: 0, grants: [] };
     return { subject, version: 0, grants: this.activeGrants(fallback).filter((grant) => !this.catalog[grant.capabilityId]?.namedPersonOnly), inheritedFrom: AGENT_DEFAULT_SUBJECT };
@@ -1593,9 +1660,18 @@ class CapabilityStore {
       }) };
     }
     if (policy.chatAuthorized)
-      return policy;
+      return this.withMemberGrants(policy, subject, actorUserId);
     const actor = this.resolve(`user:${actorUserId}`);
-    return { ...policy, grants: policy.grants.filter((grant) => this.catalog[grant.capabilityId]?.sharedAllowed === true && actor.grants.some((personal) => personal.capabilityId === grant.capabilityId && personal.resourceId === grant.resourceId)) };
+    return this.withMemberGrants({ ...policy, grants: policy.grants.filter((grant) => this.catalog[grant.capabilityId]?.sharedAllowed === true && actor.grants.some((personal) => personal.capabilityId === grant.capabilityId && personal.resourceId === grant.resourceId)) }, subject, actorUserId);
+  }
+  withMemberGrants(policy, subject, actorUserId) {
+    const row = this.policyRow(`member:${subject}:${actorUserId}`);
+    if (row == null)
+      return policy;
+    const key = (grant) => `${grant.capabilityId}\x00${grant.resourceId ?? ""}`;
+    const seen = new Set(policy.grants.map(key));
+    const own = this.activeGrants(row).filter((grant) => this.catalog[grant.capabilityId]?.sharedAllowed === true && !seen.has(key(grant)));
+    return { ...policy, version: policy.version + row.version, grants: [...policy.grants, ...own] };
   }
   policyRow(subject) {
     return this.db.query(`SELECT version,grants_json AS grantsJson,chat_authorized AS chatAuthorized
@@ -1605,6 +1681,11 @@ class CapabilityStore {
     const grants = JSON.parse(row.grantsJson);
     const activeResources = new Set(this.listResources().map((resource) => resource.id));
     return grants.filter((grant) => grant.resourceId == null || activeResources.has(grant.resourceId));
+  }
+  policyBaseKey(subject) {
+    const own = this.policyRow(subject);
+    const inherited = own == null && subject !== AGENT_DEFAULT_SUBJECT && !isInstalledAgentSubject(subject) ? this.policyRow(AGENT_DEFAULT_SUBJECT) : null;
+    return createHash4("sha256").update(JSON.stringify({ own, inherited })).digest("hex");
   }
   createPolicyPreview(input, now) {
     if (!this.businessSubjectAllowed(input.requestedBy, input.subject)) {
@@ -1631,8 +1712,8 @@ class CapabilityStore {
     const token = randomUUID2();
     this.db.transaction(() => {
       this.db.query(`INSERT INTO corporate_policy_previews(
-           token,subject,base_version,grants_json,requested_by,expires_at,state,created_at,resource_versions_json,conversation_json
-         ) VALUES(?,?,?,?,?,?,'pending',?,?,?)`).run(token, input.subject, baseVersion, safeJson(proposedGrants), input.requestedBy, input.expiresAt, now, this.resourceVersions(proposedGrants), input.conversation ? safeJson({ chatId: input.conversation.chatId, threadId: input.conversation.threadId ?? null, messageId: null }) : null);
+           token,subject,base_version,grants_json,requested_by,expires_at,state,created_at,resource_versions_json,conversation_json,base_policy_key
+         ) VALUES(?,?,?,?,?,?,'pending',?,?,?,?)`).run(token, input.subject, baseVersion, safeJson(proposedGrants), input.requestedBy, input.expiresAt, now, this.resourceVersions(proposedGrants), input.conversation ? safeJson({ chatId: input.conversation.chatId, threadId: input.conversation.threadId ?? null, messageId: null }) : null, this.policyBaseKey(input.subject));
       this.audit(input.subject, input.requestedBy, "policy_previewed", {
         tokenHash: token.slice(0, 8),
         baseVersion,
@@ -1702,8 +1783,8 @@ class CapabilityStore {
     const baseVersion = this.resolve(subject).version;
     const token = randomUUID2();
     this.db.transaction(() => {
-      this.db.query(`INSERT INTO corporate_policy_previews(token,subject,base_version,grants_json,requested_by,expires_at,state,created_at,resource_versions_json,branch_json)
-         VALUES(?,?,?,?,?,?,'pending',?,?,?)`).run(token, subject, baseVersion, safeJson(grants), `agent:${change.managerId}`, expiresAt, now, this.resourceVersions(grants), safeJson(change));
+      this.db.query(`INSERT INTO corporate_policy_previews(token,subject,base_version,grants_json,requested_by,expires_at,state,created_at,resource_versions_json,branch_json,base_policy_key)
+         VALUES(?,?,?,?,?,?,'pending',?,?,?,?)`).run(token, subject, baseVersion, safeJson(grants), `agent:${change.managerId}`, expiresAt, now, this.resourceVersions(grants), safeJson(change), this.policyBaseKey(subject));
       this.audit(subject, `agent:${change.managerId}`, `branch_${change.kind === "set" ? "policy" : "release"}_previewed`, {
         tokenHash: token.slice(0, 8),
         managerId: change.managerId,
@@ -1758,7 +1839,7 @@ class CapabilityStore {
         return { ok: false, reason: "stale" };
       }
       const keys = new Set(change.resourceKeys);
-      if (this.resolve(row.subject).version !== row.baseVersion || this.pinnedBy(row.subject, keys, allowed) || row.resourceVersionsJson !== this.resourceVersions(JSON.parse(row.grantsJson))) {
+      if (this.resolve(row.subject).version !== row.baseVersion || row.basePolicyKey !== this.policyBaseKey(row.subject) || this.pinnedBy(row.subject, keys, allowed) || row.resourceVersionsJson !== this.resourceVersions(JSON.parse(row.grantsJson))) {
         this.resolvePreview(token, "stale", now);
         return { ok: false, reason: "stale" };
       }
@@ -1831,8 +1912,19 @@ class CapabilityStore {
       return false;
     return this.db.query("UPDATE corporate_policy_previews SET conversation_json=? WHERE token=? AND state='pending' AND conversation_json=?").run(safeJson({ ...context, messageId: message.messageId }), token, row.conversationJson).changes === 1;
   }
+  accessBusinessPreview(token, message) {
+    for (const table of ["access_team_previews", "access_settings_previews"]) {
+      if (!this.db.query("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(table))
+        continue;
+      const row = this.db.query(`SELECT actor AS requestedBy,state FROM ${table}
+        WHERE token=? AND COALESCE(chat_id,actor)=? AND COALESCE(thread_id,0)=?`).get(token, message.chatId, message.threadId ?? 0);
+      if (row)
+        return row;
+    }
+    return null;
+  }
   bindBusinessMessage(token, message) {
-    const preview = this.preview(token) ?? this.resourcePreview(token);
+    const preview = this.preview(token) ?? this.resourcePreview(token) ?? this.accessBusinessPreview(token, message);
     if (!preview || preview.state !== "pending" || !this.businessAdministrator(preview.requestedBy) || !Number.isSafeInteger(message.messageId) || message.messageId <= 0 || !/^-?[1-9]\d{0,19}$/.test(message.chatId) || message.threadId != null && (!message.chatId.startsWith("-") || !Number.isSafeInteger(message.threadId) || message.threadId <= 0) || !message.chatId.startsWith("-") && message.chatId !== preview.requestedBy)
       return false;
     return this.db.query("INSERT OR IGNORE INTO corporate_business_messages(token,actor,chat_id,thread_id,message_id) VALUES(?,?,?,?,?)").run(token, preview.requestedBy, message.chatId, message.threadId ?? null, message.messageId).changes === 1;
@@ -1873,7 +1965,7 @@ class CapabilityStore {
         return { ok: false, reason: "expired" };
       }
       const currentVersion = this.resolve(row.subject).version;
-      if (currentVersion !== row.baseVersion) {
+      if (currentVersion !== row.baseVersion || row.basePolicyKey !== this.policyBaseKey(row.subject)) {
         this.resolvePreview(token, "stale", now);
         return { ok: false, reason: "stale" };
       }
@@ -1980,7 +2072,7 @@ class CapabilityStore {
     if (definition == null || definition.kind !== "write" || !definition.requiresConfirmation || !definition.delegable || !definition.operations.includes(request.operation) || readId === request.capability || read?.kind !== "read" || !read.sharedAllowed || read.requiresConfirmation || resource == null || resource.connector !== definition.adapter || read.adapter !== definition.adapter || !resource.capabilityIds.includes(request.capability) || !resource.capabilityIds.includes(readId) || request.capability === "google.docs.write" && resource.config.docsAppendOnly === true && request.operation !== "append")
       return null;
     const actor = actorUserId === this.primaryOwnerId ? this.resolveForActor(`user:${actorUserId}`, actorUserId) : this.resolve(`user:${actorUserId}`);
-    const group = this.resolve(groupSubject);
+    const group = actorUserId === this.primaryOwnerId ? this.resolveForActor(groupSubject, actorUserId) : this.resolve(groupSubject);
     return actor.grants.some((grant) => grant.capabilityId === request.capability && grant.resourceId === request.resourceId) && group.grants.some((grant) => grant.capabilityId === readId && grant.resourceId === request.resourceId) ? group.version : null;
   }
   delegatedMetaActionAuthorized(input) {
@@ -2095,6 +2187,8 @@ class CapabilityStore {
       }
       if (row.state === "cancelled" && row.failureCode === "resource_changed")
         return { ok: false, reason: "stale" };
+      if (row.state === "cancelled" && RETIRED_ACTION.has(row.failureCode ?? ""))
+        return { ok: false, reason: "retired" };
       if (row.state !== "previewed")
         return { ok: false, reason: "used" };
       const hasRuntimeState = this.db.query(`SELECT 1 FROM sqlite_master
@@ -2211,6 +2305,22 @@ class CapabilityStore {
       return true;
     })();
   }
+  retireAction(actionId, actorUserId, reason, now) {
+    return this.db.transaction(() => {
+      const token = this.db.query("SELECT token FROM corporate_actions WHERE action_id=? AND actor_user_id=?").get(actionId, actorUserId)?.token;
+      const row = token == null ? null : this.action(token);
+      if (row == null)
+        return { ok: false, state: "missing" };
+      if (row.state !== "previewed")
+        return { ok: false, state: row.state };
+      if (now > row.expiresAt) {
+        this.finishWithoutSend(row, "expired", "expired", now);
+        return { ok: false, state: "expired" };
+      }
+      this.finishWithoutSend(row, "cancelled", reason, now);
+      return { ok: true };
+    })();
+  }
   cancelAction(token, actorUserId, chatId, now) {
     return this.db.transaction(() => {
       const row = this.action(token);
@@ -2270,7 +2380,7 @@ class CapabilityStore {
         throw new Error("integration management is only for one named person");
       }
       const chatWrite = chatAuthorized && isSharedSubject(subject) && definition.requiresResource && definition.requiresConfirmation && grant.trusted === true;
-      if (isSharedSubject(subject) && (!definition.sharedAllowed || definition.requiresConfirmation) && !chatWrite) {
+      if ((isSharedSubject(subject) || memberSubject(subject)) && (!definition.sharedAllowed || definition.requiresConfirmation) && !chatWrite) {
         throw new Error("write capabilities are not allowed in shared conversations");
       }
       if (grant.trusted === true) {
@@ -2404,7 +2514,7 @@ class CapabilityStore {
   preview(token) {
     return this.db.query(`SELECT token,subject,base_version AS baseVersion,grants_json AS grantsJson,
               requested_by AS requestedBy,expires_at AS expiresAt,state,
-              resource_versions_json AS resourceVersionsJson,agent_request_id AS agentRequestId,
+              resource_versions_json AS resourceVersionsJson,base_policy_key AS basePolicyKey,agent_request_id AS agentRequestId,
               agent_request_json AS agentRequestJson,agent_message_json AS agentMessageJson,conversation_json AS conversationJson,
               branch_json AS branchJson
        FROM corporate_policy_previews WHERE token=?`).get(token);
@@ -4368,7 +4478,7 @@ class DriveFilesAdapter {
         return { ok: false, code: "unavailable" };
       let source = download;
       let info = stagedFile(source);
-      const heif = info.head.subarray(4, 8).toString("ascii") === "ftyp" && ["heic", "heix", "hevc", "heim", "heis", "hevm", "hevs", "mif1", "msf1"].includes(info.head.subarray(8, 12).toString("ascii"));
+      const heif = info.head.subarray(4, 8).equals(Buffer.from("ftyp")) && ["heic", "heix", "hevc", "heim", "heis", "hevm", "hevs", "mif1", "msf1"].some((brand) => info.head.subarray(8, 12).equals(Buffer.from(brand)));
       if (heif) {
         const conversionFailure = () => ({
           ok: false,
@@ -4530,7 +4640,7 @@ function signInRefused(stderr) {
 }
 function scrub(value) {
   return value.replace(/[\w.+-]+@[\w.-]+\.\w+/g, "<email>").replace(/\/[\w./-]*\/(gog|home|claude)[\w./-]*/g, "<path>").replace(/\b(ya29|1\/\/|AIza)[\w.-]+/g, "<token>").split(`
-`).map((line) => line.trim()).filter((line) => line.length > 0).join("; ").slice(0, 300);
+`).map((line) => line.trim()).filter((line) => line.length > 0).join("; ");
 }
 function optionalFlag(args, flag, value, max = 200) {
   if (value == null)
@@ -5001,7 +5111,7 @@ class GoogleAdapter {
       const failed = results.filter((row) => !row.success);
       if (failed.length === 0)
         return { ok: true, data: JSON.stringify({ changedThreads: results.length }) };
-      return { ok: false, code: "failed", message: `\u0417\u043C\u0456\u043D\u0435\u043D\u043E ${results.length - failed.length} \u0437 ${results.length} \u043B\u0438\u0441\u0442\u0456\u0432. ` + `\u041D\u0435 \u0432\u0434\u0430\u043B\u043E\u0441\u044F: ${failed.slice(0, 10).map((row) => `${row.threadId} (${scrub(String(row.error ?? "")).slice(0, 120) || "\u0431\u0435\u0437 \u043F\u043E\u044F\u0441\u043D\u0435\u043D\u043D\u044F"})`).join("; ")}. ` + "\u041F\u043E\u0432\u0442\u043E\u0440\u0438 \u043B\u0438\u0448\u0435 \u0434\u043B\u044F \u0446\u0438\u0445 \u043B\u0438\u0441\u0442\u0456\u0432, \u044F\u043A\u0449\u043E \u043F\u0440\u0438\u0447\u0438\u043D\u0430 \u0443\u0441\u0443\u043D\u0435\u043D\u0430." };
+      return { ok: false, code: "failed", message: `\u0417\u043C\u0456\u043D\u0435\u043D\u043E ${results.length - failed.length} \u0437 ${results.length} \u043B\u0438\u0441\u0442\u0456\u0432. ` + `\u041D\u0435 \u0432\u0434\u0430\u043B\u043E\u0441\u044F: ${failed.map((row) => `${row.threadId} (${scrub(String(row.error ?? "")) || "\u0431\u0435\u0437 \u043F\u043E\u044F\u0441\u043D\u0435\u043D\u043D\u044F"})`).join("; ")}. ` + "\u041F\u043E\u0432\u0442\u043E\u0440\u0438 \u043B\u0438\u0448\u0435 \u0434\u043B\u044F \u0446\u0438\u0445 \u043B\u0438\u0441\u0442\u0456\u0432, \u044F\u043A\u0449\u043E \u043F\u0440\u0438\u0447\u0438\u043D\u0430 \u0443\u0441\u0443\u043D\u0435\u043D\u0430." };
     } catch {
       return { ok: false, code: "uncertain", message: "Google \u043D\u0435 \u043F\u0456\u0434\u0442\u0432\u0435\u0440\u0434\u0438\u0432 \u0440\u0435\u0437\u0443\u043B\u044C\u0442\u0430\u0442 \u0437\u043C\u0456\u043D\u0438 \u044F\u0440\u043B\u0438\u043A\u0456\u0432. \u041F\u0435\u0440\u0435\u0432\u0456\u0440 \u043B\u0438\u0441\u0442\u0438 \u043F\u043E\u0448\u0443\u043A\u043E\u043C, \u043F\u0435\u0440\u0448 \u043D\u0456\u0436 \u043F\u043E\u0432\u0442\u043E\u0440\u044E\u0432\u0430\u0442\u0438." };
     }
@@ -5322,15 +5432,12 @@ class GoogleAdapter {
       for (const file2 of found) {
         if (typeof file2?.id !== "string" || !GOOGLE_FILE_ID.test(file2.id))
           continue;
-        const entry = {
+        files.push({
           id: file2.id,
-          name: String(file2.name ?? "").slice(0, 200),
+          name: String(file2.name ?? ""),
           mimeType: String(file2.mimeType ?? ""),
           ...typeof file2.modifiedTime === "string" ? { modifiedTime: file2.modifiedTime } : {}
-        };
-        if (JSON.stringify([...files, entry]).length > 8000)
-          break;
-        files.push(entry);
+        });
       }
       return { ok: true, data: JSON.stringify({
         source: "google-drive",
@@ -5347,12 +5454,8 @@ class GoogleAdapter {
     const max = Number(request.arguments.max ?? 20);
     const matches = this.permittedDriveFiles(request.resource).filter((file2) => query === "*" || file2.id.toLowerCase().includes(query) || file2.label.toLowerCase().includes(query));
     const files = [];
-    for (const file2 of matches.slice(0, max)) {
-      const entry = { id: file2.id, name: file2.label, kind: file2.kind };
-      if (JSON.stringify([...files, entry]).length > 8000)
-        break;
-      files.push(entry);
-    }
+    for (const file2 of matches.slice(0, max))
+      files.push({ id: file2.id, name: file2.label, kind: file2.kind });
     return {
       ok: true,
       data: JSON.stringify({

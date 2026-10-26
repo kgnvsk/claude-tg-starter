@@ -108,7 +108,7 @@ def register(args):
             'note': 'Registration records a purpose, not approval, execution or successful verification.'}
 
 
-def inventory(query, limit):
+def inventory(query, limit, offset=0):
     rows, known = [], set()
     for name, item in catalog()['tools'].items():
         path, rel = local_file(item['path'])
@@ -166,7 +166,9 @@ def inventory(query, limit):
             text = ' '.join([row['name'], row['path'], row['description'], *row['tags']]).casefold()
             return sum(term in text for term in terms)
         rows = sorted((row for row in rows if score(row)), key=score, reverse=True)
-    return {'tools': rows[:limit], 'more': len(rows) > limit, 'scanIncomplete': incomplete,
+    # A page of the whole list (owner, 23.10.2026: past the limit only «more» was said, and nothing could reach the rest).
+    return {'tools': rows[offset:offset + limit], 'total': len(rows), 'more': len(rows) > offset + limit,
+            **({'nextOffset': offset + limit} if len(rows) > offset + limit else {}), 'scanIncomplete': incomplete,
             'note': 'Local candidates only. Read the script and its receipts; existence is not permission or a working account. '
                     'Do not execute a discovered script just to test availability. No match is not proof of inability.'}
 
@@ -179,6 +181,7 @@ def main():
         if op == 'search':
             sub.add_argument('query')
         sub.add_argument('--limit', type=int, choices=range(1, 101), default=30)
+        sub.add_argument('--offset', type=int, default=0)
     sub = commands.add_parser('register')
     sub.add_argument('name')
     sub.add_argument('path')
@@ -186,7 +189,9 @@ def main():
     sub.add_argument('--tag', action='append', default=[])
     args = parser.parse_args()
     try:
-        result = register(args) if args.op == 'register' else inventory(getattr(args, 'query', ''), args.limit)
+        if args.op != 'register' and args.offset < 0:
+            raise ValueError('offset')
+        result = register(args) if args.op == 'register' else inventory(getattr(args, 'query', ''), args.limit, args.offset)
         print(json.dumps(result, ensure_ascii=False))
     except (OSError, ValueError, TypeError, KeyError):
         print('Work tools catalog could not be read or updated; no tool was executed.', file=sys.stderr)

@@ -50,8 +50,11 @@ before enabling third-party skills or unattended publishing.
    path-validated and requires `--confirm`.
 9. **Optional services.** StreamPost runs as `streampost`, not root, inside a
    venv with systemd filesystem and capability restrictions.
-10. **Authentication health.** The healthcheck verifies `claude auth status`;
-    a live PID is not considered healthy when Claude is logged out. On logout
+10. **Authentication health.** Onboarding observes local login metadata without
+    invoking the CLI or refreshing credentials. The healthcheck reads an existing
+    OAuth login locally; its fallback may probe only when no refreshable login is
+    present. A live response and provider receipts establish actual access;
+    a live PID or credentials file alone does not. On logout
     `claude-auth-rescue` sends the owner a re-login link over Telegram; the
     owner replies with the OAuth code and the service restarts itself. No
     password is stored and the human approval step is preserved by design.

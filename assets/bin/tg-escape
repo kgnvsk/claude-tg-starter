@@ -43,7 +43,7 @@ TOKEN_RE = re.compile(
     r'(?P<escaped>\\[' + re.escape(RESERVED + '\\') + r'])'
     r'|(?P<pre>```.*?```)'
     r'|(?P<code>`[^`\n]*?`)'
-    r'|(?P<link>\[[^\]\n]*?\]\([^)\n]*?\))'
+    r'|(?P<link>\[(?:\\[^\n]|[^\]\\\n])*?\]\([^)\n]*?\))'
     r'|(?P<bold>\*[^*\n]+?\*)'
     r'|(?P<underline>(?<!\w)__[^_\n]+?__(?!\w))'
     r'|(?P<italic>(?<!\w)_[^_\n]+?_(?!\w))'
@@ -102,7 +102,7 @@ def process(text: str) -> str:
             inner = raw[1:-1]
             result.append('`' + escape_code_inner(inner) + '`')
         elif kind == 'link':
-            lm = re.match(r'\[([^\]]*)\]\(([^)]*)\)', raw)
+            lm = re.match(r'\[((?:\\[^\n]|[^\]\\\n])*?)\]\(([^)\n]*?)\)', raw)
             label, url = lm.group(1), lm.group(2)
             result.append('[' + escape_plain(label) + '](' + escape_link_url(url) + ')')
         elif kind == 'bold':

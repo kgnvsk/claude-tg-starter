@@ -53,14 +53,25 @@ browser_answers() {
 # browser problem is reported, never the end of an install (the healthcheck's recovery takes it from there).
 refresh_browser_dropins() {
   local maintenance="$1" dir="${2:-/etc/systemd/system/claude-browser.service.d}" resolv="${3:-/etc/resolv.conf}"
-  local saved name old restart=0 restored
+  local saved name old restart=0 restored changed=0 wrote=0
   saved="$(mktemp -d)" || return 1
   for name in $BROWSER_KIT_DROPINS; do
     if [ -e "$dir/$name" ]; then cp -p "$dir/$name" "$saved/$name" || { rm -rf "$saved"; return 1; }; fi
   done
   old="$(systemctl show -p MainPID --value claude-browser.service 2>/dev/null || true)"
   [ "$maintenance" != 1 ] || ! systemctl is-active --quiet claude-browser.service || restart=1
-  if write_browser_dropins "$dir" "$resolv" && systemctl daemon-reload &&
+  if write_browser_dropins "$dir" "$resolv"; then
+    wrote=1
+    for name in $BROWSER_KIT_DROPINS; do
+      if [ ! -e "$dir/$name" ] && [ ! -e "$saved/$name" ]; then continue; fi
+      cmp -s "$dir/$name" "$saved/$name" || changed=1
+    done
+    if [ "$changed" = 0 ]; then
+      rm -rf "$saved"
+      return 0
+    fi
+  fi
+  if [ "$wrote" = 1 ] && systemctl daemon-reload &&
      { [ "$restart" = 0 ] || { systemctl restart claude-browser.service && browser_answers "$old"; }; }; then
     rm -rf "$saved"
     return 0

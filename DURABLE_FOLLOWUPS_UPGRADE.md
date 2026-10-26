@@ -421,7 +421,7 @@ Do not restore data or secrets by default. Keep the live queue, `.env`, tokens, 
 ## Troubleshooting and limitations
 
 - A queued file proves durable intent, not delivery. Check cron, host uptime, worker log, network reachability, Telegram authentication, and API responses separately.
-- One-shot stale semantics are deliberate: a one-shot more than ten minutes late is removed without sending; repeat tasks do not emit catch-up bursts.
+- Late one-shot reminders are delivered on a later worker tick, including when more than ten minutes late; repeat tasks do not emit catch-up bursts.
 - Telegram `ok:false`, network errors, and authentication failures retain the record. A healthy process alone does not prove delivery.
 - Cancel acquires the shared lock. It waits for an in-flight send to finish, so that one send may land, but after `VERIFIED ... files=0` no future send for that task remains queued.
 - Session-native smart live checks are optional; a durable fallback is required for every promised future follow-up.

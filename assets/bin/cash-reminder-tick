@@ -436,6 +436,15 @@ settle_reminder() {
 # The owner reads the failure in chat, so it names the cause in plain words:
 # a server log path told a client nothing (Кнопа, 22.09.2026). Details stay in
 # the log.
+# Telegram's answer whole, on one line (owner, 23.10.2026: it was cut to 180 bytes, sometimes mid-letter); one too long
+# for a message is named by its size.
+telegram_reason() {
+  local reason
+  reason=$(printf '%s' "$1" | tr -d '\n')
+  [ "${#reason}" -le 3500 ] || reason="відповідь на ${#reason} знаків"
+  printf '%s' "$reason"
+}
+
 failure_reason() {
   local rc="$1" out="$2" last
   if [ "$rc" = 124 ]; then
@@ -450,7 +459,10 @@ failure_reason() {
       reset=$(limit_reset_text "$out")
       printf 'вичерпано ліміт Claude%s' "${reset:+, він скинеться о $reset}" ;;
     *)
-      last=$(printf '%s' "$out" | grep -v '^[[:space:]]*$' | tail -n 1 | cut -c1-160)
+      # The last line whole (owner, 23.10.2026): `cut -c1-160` cut bytes, split a Cyrillic letter, and Telegram refused
+      # the notice. One that cannot fit a message is named by its size, never cut.
+      last=$(printf '%s' "$out" | grep -v '^[[:space:]]*$' | tail -n 1)
+      [ "${#last}" -le 3500 ] || last="останній рядок виводу на ${#last} знаків — завеликий для повідомлення"
       printf 'помилка виконання%s' "${last:+ — $last}" ;;
   esac
 }
@@ -747,12 +759,15 @@ run_agent_task() {
 Перевірку \`${check_cmd}\` уже виконано перед цим запуском; вдруге її не запускай — повторно вона нового не покаже."
     [ "$offers" -eq 0 ] || prompt="${prompt}
 Цей самий вивід уже передавався запуску, який не завершився, тож частину могло бути зроблено. Спершу перевір, що вже зроблено (відповіді, надіслані файли), і не повторюй зроблене."
-    prompt="${prompt}
+    # Whole or not at all (owner, 23.10.2026): a longer output is not given as its beginning, only as its file.
+    if [ "$size" -le "$CHECK_INLINE_BYTES" ]; then
+      prompt="${prompt}
 Ось що вона показала:
-$(head -c "$CHECK_INLINE_BYTES" "$observed")"
-    [ "$size" -le "$CHECK_INLINE_BYTES" ] || prompt="${prompt}
-
-[Тут лише початок. Увесь вивід перевірки (${size} байт) збережено у файлі ${observed} — прочитай його повністю: решта теж нова.]"
+$(cat "$observed")"
+    else
+      prompt="${prompt}
+Її вивід (${size} байт) збережено у файлі ${observed} — прочитай його повністю: усе в ньому нове."
+    fi
   fi
   if [ "$quiet" -eq 1 ]; then
     prompt="Це автоматичне завдання планувальника. Результат доставляй сам через tg-send і tg-send-file туди, куди сказано в завданні, мовою завдання. Текст, який ти повернеш, у чат не піде.
@@ -791,7 +806,7 @@ ${prompt}"
     # rendered file instead. Codex r7: one decision for the launch, and the run says it loaded them (the unread pass needs it).
     # Codex r8: the run loads its own copy of the rules, and its digest goes with the run to the seal and the delivery.
     # The owner, 23.10.2026: the same for every chat a run may send to, a quiet delivery elsewhere included: nothing is read.
-    if [ "$("$HOME/bin/answer-context" scheduled-reads --chat "$chat" 2>/dev/null)" = off ] && [ -n "$review_run" ] \
+    if [ "$("$HOME/bin/answer-context" scheduled-reads --chat "$chat" --thread "${thread_id:-0}" 2>/dev/null)" = off ] && [ -n "$review_run" ] \
       && cp "$HOME/.claude/owner-rules/scheduled-rules.md" "$review_run/scheduled-rules.md" 2>/dev/null && [ -s "$review_run/scheduled-rules.md" ]; then
       rules_file=(--append-system-prompt-file "$review_run/scheduled-rules.md")
       rules_digest=$(sha256sum "$review_run/scheduled-rules.md" | cut -d' ' -f1)
@@ -1251,6 +1266,14 @@ failure_digest() {
   retry_at=$(cat "$stamp.retry" 2>/dev/null) || retry_at=""
   if is_uint "$retry_at" && [ "$tick_now" -lt "$(decimal_value "$retry_at")" ]; then return 0; fi
   before=$(cat "$stamp" 2>/dev/null) || before=""
+  # Codex, 23.10.2026: a digest Telegram asked to wait for in the middle goes on from its first unsent part, kept here.
+  local rest="$stamp.rest"
+  if [ -s "$rest" ]; then
+    day=$(head -n 1 "$rest")
+    text=$(tail -n +2 "$rest")
+    send_digest_parts "$owner" "$stamp" "$rest" "$day" "$text" "$before"
+    return 0
+  fi
   out=$(python3 - "$(dirname "${BASH_SOURCE[0]}")/agent_notice_locale.py" "$HOME" "$REM_DIR" "$PROFILE_FILE" \
     "${SCHEDULE_DIGEST_HOUR:-9}" "$before" "$tick_now" <<'PY'
 import importlib.util
@@ -1344,7 +1367,7 @@ for epoch, task in sorted(missed):
                      task=task, time=at.strftime("%d.%m %H:%M")))
 if lines:
     print(today)
-    print("\n".join([say("schedule.digest", "📋 Автоматичні завдання за добу — що не спрацювало:"), *lines[:20]]))
+    print("\n".join([say("schedule.digest", "📋 Автоматичні завдання за добу — що не спрацювало:"), *lines]))
 PY
   ) || return 0
   [ -n "$out" ] || return 0
@@ -1353,21 +1376,48 @@ PY
   # The day is taken before Telegram is called; only a definite «wait» (429) gives it back, after its delay, so an
   # answer that never came back cannot send the list twice.
   mkdir -p -m 700 "$REM_DIR/.owner-alerts" && atomic_text "$stamp" "$day sending" || return 0
-  if resp=$(send_text "$owner" "$text" text "" 1); then
-    atomic_text "$stamp" "$day"
-    rm -f "$stamp.retry"
-    return 0
-  fi
-  class=$(printf '%s' "$resp" | run_delivery_response_class)
-  if [ "$class" = retry ]; then
-    after=$(printf '%s' "$resp" | python3 -c 'import json, sys
+  send_digest_parts "$owner" "$stamp" "$stamp.rest" "$day" "$text" "$before"
+}
+
+# Every line of the digest (owner, 23.10.2026: the first 20 went and the rest vanished on exactly the bad days), as
+# several messages when long. What is still unsent is kept with its day: a definite «wait» (429) sends it later, from
+# that part on; nothing that may have arrived is sent twice. Only a fresh digest refused at its first part gives the
+# day back.
+send_digest_parts() {
+  local owner="$1" stamp="$2" rest="$3" day="$4" text="$5" before="$6" parts=() part index resp class after remaining
+  while IFS= read -r -d '' part || [ -n "$part" ]; do parts+=("$part"); done < <(printf '%s' "$text" | split_chunks)
+  for index in "${!parts[@]}"; do
+    if resp=$(send_text "$owner" "${parts[$index]}" text "" 1); then
+      if [ "$index" -lt $(( ${#parts[@]} - 1 )) ]; then
+        remaining=$(IFS=$'\n'; printf '%s' "${parts[*]:$((index + 1))}")
+        atomic_text "$rest" "$day"$'\n'"$remaining" || log_message "failure digest for $day: unsent parts not kept"
+      fi
+      continue
+    fi
+    class=$(printf '%s' "$resp" | run_delivery_response_class)
+    if [ "$class" = retry ]; then
+      after=$(printf '%s' "$resp" | python3 -c 'import json, sys
 try:
     print(max(1, int(json.load(sys.stdin)["parameters"]["retry_after"])))
 except Exception:
     print(60)')
-    atomic_text "$stamp" "$before" && atomic_text "$stamp.retry" "$((tick_now + after))"
-  fi
-  log_message "failure digest for $day: send status=$class"
+      if [ -s "$rest" ]; then
+        remaining=$(IFS=$'\n'; printf '%s' "${parts[*]:$index}")
+        atomic_text "$rest" "$day"$'\n'"$remaining"
+      else
+        atomic_text "$stamp" "$before"
+      fi
+      atomic_text "$stamp.retry" "$((tick_now + after))"
+      log_message "failure digest for $day: part $((index + 1)) of ${#parts[@]} waits ${after}s"
+      return 0
+    fi
+    rm -f "$rest"
+    atomic_text "$stamp" "$day"
+    log_message "failure digest for $day: part $((index + 1)) of ${#parts[@]} status=$class; not repeated"
+    return 0
+  done
+  rm -f "$rest" "$stamp.retry"
+  atomic_text "$stamp" "$day"
 }
 
 # A scheduled occurrence that ends blocked, uncertain or failed tells the owner,
@@ -2383,7 +2433,7 @@ for f in "$REM_DIR"/*.rem; do
       # The owner hears it: the chat that refused five times rarely takes a sixth.
       give_up_chat=$(owner_chat_id)
       notice=$(owner_notice reminder.undelivered "⚠️ Не вдалося доставити нагадування «{name}». Telegram відхилив: {reason}" \
-        name="$(basename "$f" .rem)" reason="$(printf '%s' "$resp" | tr -d '\n' | cut -c1-180)")
+        name="$(basename "$f" .rem)" reason="$(telegram_reason "$resp")")
       curl -s -m 10 -X POST -K - \
         --data-urlencode "chat_id=${give_up_chat:-$chat}" \
         --data-urlencode "text=${notice}" \

@@ -2,5 +2,10 @@
 set -euo pipefail
 [ "$#" -ge 1 ] || { echo "Usage: html-to-pdf <input.html> [output.pdf]" >&2; exit 2; }
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-export PLAYWRIGHT_BROWSERS_PATH=/var/lib/claude-browser/ms-playwright
+if [ -e "/etc/claude-browser-private/$(id -u).json" ] || [ -L "/etc/claude-browser-private/$(id -u).json" ]; then
+  export CLAUDE_BROWSER_PDF_RUNTIME="$("$SCRIPT_DIR/browser-mcp" --runtime)"
+  export PLAYWRIGHT_BROWSERS_PATH="$CLAUDE_BROWSER_PDF_RUNTIME/ms-playwright"
+else
+  export PLAYWRIGHT_BROWSERS_PATH=/var/lib/claude-browser/ms-playwright
+fi
 exec node "$SCRIPT_DIR/browser-pdf.mjs" "$@"

@@ -630,6 +630,32 @@ def _event_epoch_ms(event: dict) -> int | None:
         return None
 
 
+def _structured_limit_info(event: dict) -> dict | None:
+    """CLI 2.1.302's rejected API error, never an informational quota event."""
+    params = event.get("apiErrorParams")
+    info = params.get("rate_limit_info") if isinstance(params, dict) else None
+    if (event.get("type") != "assistant" or event.get("isApiErrorMessage") is not True
+        or type(event.get("apiErrorStatus")) is not int or event["apiErrorStatus"] != 429
+        or event.get("error") != "rate_limit" or not isinstance(info, dict)
+        or info.get("status") != "rejected"
+        or (info.get("overageStatus") in ("allowed", "allowed_warning")
+            and not info.get("overageDisabledReason"))):
+        return None
+    return info
+
+
+def _provider_reset(event: dict, rendered: str, event_ms: int) -> ResetAt | None:
+    info = _structured_limit_info(event)
+    if info is not None:
+        seconds = info.get("resetsAt")
+        # This protocol is integer seconds. Do not guess units or round a past
+        # timestamp forward; exact provider times have no rendered-clock skew.
+        if type(seconds) is int and event_ms <= seconds * 1000 <= event_ms + 8 * INCIDENT_TTL_MS:
+            return ResetAt("provider", str(seconds), seconds * 1000)
+        return None
+    return parse_reset(rendered, event_ms)
+
+
 def classify_limit(
     event: dict,
     events_by_uuid: dict[str, dict],
@@ -654,6 +680,8 @@ def classify_limit(
 
     event_epoch_ms = _event_epoch_ms(event)
     error = rendered_error(event)
+    if error is None and _structured_limit_info(event) is not None:
+        error = rendered_assistant_text(event)
     if event_epoch_ms is None or error is None:
         return None
     if sidechain:
@@ -669,7 +697,7 @@ def classify_limit(
         if channel is None:
             return None
         chat_id, message_id = channel.chat_id, channel.message_id
-    reset = parse_reset(error, event_epoch_ms)
+    reset = _provider_reset(event, error, event_epoch_ms)
     return {
         "event_uuid": event_uuid,
         "event_epoch_ms": event_epoch_ms,
@@ -732,7 +760,7 @@ def _needs_interruption_ancestry(event: dict) -> bool:
     rendered = rendered_assistant_text(event)
     if rendered is None:
         return False
-    return provider_failure_kind(status, rendered) in {
+    return _structured_limit_info(event) is not None or provider_failure_kind(status, rendered) in {
         "limit", "overloaded", *ACCOUNT_NOTICE_KINDS,
     }
 
@@ -763,12 +791,12 @@ def classify_interruption(
     event_epoch_ms = _event_epoch_ms(event)
     if rendered is None or channel is None or event_epoch_ms is None:
         return None
-    kind = provider_failure_kind(status, rendered)
+    kind = "limit" if _structured_limit_info(event) is not None else provider_failure_kind(status, rendered)
     # OAuth is handled by the one-shot auth helper. Sending a second generic
     # interruption message here would duplicate its owner login notification.
     if kind not in {"limit", "overloaded", *ACCOUNT_NOTICE_KINDS}:
         return None
-    reset = parse_reset(rendered, event_epoch_ms) if kind == "limit" else None
+    reset = _provider_reset(event, rendered, event_epoch_ms) if kind == "limit" else None
     return {
         "event_uuid": event_uuid,
         "event_epoch_ms": event_epoch_ms,
@@ -1269,6 +1297,20 @@ def initialize_state(projects_dir: Path, state_path: Path) -> int:
     }
     atomic_write_state(state_path, state)
     return len(transcripts)
+
+
+def ensure_state(projects_dir: Path, state_path: Path) -> dict:
+    """Install baseline only when absent; existing latches/checkpoints are state.
+
+    Called under the same lifecycle lock as initialize/observe/notify. A bad,
+    unreadable or symlinked existing file needs explicit repair, never a reset
+    hidden inside an install or update.
+    """
+    try:
+        state_path.lstat()
+    except FileNotFoundError:
+        initialize_state(projects_dir, state_path)
+    return load_state(state_path)
 
 
 def _discover_transcripts(projects_dir: Path) -> dict[str, tuple[Path, os.stat_result]]:
@@ -1906,12 +1948,14 @@ def limit_until(projects_dir: Path) -> int:
                     answered_at = max(answered_at, event_ms)
                 continue
             error = rendered_error(event)
+            if error is None and _structured_limit_info(event) is not None:
+                error = rendered_assistant_text(event)
             status = event.get("apiErrorStatus")
             if error is None or type(status) is not int or status != 429:
                 continue
             # parse_reset never returns a reset earlier than the error beyond
             # the clock skew: that one, like an unreadable copy, is None.
-            reset = parse_reset(error, event_ms)
+            reset = _provider_reset(event, error, event_ms)
             if reset is not None:
                 limits.append((event_ms, reset.epoch_ms + RESET_MARGIN_MS))
             else:
@@ -3314,6 +3358,194 @@ def _record_suppression(agent_root: Path, reason: str) -> None:
             os.close(descriptor)
 
 
+def _bind_live_limit_carriers(agent_root: Path, transcript: str, events: list[dict]) -> list[dict]:
+    """Supply an in-memory origin only for a live prompt admitted by the ledger.
+
+    Live CLI input has no channel origin. Its exact UUID must have both the
+    receiver's accepted echo and the hook's current turn/session/stamp binding.
+    Neither channel-looking text nor a historical admission is sufficient.
+    The transcript and the database are never rewritten.
+    """
+    if not _valid_relative_transcript(transcript):
+        return events
+    by_uuid = _batch_uuid_map(events)
+    candidates = []
+    for envelope in events:
+        event = envelope["record"]
+        if (not envelope["is_new"] or not _needs_interruption_ancestry(event)
+            or _structured_limit_info(event) is None):
+            continue
+        session = event.get("sessionId")
+        if not isinstance(session, str) or PurePosixPath(transcript).name != f"{session}.jsonl":
+            continue
+        parent_uuid, visited = event.get("parentUuid"), {event.get("uuid")}
+        for _ in range(min(len(by_uuid), MAX_ANCESTRY_EVENTS)):
+            parent = by_uuid.get(parent_uuid) if isinstance(parent_uuid, str) else None
+            if (parent is None or parent_uuid in visited or not _active_ancestry_event(parent)
+                or parent.get("sessionId") != session):
+                break
+            visited.add(parent_uuid)
+            disposition, _ref = _ancestry_disposition(parent)
+            if disposition == "continue":
+                parent_uuid = parent.get("parentUuid")
+                continue
+            ref = _embedded_channel_ref(parent)
+            if (disposition == "reject" and parent.get("type") == "user"
+                and parent.get("origin") is None and ref is not None and ref.message_id is not None):
+                candidates.append((parent_uuid, session, ref, _event_epoch_ms(event)))
+            break
+    if not candidates:
+        return events
+    db = agent_root / ".claude/channels/telegram/messages.db"
+    try:
+        expected = db.lstat()
+    except FileNotFoundError:
+        return events
+    if not stat.S_ISREG(expected.st_mode) or expected.st_uid != os.getuid():
+        raise StateError("untrusted live limit ledger")
+    descriptors = _open_descriptor_snapshot()
+    trusted = {}
+    connection = None
+    try:
+        connection = sqlite3.connect(f"{db.absolute().as_uri()}?mode=ro", uri=True, timeout=1)
+        connection.execute("PRAGMA query_only=ON")
+        if connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='owner_submissions'").fetchone() is None:
+            return events  # Pre-live installations have no such carrier.
+        path = str(_projects_dir(agent_root) / transcript)
+        for uuid, session, ref, event_ms in candidates:
+            row = connection.execute("""
+                SELECT 1 FROM owner_submissions s
+                JOIN delivery_results r ON r.delivery_id=s.delivery_id AND r.session_id=s.session_id AND r.stamp=s.stamp
+                JOIN delivery_sessions d ON d.session_id=s.session_id AND d.stamp=s.stamp
+                JOIN delivery_turns t ON t.session_id=s.session_id
+                JOIN delivery_turn_messages m ON m.turn_id=t.turn_id AND m.delivery_id=s.delivery_id
+                WHERE s.submission_id=? AND s.state='accepted' AND s.session_id=? AND s.stamp IS NOT NULL AND s.stamp<>''
+                  AND s.delivery_id=? AND m.chat_id=? AND s.echoed_at IS NOT NULL AND s.settled_at IS NOT NULL
+                  AND s.written_at<=? AND t.opened_at<=? AND (t.closed_at IS NULL OR t.closed_at>=?)
+                  AND (t.close_kind IS NULL OR t.close_kind='stop_failure')
+                  AND t.transcript_path=? AND d.transcript_path=? AND r.state IN ('pending','paused')
+                  AND coalesce(r.response_turn_id,r.turn_id)=t.turn_id
+                  AND (r.state<>'paused' OR r.recovery_from_turn=t.turn_id)
+                  AND s.stamp=(SELECT substr(key,?) FROM delivery_runtime WHERE substr(key,1,?)=?
+                               ORDER BY CAST(value AS INTEGER) DESC,key DESC LIMIT 1)
+                  AND d.started_at=(SELECT max(started_at) FROM delivery_sessions WHERE stamp=s.stamp) LIMIT 1
+                """, (uuid, session, f"{ref.chat_id}:{ref.message_id}", ref.chat_id,
+                       event_ms, event_ms, event_ms, path, path,
+                       len(LEDGER_EPOCH)+1, len(LEDGER_EPOCH), LEDGER_EPOCH)).fetchone()
+            if row is not None:
+                trusted[uuid] = {"kind": "channel", "server": "plugin:telegram:telegram",
+                                 "chat_id": ref.chat_id, "message_id": ref.message_id}
+        actual = db.lstat()
+        if (actual.st_ino != expected.st_ino or actual.st_dev != expected.st_dev
+            or descriptors is None or not _sqlite_opened_verified_database(descriptors, expected)):
+            raise StateError("live limit ledger changed while reading")
+    except sqlite3.Error as error:
+        # Do not advance the transcript checkpoint when its authority could not
+        # be checked: the next watcher tick must retry the same evidence.
+        raise StateError("live limit ledger unavailable") from error
+    finally:
+        if connection is not None:
+            connection.close()
+    return [{**envelope, "record": {**envelope["record"], "origin": trusted[envelope["record"]["uuid"]]}}
+            if envelope["record"].get("uuid") in trusted else envelope for envelope in events]
+
+
+def _current_live_paused_limit(agent_root: Path, submission_id: str | None = None) -> tuple | None:
+    """Read the exact current pause identity; recheck it after transcript I/O."""
+    db = agent_root / ".claude/channels/telegram/messages.db"
+    try:
+        expected = db.lstat()
+    except FileNotFoundError:
+        return
+    if not stat.S_ISREG(expected.st_mode) or expected.st_uid != os.getuid():
+        raise StateError("untrusted paused limit ledger")
+    descriptors = _open_descriptor_snapshot()
+    connection = None
+    try:
+        connection = sqlite3.connect(f"{db.absolute().as_uri()}?mode=ro", uri=True, timeout=1)
+        connection.execute("PRAGMA query_only=ON")
+        tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if not {"owner_submissions", "delivery_results", "delivery_sessions", "delivery_turns", "delivery_runtime"} <= tables:
+            return
+        rows = connection.execute("""
+            SELECT DISTINCT t.transcript_path,r.session_id,t.opened_at,t.closed_at,r.delivery_id,r.stamp,t.turn_id
+            FROM delivery_results r
+            JOIN delivery_turns t ON t.turn_id=coalesce(r.response_turn_id,r.turn_id) AND t.session_id=r.session_id
+            JOIN delivery_sessions d ON d.session_id=r.session_id AND d.stamp=r.stamp AND d.transcript_path=t.transcript_path
+            JOIN owner_submissions s ON s.delivery_id=r.delivery_id AND s.session_id=r.session_id AND s.stamp=r.stamp AND s.state='accepted'
+            WHERE r.state='paused' AND r.recovery_reason='provider_limit' AND r.recovery_from_turn=t.turn_id
+              AND t.close_kind='stop_failure' AND t.close_detail='rate_limit' AND t.closed_at IS NOT NULL
+              AND r.stamp=(SELECT substr(key,?) FROM delivery_runtime WHERE substr(key,1,?)=?
+                           ORDER BY CAST(value AS INTEGER) DESC,key DESC LIMIT 1)
+              AND d.started_at=(SELECT max(started_at) FROM delivery_sessions WHERE stamp=r.stamp)
+              AND t.turn_id=(SELECT max(turn_id) FROM delivery_turns WHERE session_id=r.session_id)
+              AND (? IS NULL OR s.submission_id=?)
+            LIMIT 2
+            """, (len(LEDGER_EPOCH)+1, len(LEDGER_EPOCH), LEDGER_EPOCH,
+                   submission_id, submission_id)).fetchall()
+        actual = db.lstat()
+        if (actual.st_ino != expected.st_ino or actual.st_dev != expected.st_dev
+            or descriptors is None or not _sqlite_opened_verified_database(descriptors, expected)):
+            raise StateError("paused limit ledger changed while reading")
+    except sqlite3.Error as error:
+        raise StateError("paused limit ledger unavailable") from error
+    finally:
+        if connection is not None:
+            connection.close()
+    if len(rows) != 1:
+        return
+    return rows[0]
+
+
+def _reconcile_live_paused_reset(agent_root: Path, state: dict, now_ms: int) -> None:
+    """Recover one current pause, without rewind, replay, or ledger writes."""
+    if state["incident"] is not None:
+        return
+    identity = _current_live_paused_limit(agent_root)
+    if identity is None:
+        return
+    filename, session, opened_at, closed_at, delivery, _stamp, _turn = identity
+    projects = _projects_dir(agent_root)
+    try:
+        path = Path(filename)
+        relative = path.relative_to(projects).as_posix()
+        if not _valid_relative_transcript(relative) or not path.resolve().is_relative_to(projects.resolve()):
+            return
+        file_stat = path.lstat()
+        if not stat.S_ISREG(file_stat.st_mode) or file_stat.st_uid != os.getuid():
+            return
+        events = _turn_status_events(path, file_stat)  # existing 16 MiB / 20k-event cap
+    except (OSError, TypeError, ValueError):
+        return
+    for envelope in events:
+        event = envelope["record"]
+        event_ms = _event_epoch_ms(event)
+        envelope["is_new"] = bool(event.get("sessionId") == session and event_ms is not None
+            and opened_at <= event_ms <= closed_at and _structured_limit_info(event) is not None)
+    raw_by_uuid = _batch_uuid_map(events)
+    events = _bind_live_limit_carriers(agent_root, relative, events)
+    by_uuid = _batch_uuid_map(events)
+    carriers = [uuid for uuid, record in by_uuid.items()
+                if raw_by_uuid[uuid].get("origin") is None and record.get("origin") is not None]
+    if len(carriers) != 1:
+        return  # Migration requires this exact ledger-authenticated live UUID.
+    candidates = [event for envelope in events if envelope["is_new"]
+                  and (event := by_uuid.get(envelope["record"].get("uuid"))) is not None]
+    # Duplicate native copies keep one UUID; genuinely different rejections in
+    # the same closed turn are ambiguous and cannot supply a migration deadline.
+    candidates = {event["uuid"]: event for event in candidates}
+    if len(candidates) != 1:
+        return
+    event = next(iter(candidates.values()))
+    classified = classify_limit(event, by_uuid)
+    if (classified is None or classified["reset_epoch_ms"] is None or classified["reset_epoch_ms"] <= now_ms
+        or f'{classified["chat_id"]}:{classified["message_id"]}' != delivery):
+        return
+    if _current_live_paused_limit(agent_root, carriers[0]) != identity:
+        return  # Startup, retry or release changed authority while reading.
+    _start_incident_if_new(state, relative, event, by_uuid)
+
+
 def _refresh_transcripts(agent_root: Path, state: dict, now_ms: int) -> dict:
     state, batches = scan_incremental(
         _projects_dir(agent_root),
@@ -3323,6 +3555,7 @@ def _refresh_transcripts(agent_root: Path, state: dict, now_ms: int) -> dict:
     # private state avoids copying/checking all transcript baselines per batch.
     applied: dict[str, list[dict]] = {}
     for batch in batches:
+        batch["events"] = _bind_live_limit_carriers(agent_root, batch["transcript"], batch["events"])
         before = state["incident"]
         _apply_batch_in_place(
             state,
@@ -3342,6 +3575,7 @@ def _refresh_transcripts(agent_root: Path, state: dict, now_ms: int) -> dict:
                 envelope for envelope in applied[started["transcript"]]
                 if (_event_epoch_ms(envelope["record"]) or -1) >= started["event_epoch_ms"]
             ], now_ms)
+    _reconcile_live_paused_reset(agent_root, state, now_ms)
     incident = state["incident"]
     if (
         incident is not None
@@ -3492,7 +3726,7 @@ def _subagent_limit_interruption(agent_root: Path, transcript: str, event: dict)
 
 def notification_tick(mode: str) -> int:
     """Initialize or deliver interruption notices after confirmed sends."""
-    if mode not in {"initialize-notices", "notify"}:
+    if mode not in {"initialize-notices", "ensure-notices", "notify"}:
         return 2
     descriptor: int | None = None
     try:
@@ -3501,8 +3735,11 @@ def notification_tick(mode: str) -> int:
         state_path = logs / NOTICE_STATE_NAME
         descriptor = _open_lifecycle_lock(logs / NOTICE_LOCK_NAME)
         if descriptor is None:
-            return INITIALIZE_LOCK_BUSY_EXIT if mode == "initialize-notices" else 0
+            return INITIALIZE_LOCK_BUSY_EXIT if mode in {"initialize-notices", "ensure-notices"} else 0
         projects_dir = _projects_dir(agent_root)
+        if mode == "ensure-notices":
+            ensure_state(projects_dir, state_path)
+            return 0
         if mode == "initialize-notices":
             initialize_state(projects_dir, state_path)
             initialized = load_state(state_path)
@@ -3526,6 +3763,7 @@ def notification_tick(mode: str) -> int:
         handled = state["handled_event_uuids"]
         retry_handled = retry_state["handled_event_uuids"]
         for batch in batches:
+            batch["events"] = _bind_live_limit_carriers(agent_root, batch["transcript"], batch["events"])
             events_by_uuid = _batch_uuid_map(batch["events"])
             for envelope in batch["events"]:
                 if envelope["is_new"] is not True:
@@ -3661,8 +3899,8 @@ def notification_tick(mode: str) -> int:
 
 
 def tick(mode: str) -> int:
-    """Run one initialize, observe, or active scheduler tick."""
-    if mode not in {"initialize", "observe", "active"}:
+    """Run one explicit baseline, ensure, observe, or active scheduler tick."""
+    if mode not in {"initialize", "ensure", "observe", "active"}:
         return 2
     descriptor: int | None = None
     freeze_lock: int | None = None
@@ -3673,10 +3911,13 @@ def tick(mode: str) -> int:
         descriptor = _open_lifecycle_lock(logs / "transport-lifecycle.lock")
         if descriptor is None:
             _record_suppression(agent_root, "lifecycle_lock_busy")
-            if mode == "initialize":
+            if mode in {"initialize", "ensure"}:
                 return INITIALIZE_LOCK_BUSY_EXIT
             return 0
         projects_dir = _projects_dir(agent_root)
+        if mode == "ensure":
+            ensure_state(projects_dir, state_path)
+            return 0
         if mode == "initialize":
             initialize_state(projects_dir, state_path)
             initialized = load_state(state_path)
@@ -3907,6 +4148,7 @@ def main() -> int:
         return 2
     notice_modes = {
         "--initialize-notices": "initialize-notices",
+        "--ensure-notices": "ensure-notices",
         "--notify": "notify",
     }
     notice_mode = notice_modes.get(arguments[0])
@@ -3914,6 +4156,7 @@ def main() -> int:
         return notification_tick(notice_mode)
     modes = {
         "--initialize": "initialize",
+        "--ensure": "ensure",
         "--observe": "observe",
         "--active": "active",
     }

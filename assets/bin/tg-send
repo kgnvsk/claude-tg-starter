@@ -792,7 +792,18 @@ def capture_delivery(chat_id, thread_id=None):
                     (delivery_id, *scope),
                 ).fetchone() if results_present else None
                 if not target:
-                    raise ValueError("TG_DELIVERY_ID does not belong to this chat, topic and service session")
+                    # A second recipient has its own receipt and history. It must
+                    # never settle a request in that recipient's chat, nor claim
+                    # the original task complete merely because one copy arrived.
+                    verdict = require_answer_context(chat_id, thread_id, "", delivery_id)
+                    extra = verdict.get("additionalDestination") if isinstance(verdict, dict) else None
+                    if (not isinstance(extra, dict) or extra.get("requestId") != delivery_id
+                            or extra.get("generation") != stamp
+                            or extra.get("destination") != {"chatId": str(chat_id), "threadId": thread_id}):
+                        raise ValueError("TG_DELIVERY_ID does not belong to this chat, topic and service session")
+                    context["additional_destination"] = extra
+                    connection.commit()
+                    return context
                 turn, delivery, session, status, response_turn = target
                 current = connection.execute(
                     "SELECT turn_id FROM delivery_turns WHERE session_id=? AND closed_at IS NULL "
@@ -1730,7 +1741,7 @@ def main(argv):
                     if secret:
                         words = words.replace(secret, "***")
                 words = "".join(ch for ch in " ".join(words.split()) if ch.isprintable())
-                reason = f" Telegram {payload['error_code']}: {words[:200]}"
+                reason = f" Telegram {payload['error_code']}: {words}"  # whole (owner, 23.10.2026)
             sys.exit("delivery state unknown: Telegram did not prove the requested destination; do not retry "
                      "acknowledged parts" + reason + note)
         sent_ids.append(payload["result"]["message_id"])

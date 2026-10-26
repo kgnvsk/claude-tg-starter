@@ -2520,10 +2520,51 @@ def recorded_callbacks_have_final_receipts(hook: dict) -> bool:
         return False
 
 
+def validate_scoped_team_client(client: Path) -> None:
+    """Run only a root-installed branch client, never a path supplied by a task."""
+    if not re.fullmatch(r'/usr/local/lib/novsky-team-br-[0-9a-f]{10}/client\.py', str(client)):
+        raise ValueError('Invalid scoped delegation client')
+    marker = client.parent / 'instance.json'
+    for path in (client, marker, client.parent, *client.parent.parents):
+        info = path.lstat()
+        directory = path not in (client, marker)
+        if (info.st_uid != 0 or info.st_mode & 0o022
+                or not (stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode))
+                or (not directory and info.st_nlink != 1)):
+            raise ValueError('Unsafe scoped delegation installation')
+    if marker.stat().st_size > 4096:
+        raise ValueError('Invalid scoped delegation marker')
+    identity = json.loads(marker.read_text())
+    if identity != {'name': client.parent.name.removeprefix('novsky-team-')}:
+        raise ValueError('Scoped delegation marker mismatch')
+
+
+def delegation_clients() -> list[Path]:
+    clients = [TEAM_CLIENT] if TEAM_CLIENT.is_file() else []
+    # The scoped installer adds exact context hooks only to its own pair.
+    # Do not probe every branch on the machine during every ordinary turn.
+    config = Path(os.environ.get('CLAUDE_CONFIG_DIR') or AGENT_ROOT / '.claude') / 'settings.json'
+    if not config.exists():
+        return clients
+    if config.stat().st_size > 2 * 1024 * 1024:
+        raise ValueError('Delegation settings exceed the supported size')
+    settings = json.loads(config.read_text())
+    for entries in settings.get('hooks', {}).values():
+        for entry in entries:
+            for item in entry.get('hooks', []):
+                command = item.get('command')
+                match = re.fullmatch(r'/usr/bin/python3 (/usr/local/lib/novsky-team-br-[0-9a-f]{10}/client\.py) context',
+                                     command) if isinstance(command, str) else None
+                if match:
+                    client = Path(match[1])
+                    if client not in clients:
+                        validate_scoped_team_client(client)
+                        clients.append(client)
+    return clients
+
+
 def delegated_turn_work(hook: dict, events: list[dict], turn_events: list[dict]) -> dict:
     """An acknowledgement must not release the owner FIFO during delegation."""
-    if not TEAM_CLIENT.is_file():
-        return {'pending': [], 'reportedAt': None}
     # A plain delivered reply cannot have submitted work. Keep ordinary owner
     # conversations available during a broker outage; fail closed when this
     # turn actually used a shell, native agent or team task tool.
@@ -2532,6 +2573,9 @@ def delegated_turn_work(hook: dict, events: list[dict], turn_events: list[dict])
         for event in turn_events for block in content_blocks(event))
     if not possible_work:
         return {'pending': [], 'reportedAt': None}
+    clients = delegation_clients()
+    if not clients:
+        return {'pending': [], 'reportedAt': None}
     scope = str(uuid.UUID(hook['session_id']))
     carrier_id = ancestry_parent_uuid(turn_events[0], {e.get('uuid') for e in turn_events},
                                       transcript_uuid_map(events) or {}) if turn_events else None
@@ -2539,30 +2583,33 @@ def delegated_turn_work(hook: dict, events: list[dict], turn_events: list[dict])
     after = event_timestamp(carrier)
     if after is None:
         raise ValueError('Native turn timestamp unavailable')
-    try:
-        result = subprocess.run([sys.executable, str(TEAM_CLIENT), 'turn-work', scope, str(after)],
-                                capture_output=True, text=True, timeout=15, check=True)
-    except subprocess.CalledProcessError as error:
-        # A uid the broker does not know belongs to no org chart, so it cannot
-        # have delegated anything: the honest answer is "no work", not an
-        # outage. The team module is installed on boxes that never received an
-        # org chart, and failing closed there blocked every turn that touched a
-        # shell — the Telegram request stayed at the head of the queue until
-        # somebody restarted the bot. Any other broker failure still blocks.
-        if UNREGISTERED_TEAM_AGENT in (error.stderr or ''):
-            return {'pending': [], 'reportedAt': None}
-        raise
-    work = json.loads(result.stdout)
-    if (not isinstance(work, dict) or set(work) != {'pending', 'reportedAt'}
-            or not isinstance(work['pending'], list) or len(work['pending']) > 20):
-        raise ValueError('Invalid delegation state')
-    for task_id in work['pending']:
-        if str(uuid.UUID(task_id)) != task_id:
-            raise ValueError('Invalid delegation identity')
-    reported = work['reportedAt']
-    if reported is not None and (type(reported) not in (int, float) or not 0 < reported < 10**11):
-        raise ValueError('Invalid delegation receipt')
-    return work
+    combined = {'pending': [], 'reportedAt': None}
+    deadline = time.monotonic() + 15
+    for client in clients:
+        try:
+            result = subprocess.run([sys.executable, str(client), 'turn-work', scope, str(after)],
+                                    capture_output=True, text=True, timeout=max(.01, deadline-time.monotonic()), check=True)
+        except subprocess.CalledProcessError as error:
+            # An unknown uid has no work in this broker. Other registered
+            # branches must still be checked; every other error fails closed.
+            if UNREGISTERED_TEAM_AGENT in (error.stderr or ''):
+                continue
+            raise
+        work = json.loads(result.stdout)
+        if (not isinstance(work, dict) or set(work) != {'pending', 'reportedAt'}
+                or not isinstance(work['pending'], list) or len(work['pending']) > 20):
+            raise ValueError('Invalid delegation state')
+        for task_id in work['pending']:
+            if str(uuid.UUID(task_id)) != task_id:
+                raise ValueError('Invalid delegation identity')
+            if task_id not in combined['pending']:
+                combined['pending'].append(task_id)
+        reported = work['reportedAt']
+        if reported is not None and (type(reported) not in (int, float) or not 0 < reported < 10**11):
+            raise ValueError('Invalid delegation receipt')
+        if reported is not None:
+            combined['reportedAt'] = max(combined['reportedAt'] or reported, reported)
+    return combined
 
 
 def block_delegation(reason: str) -> None:

@@ -62,6 +62,7 @@ CORPORATE_STATE_DIR="$H/.claude/channels/telegram"
 CORPORATE_DB="$CORPORATE_STATE_DIR/messages.db"
 CORPORATE_MARKER="$CORPORATE_STATE_DIR/corporate-isolation-activated"
 CORPORATE_ISOLATION_ACTIVATED=0
+CORPORATE_PARKED_OWNER_PAUSES=0
 TG_CORPORATE_SESSIONS_LIVE=""
 CLAUDE_UPDATE_MAINTENANCE="${CLAUDE_UPDATE_MAINTENANCE:-0}"
 RUNTIME_RESOLUTION_ARGS=()
@@ -184,7 +185,11 @@ remove_maintenance_dropin() {
 }
 
 require_corporate_stopped_preflight() {
-  local receipt_digest
+  local receipt_digest fresh_preflight
+  CORPORATE_PARKED_OWNER_PAUSES=0
+  [ "$CLAUDE_UPDATE_MAINTENANCE" = 1 ] || return 1
+  require_valid_restart_hold || return 1
+  require_primary_service_stopped || return 1
   receipt_digest="$(python3 - "$CORPORATE_STOPPED_PREFLIGHT" <<'PY'
 import json
 import os
@@ -265,16 +270,41 @@ PY
     echo "FATAL: комплект оновлення не має corporate-control" >&2
     return 1
   }
-  runuser -u "$AGENT_USER" -- env HOME="$H" \
+  fresh_preflight="$(runuser -u "$AGENT_USER" -- env HOME="$H" \
     TELEGRAM_STATE_DIR="$CORPORATE_STATE_DIR" \
     CORPORATE_MODULE_DIR="$KIT/modules/telegram-corporate" \
     PATH="$H/.local/bin:$H/.bun/bin:/usr/local/bin:/usr/bin:/bin" \
     "$KIT/modules/telegram-corporate/bin/corporate-control" \
-    preflight --json --expect-digest "$receipt_digest" --expect-paused \
-    >/dev/null || {
+    preflight --json --expect-digest "$receipt_digest" --expect-paused)" || {
       echo "FATAL: stopped-preflight receipt більше не відповідає live-стану" >&2
       return 1
     }
+  # Only the staged stock controller classifies a retained provider refusal.
+  # The root-owned receipt's digest pins configuration; fresh output proves
+  # current DB quiescence. Never classify or rewrite FIFO rows in the updater.
+  CORPORATE_PARKED_OWNER_PAUSES="$(printf '%s' "$fresh_preflight" | python3 -c '
+import json, sys
+try:
+    value=json.load(sys.stdin)
+    runtime=value["plan"]["runtime"]
+    work=value["workStatus"]
+    if (type(value.get("schemaVersion")) is not int or value["schemaVersion"] != 1
+        or value.get("digest") != sys.argv[1] or value.get("digestMatches") is not True
+        or value.get("safeToMaintain") is not True or value.get("quiescent") is not True
+        or runtime.get("isolationActivated") is not True or runtime.get("phase2Enabled") is not True
+        or runtime.get("admissionState") != "paused" or work.get("ownerFifoStarted") is not False):
+        raise ValueError("unsafe current proof")
+    for key in ("unfinishedJobs","unfinishedChunks","sendingActions"):
+        if type(work.get(key)) is not int or work[key] != 0: raise ValueError("unfinished work")
+    count=work.get("parkedOwnerProviderPauses")
+    if type(count) is not int or not 0 <= count <= 100: raise ValueError("invalid retained count")
+    print(count)
+except (ValueError, TypeError, KeyError, AttributeError):
+    raise SystemExit(2)
+' "$receipt_digest")" || {
+    echo "FATAL: stopped-preflight не довів поточну безпечну паузу" >&2
+    return 1
+  }
 }
 
 validate_kit_checkout() {
@@ -473,6 +503,18 @@ if [ "$CHECK_STATUS" -ne 0 ]; then
   wall "managed persona"
 fi
 # END pre-stop persona preflight
+# The same system unit/logrotate checks run before maintenance stops the agent.
+preflight_system_context_before_stop() (
+  CLAUDE_UPDATE_MAINTENANCE=1
+  source "$KIT/assets/lib/install-system-context.sh"
+  verify_instance_system_context
+)
+run_check preflight_system_context_before_stop
+if [ "$CHECK_STATUS" -ne 0 ]; then
+  status=$CHECK_STATUS
+  [ "$UPDATE_ACTION" = --preflight-all ] || exit "$status"
+  wall "system unit/logrotate requires reviewed migration"
+fi
 if [ "${1:-}" = --license-preflight ]; then
   exit 0
 fi
@@ -737,6 +779,7 @@ agent_sqlite() {
   runuser -u "$AGENT_USER" -- sqlite3 -readonly "$CORPORATE_DB" "$@"
 }
 
+owner_fifo_pending=0
 if [ -L "$CORPORATE_DB" ]; then
   echo "FATAL: база Telegram не може бути символьним посиланням" >&2
   exit 2
@@ -793,15 +836,15 @@ elif [ -e "$CORPORATE_DB" ]; then
       owner_fifo_pending="$(agent_sqlite \
         "SELECT COUNT(*) FROM pending_inbound_deliveries;")"
     fi
-    [ "$owner_fifo_pending" = 0 ] || {
-      echo "FATAL: legacy owner FIFO ще не завершив усі вхідні повідомлення" >&2
-      exit 2
-    }
   fi
 fi
 
 if [ "$CORPORATE_ISOLATION_ACTIVATED" = 1 ]; then
   require_corporate_stopped_preflight || exit 2
+  [ "$owner_fifo_pending" = "$CORPORATE_PARKED_OWNER_PAUSES" ] || {
+    echo "FATAL: legacy owner FIFO ще не завершив усі вхідні повідомлення" >&2
+    exit 2
+  }
   [ -x "$H/bin/corporate-control" ] || {
     echo "FATAL: активована корпоративна ізоляція не має corporate-control" >&2
     exit 2
@@ -822,9 +865,10 @@ if value.get("admissionState") != "paused":
 for key in ("activeWorkers", "promptSubmitted", "sendingChunks"):
     if type(value.get(key)) is not int or value[key] != 0:
         raise SystemExit(2)
-if value.get("ownerFifoStarted") is not False:
+parked=int(sys.argv[1])
+if value.get("ownerFifoStarted") is not (parked > 0):
     raise SystemExit(2)
-' || {
+' "$CORPORATE_PARKED_OWNER_PAUSES" || {
     echo "FATAL: корпоративні сесії не перебувають у безпечному paused-стані" >&2
     exit 2
   }
@@ -840,9 +884,23 @@ if value.get("ownerFifoStarted") is not False:
     exit 2
   }
 else
+  [ "$owner_fifo_pending" = 0 ] || {
+    echo "FATAL: legacy owner FIFO ще не завершив усі вхідні повідомлення" >&2
+    exit 2
+  }
   # A stale saved/profile flag is never activation authority. Legacy routing
   # stays legacy until the owner completes the explicit paused cutover.
   TG_CORPORATE_SESSIONS_LIVE=0
+fi
+
+# Revalidate the candidate's current DB/digest immediately before the first
+# backup/code mutation; neither an earlier receipt nor an earlier count suffices.
+if [ "$CORPORATE_ISOLATION_ACTIVATED" = 1 ]; then
+  require_corporate_stopped_preflight || exit 2
+  [ "$owner_fifo_pending" = "$CORPORATE_PARKED_OWNER_PAUSES" ] || {
+    echo "FATAL: збережена черга власника змінилася перед оновленням" >&2
+    exit 2
+  }
 fi
 
 # Keep one transaction-local, root-only SQLite recovery source before the first

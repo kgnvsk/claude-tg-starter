@@ -438,7 +438,7 @@ def _check_current(home, user, unit, engine, *, source_dir=None, python_binary=N
     agent_cron = CRON_DIRECTORY / ("novsky-agent-full-backup-" + profile)
     if allow_maintenance_hold:
         names = ["zz-maintenance-hold.conf"]
-        if engine == "claude" and unit == "claude-telegram.service":
+        if engine == "claude" and unit in ("claude-telegram.service", f"claude-telegram@{user}.service"):
             names.append("zy-novsky-transaction.conf")
         expected = f"[Unit]\nConditionPathExists=!{home}/logs/restart-hold.until\n".encode()
         for name in names:

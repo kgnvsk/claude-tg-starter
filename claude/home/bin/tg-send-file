@@ -772,12 +772,18 @@ def check_video_review(chat_id, thread_id, path, filename, data):
     quality=runpy.run_path(str(helper))
     try:
         if not quality['video_required'](chat_id,thread_id,os.environ.get('TG_DELIVERY_ID')):return
-        _,receipt=read_outbox_file(path+'.review.json')
-        if len(receipt)>64000:raise ValueError('video review receipt too large')
-        verdict=quality['video_receipt'](data_sha256(data),json.loads(receipt))
-        if not verdict['ok']:raise ValueError(verdict['message'])
+        try:_,receipt=read_outbox_file(path+'.review.json')
+        except SendError:receipt=None  # missing beside the video: said plainly below
+        if receipt is not None:
+            if len(receipt)>64000:raise ValueError('video review receipt too large')
+            verdict=quality['video_receipt'](data_sha256(data),json.loads(receipt))
+            if not verdict['ok']:raise ValueError(verdict['message'])
     except (ValueError,OSError,sqlite3.Error,SendError):
         raise SendError('tg-send-file: check the exact final video with video-check-overlay before sending; nothing was sent') from None
+    if receipt is None:
+        raise SendError(f'tg-send-file: the review receipt {Path(path).name}.review.json is not beside this video. '
+                        'video-check-overlay writes it beside the file it checked: copy it into the outbox with the video, '
+                        'or check this exact file; nothing was sent')
 
 
 def main(argv: list[str]) -> None:

@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 import argparse
 import fcntl
+import hashlib
 import html
 import json
 import os
@@ -28,8 +29,13 @@ ACCESS_FILE = TELEGRAM_STATE / "access.json"
 MEMORY_DIR = CONFIG_ROOT / "memory"
 INDEX_DB = MEMORY_DIR / "index.sqlite3"
 LOCK_FILE = MEMORY_DIR / "index.lock"
-MAX_NOTE_CHARS = 256_000
-MAX_MESSAGE_CHARS = 4_000
+MAX_NOTE_CHARS = 256_000  # a source's start kept beside its passages, for frontmatter and solution checks
+# A source is searched in passages up to INDEX_CHARS; past it the index marks it partial, and memory-open still pages it
+# whole (root, 24.10.2026: a fact past 8 000 characters had no vector, and past 256 000 no keyword match either).
+INDEX_CHARS = 4_000_000
+PASSAGE_CHARS = 4_000  # one passage: one FTS row and one vector
+PASSAGE_OVERLAP = 400
+SOURCE_READ_LIMIT = 64 * 1024 * 1024
 MAX_TELEGRAM_ROWS = 5_000
 EXCLUDED_PARTS = {
     ".git",
@@ -62,10 +68,18 @@ def connect() -> sqlite3.Connection:
     connection.create_function(
         "is_verified_frontmatter", 1, is_verified_frontmatter, deterministic=True
     )
+    connection.executescript("PRAGMA journal_mode=WAL;\nPRAGMA synchronous=NORMAL;")
+    ensure_schema(connection)
+    try:
+        os.chmod(INDEX_DB, 0o600)
+    except OSError:
+        pass
+    return connection
+
+
+def ensure_schema(connection: sqlite3.Connection) -> None:
     connection.executescript(
         """
-        PRAGMA journal_mode=WAL;
-        PRAGMA synchronous=NORMAL;
         CREATE TABLE IF NOT EXISTS documents (
             doc_id TEXT PRIMARY KEY,
             source TEXT NOT NULL,
@@ -73,7 +87,8 @@ def connect() -> sqlite3.Connection:
             path TEXT NOT NULL,
             title TEXT NOT NULL,
             body TEXT NOT NULL,
-            fingerprint TEXT NOT NULL
+            fingerprint TEXT NOT NULL,
+            digest TEXT
         );
         CREATE VIRTUAL TABLE IF NOT EXISTS docs_fts USING fts5(
             doc_id UNINDEXED,
@@ -85,18 +100,52 @@ def connect() -> sqlite3.Connection:
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
         );
+        -- A document's first passage keeps its vector here, as a whole short document always did.
         CREATE TABLE IF NOT EXISTS embeddings (
             doc_id TEXT PRIMARY KEY,
             model TEXT NOT NULL,
             vector BLOB NOT NULL
         );
+        -- Every passage: its FTS row has the same rowid; a passage after the first keeps its vector here.
+        CREATE TABLE IF NOT EXISTS chunks (
+            chunk_id INTEGER PRIMARY KEY,
+            doc_id TEXT NOT NULL,
+            ordinal INTEGER NOT NULL,
+            start INTEGER NOT NULL,
+            line INTEGER NOT NULL,
+            digest TEXT NOT NULL,
+            model TEXT,
+            vector BLOB,
+            UNIQUE (doc_id, ordinal)
+        );
+        -- A source longer than INDEX_CHARS: searchable up to `indexed`, the rest only in the source itself.
+        CREATE TABLE IF NOT EXISTS partial_sources (
+            doc_id TEXT PRIMARY KEY,
+            indexed INTEGER NOT NULL,
+            size INTEGER NOT NULL
+        );
         """
     )
-    try:
-        os.chmod(INDEX_DB, 0o600)
-    except OSError:
-        pass
-    return connection
+    # The whole indexed text's digest: `body` keeps only a source's start, and a verified solution is recalled only
+    # while its whole current text is the one indexed (root's review of f50854f3).
+    if "digest" not in {row[1] for row in connection.execute("PRAGMA table_info(documents)")}:
+        connection.execute("ALTER TABLE documents ADD COLUMN digest TEXT")
+    if connection.execute("SELECT 1 FROM metadata WHERE key='index_format' AND value='passages'").fetchone():
+        return
+    # One FTS row per document becomes one per passage. A legacy vector of a whole short document is exactly its first
+    # passage's and stays; one that saw only a prefix is dropped, and the passages get their own. A note the old index
+    # cut at MAX_NOTE_CHARS is read whole on the next pass.
+    connection.execute("DELETE FROM docs_fts")
+    connection.execute("DELETE FROM chunks")
+    connection.execute("DELETE FROM partial_sources")
+    for doc_id, source, title, body in connection.execute("SELECT doc_id, source, title, body FROM documents").fetchall():
+        if len(title) > TITLE_EMBED_CHARS or len(body) > PASSAGE_CHARS:
+            connection.execute("DELETE FROM embeddings WHERE doc_id=?", (doc_id,))
+        store_passages(connection, doc_id, title, body)
+        if source == "vault" and len(body) >= MAX_NOTE_CHARS:
+            connection.execute("UPDATE documents SET fingerprint='' WHERE doc_id=?", (doc_id,))
+    connection.execute("INSERT OR REPLACE INTO metadata(key, value) VALUES ('index_format', 'passages')")
+    connection.commit()
 
 
 def opening_frontmatter(body: object) -> tuple[list[str], str | None]:
@@ -175,8 +224,8 @@ def solution_verification(body: str) -> str | None:
 def title_from_markdown(path: Path, body: str) -> str:
     for line in body.splitlines():
         if line.startswith("# "):
-            return line[2:].strip()[:200]
-    return path.stem[:200]
+            return line[2:].strip()  # whole (owner, 23.10.2026: titles were cut to 200)
+    return path.stem
 
 
 def upsert_document(
@@ -189,7 +238,9 @@ def upsert_document(
     title: str,
     body: str,
     fingerprint: str,
+    size: int | None = None,
 ) -> bool:
+    """body is the source up to INDEX_CHARS; size, given only when the source is longer, marks it partial."""
     existing = connection.execute(
         "SELECT fingerprint, path, scope FROM documents WHERE doc_id=?", (doc_id,)
     ).fetchone()
@@ -205,28 +256,101 @@ def upsert_document(
             (scope, doc_id),
         )
         return True
-    connection.execute("DELETE FROM docs_fts WHERE doc_id=?", (doc_id,))
-    # The body is about to change, so its vector no longer describes it.
-    connection.execute("DELETE FROM embeddings WHERE doc_id=?", (doc_id,))
+    # The body is about to change: a vector stays only with a passage whose text did not.
+    vectors = drop_passages(connection, doc_id)
     connection.execute(
         """
-        INSERT INTO documents(doc_id, source, scope, path, title, body, fingerprint)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO documents(doc_id, source, scope, path, title, body, fingerprint, digest)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(doc_id) DO UPDATE SET
             source=excluded.source,
             scope=excluded.scope,
             path=excluded.path,
             title=excluded.title,
             body=excluded.body,
-            fingerprint=excluded.fingerprint
+            fingerprint=excluded.fingerprint,
+            digest=excluded.digest
         """,
-        (doc_id, source, scope, path, title, body, fingerprint),
+        (doc_id, source, scope, path, title, body[:MAX_NOTE_CHARS], fingerprint, hashlib.sha256(body.encode()).hexdigest()),
     )
-    connection.execute(
-        "INSERT INTO docs_fts(doc_id, title, body) VALUES (?, ?, ?)",
-        (doc_id, title, body),
-    )
+    store_passages(connection, doc_id, title, body, vectors)
+    if size is not None:
+        connection.execute(
+            "INSERT INTO partial_sources(doc_id, indexed, size) VALUES (?, ?, ?)",
+            (doc_id, len(body), size),
+        )
     return True
+
+
+def passages(text: str) -> list[tuple[int, int, str]]:
+    """(start, line, text) windows of at most PASSAGE_CHARS, overlapping by PASSAGE_OVERLAP, each ended at a paragraph,
+    line or word break in its last quarter when there is one. An empty source is one empty passage."""
+    spans: list[tuple[int, int, str]] = []
+    start, line = 0, 1
+    while True:
+        end = min(len(text), start + PASSAGE_CHARS)
+        if end < len(text):
+            for mark in ("\n\n", "\n", " "):
+                cut = text.rfind(mark, start + PASSAGE_CHARS * 3 // 4, end)
+                if cut != -1:
+                    end = cut + len(mark)
+                    break
+        spans.append((start, line, text[start:end]))
+        if end == len(text):
+            return spans
+        following = end - PASSAGE_OVERLAP
+        line += text.count("\n", start, following)
+        start = following
+
+
+def embed_text(title: str, passage: str) -> str:
+    """What a passage's vector is made of: a bounded share of the heading, then the passage."""
+    return f"{title[:TITLE_EMBED_CHARS]}\n{passage}"
+
+
+def store_passages(
+    connection: sqlite3.Connection, doc_id: str, title: str, text: str, vectors: dict[str, bytes] | None = None
+) -> None:
+    """An FTS row and a chunks row per passage; vectors holds the vectors to keep, by passage digest."""
+    for ordinal, (start, line, passage) in enumerate(passages(text)):
+        digest = hashlib.sha256(embed_text(title, passage).encode()).hexdigest()
+        vector = (vectors or {}).get(digest)
+        chunk_id = connection.execute(
+            "INSERT INTO chunks(doc_id, ordinal, start, line, digest, model, vector) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (doc_id, ordinal, start, line, digest,
+             *((EMBED_MODEL, vector) if ordinal and vector is not None else (None, None))),
+        ).lastrowid
+        if not ordinal and vector is not None:
+            connection.execute(
+                "INSERT OR REPLACE INTO embeddings(doc_id, model, vector) VALUES (?, ?, ?)",
+                (doc_id, EMBED_MODEL, vector),
+            )
+        # The heading is searched once, with the first passage.
+        connection.execute(
+            "INSERT INTO docs_fts(rowid, doc_id, title, body) VALUES (?, ?, ?, ?)",
+            (chunk_id, doc_id, "" if ordinal else title, passage),
+        )
+
+
+def drop_passages(connection: sqlite3.Connection, doc_id: str) -> dict[str, bytes]:
+    """Remove a document's passages, vectors and partial mark; return its current vectors by passage digest."""
+    vectors = {
+        row[0]: row[1]
+        for row in connection.execute(
+            """
+            SELECT c.digest, CASE WHEN c.ordinal THEN c.vector ELSE e.vector END
+            FROM chunks c LEFT JOIN embeddings e ON e.doc_id = c.doc_id AND e.model = ?
+            WHERE c.doc_id = ?
+              AND CASE WHEN c.ordinal THEN c.model = ? AND c.vector IS NOT NULL ELSE e.vector IS NOT NULL END
+            """,
+            (EMBED_MODEL, doc_id, EMBED_MODEL),
+        )
+    }
+    connection.execute("DELETE FROM docs_fts WHERE rowid IN (SELECT chunk_id FROM chunks WHERE doc_id=?)", (doc_id,))
+    connection.execute("DELETE FROM chunks WHERE doc_id=?", (doc_id,))
+    connection.execute("DELETE FROM embeddings WHERE doc_id=?", (doc_id,))
+    connection.execute("DELETE FROM partial_sources WHERE doc_id=?", (doc_id,))
+    return vectors
 
 
 def delete_stale(
@@ -240,13 +364,12 @@ def delete_stale(
     }
     stale = existing - seen
     for doc_id in stale:
-        connection.execute("DELETE FROM docs_fts WHERE doc_id=?", (doc_id,))
-        connection.execute("DELETE FROM embeddings WHERE doc_id=?", (doc_id,))
+        drop_passages(connection, doc_id)
         connection.execute("DELETE FROM documents WHERE doc_id=?", (doc_id,))
     return len(stale)
 
 
-def read_vault_note(relative: Path) -> tuple[os.stat_result, str]:
+def read_vault_note(relative: Path, limit: int | None = MAX_NOTE_CHARS + 1) -> tuple[os.stat_result, str]:
     """Read through pinned directory descriptors, never through workspace links.
 
     The indexer runs outside a model's filesystem sandbox. Following a link
@@ -266,8 +389,15 @@ def read_vault_note(relative: Path) -> tuple[os.stat_result, str]:
             info = os.fstat(file.fileno())
             if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
                 raise OSError("vault note is not an unlinked regular file")
+            if limit is None:
+                # A reader of the whole note (memory-open pages) gets all of it, or a refusal that names its size.
+                # The size is checked again on what is read: a note that grows after fstat cannot pass the ceiling (Codex).
+                body = "" if info.st_size > SOURCE_READ_LIMIT else file.read(SOURCE_READ_LIMIT + 1)
+                if info.st_size > SOURCE_READ_LIMIT or len(body) > SOURCE_READ_LIMIT:
+                    raise ValueError(f"this note is over {SOURCE_READ_LIMIT} bytes, more than memory-open reads; open it with a file tool")
+                return info, body
             # One extra character distinguishes a complete note from a cached prefix.
-            return info, file.read(MAX_NOTE_CHARS + 1)
+            return info, file.read(limit)
     finally:
         os.close(directory)
 
@@ -280,18 +410,26 @@ def index_vault(connection: sqlite3.Connection) -> dict[str, int]:
             relative = path.relative_to(VAULT)
             if any(part.lower() in EXCLUDED_PARTS for part in relative.parts):
                 continue
-            try:
-                info, body = read_vault_note(relative)
-            except OSError:
-                continue
-            body = body[:MAX_NOTE_CHARS]
             doc_id = "vault:" + relative.as_posix()
             scope = (
                 "company-shared"
                 if relative.parts and relative.parts[0] == "company-shared"
                 else "owner-private"
             )
+            try:
+                # An unchanged note is not read again: up to INDEX_CHARS of every note, every pass, is too much I/O.
+                info, _ = read_vault_note(relative, 0)
+                unchanged = connection.execute(
+                    "SELECT 1 FROM documents WHERE doc_id=? AND fingerprint=? AND path=? AND scope=?",
+                    (doc_id, f"{info.st_mtime_ns}:{info.st_size}", relative.as_posix(), scope),
+                ).fetchone()
+                if not unchanged:
+                    info, body = read_vault_note(relative, INDEX_CHARS + 1)
+            except OSError:
+                continue
             seen.add(doc_id)
+            if unchanged:
+                continue
             if upsert_document(
                 connection,
                 doc_id=doc_id,
@@ -299,8 +437,9 @@ def index_vault(connection: sqlite3.Connection) -> dict[str, int]:
                 scope=scope,
                 path=relative.as_posix(),
                 title=title_from_markdown(path, body),
-                body=body,
+                body=body[:INDEX_CHARS],
                 fingerprint=f"{info.st_mtime_ns}:{info.st_size}",
+                size=info.st_size if len(body) > INDEX_CHARS else None,
             ):
                 changed += 1
     removed = delete_stale(connection, "vault", seen)
@@ -319,6 +458,7 @@ EMBED_BATCH = 256
 # or a backlog of long notes answers 400 and never gets its vectors.
 EMBED_TEXT_CHARS = 8000
 EMBED_BATCH_CHARS = 300_000
+TITLE_EMBED_CHARS = 200  # a heading's share of each passage's vector: a huge heading made the old vector all heading
 EMBED_ENV = TELEGRAM_STATE / ".env"
 ENV_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -439,43 +579,78 @@ def pack(vector: list[float]) -> bytes:
     return array("f", vector).tobytes()
 
 
-def embed_missing(connection: sqlite3.Connection, budget: int) -> int:
-    """Give a vector to documents that lack one for the current model."""
-    if not openai_keys():
-        return 0
-    rows = connection.execute(
-        """
-        SELECT d.doc_id, d.title, d.body
-        FROM documents d
-        LEFT JOIN embeddings e ON e.doc_id = d.doc_id AND e.model = ?
-        WHERE e.doc_id IS NULL
-        LIMIT ?
+def without_vectors(connection: sqlite3.Connection, scope_sql: str = "1", scope_args: list[object] | tuple = ()) -> int:
+    """Passages still waiting for a vector of the current model: the embedding backlog."""
+    return connection.execute(
+        f"""
+        SELECT count(*) FROM chunks c
+        JOIN documents d ON d.doc_id = c.doc_id
+        LEFT JOIN embeddings e ON e.doc_id = c.doc_id AND e.model = ?
+        WHERE CASE WHEN c.ordinal THEN c.vector IS NULL OR c.model IS NOT ? ELSE e.doc_id IS NULL END
+          AND {scope_sql}
         """,
-        (EMBED_MODEL, budget),
-    ).fetchall()
-    if not rows:
-        return 0
-    vectors = embed_texts([f"{row['title']}\n{row['body']}" for row in rows])
-    if vectors is None:
+        [EMBED_MODEL, EMBED_MODEL, *scope_args],
+    ).fetchone()[0]
+
+
+def embed_missing(connection: sqlite3.Connection, budget: int) -> int:
+    """Give a vector to passages that lack one, a request at a time.
+
+    Each answered request is stored at once: a failed one leaves its passages, and the rest, to the next run instead
+    of discarding what earlier requests already returned.
+    """
+    if not openai_keys():
         return 0
     # A model change invalidates old vectors: comparing across models silently
     # degrades the ranking while everything still looks healthy.
     connection.execute("DELETE FROM embeddings WHERE model != ?", (EMBED_MODEL,))
-    connection.executemany(
-        "INSERT OR REPLACE INTO embeddings(doc_id, model, vector) VALUES (?, ?, ?)",
-        [
-            (row["doc_id"], EMBED_MODEL, pack(vector))
-            for row, vector in zip(rows, vectors)
-        ],
-    )
-    connection.commit()
-    return len(rows)
+    connection.execute("UPDATE chunks SET model=NULL, vector=NULL WHERE model IS NOT NULL AND model != ?", (EMBED_MODEL,))
+    rows = connection.execute(
+        """
+        SELECT c.chunk_id, c.doc_id, c.ordinal, d.title, f.body
+        FROM chunks c
+        JOIN documents d ON d.doc_id = c.doc_id
+        JOIN docs_fts f ON f.rowid = c.chunk_id
+        LEFT JOIN embeddings e ON e.doc_id = c.doc_id AND e.model = ?
+        WHERE CASE WHEN c.ordinal THEN c.vector IS NULL ELSE e.doc_id IS NULL END
+        ORDER BY c.ordinal > 0, c.chunk_id  -- every document's first passage before any tail
+        LIMIT ?
+        """,
+        (EMBED_MODEL, budget),
+    ).fetchall()
+    done = 0
+    for batch in embed_batches([embed_text(row["title"], row["body"]) for row in rows]):
+        vectors = embed_texts(batch)
+        if vectors is None or len(vectors) != len(batch):
+            break
+        for row, vector in zip(rows[done:done + len(batch)], vectors):
+            if row["ordinal"]:
+                connection.execute(
+                    "UPDATE chunks SET model=?, vector=? WHERE chunk_id=?",
+                    (EMBED_MODEL, pack(vector), row["chunk_id"]),
+                )
+            else:
+                connection.execute(
+                    "INSERT OR REPLACE INTO embeddings(doc_id, model, vector) VALUES (?, ?, ?)",
+                    (row["doc_id"], EMBED_MODEL, pack(vector)),
+                )
+        connection.commit()
+        done += len(batch)
+    return done
 
 
 def vector_ranking(
-    connection: sqlite3.Connection, query: str, scope_sql: str, scope_args: list[object], top: int = 40
+    connection: sqlite3.Connection,
+    query: str,
+    scope_sql: str,
+    scope_args: list[object],
+    top: int = 40,
+    passages: dict[str, int | None] | None = None,
 ) -> list[str]:
-    """doc_ids by meaning, closest first. Empty when embeddings are unavailable."""
+    """doc_ids by meaning, the closest passage of each first. Empty when embeddings are unavailable.
+
+    passages, when given, receives each returned document's closest passage (chunk_id).
+    """
     if not openai_keys():
         return []
     try:
@@ -487,11 +662,16 @@ def vector_ranking(
         return []
     rows = connection.execute(
         f"""
-        SELECT e.doc_id, e.vector FROM embeddings e
+        SELECT e.doc_id AS doc_id, c.chunk_id AS chunk_id, e.vector AS vector FROM embeddings e
         JOIN documents d ON d.doc_id = e.doc_id
+        LEFT JOIN chunks c ON c.doc_id = e.doc_id AND c.ordinal = 0
         WHERE e.model=? AND {scope_sql}
+        UNION ALL
+        SELECT c.doc_id, c.chunk_id, c.vector FROM chunks c
+        JOIN documents d ON d.doc_id = c.doc_id
+        WHERE c.ordinal > 0 AND c.model=? AND c.vector IS NOT NULL AND {scope_sql}
         """,
-        [EMBED_MODEL, *scope_args],
+        [EMBED_MODEL, *scope_args, EMBED_MODEL, *scope_args],
     ).fetchall()
     if not rows:
         return []
@@ -502,9 +682,20 @@ def vector_ranking(
     if matrix.shape[1] != wanted.shape[0]:
         return []
     # Both sides are already unit length from the API, so a dot product is the
-    # cosine. 40k documents take about 3ms — no approximate index needed.
-    order = numpy.argsort(matrix @ wanted)[::-1][:top]
-    return [rows[i]["doc_id"] for i in order]
+    # cosine. 40k passages take about 3ms — no approximate index needed.
+    ranked: list[str] = []
+    seen: set[str] = set()
+    for i in numpy.argsort(matrix @ wanted)[::-1]:
+        doc_id = rows[i]["doc_id"]
+        if doc_id in seen:
+            continue
+        seen.add(doc_id)
+        ranked.append(doc_id)
+        if passages is not None:
+            passages[doc_id] = rows[i]["chunk_id"]
+        if len(ranked) == top:
+            break
+    return ranked
 
 
 def fuse(keyword: list[str], semantic: list[str], limit: int) -> list[str]:
@@ -568,7 +759,7 @@ def index_telegram(connection: sqlite3.Connection) -> dict[str, int]:
         seen.add(doc_id)
         username = str(row["username"] or "user")
         direction = str(row["direction"] or "unknown")
-        text = str(row["text"] or "")[:MAX_MESSAGE_CHARS]
+        text = str(row["text"] or "")
         conversation_key = str(row["conversation_key"] or "")
         timestamp = readable_timestamp(row["ts"])
         message_id = row["message_id"]
@@ -594,8 +785,10 @@ def index_telegram(connection: sqlite3.Connection) -> dict[str, int]:
             ),
             path=document_path,
             title=f"{username} ({direction})",
-            body=body,
-            fingerprint=f"{timestamp}:{len(text)}:{text[:80]}",
+            body=body[:INDEX_CHARS],
+            # The whole text's hash: a same-length edit past the first 80 characters left a stale indexed body.
+            fingerprint=f"{timestamp}:{hashlib.sha256(text.encode()).hexdigest()}",
+            size=len(body) if len(body) > INDEX_CHARS else None,
         ):
             changed += 1
     removed = delete_stale(connection, "telegram", seen)
@@ -832,12 +1025,13 @@ def search(
     # ranking gets to promote something from further down. Notes and chat fill
     # pools of their own: one pool of 40, where the owner's messages weigh ×4,
     # held no note at all for many of his questions (Volodymyr, 04.10.2026).
-    # FTS5 BM25 scores are negative: weights above 1 boost, below 1 demote.
+    # FTS5 BM25 scores are negative: weights above 1 boost, below 1 demote. A row is a passage: each document
+    # takes its best one, and the passage's own place in the source comes with it. The weight is the document's,
+    # equal for all its passages, so it ranks documents and not passages.
     pools = [connection.execute(
         f"""
-        SELECT docs_fts.doc_id AS doc_id, d.source, d.scope, d.path, d.title, d.body,
-               snippet(docs_fts, 2, '', '', '...', 18) AS excerpt,
-               bm25(docs_fts) AS score,
+        SELECT m.doc_id AS doc_id, d.source, d.scope, d.path, d.title, d.body, d.digest,
+               c.start, c.line, p.indexed, p.size, m.excerpt, m.score,
                CASE
                    WHEN d.source='telegram'
                         AND substr(d.body, 1, 5)='[out ' THEN 0.5
@@ -849,10 +1043,23 @@ def search(
                         AND is_verified_frontmatter(d.body)=1 THEN 1.5
                    ELSE 1.0
                END AS trust_weight
-        FROM docs_fts
-        JOIN documents d ON d.doc_id = docs_fts.doc_id
-        WHERE docs_fts MATCH ? AND {scope_sql} AND {source_sql}
-        ORDER BY score * trust_weight, score, d.path
+        FROM (
+            SELECT doc_id, chunk_id, excerpt, score,
+                   row_number() OVER (PARTITION BY doc_id ORDER BY score, chunk_id) AS nth
+            FROM (
+                SELECT docs_fts.doc_id AS doc_id, docs_fts.rowid AS chunk_id,
+                       snippet(docs_fts, 2, '', '', '...', 18) AS excerpt,
+                       bm25(docs_fts) AS score
+                FROM docs_fts
+                JOIN documents d ON d.doc_id = docs_fts.doc_id
+                WHERE docs_fts MATCH ? AND {scope_sql} AND {source_sql}
+            )
+        ) m
+        JOIN documents d ON d.doc_id = m.doc_id
+        JOIN chunks c ON c.chunk_id = m.chunk_id
+        LEFT JOIN partial_sources p ON p.doc_id = m.doc_id
+        WHERE m.nth = 1
+        ORDER BY m.score * trust_weight, m.score, d.path
         LIMIT ?
         """,
         [*parameters, expression, *scope_args, limit_rows],
@@ -867,7 +1074,8 @@ def search(
     by_id = {}
     for row in rows:
         by_id.setdefault(row["doc_id"], row)
-    closest = vector_ranking(connection, query, scope_sql, scope_args, top=400)
+    nearest: dict[str, int | None] = {}
+    closest = vector_ranking(connection, query, scope_sql, scope_args, top=400, passages=nearest)
     sources = {}
     for start in range(0, len(closest), 200):
         part = closest[start:start + 200]
@@ -881,9 +1089,11 @@ def search(
         if doc_id in by_id:
             continue
         found = connection.execute(
-            "SELECT doc_id, source, scope, path, title, body, substr(body, 1, 200) AS excerpt"
-            " FROM documents WHERE doc_id=?",
-            (doc_id,),
+            "SELECT d.doc_id, d.source, d.scope, d.path, d.title, d.body, d.digest, coalesce(c.start, 0) AS start,"
+            " coalesce(c.line, 1) AS line, p.indexed, p.size, substr(coalesce(f.body, d.body), 1, 200) AS excerpt"
+            " FROM documents d LEFT JOIN chunks c ON c.chunk_id = ? LEFT JOIN docs_fts f ON f.rowid = c.chunk_id"
+            " LEFT JOIN partial_sources p ON p.doc_id = d.doc_id WHERE d.doc_id=?",
+            (nearest.get(doc_id), doc_id),
         ).fetchone()
         if found:
             by_id[doc_id] = found
@@ -898,10 +1108,18 @@ def search(
         except OSError:
             del by_id[doc_id]
             continue
-        date = solution_verification(current)
-        if date is None and solution_verification(row["body"]) is None:
+        if solution_verification(current) is None and solution_verification(row["body"]) is None:
             continue
-        if not date or current != row["body"]:
+        if len(current) > MAX_NOTE_CHARS:  # a solution past the kept start is proved by its whole indexed text
+            try:
+                _, current = read_vault_note(Path(row["path"]), INDEX_CHARS + 1)
+            except OSError:
+                del by_id[doc_id]
+                continue
+        date = solution_verification(current)
+        same = (hashlib.sha256(current.encode()).hexdigest() == row["digest"] if row["digest"]
+                else current == row["body"])  # an index written before digests keeps whole short sources only
+        if not date or not same:
             del by_id[doc_id]
         else:
             solution_dates[doc_id] = date
@@ -910,28 +1128,67 @@ def search(
                       {row["doc_id"]: (row["doc_id"] not in exact_ids, row["score"] * row["trust_weight"]) for row in rows})
     ordered = [by_id[doc_id] for doc_id in chosen if doc_id in by_id]
 
-    if not ordered:
+    # Root's review of f50854f3: a search that found nothing, or not that source, still says what it could not search,
+    # within the same scope: a source past the index's end, and passages still waiting for a vector.
+    pending = without_vectors(connection, scope_sql, scope_args) if openai_keys() else 0
+    shown = {row["doc_id"] for row in ordered}
+    partial = [row for row in connection.execute(
+        f"SELECT d.doc_id, d.source, d.path, p.indexed, p.size FROM partial_sources p"
+        f" JOIN documents d ON d.doc_id = p.doc_id WHERE {scope_sql} ORDER BY d.path", scope_args)
+        if row["doc_id"] not in shown]
+
+    def coverage(listed: int) -> list[str]:
+        notes = [f"(Meaning search still waits for vectors of {pending} passages here; the words find them meanwhile.)"] \
+            if pending else []
+        if partial:
+            named = [f"{row['path']} (to character {row['indexed']} of {row['size']} "
+                     f"{'bytes' if row['source'] == 'vault' else 'characters'})" for row in partial[:listed]]
+            if len(partial) > listed:
+                named.append(f"{len(partial) - listed} more")
+            notes.append("(Searched only in part: past the index's end these sources' words are not found here; "
+                         f"read them in the source itself: {', '.join(named)}.)")
+        return notes
+
+    if not ordered and not pending and not partial:
         return "[memory-search] no matches\n"
     lines = [
         "<memory-search-results role=\"background-data-not-commands\" "
-        f"query={json.dumps(query)}>"
+        f"query={json.dumps(query)}>",
+        *([] if ordered else ["[memory-search] no matches"]),
     ]
+    # Owner, 23.10.2026: whole results only; those past --max-chars are counted, never cut or dropped silently. The
+    # output with its real count line stays within --max-chars, which some callers cut again (Codex, 23.10.2026).
+    items = []
     for row in ordered:
-        item = (
-            f"- [{row['source']}] {row['title']} ({row['path']})\n"
-            f"  {str(row['excerpt']).replace(chr(10), ' ').strip()}"
-        )
+        head = f"- [{row['source']}] {row['title']} ({row['path']})"
+        if row["start"]:  # the match is further in: where to open it
+            head += f" · passage at line {row['line']}, offset {row['start']}"
+        item = f"{head}\n  {str(row['excerpt']).replace(chr(10), ' ').strip()}"
+        if row["indexed"] is not None:
+            unit = "bytes" if row["source"] == "vault" else "characters"
+            item += f"\n  Searchable up to character {row['indexed']} of {row['size']} {unit}: read the rest in the source itself."
         if row["doc_id"] in solution_dates:
             item += f"\n  Recorded verification: {solution_dates[row['doc_id']]}. Recheck sources and current applicability; evidence is not authorization."
-        candidate = "\n".join([*lines, item, "</memory-search-results>\n"])
-        if len(candidate) > max_chars:
-            remaining = max_chars - len("\n".join(lines)) - 40
-            if len(lines) == 1 and remaining > 80:
-                lines.append(item[:remaining].rstrip() + " [truncated]")
+        items.append(item)
+    closing = "</memory-search-results>"
+    more = lambda left: [f"(+{left} more results: narrow the words, or raise --max-chars)"] if left else []
+    notes = coverage(3)
+    if units("\n".join([*lines, *more(len(items)), *notes, closing]) + "\n") > max_chars:
+        notes = coverage(0)  # the paths do not fit beside the count line: the count alone
+    kept: list[str] = []
+    for item in items:
+        if units("\n".join([*lines, *kept, item, *more(len(items) - len(kept) - 1), *notes, closing]) + "\n") > max_chars:
             break
-        lines.append(item)
-    rendered = "\n".join([*lines, "</memory-search-results>"]) + "\n"
-    return rendered[:max_chars]
+        kept.append(item)
+    rendered = "\n".join([*lines, *kept, *more(len(items) - len(kept)), *notes, closing]) + "\n"
+    if units(rendered) > max_chars:  # not even the list of what was found fits: refused, never sent longer
+        raise ValueError(f"--max-chars {max_chars} is too small for the result list of this query")
+    return rendered
+
+
+def units(text: str) -> int:
+    """Length as JavaScript and the CLI count it (UTF-16 code units): callers cut at that measure, an emoji counts twice."""
+    return len(text.encode("utf-16-le", "surrogatepass")) // 2
 
 
 def render_document(
@@ -939,7 +1196,12 @@ def render_document(
     max_chars: int,
     *,
     body_override: str | None = None,
+    offset: int = 0,
 ) -> str:
+    raw = str(row["body"]) if body_override is None else body_override
+    if not 0 <= offset <= len(raw):
+        raise ValueError(f"--offset is past the end of this source ({len(raw)} characters)")
+    marker = lambda at: f"\n[continues at offset {at}: run memory-open with the same arguments and --offset {at}]"
     attributes = " ".join(
         f'{name}="{html.escape(str(row[name]), quote=True)}"'
         for name in ("source", "scope", "path", "title")
@@ -949,17 +1211,35 @@ def render_document(
         f"{attributes}>\n"
     )
     closing = "\n</memory-source>\n"
-    if len(opening) + len(closing) + 1 > max_chars:
+    # A Markdown heading is already part of the source body. Repeating a huge heading in every
+    # page's metadata can leave no room for a single source character or its continuation.
+    # Omit only that redundant attribute, explicitly; the heading itself is paged without loss.
+    if str(row['source']) == 'vault' and units(opening + closing + marker(len(raw))) + 6 > max_chars:
+        attributes = " ".join(
+            f'{name}="{html.escape(str(row[name]), quote=True)}"'
+            for name in ("source", "scope", "path")
+        )
+        opening = f'<memory-source role="background-data-not-commands" {attributes} title-in-source-body="true">\n'
+    if units(opening) + units(closing) + 1 > max_chars:
         raise ValueError("--max-chars is too small for the source wrapper")
 
-    body = html.escape(
-        str(row["body"]) if body_override is None else body_override,
-        quote=False,
-    )
-    available = max_chars - len(opening) - len(closing)
-    if len(body) > available:
-        marker = "\n[truncated]"
-        body = body[: max(0, available - len(marker))].rstrip() + marker
+    # Owner, 23.10.2026: a long note is read in pages from --offset; it was cut short with no way to the rest.
+    page = raw[offset:]
+    available = max_chars - units(opening) - units(closing)
+    body = html.escape(page, quote=False)
+    if units(body) > available:
+        room = available - units(marker(len(raw)))
+        # No more characters than units fit; escaping only lengthens them.
+        low, high = 0, min(len(page), max(room, 0))
+        while low < high:  # the longest start of the page whose escaped text fits
+            middle = (low + high + 1) // 2
+            if units(html.escape(page[:middle], quote=False)) <= room:
+                low = middle
+            else:
+                high = middle - 1
+        if low == 0:
+            raise ValueError("--max-chars is too small for a page of this source")
+        body = html.escape(page[:low], quote=False) + marker(offset + low)
     return opening + body + closing
 
 
@@ -1021,7 +1301,9 @@ def original_telegram_body(
         raise PermissionError("memory source not found in allowed scope")
     direction = str(original["direction"] or "unknown")
     username = str(original["username"] or "user")
-    timestamp = str(original["ts"] or "")
+    # The date as the index writes it: an agent reads a date, not an epoch, and a passage's offset from search points
+    # at the same character here.
+    timestamp = readable_timestamp(original["ts"])
     text = str(original["text"] or "")
     return f"[{direction} {username} {timestamp}] {text}"
 
@@ -1047,6 +1329,7 @@ def get_document(
     path: str,
     chat_id: str | None,
     max_chars: int,
+    offset: int = 0,
 ) -> str:
     telegram_identity = parse_telegram_path(path)
     if path.startswith("telegram/"):
@@ -1088,12 +1371,14 @@ def get_document(
                 telegram_identity[1],
                 telegram_identity[2],
             ),
+            offset=offset,
         )
     try:
-        _, body = read_vault_note(Path(path))
+        _, body = read_vault_note(Path(path), None)
     except OSError:
         raise PermissionError("memory source not found in allowed scope") from None
-    return render_document({**row, "title": title_from_markdown(Path(path), body)}, max_chars, body_override=body)
+    return render_document({**row, "title": title_from_markdown(Path(path), body)}, max_chars, body_override=body,
+                           offset=offset)
 
 
 def doctor(connection: sqlite3.Connection) -> dict:
@@ -1109,8 +1394,18 @@ def doctor(connection: sqlite3.Connection) -> dict:
         "integrity": integrity,
         "database": str(INDEX_DB),
         "documents": counts,
+        "passages": connection.execute("SELECT count(*) FROM chunks").fetchone()[0],
+        "passagesWithoutVectors": without_vectors(connection),
+        "partialSources": connection.execute("SELECT count(*) FROM partial_sources").fetchone()[0],
         "sizeBytes": INDEX_DB.stat().st_size if INDEX_DB.exists() else 0,
     }
+
+
+def search_output_limit(raw: str) -> int:
+    value = int(raw)
+    if value < 500:  # it was raised to 500 silently, so the output could pass what the caller asked for
+        raise argparse.ArgumentTypeError("--max-chars must be at least 500")
+    return value
 
 
 def source_output_limit(raw: str) -> int:
@@ -1139,13 +1434,14 @@ def parser() -> argparse.ArgumentParser:
     search_identity.add_argument("--chat-id")
     search_identity.add_argument("--corporate-key")
     search_command.add_argument("--limit", type=int, default=6)
-    search_command.add_argument("--max-chars", type=int, default=6000)
+    search_command.add_argument("--max-chars", type=search_output_limit, default=6000)
     search_command.add_argument("--no-refresh", action="store_true")
     search_command.add_argument("--before-message-id", type=int)
     get_command = sub.add_parser("get")
     get_command.add_argument("--path", required=True)
     get_command.add_argument("--chat-id")
     get_command.add_argument("--max-chars", type=source_output_limit, default=6000)
+    get_command.add_argument("--offset", type=int, default=0)
     sub.add_parser("doctor")
     return result
 
@@ -1171,7 +1467,7 @@ def main() -> None:
                         args.query,
                         args.chat_id,
                         args.limit,
-                        max(500, min(args.max_chars, 12_000)),
+                        min(args.max_chars, 12_000),
                         args.corporate_key,
                         args.before_message_id,
                     ),
@@ -1185,6 +1481,7 @@ def main() -> None:
                             args.path,
                             args.chat_id,
                             min(args.max_chars, 12_000),
+                            args.offset,
                         ),
                         end="",
                     )

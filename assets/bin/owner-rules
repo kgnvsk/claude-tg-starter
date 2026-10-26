@@ -158,7 +158,7 @@ def core_rules(raw):
     return [p.strip() for p in parts if p.strip()],''.join(kept)
 
 
-def _snapshot(scope=None):
+def _snapshot(scope=None, review_scopes=()):
     core=read_bytes(core_path(),True);raw=read_bytes(DIRECTORY/'index.json',True)
     value=json.loads(raw) if raw is not None else {'schemaVersion':1,'rules':[]}
     if not isinstance(value,dict) or value.get('schemaVersion')!=1 or not isinstance(value.get('rules'),list):
@@ -180,7 +180,7 @@ def _snapshot(scope=None):
     revision=digest(json.dumps([None if core is None else digest(core),None if raw is None else digest(raw)],separators=(',',':')).encode())
     owner_context=read_bytes(core_path().parent/'OWNER.md',True)
     if owner_context is not None:revision=digest((revision+digest(owner_context)).encode())
-    projected=[row for row in rows if scope is None or row['scope'] in (scope,'all')]
+    projected=[row for row in rows if scope is None or row['scope'] in (scope,'all',*review_scopes)]
     if scope is not None:
         # Provenance stays in the owner's private store. A rule published for a
         # company chat must not carry unrelated words from its private source.
@@ -192,8 +192,8 @@ def _snapshot(scope=None):
     return result,{'core':core,'index':raw,'value':value,'cleaned':cleaned}
 
 
-def snapshot(scope=None):
-    with locked():return _snapshot(scope)[0]
+def snapshot(scope=None, *, review_scopes=()):
+    with locked():return _snapshot(scope,review_scopes)[0]
 
 
 def instruction_receipt(source):
@@ -204,16 +204,18 @@ def instruction_receipt(source):
             return saved.get('disposition')
 
 
-def apply_rules(request, scope=None):
+def apply_rules(request, scope=None, *, allow_owner_scopes=False, review_scopes=()):
     """Host-authenticated source is required by the engine adapter; this is storage, not ACL.
 
     No semantic guessing: the caller reads all active candidates and explicitly
     names replacements, full conditions/exceptions, and a stable subject/scope.
     """
     if not isinstance(request,dict):raise ValueError('invalid rule change')
+    if review_scopes and (not allow_owner_scopes or any(not isinstance(s,str) or not re.fullmatch(r'owner|all|chat:-?\d+:\d+',s) for s in review_scopes)):
+        raise ValueError('invalid owner review scope')
     with locked():
         current,state=_snapshot()
-        applicable=_snapshot(scope)[0] if scope is not None else current
+        applicable=_snapshot(scope,review_scopes)[0] if scope is not None else current
         source=request.get('source');changes=request.get('changes')
         if isinstance(source,dict):
             operation=f"{source.get('chatId')}:{source.get('messageId')}"
@@ -248,7 +250,7 @@ def apply_rules(request, scope=None):
             key,change_scope,text,replaces=(change[k] for k in ('key','scope','text','replaces'))
             if not isinstance(key,str) or not re.fullmatch(r'[a-z0-9][a-z0-9._-]{0,119}',key):raise ValueError('invalid rule subject')
             if not isinstance(change_scope,str) or not re.fullmatch(r'owner|all|chat:-?\d+:\d+',change_scope):raise ValueError('explicit rule scope required')
-            if scope is not None and change_scope!=scope:raise ValueError('rule change outside current scope')
+            if scope is not None and change_scope!=scope and not allow_owner_scopes:raise ValueError('rule change outside current scope')
             if not isinstance(text,str) or len(text.strip())>60_000 or (not text.strip() and not replaces):raise ValueError('complete rule text or explicit retirement required')
             if not isinstance(replaces,list) or len(set(replaces))!=len(replaces) or not set(replaces)<=ids or removed.intersection(replaces):
                 raise ValueError('invalid replacement IDs')
@@ -281,7 +283,7 @@ def apply_rules(request, scope=None):
         if not backup.exists():atomic(backup,json.dumps(tx,ensure_ascii=False).encode())
         atomic(DIRECTORY/'transaction.json',json.dumps(tx,ensure_ascii=False).encode())
         recover()
-        return {'ok':True,'revision':_snapshot(scope)[0]['revision'],'savedIds':[row['id'] for row in added],'disposition':disposition}
+        return {'ok':True,'revision':_snapshot(scope,review_scopes)[0]['revision'],'savedIds':[row['id'] for row in added],'disposition':disposition}
 
 def blocks(text):
     # Start a new block at a margin list item or a heading; retain every continuation, whitespace and paragraph.
@@ -363,33 +365,68 @@ def ranked(rows, query):
     scored=[(score(row),i,row) for i,row in enumerate(rows)]
     return [(i,row) for value,i,row in sorted(scored,key=lambda p:(-p[0],p[1])) if value>0]
 
+def heading(row):
+    """A rule's own label in the index: its heading when short (the text before « (», «: », «. » or «»»), else its
+    subject, dotted number or size; never words cut mid-rule."""
+    text=' '.join(row['text'].split())
+    head=re.split(r' \(|: |\. |«',text,maxsplit=1)[0].lstrip('-*•0123456789.) ')
+    return head if head and len(head)<=80 else row.get('key') or rule_label(row) or f'({len(text)} characters)'
+
+def units(text):
+    return len(text.encode('utf-16-le','surrogatepass'))//2
+
+def index_lines(rows):
+    return [f"{i}. [scope={row.get('scope','owner')}] {heading(row)}" for i,row in enumerate(rows,1)]
+
+def index_page(page):
+    rows=load()['rules'];pages=[[]];used=0
+    for line in index_lines(rows):
+        size=units(line)+1
+        if size>CAP-250:raise ValueError('rule index entry is too large; read the complete library index.json')
+        if used+size>CAP-250:pages.append([]);used=0
+        pages[-1].append(line);used+=size
+    if not 0<=page<len(pages):raise ValueError('rule index page is outside the current index')
+    out=[f'OWNER RULES INDEX: page {page} of {len(pages)}, {len(rows)} rules. Full rule: ~/bin/owner-rules read POSITION.',*pages[page]]
+    if page+1<len(pages):out.append(f'MORE: ~/bin/owner-rules list --page {page+1}')
+    return '\n'.join(out)
+
+
 def context(query):
+    """Owner, 23.10.2026: nothing the model reads is cut. The index names every rule by its subject, dotted label or ID
+    (the first 12-64 characters of each were cut); the rules the query touches come whole while they fit, the others
+    by position, to be read whole."""
     rows=load()['rules']
     ordered=ranked(rows,query)
     out=['OWNER RULES: apply only the scope named on each rule; all means every scope. Full text: ~/bin/owner-rules read POSITION, dotted LABEL, or ID.']
-    # Numeric positions keep the always-visible index compact. IDs remain stable in storage.
-    room=max(12,min(64,(3000-len(out[0]))//max(1,len(rows))-8))
-    for i,row in enumerate(rows,1):
-        title=' '.join(row['text'].split())
-        out.append(f"{i}. [scope={row.get('scope','owner')}] {title[:room]}"+('…' if len(title)>room else ''))
-    out.append('MATCHED RULE DETAILS (read the full numbered rule when clipped):')
+    index=index_lines(rows)
+    if units('\n'.join([*out,*index]))>CAP-250:
+        out.append(f'Index has {len(rows)} rules; complete headings: ~/bin/owner-rules list --page 0 (follow MORE).')
+    else:out.extend(index)
+    out.append('MATCHED RULE DETAILS, whole (read the others by position):')
+    unread=[]
     for i,row in ordered:
-        room=CAP-len('\n'.join(out))-40
-        if room<100:break
-        text=row['text'];excerpt=text[:min(room,1500)]
-        out.append(f"{i+1}. [scope={row.get('scope','owner')}] {excerpt}"+('…' if excerpt!=text else ''))
+        line=f"{i+1}. [scope={row.get('scope','owner')}] {row['text']}"
+        if not unread and units('\n'.join(out))+1+units(line)<=CAP-250:out.append(line)
+        else:unread.append(str(i+1))
+    if unread:
+        note='Also touched, read each whole before acting on it: '+', '.join(unread)
+        if units('\n'.join(out))+1+units(note)>CAP:
+            note=f'{len(unread)} more matching rules; complete index: ~/bin/owner-rules list --page 0 (follow MORE).'
+        out.append(note)
     return '\n'.join(out)
 
 def main():
     p=argparse.ArgumentParser(description=__doc__); sub=p.add_subparsers(dest='action',required=True)
     s=sub.add_parser('migrate');s.add_argument('--expected-sha',required=True)
     s=sub.add_parser('context');s.add_argument('query')
+    s=sub.add_parser('list');s.add_argument('--page',type=int,default=0)
     s=sub.add_parser('read');s.add_argument('id')
     s=sub.add_parser('snapshot');s.add_argument('--scope')
     args=p.parse_args()
     if args.action=='migrate':
         with locked():print(json.dumps(migrate(args.expected_sha),ensure_ascii=False))
     elif args.action=='context': print(context(args.query))
+    elif args.action=='list': print(index_page(args.page))
     elif args.action=='snapshot': print(json.dumps(snapshot(args.scope),ensure_ascii=False))
     else:
         rows=load()['rules']

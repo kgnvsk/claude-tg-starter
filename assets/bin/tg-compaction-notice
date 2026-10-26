@@ -5,6 +5,9 @@ One attempt per open turn and chat/topic. Claim before sending because a timeout
 does not prove Telegram rejected the message. Missing/legacy identity is silent.
 Nothing in this hook reads the transcript or changes the delivery ledger.
 """
+import argparse
+import stat
+import tempfile
 import concurrent.futures
 import fcntl
 import hashlib
@@ -43,6 +46,111 @@ def addressed(payload):
         return True
 
 
+def scope(chat, thread):
+    if not re.fullmatch(r'-?[1-9][0-9]{0,19}', chat):
+        raise ValueError('invalid chat')
+    if thread is not None and (not chat.startswith('-') or not re.fullmatch(r'[1-9][0-9]{0,9}', thread)):
+        raise ValueError('invalid topic')
+    return json.dumps([chat, thread], separators=(',', ':'))
+
+
+def preferences(state):
+    path = state / 'compaction-preferences.json'
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return {'version': 1, 'scopes': {}}
+    with os.fdopen(fd, 'r') as handle:
+        info = os.fstat(handle.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > 1_000_000:
+            raise ValueError('unsafe preference file')
+        data = json.load(handle)
+    if (not isinstance(data, dict) or data.get('version') != 1 or not isinstance(data.get('scopes'), dict)
+            or any(not isinstance(row, dict) or type(row.get('enabled')) is not bool
+                   for row in data['scopes'].values())):
+        raise ValueError('invalid preferences')
+    return data
+
+
+def preference_result(data, chat, thread):
+    row = data['scopes'].get(scope(chat, thread))
+    return {'chatId': chat, 'threadId': thread, 'enabled': row['enabled'] if row else True,
+            'configured': row is not None, 'source': row.get('source') if row else None}
+
+
+def primary_owner(state):
+    owner = os.environ.get('OWNER_CHAT_ID', '')
+    if not owner:
+        owner = next((line.split('=', 1)[1].strip().strip('\"\'') for line in (state / '.env').read_text().splitlines()
+                      if line.startswith('OWNER_CHAT_ID=')), '')
+    if not re.fullmatch(r'[1-9][0-9]{0,19}', owner):
+        raise ValueError('owner identity unavailable')
+    return owner
+
+
+def preference_source(state, chat, thread, delivery):
+    """Only an original owner's request for this exact scope; text is interpreted by the native agent."""
+    if not re.fullmatch(re.escape(chat) + r':[1-9][0-9]{0,19}', delivery):
+        raise ValueError('source must be a delivery from this chat')
+    owner = primary_owner(state)
+    with sqlite3.connect(f'file:{state / "messages.db"}?mode=ro', uri=True, timeout=1) as db:
+        row = db.execute('SELECT request_payload FROM delivery_results WHERE delivery_id=?', (delivery,)).fetchone()
+    meta = json.loads(row[0])['params']['meta'] if row else {}
+    if (meta.get('delivery_id') != delivery or str(meta.get('chat_id')) != chat
+            or str(meta.get('user_id')) != owner or (None if meta.get('thread_id') is None else str(meta['thread_id'])) != thread
+            or meta.get('forward_from') is not None or meta.get('sender_chat_id') is not None):
+        raise ValueError('source is not an original owner request for this chat and topic')
+    return {'deliveryId': delivery, 'actorUserId': owner}
+
+
+def preference_command(state):
+    parser = argparse.ArgumentParser(description='Routine native compaction notice preference for the primary owner private chat only')
+    parser.add_argument('action', choices=('get', 'set'))
+    parser.add_argument('chat')
+    parser.add_argument('value', nargs='?', choices=('on', 'off'))
+    parser.add_argument('--source', help='exact original owner delivery_id in the primary owner private chat')
+    args = parser.parse_args()
+    key = scope(args.chat, None)
+    if args.chat != primary_owner(state):
+        raise ValueError('preference is supported only in the primary owner private chat')
+    if args.action == 'get':
+        if args.value or args.source:
+            raise ValueError('get takes only the primary owner private chat')
+        data = preferences(state)
+    else:
+        if not args.value or not args.source:
+            raise ValueError('set needs on/off and --source delivery_id')
+        source = preference_source(state, args.chat, None, args.source)
+        fd = os.open(state / 'compaction-preferences.lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, 'a') as lock:
+            info = os.fstat(lock.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                raise ValueError('unsafe preference lock')
+            os.fchmod(lock.fileno(), 0o600)
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            data = preferences(state)
+            previous = data['scopes'].get(key)
+            if previous:
+                old = int(previous['source']['deliveryId'].rsplit(':', 1)[1])
+                new = int(args.source.rsplit(':', 1)[1])
+                if old > new or (old == new and previous['enabled'] != (args.value == 'on')):
+                    raise ValueError('a newer or conflicting preference already exists')
+            data['scopes'][key] = {'enabled': args.value == 'on', 'source': source, 'updatedAt': time.time()}
+            fd, temporary = tempfile.mkstemp(prefix='.compaction-preferences-', dir=state)
+            try:
+                with os.fdopen(fd, 'w') as output:
+                    json.dump(data, output); output.flush(); os.fsync(output.fileno())
+                os.replace(temporary, state / 'compaction-preferences.json')
+                directory = os.open(state, os.O_RDONLY)
+                try:
+                    os.fsync(directory)
+                finally:
+                    os.close(directory)
+            finally:
+                Path(temporary).unlink(missing_ok=True)
+    print(json.dumps(preference_result(data, args.chat, None)))
+
+
 def main():
     if os.environ.get('ATARAX_SUPPRESS_TELEGRAM') == '1':
         return
@@ -66,6 +174,21 @@ def main():
             "AND t.closed_at IS NULL AND r.state IN ('pending','deferred')",
             (session, stamp, session, stamp),
         ).fetchall()
+    if not targets:
+        return
+    # This preference belongs only to the primary owner's native private session.
+    # Corporate workers have their own notices; neither their scope nor other chats is changed here.
+    try:
+        owner = primary_owner(state)
+    except (OSError, ValueError):
+        owner = None  # Legacy installations without a known owner keep their existing default.
+    if owner is not None and any(str(target[1]) == owner and target[2] is None for target in targets):
+        try:
+            enabled = preference_result(preferences(state), owner, None)['enabled']
+        except (OSError, ValueError, TypeError, KeyError):
+            enabled = False  # Invalid optional preferences must not silence any other chat.
+        if not enabled:
+            targets = [target for target in targets if str(target[1]) != owner or target[2] is not None]
     if not targets:
         return
     claims = state / 'compaction-notices.json'
@@ -108,7 +231,14 @@ def main():
         list(executor.map(send, attempts))
 
 
-if __name__ == '__main__':
+if __name__ == '__main__' and len(sys.argv) > 1:
+    try:
+        config = Path(os.environ.get('CLAUDE_CONFIG_DIR') or Path.home() / '.claude')
+        preference_command(Path(os.environ.get('TELEGRAM_STATE_DIR') or config / 'channels/telegram'))
+    except Exception as error:
+        print('Compaction preference command failed; use get to verify: ' + type(error).__name__, file=sys.stderr)
+        sys.exit(1)
+elif __name__ == '__main__':
     try:
         main()
     except Exception:

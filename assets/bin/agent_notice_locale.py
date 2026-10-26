@@ -123,11 +123,14 @@ RUSSIAN_NOTICES = {
     "secretary.forward": "📩 {channel} · {name}: «{text}»\nОтвет не подготовлен.",
     "secretary.forward_limit": "📩 {channel} · {name}: «{text}»\nОтвет не подготовлен: исчерпан лимит Claude.",
     "secretary.forward_login": "📩 {channel} · {name}: «{text}»\nОтвет не подготовлен: Claude не принимает вход.",
+    "secretary.forward_playbook": "📩 {channel} · {name}: «{text}»\nОтвет не подготовлен: плейбук длиннее 20 000 знаков. Сократи его: обрезанным секретарь его не берёт.",
+    "secretary.draft_long": "черновик на {size} знаков длиннее одного сообщения ({limit})",
+    "secretary.too_long": "не отправлено: текст на {size} знаков, а в одно сообщение помещается {limit} — сократи его",
     "secretary.escalate": "📩 {channel} · {name}: «{text}»\nНужен ты: {reason}",
     "secretary.escalate_note": "Нужен ты: {reason}",
     "secretary.proposal": (
         "📩 {channel} · {name}: «{text}»\n\nПредлагаю ответить:\n«{draft}»{note}\n\n"
-        "Отправить? Скажи «да» или напиши свой вариант. [{id}]"
+        "Отправить? Скажи «да» или напиши свой вариант."
     ),
     "secretary.cap": (
         "⚠️ {channel} · {name}: слишком много сообщений за час — дальше отвечай сам или дождись, "
@@ -250,11 +253,14 @@ POLISH_NOTICES = {
     "secretary.forward": "📩 {channel} · {name}: «{text}»\nOdpowiedź nie została przygotowana.",
     "secretary.forward_limit": "📩 {channel} · {name}: «{text}»\nOdpowiedź nie została przygotowana: wyczerpany limit Claude.",
     "secretary.forward_login": "📩 {channel} · {name}: «{text}»\nOdpowiedź nie została przygotowana: Claude nie przyjmuje logowania.",
+    "secretary.forward_playbook": "📩 {channel} · {name}: «{text}»\nOdpowiedź nie została przygotowana: playbook jest dłuższy niż 20 000 znaków. Skróć go: sekretarz nie bierze go przyciętego.",
+    "secretary.draft_long": "szkic ma {size} znaków, więcej niż jedna wiadomość ({limit})",
+    "secretary.too_long": "nie wysłano: tekst ma {size} znaków, a w jednej wiadomości mieści się {limit} — skróć go",
     "secretary.escalate": "📩 {channel} · {name}: «{text}»\nPotrzebuję ciebie: {reason}",
     "secretary.escalate_note": "Potrzebuję ciebie: {reason}",
     "secretary.proposal": (
         "📩 {channel} · {name}: «{text}»\n\nProponuję odpowiedzieć:\n«{draft}»{note}\n\n"
-        "Wysłać? Powiedz «tak» albo napisz swoją wersję. [{id}]"
+        "Wysłać? Powiedz «tak» albo napisz swoją wersję."
     ),
     "secretary.cap": (
         "⚠️ {channel} · {name}: za dużo wiadomości w ciągu godziny — dalej odpowiadaj sam albo poczekaj, "
@@ -374,11 +380,14 @@ ENGLISH_NOTICES = {
     "secretary.forward": "📩 {channel} · {name}: «{text}»\nNo reply prepared.",
     "secretary.forward_limit": "📩 {channel} · {name}: «{text}»\nNo reply prepared: the Claude limit is used up.",
     "secretary.forward_login": "📩 {channel} · {name}: «{text}»\nNo reply prepared: Claude does not accept the login.",
+    "secretary.forward_playbook": "📩 {channel} · {name}: «{text}»\nNo reply prepared: the playbook is longer than 20,000 characters. Shorten it: the secretary never takes it cut.",
+    "secretary.draft_long": "the draft of {size} characters is longer than one message ({limit})",
+    "secretary.too_long": "not sent: the text has {size} characters and one message holds {limit} — shorten it",
     "secretary.escalate": "📩 {channel} · {name}: «{text}»\nI need you: {reason}",
     "secretary.escalate_note": "I need you: {reason}",
     "secretary.proposal": (
         "📩 {channel} · {name}: «{text}»\n\nI suggest replying:\n«{draft}»{note}\n\n"
-        "Send it? Say «yes» or write your own version. [{id}]"
+        "Send it? Say «yes» or write your own version."
     ),
     "secretary.cap": (
         "⚠️ {channel} · {name}: too many messages within an hour — reply yourself from here or wait "

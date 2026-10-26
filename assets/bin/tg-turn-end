@@ -55,6 +55,14 @@ BOUNCE_REASON = (
     "send the result with reply phase=final and its delivery_id, or explicitly defer that delivery "
     "to its registered background task_id. Call no_reply only for a group message that needs no answer."
 )
+# L20 (root, 24.10.2026): a turn started background work and ended on an internal summary, and its person heard
+# nothing for 276 seconds. A request whose work runs while nothing has reached its chat gets this hint instead.
+BACKGROUND_REASON = (
+    "A Telegram request in this turn has background work running, but nothing has reached its chat yet. "
+    "Tell the person now, in their language, what you started: reply phase=progress with its delivery_id and "
+    "that work's task_id, which also defers the request to its callback. A launch is not the result; do not "
+    "say the work is done."
+)
 # B4 (receipts-b4-forgot-reply NOTE v2): what a turn that still owes a result
 # closed on. The receiver uses it only when the request's one recovery turn also
 # ends without an answer: an `answer` may be forwarded to a private chat, and
@@ -178,29 +186,36 @@ SCOPE_WORK = (
 )
 
 
-def owes_now(conn: sqlite3.Connection, session_id: str, turn_id: int) -> bool:
-    """A pending request of this turn that the bounce is for. One whose worker still
-    runs in its scope, registered or not, waits for that worker like a deferred
-    one, unless its failed progress notice was offered its one resend (R4-7)."""
+def owes_now(conn: sqlite3.Connection, session_id: str, turn_id: int) -> str | None:
+    """The hint for a pending request of this turn that the bounce is for, or None. One whose
+    worker still runs in its scope, registered or not, waits for that worker like a deferred
+    one, unless its failed progress notice was offered its one resend (R4-7) or nothing has
+    reached its chat yet (L20)."""
     columns = {row[1] for row in conn.execute("PRAGMA table_info(delivery_results)")}
     if "progress_retry" not in columns or not conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='delivery_task_launches'").fetchone():
-        return conn.execute(
+        return BOUNCE_REASON if conn.execute(
             "SELECT 1 FROM delivery_results WHERE session_id=? AND state='pending' "
             "AND COALESCE(response_turn_id, turn_id)=? LIMIT 1", (session_id, turn_id),
-        ).fetchone() is not None
+        ).fetchone() is not None else None
     # A worker the owner was told about no longer counts: it stops blocking (NOVSKY 27.09).
     released = "silent_notified_at" in {row[1] for row in conn.execute("PRAGMA table_info(delivery_task_launches)")}
     scope_work = SCOPE_WORK.format(released=" AND silent_notified_at IS NULL" if released else "")
-    for delivery, stamp, turn, response, generation, retry in conn.execute(
-            "SELECT delivery_id, stamp, turn_id, response_turn_id, result_generation, progress_retry "
-            "FROM delivery_results WHERE session_id=? AND state='pending' AND COALESCE(response_turn_id, turn_id)=?",
-            (session_id, turn_id)).fetchall():
+    heard = "acknowledged_at" if "acknowledged_at" in columns else "1"
+    attempt = "outbound_attempt_at" if "outbound_attempt_at" in columns else "1"
+    for delivery, stamp, turn, response, generation, retry, chat, thread, acknowledged, attempted in conn.execute(
+            "SELECT delivery_id, stamp, turn_id, response_turn_id, result_generation, progress_retry, chat_id, "
+            f"thread_id, {heard}, {attempt} FROM delivery_results WHERE session_id=? AND state='pending' "
+            "AND COALESCE(response_turn_id, turn_id)=?", (session_id, turn_id)).fetchall():
         if retry == f"{generation}:offered" or not conn.execute(scope_work, {
                 "session": session_id, "stamp": stamp, "turn": turn, "response": response,
                 "delivery": delivery}).fetchone():
-            return True
-    return False
+            return BOUNCE_REASON
+        # A task notice tried and failed, or sent and fenced unrecorded, is R4-7's: it may have reached the person.
+        if (acknowledged is None and retry is None and attempted is None
+                and not has_outcome(conn, turn_id, delivery, chat, thread)):
+            return BACKGROUND_REASON
+    return None
 
 
 def final_text_kind(text: str) -> str:
@@ -317,8 +332,8 @@ def resolve_from_transcript(session_id: str, transcript_path: str | None) -> Non
                 log(f"Stop: TaskStop {call} of {task} not recorded from the transcript: {error!r}")
 
 
-def bounce_once(conn: sqlite3.Connection, session_id: str) -> bool:
-    """Receiver mode, Stop: the current turn still owes a result — bounce once.
+def bounce_once(conn: sqlite3.Connection, session_id: str) -> str | None:
+    """Receiver mode, Stop: the current turn still owes a result — bounce once, with its hint.
     A schema this hook does not know fails open: the turn closes as usual."""
     turn = conn.execute(
         "SELECT turn_id, bounce_count FROM delivery_turns "
@@ -326,13 +341,13 @@ def bounce_once(conn: sqlite3.Connection, session_id: str) -> bool:
         (session_id,),
     ).fetchone()
     if turn is None or turn[1] > 0:
-        return False
+        return None
     turn_id, _ = turn
     try:
         results_present = conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='delivery_results'"
         ).fetchone() is not None
-        pending = results_present and owes_now(conn, session_id, turn_id)
+        pending = owes_now(conn, session_id, turn_id) if results_present else None
         legacy_filter = (
             "AND NOT EXISTS (SELECT 1 FROM delivery_results r "
             "WHERE r.delivery_id=m.delivery_id AND r.turn_id=m.turn_id)"
@@ -346,12 +361,12 @@ def bounce_once(conn: sqlite3.Connection, session_id: str) -> bool:
             has_outcome(conn, turn_id, delivery_id, chat_id, thread_id)
             for delivery_id, chat_id, thread_id in messages
         ):
-            return False
+            return None
     except sqlite3.Error as error:
         log(f"Stop: outcome check failed, turn {turn_id} closed without a bounce: {error}")
-        return False
+        return None
     conn.execute("UPDATE delivery_turns SET bounce_count=bounce_count+1 WHERE turn_id=?", (turn_id,))
-    return True
+    return pending or BOUNCE_REASON
 
 
 def main() -> None:
@@ -374,7 +389,7 @@ def main() -> None:
     if not isinstance(transcript_path, str):
         transcript_path = None
     now = int(time.time() * 1000)
-    bounced = False
+    bounced = None
     if event in CLOSE_KIND:
         resolve_from_transcript(session_id, transcript_path)
 
@@ -390,9 +405,9 @@ def main() -> None:
                 log(f"{event}: turn ledger missing; unknown native session quarantined")
             else:
                 log(f"{event}: ledger tables missing; nothing recorded")
-        elif event == "Stop" and AUTHORITY == "receiver" and bounce_once(conn, session_id):
+        elif event == "Stop" and AUTHORITY == "receiver" and (reason := bounce_once(conn, session_id)):
             # The turn stays open: the model continues it with the hint below.
-            bounced = True
+            bounced = reason
         elif event == "SessionStart":
             source = data.get("source") if isinstance(data.get("source"), str) else None
             columns_present = session_columns(conn)
@@ -488,7 +503,7 @@ def main() -> None:
         if conn is not None:
             conn.close()
     if bounced:
-        print(json.dumps({"decision": "block", "reason": BOUNCE_REASON}))
+        print(json.dumps({"decision": "block", "reason": bounced}))
 
 
 try:
