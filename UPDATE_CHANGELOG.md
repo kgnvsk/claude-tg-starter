@@ -1,9 +1,9 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-11-13.b006c2a49c91`
+- Реліз: `2026-10-26.c60f82304126`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `b006c2a49c9124702894c116fb2ef89ad149762e`
-- Дата релізу: `2026-11-13`
+- Ревізія вихідного комплекту: `c60f8230412624e5897fdfad45fc3ec7486c048a`
+- Дата релізу: `2026-10-26`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
 
@@ -19,9 +19,7 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    tg-answer-check: a reply that claims what the turn did not do goes back once (#481)
-    Every channel message carries the dispatch line: long work goes to a background Agent (#480)
-    tests: wait for the re-offer before the old run's notice in the Knopa restart replays (#479)
+    Align upgrade guidance and assertions with shipped behavior
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не

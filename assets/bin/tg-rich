@@ -28,6 +28,7 @@ or checklist answer would leave no receipt for the receiver.
 import sys, os, json, re, subprocess, tempfile, runpy
 
 
+
 def telegram_api_base():
     import os, runpy
     from pathlib import Path
@@ -86,6 +87,13 @@ def main(argv):
     if "--reply-to" in argv:
         reply_to = int(argv[argv.index("--reply-to") + 1])
 
+    token = read_token()
+    # The token reaches curl in its config on stdin, never as an argument other users can read in /proc. Checked
+    # before the delivery is captured or the body written, so a bad token leaves neither behind.
+    if not token or any(c in token for c in '"\\\r\n\0'):
+        print("tg-rich: TELEGRAM_BOT_TOKEN missing or malformed", file=sys.stderr)
+        sys.exit(1)
+
     delivery = runpy.run_path(os.path.join(os.path.dirname(__file__), 'tg-send'))
     thread_id = None
     try:
@@ -108,13 +116,12 @@ def main(argv):
     with os.fdopen(descriptor, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False)
 
-    token = read_token()
     url = telegram_api_base() + "/bot%s/sendRichMessage" % token
     try:
         r = subprocess.run(
-            ["curl", "-sS", "--max-time", "15", "-X", "POST", url,
+            ["curl", "-sS", "--max-time", "15", "-X", "POST", "-K", "-",
              "-H", "Content-Type: application/json", "-d", "@" + body_path],
-            capture_output=True, text=True,
+            input='url = "%s"\n' % url, capture_output=True, text=True,
         )
     finally:
         try:
@@ -122,7 +129,7 @@ def main(argv):
         except OSError:
             pass
     out = r.stdout.strip()
-    print(out[:2000])
+    print(out)  # whole (owner, 23.10.2026): Telegram's answer, cut at 2 000, lost its end
     try:
         response = json.loads(out)
     except (ValueError, UnicodeError):

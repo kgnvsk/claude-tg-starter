@@ -445,28 +445,6 @@ for candidate in [owner, *profile_value("ALERT_COPY_CHAT_IDS").split(",")]:
 PY
 }
 
-# notice KEY UKRAINIAN [NAME=VALUE...]: the text in the owner's notice language (OWNER_NOTICE_LOCALE) from the
-# kit's catalog next to this script, the way cash-reminder-tick loads it. Ukrainian stays the default and the
-# fallback whenever the catalog fails to load: an empty alert would be lost (owner, 02.11.2026: Brodsky in Russian).
-notice() {
-    python3 - "$(dirname "${BASH_SOURCE[0]}")/agent_notice_locale.py" "$H" "$@" <<'NOTICE_PY'
-import importlib.util
-import sys
-from pathlib import Path
-
-helper, home, key, ukrainian, *pairs = sys.argv[1:]
-values = dict(pair.split("=", 1) for pair in pairs)
-try:
-    spec = importlib.util.spec_from_file_location("agent_notice_locale", helper)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    text = module.notice_text(key, ukrainian, home=Path(home)).format(**values)
-except Exception:
-    text = ukrainian.format(**values)
-print(text, end="")
-NOTICE_PY
-}
-
 # Alert function (with cooldown per alert-key)
 # What a refused request means for the person who reads the alert: what happened, what to do
 # and where to look (owner, 29.09: «человек должен понимать, что делать и куда смотреть»).
@@ -475,20 +453,20 @@ plain_api_problem() {
     local status="$1" kind="$2" text="$3" model
     case "|$kind|$status|$text" in
         *oauth_org_not_allowed*|*"disabled Claude subscription"*|*"subscription access"*)
-            notice health.subscription 'Claude Code недоступний для акаунта Claude, під яким я працюю. Власнику акаунта: перевір підписку на claude.ai → Settings → Billing. Якщо підписка активна, а акаунт належить компанії, попроси адміністратора компанії увімкнути доступ до Claude Code. Щойно доступ повернеться, я запрацюю сам; щоб увійти іншим акаунтом, напиши /relogin.' ;;
+            printf 'Claude Code недоступний для акаунта Claude, під яким я працюю. Власнику акаунта: перевір підписку на claude.ai → Settings → Billing. Якщо підписка активна, а акаунт належить компанії, попроси адміністратора компанії увімкнути доступ до Claude Code. Щойно доступ повернеться, я запрацюю сам; щоб увійти іншим акаунтом, напиши /relogin.' ;;
         *account_on_hold*|*suspended*|*"on hold"*)
-            notice health.on_hold 'Акаунт Claude, під яким я працюю, призупинено. Власнику акаунта: перевір пошту від Anthropic і стан акаунта на claude.ai.' ;;
+            printf 'Акаунт Claude, під яким я працюю, призупинено. Власнику акаунта: перевір пошту від Anthropic і стан акаунта на claude.ai.' ;;
         *verification_required*)
-            notice health.verification 'Claude просить підтвердити акаунт, під яким я працюю. Власнику акаунта: увійди на claude.ai, пройди перевірку, потім напиши мені /relogin.' ;;
+            printf 'Claude просить підтвердити акаунт, під яким я працюю. Власнику акаунта: увійди на claude.ai, пройди перевірку, потім напиши мені /relogin.' ;;
         *billing_error*|*"credit balance"*)
-            notice health.billing 'На акаунті Claude закінчились кошти. Власнику акаунта: поповни баланс у налаштуваннях Claude на claude.ai.' ;;
+            printf 'На акаунті Claude закінчились кошти. Власнику акаунта: поповни баланс у налаштуваннях Claude на claude.ai.' ;;
         *"|401|"*|*authentication*|*OAuth*|*"Not logged in"*|*"/login"*)
-            notice health.logged_out 'Мене розлогінило. Напиши /relogin — я надішлю посилання для входу.' ;;
+            printf 'Мене розлогінило. Напиши /relogin — я надішлю посилання для входу.' ;;
         *"model:"*|*not_found_error*|*"|404|"*)
             model=$(printf '%s' "$text" | grep -oE 'claude-[a-z0-9.-]+' | head -1)
-            notice health.model 'Модель{model} з моїх налаштувань недоступна для цього акаунта. Напиши нам — треба змінити модель.' model="${model:+ $model}" ;;
+            printf 'Модель%s з моїх налаштувань недоступна для цього акаунта. Напиши нам — треба змінити модель.' "${model:+ $model}" ;;
         *)
-            notice health.refused 'Claude відхиляє мої запити, і перезапуск не допомагає. Напиши нам — ми подивимось.' ;;
+            printf 'Claude відхиляє мої запити, і перезапуск не допомагає. Напиши нам — ми подивимось.' ;;
     esac
 }
 
@@ -498,11 +476,11 @@ real_auth_verdict() {
     # повідомлення ($1 хвилин), а не пробний виклик моделі зі сторожа.
     local window_min="${1:-30}" scan status kind text
     if [ "$LIMIT_RECOVERY_STATUS" = active ]; then
-        notice health.limit 'Уперся в ліміт акаунта. Він сам відпустить; напиши /health, щоб побачити коли.'
+        printf 'Уперся в ліміт акаунта. Він сам відпустить; напиши /health, щоб побачити коли.'
         return
     fi
     if [ "${CLAUDE_AUTHENTICATED:-true}" = false ]; then
-        notice health.relogin_needed 'Мене розлогінило — потрібен новий вхід. Напиши /relogin, і я надішлю посилання.'
+        printf 'Мене розлогінило — потрібен новий вхід. Напиши /relogin, і я надішлю посилання.'
         return
     fi
     scan=$(api_error_scan $((window_min * 60)) any)
@@ -516,13 +494,13 @@ real_auth_verdict() {
     esac
     case "$status $text" in
         *401*|*"OAuth"*|*"Re-authenticate"*|*"Not logged in"*|*"/login"*)
-            notice health.relogin_needed 'Мене розлогінило — потрібен новий вхід. Напиши /relogin, і я надішлю посилання.' ;;
+            printf 'Мене розлогінило — потрібен новий вхід. Напиши /relogin, і я надішлю посилання.' ;;
         *429*|*"session limit"*|*"usage limit"*|*"weekly limit"*|*"rate limit"*)
-            notice health.limit 'Уперся в ліміт акаунта. Він сам відпустить; напиши /health, щоб побачити коли.' ;;
+            printf 'Уперся в ліміт акаунта. Він сам відпустить; напиши /health, щоб побачити коли.' ;;
         *529*|*503*|*500*|*Overloaded*|*overloaded*)
-            notice health.anthropic_down 'Це збій на боці Anthropic, не в мене: моделі відповідають помилкою. Я повернусь сам, коли їх полагодять — статус на status.anthropic.com.' ;;
+            printf 'Це збій на боці Anthropic, не в мене: моделі відповідають помилкою. Я повернусь сам, коли їх полагодять — статус на status.anthropic.com.' ;;
         *)
-            notice health.lost_turn 'Логін і ліміт живі — схоже, загубився хід. Напиши /unstick: запит збережено, я візьму його знову, пересилати не треба.' ;;
+            printf 'Логін і ліміт живі — схоже, загубився хід. Напиши /unstick: запит збережено, я візьму його знову, пересилати не треба.' ;;
     esac
 }
 
@@ -542,8 +520,8 @@ alert() {
     # message, and a suppressed restart is our refusal, not the owner's task.
     # service-down joined it because it now fires only after several minutes of
     # failed starts, which is a dead assistant and worth saying out loud.
-    # corporate-paused / corporate-unavailable: employees are unanswered while
-    # the owner's own chat works, so nothing else would ever tell him.
+    # corporate-paused / corporate-unavailable: employee replies are unavailable;
+    # that state alone does not prove the owner's model can answer either.
     # limit-detector-silent: the limit watchdog is the thing that would tell the
     # owner a Claude limit ran out; once it stops answering, a spent limit turns
     # into an assistant that silently stops replying, and nothing self-heals it.
@@ -558,9 +536,7 @@ alert() {
     # whatsapp-unlinked: WhatsApp dropped the owner's linked server; nothing is read
     # or sent there until he links it again (Арти, 09.10.2026: twice in a day, and he
     # learned it from a stopped broadcast).
-    # whatsapp-offline: the server is still linked, but its bridge has had no WhatsApp for a quarter of an hour and
-    # did not come back by itself (Арти, 06–07.11.2026: 13.5 hours, nobody told).
-    case "$key" in browser-down|crash-loop|low-disk|service-down|stuck-escalate|corporate-paused|corporate-unavailable|limit-detector-silent|api-error-turns|answered-unsettled|malformed-tool|vault-sync-failing|whatsapp-unlinked|whatsapp-offline) ;; *) return 0 ;; esac
+    case "$key" in browser-down|crash-loop|low-disk|service-down|stuck-escalate|corporate-paused|corporate-unavailable|limit-detector-silent|api-error-turns|answered-unsettled|malformed-tool|vault-sync-failing|whatsapp-unlinked) ;; *) return 0 ;; esac
     if [ -n "$scope" ] && ! [[ "$scope" =~ ^-?[0-9]+_[0-9]+$ ]]; then
         return 0
     fi
@@ -580,15 +556,21 @@ alert() {
         echo "[$(date -u +%FT%TZ)] ALERT [${key}]: no valid recipient configured" >> "$LOG"
         return 0
     fi
-    local chat_id delivered=0 first=1 telegram_base prefix
-    prefix=$(notice health.prefix '🚨 {agent}, перевірка стану: ' agent="{{AGENT_NAME}}")
+    # The token reaches curl in its config on stdin, never as an argument other users can read in /proc.
+    if ! [[ -n ${BOT_TOKEN:-} && ${BOT_TOKEN:-} != *'"'* && ${BOT_TOKEN:-} != *'\'* && ${BOT_TOKEN:-} != *$'\n'* && ${BOT_TOKEN:-} != *$'\r'* ]]; then
+        # Nothing is sent, but the alert itself is still logged below and no cooldown starts.
+        echo "[$(date -u +%FT%TZ)] ALERT [${key}]: bot token missing or malformed" >> "$LOG"
+        recipients=""
+    fi
+    local chat_id delivered=0 first=1 telegram_base
     telegram_base=$(telegram_api_base) || { echo "Telegram endpoint configuration unavailable" >> "$LOG"; return 0; }
     while IFS= read -r chat_id; do
         [ -n "$chat_id" ] || continue
-        if curl -sS --fail --max-time 10 -X POST "${telegram_base}/bot${BOT_TOKEN}/sendMessage" \
+        if curl -sS --fail --max-time 10 -X POST -K - \
             --data-urlencode "chat_id=${chat_id}" \
-            --data-urlencode "text=${prefix}${msg}" \
-            --data-urlencode "parse_mode=HTML" >/dev/null 2>&1; then
+            --data-urlencode "text=🚨 {{AGENT_NAME}}, перевірка стану: ${msg}" \
+            --data-urlencode "parse_mode=HTML" >/dev/null 2>&1 \
+            <<<"url = \"${telegram_base}/bot${BOT_TOKEN}/sendMessage\""; then
             [ "$first" = 1 ] && delivered=1
         else
             echo "[$(date -u +%FT%TZ)] ALERT [${key}]: delivery failed for one configured recipient" >> "$LOG"
@@ -637,10 +619,10 @@ if [ "$RESTARTS" -gt 4 ]; then
     if service_mutation_allowed; then
         if sudo systemctl stop "$SVC" 2>/dev/null; then
             echo "[$(date -u +%FT%TZ)] CRASH LOOP — stopped service (${RESTARTS} restarts)" >> "$LOG"
-            alert "crash-loop" "$(notice health.crash_stopped 'Я падаю одразу після запуску ({count} разів за 10 хв), тому зупинився, щоб не крутитися в збоях. Напиши нам — це треба подивитися руками.' count="$RESTARTS")"
+            alert "crash-loop" "Я падаю одразу після запуску (${RESTARTS} разів за 10 хв), тому зупинився, щоб не крутитися в збоях. Напиши нам — це треба подивитися руками."
         else
             echo "[$(date -u +%FT%TZ)] CRASH LOOP — service stop failed exit=$?" >> "$LOG"
-            alert "crash-loop" "$(notice health.crash_running 'Я падаю одразу після запуску ({count} разів за 10 хв) і не зміг сам зупинитися. Напиши нам — це треба подивитися руками.' count="$RESTARTS")"
+            alert "crash-loop" "Я падаю одразу після запуску (${RESTARTS} разів за 10 хв) і не зміг сам зупинитися. Напиши нам — це треба подивитися руками."
         fi
         exit 0
     fi
@@ -695,7 +677,12 @@ browser_probe() {
 # scripts/install-browser.sh. There the probe hits a port nobody serves, the
 # recovery helper is missing too, and every tick reports a broken browser that
 # was never part of the install.
-if [ -f "${HEALTHCHECK_BROWSER_UNIT:-/etc/systemd/system/claude-browser.service}" ] && ! browser_probe; then
+if [ -e "/etc/claude-browser-private/$(id -u).json" ] || [ -L "/etc/claude-browser-private/$(id -u).json" ]; then
+    # Socket activation starts one bounded browser when needed. A read-only
+    # status failure never triggers the legacy root recovery helper.
+    "$H/bin/browser-mcp" --check >/dev/null 2>&1 || \
+        echo "[$(date -u +%FT%TZ)] selected private browser configuration/socket needs attention" >> "$LOG"
+elif [ "$(id -un)" = claude ] && [ -f "${HEALTHCHECK_BROWSER_UNIT:-/etc/systemd/system/claude-browser.service}" ] && ! browser_probe; then
     echo "[$(date -u +%FT%TZ)] browser MCP endpoint is unavailable" >> "$LOG"
     if service_mutation_allowed; then
         # Repairs stay silent. The owner cannot restart a service or install a
@@ -728,7 +715,7 @@ if [ -f "${HEALTHCHECK_BROWSER_UNIT:-/etc/systemd/system/claude-browser.service}
                 ;;
         esac
         if [ "$(( $(date -u +%s) - browser_down_since ))" -ge "${BROWSER_DOWN_ALERT_AFTER:-1800}" ]; then
-            alert "browser-down" "$(notice health.browser_down 'Браузер не працює вже пів години, і перезапуск не допомагає. Напиши нам — це треба дивитися руками.')" 86400
+            alert "browser-down" "Браузер не працює вже пів години, і перезапуск не допомагає. Напиши нам — це треба дивитися руками." 86400
         fi
     fi
 else
@@ -754,7 +741,7 @@ if [ -s "$MALFORMED_TOOL_MARKER" ]; then
         fi
 
         if ! restart_service malformed_tool_call_loop; then
-            alert "malformed-tool" "$(notice health.malformed_tool 'Я не зміг сам відновитися після збою. Напиши нам — це треба подивитися руками.')"
+            alert "malformed-tool" "Я не зміг сам відновитися після збою. Напиши нам — це треба подивитися руками."
             echo "[$(date -u +%FT%TZ)] malformed tool-call recovery restart failed; marker consumed" >> "$LOG"
         fi
         rm -f "$MALFORMED_TOOL_PROCESSING"
@@ -821,7 +808,7 @@ if ! sudo systemctl is-active "$SVC" >/dev/null 2>&1; then
             ;;
     esac
     if [ "$(( $(date -u +%s) - service_down_since ))" -ge "${SERVICE_DOWN_ALERT_AFTER:-300}" ]; then
-        alert "service-down" "$(notice health.service_down 'Я не можу запуститися вже кілька хвилин, і автоматичний старт не допомагає. Напиши нам.')"
+        alert "service-down" "Я не можу запуститися вже кілька хвилин, і автоматичний старт не допомагає. Напиши нам."
     fi
 else
     rm -f "$STAMP/service-down-since.epoch"
@@ -924,7 +911,7 @@ if [ -s "$LIMIT_SILENT_STAMP" ]; then
             LIMIT_SILENT_MIN=$(( ($(date +%s) - LIMIT_SILENT_SINCE) / 60 ))
             if [ "$LIMIT_SILENT_MIN" -ge 30 ]; then
                 echo "[$(date -u +%FT%TZ)] limit watchdog has not answered for ${LIMIT_SILENT_MIN} min" >> "$LOG"
-                alert "limit-detector-silent" "$(notice health.limit_watch_silent 'Моя перевірка лімітів Claude не працює вже {minutes} хв. Поки вона мовчить, я можу замовкнути, коли скінчиться ліміт, і ніхто не дізнається чому. Напиши нам.' minutes="$LIMIT_SILENT_MIN")" 86400
+                alert "limit-detector-silent" "Моя перевірка лімітів Claude не працює вже ${LIMIT_SILENT_MIN} хв. Поки вона мовчить, я можу замовкнути, коли скінчиться ліміт, і ніхто не дізнається чому. Напиши нам." 86400
             fi
             ;;
     esac
@@ -933,7 +920,7 @@ fi
 # 8. Disk space (< 5% free = critical)
 DISK_PCT=$(disk_free_pct)
 if [ "$DISK_PCT" -lt 10 ]; then
-    alert "low-disk" "$(notice health.low_disk 'На сервері закінчується місце (вільно {pct}%). Коли воно скінчиться, я перестану працювати. Напиши нам — треба почистити сервер.' pct="$DISK_PCT")"
+    alert "low-disk" "На сервері закінчується місце (вільно ${DISK_PCT}%). Коли воно скінчиться, я перестану працювати. Напиши нам — треба почистити сервер."
 fi
 
 # 8b. Vault autosave. vault-sync writes one line per run and nothing else said it failed: a note
@@ -942,17 +929,8 @@ fi
 vault_sync_stall() {
     local limit=""
     command -v timeout >/dev/null && limit="timeout 20"
-    $limit python3 - "$H/logs/vault-sync.log" "$H/logs/history-unsafe.last" \
-        "$(dirname "${BASH_SOURCE[0]}")/agent_notice_locale.py" "$H" <<'VAULT_SYNC_PY' 2>/dev/null
+    $limit python3 - "$H/logs/vault-sync.log" "$H/logs/history-unsafe.last" <<'VAULT_SYNC_PY' 2>/dev/null
 import datetime, html, re, sys
-try:
-    import importlib.util, pathlib
-    _spec = importlib.util.spec_from_file_location("agent_notice_locale", sys.argv[3])
-    _notices = importlib.util.module_from_spec(_spec)
-    _spec.loader.exec_module(_notices)
-    say = lambda key, text, **values: _notices.notice_text(key, text, home=pathlib.Path(sys.argv[4])).format(**values)
-except Exception:
-    say = lambda key, text, **values: text.format(**values)
 
 
 def tail(path, size):
@@ -975,7 +953,7 @@ try:
     lines = tail(sys.argv[1], 256 * 1024).splitlines()
 except OSError:
     sys.exit()
-first = code = last = None
+first = code = None
 for line in lines:
     found = re.match(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})Z (.*)", line)
     if not found:
@@ -983,19 +961,14 @@ for line in lines:
     failed = re.match(r"ERROR: vault sync failed \(([a-z-]+)\)", found.group(2))
     if failed:
         first = first or moment(found.group(1))
-        last = moment(found.group(1))
         code = failed.group(1)
     elif found.group(2).startswith("vault sync complete"):
         first = code = None
-# A streak is told only while vault-sync still runs. The V2 kit runs it only by hand (VAULT_SYNC_MANUAL=1); copies are
-# agent-github-backup's. A streak left over from before the move has had no run for over a day, so it is not news
-# (Руфус, 02.11.2026: his 22.09 kit's failures since 31.10 would have been told once a day forever).
-now = datetime.datetime.now(datetime.timezone.utc)
-if first is None or (now - first).total_seconds() < 6 * 3600 or (now - last).total_seconds() > 24 * 3600:
+if first is None or (datetime.datetime.now(datetime.timezone.utc) - first).total_seconds() < 6 * 3600:
     sys.exit()
-why = {"history-unsafe": say("health.vault_secret", "у нотатках трапилось щось схоже на ключ доступу"),
-       "history-unverifiable": say("health.vault_unverifiable", "історію нотаток не вдається перевірити (буває через файл понад 100 МБ)"),
-       "index-dirty": say("health.vault_dirty", "у git лишились незавершені зміни")}.get(code, code)
+why = {"history-unsafe": "у нотатках трапилось щось схоже на ключ доступу",
+       "history-unverifiable": "історію нотаток не вдається перевірити (буває через файл понад 100 МБ)",
+       "index-dirty": "у git лишились незавершені зміни"}.get(code, code)
 place = ""
 if code == "history-unsafe":
     try:
@@ -1005,13 +978,13 @@ if code == "history-unsafe":
         record, written = "", None
     # Only a place written during this run of failures; an older one may name another note.
     if written is not None and (written - first).total_seconds() >= -600:
-        # Telegram takes 4096 characters per message: the place, the only open-ended part, is cut.
-        parts = [part if len(part) <= 140 else part[:139] + "…" for part in re.findall(r"«([^»]*)»", record)[:3]]
-        place = (say("health.vault_where", " Де: {places}.",
-                     places=say("health.vault_in", " у ").join(f"«{part}»" for part in parts)) if parts else "")
-print(html.escape(say("health.vault_sync", "нові зміни нотаток не потрапляють в історію змін і резервну копію з {since} UTC:"
-                      " автозбереження не проходить, бо {why}.{place} Нотатки на сервері на місці. Напиши нам — полагодимо.",
-                      since=f"{first:%d.%m %H:%M}", why=why, place=place)))
+        # Keep the filename when a location is too long for the alert; this is a locator,
+        # not the note's content. A huge path must not make the warning undeliverable.
+        parts = [part if len(part) <= 140 else "…" + part[-139:]
+                 for part in re.findall(r"«([^»]*)»", record)[:3]]
+        place = (" Де: " + " у ".join(f"«{part}»" for part in parts) + ".") if parts else ""
+print(html.escape(f"нові зміни нотаток не потрапляють в історію змін і резервну копію з {first:%d.%m %H:%M} UTC:"
+                  f" автозбереження не проходить, бо {why}.{place} Нотатки на сервері на місці. Напиши нам — полагодимо."))
 VAULT_SYNC_PY
 }
 VAULT_SYNC_STALL=$(vault_sync_stall)
@@ -1105,49 +1078,16 @@ store = sqlite3.connect(f"file:{os.path.join(sys.argv[1], 'session.db')}?mode=ro
 sys.exit(0 if store.execute("SELECT 1 FROM whatsmeow_device LIMIT 1").fetchone() else 1)
 WA_DEVICE_PY
     service_mutation_allowed || return 0
-    # V2's wa-bridge-run only opens the run in the log; the bridge then starts as personal-inbox/setup.sh starts it.
-    if "$H/bin/wa-bridge-run" "$home" bridge.log >/dev/null 2>>"$LOG"; then
-        # 9>&-: the bridge outlives this tick and must not keep the lifecycle lock (Arti, Brodsky 30.10.2026).
-        PERSONAL_INBOX_HOME="$home" setsid nohup "$H/bin/wa-bridge" >> "$home/bridge.log" 2>&1 < /dev/null 9>&- &
-        echo "[$(date -u +%FT%TZ)] whatsapp bridge was not running while linked; started pid $!" >> "$LOG"
+    if pid=$("$H/bin/wa-bridge-run" "$home" bridge.log --start "$H/bin/wa-bridge" 2>>"$LOG"); then
+        echo "[$(date -u +%FT%TZ)] whatsapp bridge was not running while linked; started pid $pid" >> "$LOG"
     else
         echo "[$(date -u +%FT%TZ)] whatsapp bridge was not running while linked; start failed" >> "$LOG"
     fi
 }
-# A paired bridge that lives but has been off WhatsApp for a quarter of an hour (Арти, 06–07.11.2026: 13.5 hours
-# after a second connection replaced it, and nobody was told). The bridge reconnects by itself; past that this is the
-# alarm, and that very process (its pid from its own status) is stopped for a fresh start before the keepalive below
-# runs, so a bridge the keepalive just started is never the one stopped (Codex, 07.11.2026). Printed: minutes and pid.
-whatsapp_offline() {
-    python3 - "$1/status.json" <<'WA_OFFLINE_PY' 2>/dev/null || true
-import json, sys, time
-try:
-    state = json.load(open(sys.argv[1], encoding="utf-8"))
-except (OSError, ValueError):
-    sys.exit()
-now, since, pid = time.time(), state.get("offline_since") or 0, state.get("pid")
-if (state.get("paired") is True and state.get("connected") is False and isinstance(since, int) and since > 0
-        and isinstance(pid, int) and pid > 1 and now - state.get("updated", 0) < 120 and now - since >= 900):
-    print(int((now - since) // 60), pid)
-WA_OFFLINE_PY
-}
 WHATSAPP_LOGOUT=$(whatsapp_logout_incident "$H/.claude/personal-inbox/whatsapp")
-WHATSAPP_OFFLINE=""
-if [ -z "$WHATSAPP_LOGOUT" ] && [ "$(id -u)" != 0 ]; then
-    WHATSAPP_OFFLINE=$(whatsapp_offline "$H/.claude/personal-inbox/whatsapp")
-fi
-if [ -n "$WHATSAPP_OFFLINE" ]; then
-    read -r WA_OFF_MIN WA_OFF_PID <<< "$WHATSAPP_OFFLINE"
-    if [ "$(ps -o comm= -p "$WA_OFF_PID" 2>/dev/null)" = wa-bridge ] && [ "$(ps -o uid= -p "$WA_OFF_PID" 2>/dev/null | tr -d ' ')" = "$(id -u)" ] \
-        && service_mutation_allowed && kill -TERM "$WA_OFF_PID" 2>/dev/null; then
-        for _ in 1 2 3 4 5 6 7 8 9 10; do kill -0 "$WA_OFF_PID" 2>/dev/null || break; sleep 1; done
-        echo "[$(date -u +%FT%TZ)] whatsapp bridge $WA_OFF_PID offline for ${WA_OFF_MIN} min while paired; stopped it for a fresh start" >> "$LOG"
-    fi
-    alert "whatsapp-offline" "$(notice health.whatsapp_offline "WhatsApp на цьому сервері без зв'язку вже {minutes} хв: повідомлення WhatsApp зараз не читаються й не надсилаються. Прив'язка ціла; якщо за пів години не запрацює — напиши нам." minutes="$WA_OFF_MIN")" 21600
-fi
 whatsapp_bridge_keepalive "$H/.claude/personal-inbox/whatsapp" "$WHATSAPP_LOGOUT"
 if [ -n "$WHATSAPP_LOGOUT" ]; then
-    alert "whatsapp-unlinked" "$(notice health.whatsapp_unlinked "WhatsApp відв'язав сервер: повідомлення WhatsApp зараз не читаються й не надсилаються. Щоб прив'язати знову, напиши мені «прив'яжи WhatsApp».")" 604800 "$WHATSAPP_LOGOUT"
+    alert "whatsapp-unlinked" "WhatsApp відв'язав сервер: повідомлення WhatsApp зараз не читаються й не надсилаються. Щоб прив'язати знову, напиши мені «прив'яжи WhatsApp»." 604800 "$WHATSAPP_LOGOUT"
 fi
 
 # Corporate work has its own durable queue. Never infer a global Telegram hang
@@ -1234,7 +1174,7 @@ PY
             while read -r UH_DELIVERY UH_TURN UH_ANSWER UH_RECEIPT UH_AGE; do
                 [[ "$UH_DELIVERY" =~ ^-?[0-9]+:[0-9]+$ ]] || continue
                 echo "[$(date -u +%FT%TZ)] answered but unsettled head ${UH_DELIVERY} turn ${UH_TURN}/${UH_ANSWER} receipt ${UH_RECEIPT}, ${UH_AGE} min" >> "$LOG"
-                alert "answered-unsettled" "$(notice health.answered_unsettled 'Я відповів на повідомлення, але черга не звільнилась уже {minutes} хв, і наступні повідомлення чекають. Напиши нам — треба перевірити доставку (код {code}).' minutes="$UH_AGE" code="$UH_DELIVERY")" 3600 "${UH_DELIVERY/:/_}"
+                alert "answered-unsettled" "Я відповів на повідомлення, але черга не звільнилась уже ${UH_AGE} хв, і наступні повідомлення чекають. Напиши нам — треба перевірити доставку (код ${UH_DELIVERY})." 3600 "${UH_DELIVERY/:/_}"
             done <<< "$UNSETTLED_HEADS"
             ;;
     esac
@@ -1541,8 +1481,8 @@ case "$CORPORATE_ACTIVE" in ''|*[!0-9]*) CORPORATE_ACTIVE=0 ;; esac
 case "$CORPORATE_QUEUED" in ''|*[!0-9]*) CORPORATE_QUEUED=0 ;; esac
 case "$CORPORATE_BLOCKED" in ''|*[!0-9]*) CORPORATE_BLOCKED=0 ;; esac
 # Admission that stays paused for anything but a Claude usage limit (that one
-# resumes itself) leaves every employee unanswered while the owner's chat keeps
-# working. A legacy box whose corporate schema fails closed does the same to
+# resumes itself) leaves employee replies disabled. It does not prove that the
+# owner's model is working. A legacy box whose corporate schema fails closed does the same to
 # guests and groups with "тимчасово недоступний" replies. Say both out loud.
 if [ -f "$DB" ] && command -v sqlite3 >/dev/null 2>&1; then
     if [ "$CORPORATE_ACTIVATED" -eq 1 ] && [ "$CORPORATE_ADMISSION" = paused ]; then
@@ -1550,21 +1490,36 @@ if [ -f "$DB" ] && command -v sqlite3 >/dev/null 2>&1; then
         PAUSED_MS=$(sqlite3 "$DB" "SELECT COALESCE(updated_at,0) FROM corporate_runtime_state WHERE singleton=1;" 2>/dev/null || echo 0)
         case "$PAUSED_MS" in ''|*[!0-9]*) PAUSED_MS=0 ;; esac
         PAUSED_MIN=$(( ($(date +%s) - PAUSED_MS / 1000) / 60 ))
+        # alert() writes this receipt only after delivery to the owner. One
+        # maintenance pause needs one notice, including one sent by an older kit.
+        # A later pause has a newer updated_at and is reported independently.
+        MAINTENANCE_TOLD=0
+        if [ "$PAUSE_REASON" = maintenance ] && [ "$PAUSED_MS" -gt 0 ]; then
+            MAINTENANCE_NOTICE=$(cat "$STAMP/cash-alert-corporate-paused.ts" 2>/dev/null || true)
+            if [[ "$MAINTENANCE_NOTICE" =~ ^[0-9]{1,12}$ ]] \
+                && [ "$MAINTENANCE_NOTICE" -gt "$((PAUSED_MS / 1000))" ]; then
+                MAINTENANCE_TOLD=1
+            fi
+        fi
         # A lost login (its link goes out from claude-auth-rescue) and a Claude limit (the limit
         # watcher's notice) are each told once; a company pause on top only confused the owner (04.10).
         if [ "$PAUSE_REASON" != usage_limit ] && [ "$PAUSE_REASON" != auth ] \
             && [ "${CLAUDE_AUTHENTICATED:-true}" != false ] && [ "$LIMIT_RECOVERY_STATUS" != active ] \
-            && [ "$PAUSED_MIN" -ge 10 ]; then
-            alert "corporate-paused" "$(notice health.corporate_paused '⏸ Співробітникам я не відповідаю вже ~{minutes} хв: корпоративний режим на паузі ({reason}). Твій чат працює. Напиши мені «віднови корпоративний приймач».' minutes="$PAUSED_MIN" reason="$(case "$PAUSE_REASON" in auth) notice health.pause_auth 'злетів вхід у Claude' ;; startup) notice health.pause_startup 'не вдалося запуститися' ;; manual|owner) notice health.pause_manual 'поставлено вручну' ;; *) notice health.pause_other 'причина: {reason}' reason="${PAUSE_REASON:-$(notice health.pause_unknown 'невідома')}" ;; esac)")" 3600
+            && [ "$PAUSED_MIN" -ge 10 ] && [ "$MAINTENANCE_TOLD" -eq 0 ]; then
+            case "$PAUSE_REASON" in
+                maintenance) PAUSE_TEXT='Відповіді співробітникам ще призупинені після оновлення: перевірка готовності не завершена. Звернись у підтримку, щоб завершити відновлення.' ;;
+                startup) PAUSE_TEXT='Не вдалося запустити відповіді співробітникам. Звернись у підтримку, щоб перевірити причину й відновити роботу.' ;;
+                manual|owner) PAUSE_TEXT='Відповіді співробітникам призупинено вручну. Для відновлення напиши мені «віднови відповіді співробітникам». Якщо я не відповідаю, звернись у підтримку.' ;;
+                *) PAUSE_TEXT='Відповіді співробітникам призупинено. Звернись у підтримку, щоб перевірити причину й відновити роботу.' ;;
+            esac
+            alert "corporate-paused" "⏸ $PAUSE_TEXT" 3600
         fi
     fi
     if [ "$CORPORATE_ACTIVATED" -eq 0 ]; then
-        # The receiver gives guests this reply in the owner's notice language (telegram-server-fixed.ts),
-        # so every copy counts: Brodsky (ru, 02.11.2026) would never have been told.
-        UNAVAILABLE_15M=$(sqlite3 "$DB" "SELECT COUNT(*) FROM messages WHERE direction='out' AND ts > (strftime('%s','now') - 900) * 1000 AND (text LIKE '%Корпоративний режим тимчасово недоступний%' OR text LIKE '%Корпоративный режим временно недоступен%' OR text LIKE '%Tryb firmowy jest chwilowo niedostępny%' OR text LIKE '%Company mode is temporarily unavailable%');" 2>/dev/null || echo 0)
+        UNAVAILABLE_15M=$(sqlite3 "$DB" "SELECT COUNT(*) FROM messages WHERE direction='out' AND ts > (strftime('%s','now') - 900) * 1000 AND text LIKE '%Корпоративний режим тимчасово недоступний%';" 2>/dev/null || echo 0)
         case "$UNAVAILABLE_15M" in ''|*[!0-9]*) UNAVAILABLE_15M=0 ;; esac
         if [ "$UNAVAILABLE_15M" -gt 0 ]; then
-            alert "corporate-unavailable" "$(notice health.corporate_unavailable '⚠️ За 15 хв я {count} разів відповів гостям і групам «Корпоративний режим тимчасово недоступний», хоча він у тебе не ввімкнений, тож вони лишаються без відповіді. Напиши мені «перевір корпоративний стан» або нам.' count="$UNAVAILABLE_15M")" 3600
+            alert "corporate-unavailable" "⚠️ За 15 хв я ${UNAVAILABLE_15M} разів відповів гостям і групам «Корпоративний режим тимчасово недоступний», хоча він у тебе не ввімкнений, тож вони лишаються без відповіді. Напиши мені «перевір корпоративний стан» або нам." 3600
         fi
     fi
 fi
@@ -1594,9 +1549,14 @@ CODEX_STAMP=$STAMP/cash-codex-check.ts
 NOW_S=$(date +%s)
 LAST_CODEX=$(cat "$CODEX_STAMP" 2>/dev/null || echo 0)
 # Only if the images option is installed (codex present) — else base installs false-alert.
-if [ -x "$H/.npm-global/bin/codex" ] && [ $(( NOW_S - LAST_CODEX )) -ge 1800 ]; then
+# Novsky's images step puts the CLI in ~/.local/bin; older installs have it in ~/.npm-global/bin.
+CODEX_CLI=""
+for cli in "$H/.npm-global/bin/codex" "$H/.local/bin/codex"; do
+    [ -x "$cli" ] && { CODEX_CLI=$cli; break; }
+done
+if [ -n "$CODEX_CLI" ] && [ $(( NOW_S - LAST_CODEX )) -ge 1800 ]; then
     echo "$NOW_S" > "$CODEX_STAMP"
-    if ! timeout 20 "$H/.npm-global/bin/codex" login status 2>&1 | grep -q "Logged in"; then
+    if ! timeout 20 "$CODEX_CLI" login status 2>&1 | grep -q "Logged in"; then
         alert "codex-auth-dead" "Не працює генерація картинок: злетів вхід у Codex. Напиши нам — ми перелогінимо." 7200
     fi
 fi
@@ -1884,7 +1844,7 @@ PY
         if [ "$AGE_MIN" -ge 30 ] && [ "$AGE_MIN" -le 1440 ] && [ "$LAST_ESC_IN" != "$FIRST_UNANSWERED" ]; then
             echo "$FIRST_UNANSWERED" > "$ESCALATE_TS"
             AUTH_VERDICT="$(real_auth_verdict "$AGE_MIN")"
-            alert "stuck-escalate" "$(notice health.stuck 'Не відповідаю вже {minutes} хв на повідомлення. {verdict}' minutes="$AGE_MIN" verdict="$AUTH_VERDICT")" 10800
+            alert "stuck-escalate" "Не відповідаю вже ${AGE_MIN} хв на повідомлення. ${AUTH_VERDICT}" 10800
         fi
     done <<PRIVATE_CHAT_ACTIVITY_EOF
 $PRIVATE_CHAT_ACTIVITY
@@ -1929,11 +1889,11 @@ if [ "$API_AUTH_COUNT" -ge 2 ] && [ "$CLAUDE_AUTHENTICATED" = true ]; then
         fi
     else
         echo "[$(date -u +%FT%TZ)] auth errors in 15 min: ${API_AUTH_COUNT} after a credentials restart — ${API_ERROR_TEXT}" >> "$LOG"
-        alert "api-error-turns" "$(notice health.api_error_restarted 'Я не можу відповідати: {problem} Перезапуск не допоміг.' problem="$(plain_api_problem "$API_ERROR_STATUS" "$API_ERROR_KIND" "$API_ERROR_TEXT")")" 3600
+        alert "api-error-turns" "Я не можу відповідати: $(plain_api_problem "$API_ERROR_STATUS" "$API_ERROR_KIND" "$API_ERROR_TEXT") Перезапуск не допоміг." 3600
     fi
 elif [ "$API_ERROR_COUNT" -ge 2 ]; then
     echo "[$(date -u +%FT%TZ)] api-error turns in 15 min: ${API_ERROR_COUNT} — ${API_ERROR_STATUS} ${API_ERROR_KIND} ${API_ERROR_TEXT}" >> "$LOG"
-    alert "api-error-turns" "$(notice health.api_error 'Я не можу відповідати: {problem}' problem="$(plain_api_problem "$API_ERROR_STATUS" "$API_ERROR_KIND" "$API_ERROR_TEXT")")" 3600
+    alert "api-error-turns" "Я не можу відповідати: $(plain_api_problem "$API_ERROR_STATUS" "$API_ERROR_KIND" "$API_ERROR_TEXT")" 3600
 fi
 
 # 9. Write one machine-readable snapshot after both owner and corporate queues

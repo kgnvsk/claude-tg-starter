@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""tg-send [--no-watchdog-credit] [--thread-id ID | --general-topic] <chat_id> "text"
+"""tg-send [--no-watchdog-credit] [--silent] [--thread-id ID | --general-topic] <chat_id> "text"
 — deliver a plain message straight through the
 Telegram Bot API, bypassing the MCP reply-tool.
 
@@ -10,6 +10,8 @@ the user gets the actual content, silently. The healthcheck restores the native
 tool within ~60s; the owner never needs to know it blipped.
 
 Portable token resolution (env or TELEGRAM_STATE_DIR); prints ok:true/false.
+--silent delivers without a notification sound (Telegram's disable_notification), for
+alerts a group wants to read but not hear (Арти's «Безопасность» group, 11.10.2026).
 TG_DELIVERY_PHASE=progress|final distinguishes an acknowledgement from a result
 (default final). TG_DELIVERY_ID selects the original request for an async result;
 TG_DELIVERY_TASK_ID registers a native background task on a progress send.
@@ -25,6 +27,9 @@ import sys, os, re, json, sqlite3, subprocess, time, urllib.parse, urllib.reques
 import urllib.error, hashlib, tempfile, fcntl, signal
 from datetime import datetime
 from pathlib import Path
+
+CONTEXT_HELPER = os.path.expanduser('~/bin/answer-context')
+
 
 
 def telegram_api_base():
@@ -48,6 +53,20 @@ def telegram_api_base():
     return 'https://api.telegram.org'
 
 
+def require_answer_context(chat, thread, text, delivery=None, file=False):
+    if not os.path.isfile(CONTEXT_HELPER):return  # older/non-Premium installation
+    try:
+        result = subprocess.run(['python3', CONTEXT_HELPER, 'send-check'], input=json.dumps(
+            {'chat':chat,'thread':thread,'text':text,'delivery':delivery,'file':file}),
+            capture_output=True,text=True,timeout=5)
+        verdict=json.loads(result.stdout)
+        if not isinstance(verdict,dict):raise ValueError('Current context verdict is malformed; nothing sent.')
+        if result.returncode==0 and verdict.get('ok') is True:return verdict
+        raise ValueError(json.dumps(verdict,ensure_ascii=False))
+    except (OSError,subprocess.SubprocessError,json.JSONDecodeError) as error:
+        raise ValueError('Current rules/history check unavailable; nothing sent. Read answer-context before answering.') from error
+
+
 def log(message):
     """A line for the operator, in the agent's logs rather than the Bash tool output
     the model reads."""
@@ -66,7 +85,7 @@ def routing_error():
 
 
 def parse_arguments(arguments):
-    watchdog_credit, general_topic, thread_id = True, False, None
+    watchdog_credit, general_topic, thread_id, silent = True, False, None, False
     positional = []
     index = 0
     while index < len(arguments):
@@ -75,6 +94,8 @@ def parse_arguments(arguments):
             watchdog_credit = False
         elif argument == "--general-topic" and not general_topic:
             general_topic = True
+        elif argument == "--silent" and not silent:
+            silent = True
         elif argument == "--thread-id" and thread_id is None:
             index += 1
             if (index >= len(arguments) or not re.fullmatch(r"[1-9][0-9]{0,9}", arguments[index])
@@ -87,7 +108,7 @@ def parse_arguments(arguments):
             positional.append(argument)
         index += 1
     if len(positional) != 2:
-        sys.exit('usage: tg-send [--no-watchdog-credit] [--thread-id ID | --general-topic] <chat_id> "text"')
+        sys.exit('usage: tg-send [--no-watchdog-credit] [--silent] [--thread-id ID | --general-topic] <chat_id> "text"')
     chat_id, text = positional
     if (not re.fullmatch(r"-?[1-9][0-9]*", chat_id)
             or (thread_id is not None and general_topic)
@@ -98,7 +119,7 @@ def parse_arguments(arguments):
         # as text, and inside a turn it became the request's answer (Мартин, 23 and 25.09).
         print("not delivered: NO_REPLY marks silence and is not a message; nothing was sent")
         sys.exit(0)
-    return chat_id, text, thread_id, general_topic, watchdog_credit
+    return chat_id, text, thread_id, general_topic, watchdog_credit, silent
 
 
 def destination_status(chat_id, thread_id, general_topic, bot_token):
@@ -771,7 +792,18 @@ def capture_delivery(chat_id, thread_id=None):
                     (delivery_id, *scope),
                 ).fetchone() if results_present else None
                 if not target:
-                    raise ValueError("TG_DELIVERY_ID does not belong to this chat, topic and service session")
+                    # A second recipient has its own receipt and history. It must
+                    # never settle a request in that recipient's chat, nor claim
+                    # the original task complete merely because one copy arrived.
+                    verdict = require_answer_context(chat_id, thread_id, "", delivery_id)
+                    extra = verdict.get("additionalDestination") if isinstance(verdict, dict) else None
+                    if (not isinstance(extra, dict) or extra.get("requestId") != delivery_id
+                            or extra.get("generation") != stamp
+                            or extra.get("destination") != {"chatId": str(chat_id), "threadId": thread_id}):
+                        raise ValueError("TG_DELIVERY_ID does not belong to this chat, topic and service session")
+                    context["additional_destination"] = extra
+                    connection.commit()
+                    return context
                 turn, delivery, session, status, response_turn = target
                 current = connection.execute(
                     "SELECT turn_id FROM delivery_turns WHERE session_id=? AND closed_at IS NULL "
@@ -881,8 +913,8 @@ def capture_delivery(chat_id, thread_id=None):
                     # makes it this request's own, at the same occurrence and launch. Under
                     # the receiver only the launch of the request's own turns is its to
                     # claim; a launch made after every request of its turn was answered
-                    # belongs to no request. A task with no recorded launch is owned by
-                    # its request. A receiver from before the launch ledger has no state.
+                    # belongs to no request. Only a run without launch-hook evidence may
+                    # take an unknown task on trust. Old receivers have no launch ledger.
                     ledger = "launch_ref" in {
                         row[1] for row in connection.execute("PRAGMA table_info(delivery_task_owners)")}
                     owner = connection.execute(
@@ -890,10 +922,10 @@ def capture_delivery(chat_id, thread_id=None):
                         + "FROM delivery_task_owners WHERE session_id=? AND stamp=? AND task_id=?",
                         (session[0], stamp, task_id),
                     ).fetchone()
-                    unlaunched = unlaunched_task(connection, session[0], stamp, task_id,
-                                                 (session[1], session[2]), receiver)
-                    if unlaunched:
-                        raise ValueError(unlaunched)
+                    if receiver and unrecorded_task_in_tracked_session(connection, session[0], stamp, task_id):
+                        raise ValueError("this task_id has no recorded launch in this session; nothing was sent. "
+                                         "Use the exact task ID returned by the launch, or send progress without "
+                                         "TG_DELIVERY_TASK_ID; do not guess an ID")
                     # A deferred request may claim a launch of another turn by this explicit
                     # notice (the coordinator's decision (a), 26.09).
                     if owner is not None and owner[1] == "unowned" and session[6] != "deferred":
@@ -1059,39 +1091,18 @@ def recorded_launch(connection, session, stamp, task_id):
         (session, stamp, task_id)).fetchone() is not None
 
 
-def unlaunched_task(connection, session, stamp, task_id, turns, receiver):
-    """The refusal of a guessed task, or None: the receiver's unlaunchedTask() (Arti, 11.10, then under the receiver
-    only; AALL, 31.10.2026 in shadow: bcvw3dr7k named for the background Bash b4qjxx8gk held an answered request in
-    the queue for good). Once the launch hook has recorded a launch in this run, a task with no recorded launch of
-    its own was guessed, in every mode. Trust stays for a ledger from before the launch table, for a run without
-    launch-hook evidence and, under guard and shadow, for a run in which the hook let a launch go unrecorded. An
-    unreadable record proves nothing: the receiver refuses, guard and shadow keep their trust."""
+def unrecorded_task_in_tracked_session(connection, session, stamp, task_id):
+    """Keep legacy trust only when this exact session/run has no launch-hook evidence.
+
+    Missing tables predate the hook; an unreadable table proves nothing and raises.
+    This also fences old phantom owner rows and the acknowledgement race.
+    """
     if not connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='delivery_task_launches'").fetchone():
-        return None
-    try:
-        if recorded_launch(connection, session, stamp, task_id):
-            return None
-        if not connection.execute("SELECT 1 FROM delivery_task_launches WHERE session_id=? AND stamp=? LIMIT 1",
-                                  (session, stamp)).fetchone():
-            return None
-        if not receiver and connection.execute(
-                "SELECT 1 FROM delivery_shadow WHERE class='launch_unrecorded' AND created_at >= "
-                "coalesce((SELECT started_at FROM delivery_sessions WHERE session_id=?), 0) "
-                "AND turn_id IN (SELECT turn_id FROM delivery_turns WHERE session_id=?) LIMIT 1",
-                (session, session)).fetchone():
-            return None
-        waiting = [row[0] for row in connection.execute(
-            "SELECT task_id FROM delivery_task_owners WHERE session_id=? AND stamp=? AND state='unowned' "
-            "AND task_id IS NOT NULL AND launched_turn IN (?, ?) ORDER BY rowid",
-            (session, stamp, turns[0], turns[0] if turns[1] is None else turns[1]))]
-    except sqlite3.Error as error:
-        log(f"launch record of {task_id} unreadable: {error}")
-        return "the launch record of this task cannot be read; nothing was sent or registered" if receiver else None
-    return (f"task {task_id} has no recorded launch in this session; nothing was sent or registered."
-            + (f" Launched in this request's turn and not registered yet: {', '.join(waiting)}." if waiting else "")
-            + " Use the exact task ID its launch returned, or send the progress without TG_DELIVERY_TASK_ID; "
-            "do not guess an ID")
+        return False
+    return not recorded_launch(connection, session, stamp, task_id) and connection.execute(
+        "SELECT 1 FROM delivery_task_launches WHERE session_id=? AND stamp=? LIMIT 1",
+        (session, stamp)).fetchone() is not None
 
 
 def continuation_proved(connection, session, stamp, task_id, delivery):
@@ -1146,10 +1157,12 @@ def register_acknowledged(connection, context, target, chat_id, thread_id, now):
         "SELECT delivery_id, state, launched_turn FROM delivery_task_owners WHERE session_id=? AND stamp=? "
         "AND task_id=?", (session, stamp, task_id),
     ).fetchone()
-    # A launch recorded while the notice was on its way makes an unknown task a guess here too.
-    unlaunched = unlaunched_task(connection, session, stamp, task_id, (claim_turn, response_turn), True)
-    if unlaunched:
-        log(f"progress of {delivery} registers nothing: {unlaunched}")
+    try:
+        if unrecorded_task_in_tracked_session(connection, session, stamp, task_id):
+            log(f"progress of {delivery} registers nothing: task {task_id} has no recorded launch in this session")
+            return False
+    except sqlite3.Error as error:
+        log(f"progress of {delivery} registers nothing: launch ledger unreadable: {error}")
         return False
     finished_launch = None
     if owner and owner[1] in ("returned", "stopped", "ended_unread") and owner[0] == delivery:
@@ -1461,6 +1474,36 @@ def quiet_failure(record, path, code, payload=None):
     quiet_write(path, record)
 
 
+def saved_context_current(record, text, file_sha256=None):
+    if not os.path.isfile(CONTEXT_HELPER):return True,''  # older installation
+    fallback='Перевірка правил і переписки ще не завершена. Виконання не підтверджую; уже зроблених дій не повторюю.'
+    try:
+        checked=subprocess.run(['python3',CONTEXT_HELPER,'delivery-check'],input=json.dumps({
+            'proof':record.get('context_proof'),'text':text,'chat':record['chat'],'thread':record['thread'],
+            'task':record['task'],'occurrence':record['occurrence'],'file_sha256':file_sha256}),capture_output=True,text=True,timeout=5)
+        verdict=json.loads(checked.stdout)
+        if not isinstance(verdict,dict):return False,fallback
+        if isinstance(verdict.get('fallback'),str) and 0<len(verdict['fallback'])<1000:fallback=verdict['fallback']
+        return checked.returncode==0 and verdict.get('ok') is True,fallback
+    except (OSError,subprocess.SubprocessError,ValueError,TypeError):return False,fallback
+
+
+def quiet_file_context_notice(identity, source, text):
+    """A blocked file keeps a durable obligation to this one text fallback."""
+    root=quiet_root();lock=os.open(root/'.lock',os.O_RDWR|os.O_CREAT|os.O_NOFOLLOW,0o600)
+    try:
+        fcntl.flock(lock,fcntl.LOCK_EX)
+        path=root/('file-context-'+identity+'.json')
+        if path.exists():record=quiet_load(path)
+        else:
+            record={'version':1,'run_key':source.get('run_key',''),'task':source['task'],'occurrence':source['occurrence'],
+                    'chat':source['chat'],'thread':source['thread'],'general_topic':source.get('general_topic',False),
+                    'chunks':[text],'cursor':0,'receipts':[],'state':'ready','retry_at':0,'context_fallback':True}
+            quiet_write(path,record)
+        return quiet_send_record(path,record)
+    finally:os.close(lock)
+
+
 def quiet_send_record(path, record):
     if record["state"] == "sending":
         record["state"] = "uncertain"  # a killed sender may have reached Telegram
@@ -1474,11 +1517,19 @@ def quiet_send_record(path, record):
         record["retry_at"] = 0 if destination is False else int(time.time()) + 1
         quiet_write(path, record)
         return record["state"]
+    if record['cursor']==0 and not record['receipts'] and os.path.isfile(CONTEXT_HELPER) and not record.get('context_fallback'):
+        valid,fallback=saved_context_current(record,''.join(record['chunks']))
+        if not valid:
+            record['requested_chunks']=record['chunks']
+            record['chunks']=[fallback];record['context_fallback']=True
+            quiet_write(path,record)
     while record["cursor"] < len(record["chunks"]):
         chunk = record["chunks"][record["cursor"]]
         fields = {"chat_id": record["chat"], "text": chunk}
         if record["thread"] is not None:
             fields["message_thread_id"] = record["thread"]
+        if record.get("silent"):
+            fields["disable_notification"] = "true"
         request = urllib.request.Request(
             f"{telegram_api_base()}/bot{token()}/sendMessage",
             data=urllib.parse.urlencode(fields).encode())
@@ -1539,7 +1590,7 @@ def quiet_main(arguments):
                     counts["uncertain"] += 1
             print("quiet delivery: " + " ".join(f"{key}={value}" for key, value in counts.items()))
             return
-        chat_id, text, thread_id, general_topic, watchdog_credit = parse_arguments(arguments)
+        chat_id, text, thread_id, general_topic, watchdog_credit, silent = parse_arguments(arguments)
         if not watchdog_credit:
             raise ValueError("quiet delivery does not support --no-watchdog-credit")
         task = os.environ.get("ATARAX_TASK_ID", "")
@@ -1555,19 +1606,22 @@ def quiet_main(arguments):
             identity = (run_key,) + identity
         if general_topic:
             identity += ("general-topic",)
+        if silent:
+            identity += ("silent",)
         digest = hashlib.sha256("\0".join(identity).encode()).hexdigest()
         path = root / f"{digest}.json"
         chunks = [text[index:index + 4000] for index in range(0, len(text), 4000)] or [""]
         if path.exists():
             record = quiet_load(path)
             if (record.get("run_key", ""), record["task"], record["occurrence"], record["chat"], record["thread"],
-                    record["chunks"], record.get("general_topic", False)) != (
-                        run_key, task, occurrence, chat_id, thread_id, chunks, general_topic):
+                    record.get('requested_chunks',record["chunks"]), record.get("general_topic", False), record.get("silent", False)) != (
+                        run_key, task, occurrence, chat_id, thread_id, chunks, general_topic, silent):
                 raise ValueError("quiet delivery record does not match this message")
         else:
+            context=require_answer_context(chat_id,thread_id,text)
             record = {"version": 1, "run_key": run_key, "task": task, "occurrence": occurrence,
                       "chat": chat_id, "thread": thread_id, "general_topic": general_topic,
-                      "chunks": chunks,
+                      "silent": silent, "chunks": chunks, 'context_proof':(context or {}).get('proof'),
                       "cursor": 0, "receipts": [], "state": "ready", "retry_at": 0}
             quiet_write(path, record)
         state = quiet_send_record(path, record)
@@ -1616,9 +1670,22 @@ def main(argv):
         except (ValueError, UnicodeError):
             recorded = False
         sys.exit(0 if recorded else 1)
-    chat_id, text, thread_id, general_topic, watchdog_credit = parse_arguments(arguments)
+    chat_id, text, thread_id, general_topic, watchdog_credit, silent = parse_arguments(arguments)
+    try:require_answer_context(chat_id,thread_id,text,os.environ.get('TG_DELIVERY_ID'))
+    except ValueError as error:sys.exit(str(error))
     if not watchdog_credit and (os.environ.get('TG_DELIVERY_ID') or os.environ.get('TG_DELIVERY_TASK_ID')):
         sys.exit('tg-send: --no-watchdog-credit cannot bind to an inbound delivery')
+    quality_helper = os.path.expanduser('~/bin/task-review')
+    if watchdog_credit and os.path.isfile(quality_helper) and os.environ.get('TG_SEND_ORIGIN') != 'stop-guard' and os.environ.get('TASK_REVIEW_MODE') != 'off':
+        try:
+            import importlib.machinery, importlib.util
+            loader = importlib.machinery.SourceFileLoader('task_quality', quality_helper)
+            spec = importlib.util.spec_from_loader(loader.name, loader)
+            quality = importlib.util.module_from_spec(spec); loader.exec_module(quality)
+            verdict = quality.send_gate(chat_id, thread_id, text, os.environ.get('TG_DELIVERY_PHASE', 'final'), os.environ.get('TG_DELIVERY_ID'))
+            quality.observe(verdict, answer=text)
+        except Exception:
+            log('task-review shadow unavailable; answer unchanged')
     bot_token = token()
     ensure_destination(chat_id, thread_id, general_topic, bot_token)
     try:
@@ -1636,6 +1703,8 @@ def main(argv):
         fields = {"chat_id": chat_id, "text": chunk}
         if thread_id is not None:
             fields["message_thread_id"] = thread_id
+        if silent:
+            fields["disable_notification"] = "true"
         body = urllib.parse.urlencode(fields).encode()
         req = urllib.request.Request(
             f"{telegram_api_base()}/bot{bot_token}/sendMessage", data=body)
@@ -1672,7 +1741,7 @@ def main(argv):
                     if secret:
                         words = words.replace(secret, "***")
                 words = "".join(ch for ch in " ".join(words.split()) if ch.isprintable())
-                reason = f" Telegram {payload['error_code']}: {words[:200]}"
+                reason = f" Telegram {payload['error_code']}: {words}"  # whole (owner, 23.10.2026)
             sys.exit("delivery state unknown: Telegram did not prove the requested destination; do not retry "
                      "acknowledged parts" + reason + note)
         sent_ids.append(payload["result"]["message_id"])

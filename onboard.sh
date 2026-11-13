@@ -155,6 +155,16 @@ write_env_value() {
   printf '\n' >> "$ENV_OUT"
 }
 
+# Novsky sets these: corporate mode, the sold modules and their contact, roles. A rerun keeps each exactly as
+# saved and never invents one: an empty NOVSKY_MODULES means «nothing sold», an absent one «an older agent with
+# everything» (docs audit 20.10.2026: a rerun dropped them and install-core switched corporate routing off).
+write_novsky_fields() {
+  local name
+  for name in TG_CORPORATE_SESSIONS MODULE_TELEGRAM_CORPORATE NOVSKY_MODULES NOVSKY_MODULES_CONTACT ACTIVE_ROLES; do
+    [ -z "${!name+x}" ] || write_env_value "$name"
+  done
+}
+
 # A re-run is allowed to change the guided core fields, but it must not silently
 # reset integrations or module choices that were configured earlier.
 ALERT_COPY_CHAT_IDS="${ALERT_COPY_CHAT_IDS:-}"
@@ -165,6 +175,7 @@ PRESERVE_NAMES=(
   MODULE_DESIGN_PACK MODULE_CHANNEL_PUBLISH MODULE_SOCIAL_BROWSER
   MODULE_TRANSPORT_DAEMON MODULE_VAULT_WEB MODULE_INSTAGRAM_DM
   MODULE_YOUTUBE_COMMENTS CHANNEL_ID SITE_PASSWORD ACTIVE_ROLES
+  TG_CORPORATE_SESSIONS MODULE_TELEGRAM_CORPORATE NOVSKY_MODULES NOVSKY_MODULES_CONTACT
 )
 if [ -r "$ENV_OUT" ]; then
   _requested_license_key="${NOVSKY_LICENSE_KEY:-}"
@@ -516,6 +527,7 @@ for name in AGENT_NAME OWNER_NAME OWNER_TG_USERNAME OWNER_CHAT_ID ADDITIONAL_ADM
             MODULE_YOUTUBE_COMMENTS CHANNEL_ID SITE_PASSWORD; do
   write_env_value "$name"
 done
+write_novsky_fields
 chmod 600 "$ENV_OUT"
 umask "$env_umask"
 
@@ -525,6 +537,9 @@ export RECALL_API_KEY RECALL_REGION CALENDAR_EMAIL VAULT_LOCALE OWNER_NOTICE_LOC
 export MODULE_DESIGN_PACK MODULE_CHANNEL_PUBLISH MODULE_SOCIAL_BROWSER
 export MODULE_TRANSPORT_DAEMON MODULE_VAULT_WEB MODULE_INSTAGRAM_DM MODULE_YOUTUBE_COMMENTS
 export CHANNEL_ID SITE_PASSWORD
+for name in TG_CORPORATE_SESSIONS MODULE_TELEGRAM_CORPORATE NOVSKY_MODULES NOVSKY_MODULES_CONTACT ACTIVE_ROLES; do
+  [ -z "${!name+x}" ] || export "$name"
+done
 
 echo "==> Готую систему (пакети, Node)"
 bash "$KIT/scripts/install-base.sh"

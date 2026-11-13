@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import fcntl
 import grp
 import hashlib
@@ -14,7 +14,10 @@ from pathlib import Path
 import pwd
 import re
 import stat
+import subprocess
 import sys
+import tempfile
+import time
 from typing import Literal
 import uuid
 
@@ -28,261 +31,136 @@ UPSTREAM_SERVER_SHA256 = (
 )
 UPSTREAM_PACKAGE_START = "bun install --no-summary 1>&2 && bun server.ts"
 GOLDEN_SERVER_SHA256 = (
-    "e3d3caf6f37057f1fc84d9b1110af6a3749007cdcd13d3a873885e598bb63d31"
+    "1826a3524794f2ac9eceba5743a263dccca734a56d9cca1bf15c5ae8d06636c9"
 )
 PREVIOUS_GOLDEN_SERVER_SHA256S = frozenset(
     {
-        # b017cfd36805 A session of another chat is the agent itself, minus the owner's correspondence, mail and calendar (#472)
-        "59da9b03348337dc1b8c3107bd2133943783606b3fd330933591e4484b2b1e2a",
-        # 0acca8f52955 Google fields and the selected part of a reply (#470), merged, never released
-        "be6d0b9bb8e782670c7a9a9356f88826b740c0c968fd76f8a98054155cc60d70",
-        # 5056be176c5e A reply carries the part the person selected; read only when the message has one (#470)
-        "0f778bb173fb6b1e7c5875216b126e8b5c40eefcb19ee4b37f08cf6358ee29d9",
-        # 0baa6d97036b receiver: a normal turn after a limit ends every limit wait (Volchenko 11.11) (#469)
-        "d824b9f88e59f6b3e67e43abff18f9d81a2cbb0047dac81895e8d5decfed569e",
-        # 9359bd0f35ce A long typed text that Telegram split stays one request (#464)
-        "93beaf92223f1267e33b16e2a5cf840c4331f13c68298c2f628ee9c594f9cd29",
-        # The golden before a long typed text that Telegram split stays one request.
-        "81ae5692762cbfcb9ee8844bd40fd48efd817f8f27ff9857763a1398bc70d099",
-        # The golden before a text Telegram split at 4096 characters stays one request.
-        "ccf386f1056ba7b0a1abebe00e39d5c8723aacca0417fc6f3f06f48e015e318b",
-        # The golden before access card: scope line, deny after a handed-over order, repeats, recovery receipt.
-        "c54322657bad37ebba6023d7b18f844531631b9cbf1581f7270a1d92de4b795a",
-        # The golden before access request card with yes/no, the request given again, refusal reasons.
-        "a31c40516a109e7c93a635db49444aeb35afe58d3596d5a382dd6e25f2fcf928",
-        # 5719b3b85e43 An access request is a short card with «yes» / «no», and the session t
-        "b9119856fb539c917c0950313e7ef81d8a0f799c5f2d2d26f1467f1fa30fd6ae",
-        # The golden before group rule from the owner's private chat (everyone), preview reasons.
-        "53d8d5ede5f0a6b2463fe0a709a09ef1034789ee9dceb742ce8dbe89304ef652",
-        # The golden before an unsaved confirm press stopped looking accepted and the presses got an index of their own (Codex review, 10.11.2026).
-        "ef01ccbb943bd15ccdb3de55f80de3348eeb22e9fb22f0fcbc1c77d40137c0c8",
-        # The golden before the confirm button in the owner's notice language (owner, 10.11.2026).
-        "e52fcf09382cead920272889d3e6e9c0d18652fede39d133b1ea0554b0ffaa70",
-        # The golden before the reply tool's «✅ Да» button, a press recorded as a reaction (owner, 10.11.2026).
-        "0199ffb6b27bfdd95dfa9495d0dec31c2bbe0ca3807e2835017c787c51f8f2e7",
-        # 5b322b714179 Codex r2: code fences, plain fallback text, escapes
-        "db1595da0e73d7e4a4b8eace2c14ed9cd7b75fe0f2f736f1c14d61c9ad2ecbc9",
-        # cb2280a430d9 Codex r1: one message per chunk on every path, entity-aware cuts
-        "8e838d64a091df3e04e45434ff0c97fb1cc7851064b5794f403aec32a31c8181",
-        # 92ea9aa92283 Company answers never show raw markup: whole rich answers, clean cuts
-        "26420f5bb81b221bf1a168903bf5111d82d2dfb96e72a8f2cc89af2605a85fe3",
-        # fca97ad89851 Arti's week of errors: WhatsApp reconnects and tells its state, wa-lin
-        "c866d3f591cabab09b5b4f949e218e7d59cdde07d8011cc1b633c5485060ba81",
-        # 9caff25eafa1 Merge pull request #446 from kgnvsk/feat/russian-company-cards
-        "7301cb43178d84229ad58b595bf49014fea566ee9872a576067693de84341975",
-        # 82b7bae3 Company assistant: photos, videos and files in every helper, and actions at a set moment
-        "8e38cdfed3ec9e44a5f4a915fc3610090847673aa5713fad56c66d524a1f35f4",
-        # 72cc601b9d8e Codex r1 on scheduling: a press again stays scheduled, files kept befo
-        "e42179c250d5cabc00781db2f8ceb9511e329e212f8e22749620479875f5fa7a",
-        # a1efc78a0c35 Company assistant: an action at a set moment, pressed now, sent once t
-        "31dc09abf82b21683eda4187fc7b28f3f5adc2601052fe24cc98880e16bd065d",
-        # 6a65d3863178 Instagram on any kit agent without root: ig-connect does the server si
-        "3e7e1cf6aa44fc369c824ff7ae74998d6e9cccb1a76c1693ae5a1f3c7d3620f1",
-        # 3789d765fd3c Long confirmed writes: Codex r1 fixes (YouTube held copy, FB 30 min, w
-        "7755fbc919ffa0f73701a5dbbec4fd476d978213b680e9d272c0614c9b5b1581",
-        # 3bdd45303112 Corporate: a confirmed write outlives its press (YouTube and video upl
-        "bfd1c58d8ea9c722f8a56d7ceefc815ab736a2a70e242d36cb0df5c3e28127ee",
-        # c6409f2f02b4 Long confirmed writes: Codex r4 fixes; no cut of agent-read adapter te
-        "78f3b72bc17584cec76336e905c90838d15c7200e75df1dff7dc97058773ba05",
-        # 8ffc4d8c0258 Merge pull request #407 from kgnvsk/feat/work-defaults-20261101
-        "9bc75ba643c85e3b511d37de997f7782d422bc06367b58e51aa2a6feb49da0ac",
-        # 53e3574a0775 F4 r3: the receiver never writes access.json itself, a fresh epoch imp
-        "230906648dca6ac9117525bfc66d0f8e2d014f186eebbcb608750e391d7065f0",
-        # a8139c0e9cd5 F4 r2: shared resources are declared, first epochs are bound at the fi
-        "879855101cd5edac03d29994add372b59a1dbf1a1506b6df725731a75fa4e029",
-        # 5a71dc6f2e20 Merge pull request #401 from kgnvsk/fix/no-cut-memory-rules-20261101
-        "36bbc80ed1da728d2455ea290521ec7135b6191f9145bad142408238cc39f303",
-        # 17480852fd89 Company chats carry every photo and file of a request as a file, any type
-        "0e9d6b87d44c688e421be85ca3d4efc574fe88023bafde786108078d8be37ced",
-        # cb28b586f6b1 Merge remote-tracking branch 'origin/main' into fix/staff-media-202611
-        "6d5cc3282050a4db01e0dc144a9b8e9ea14c0543663e9ec95c212289840ec840",
-        # 5975d1e72cec Merge pull request #399 from kgnvsk/fix/forward-voices-20261101
-        "74e82da7bc071c96ecaec474571670749ebcef07c3b4fd65998efc5372725f34",
-        # The golden before raw and transcribed recordings keep separate message identities.
-        "0d548fda220f91fe5272cadced1f1f71faef1494e22292e45cd7d82e8664b818",
-        # Scoped private voice-burst hotfix on the reviewed 164a7c15 receiver.
-        "6101721637a3dbb75559f693d64af81dbdb92c83b8748942e2ad9d72707b82a0",
-        # The golden before transcribed private voice series is one quoted request.
-        "da81baf8e122c32eff1bc28a4589419cd40e77c01dd2da1762ed8049e1d543b8",
-        # 6ddd6aa768ab Merge remote-tracking branch 'origin/main' into fix/yuriy-v2-findings-
-        "eae51c7798ba46fb1307bc0e17c69389d6d2a393daefeb269322a16a1b991072",
-        # 3cb3b463ed92 Merge pull request #391 from kgnvsk/fix/menu-locale-20261031
-        "62135e2ba62d2631f5ef0ebfc0fadccd4c53d89a7b1aa469eee93eb37da17481",
-        # 7e6d091e62af Merge pull request #386 from kgnvsk/fix/phantom-progress-task-20261031
-        "5ee44d7ddb82eafe043b557b795169a1564d45831ff18dc7a425fc8f0371314c",
-        # 87389985fb6d Merge pull request #383 from kgnvsk/fix/plain-owner-notices-20261031
-        "8de55319f4d0d98304f5f3df6bd56c983de31449b6406ed17791fd4f9b1ec120",
-        # The golden before notices r4: a press that decided nothing answers in the toast only; answers keyed by request and hold (Codex r3, 31.10.2026).
-        "9d0c3620d3337b1784dd36c284e43e43685ddf07fca33045f48ebb0c68eae107",
-        # The golden before notices r3: durable answers to the owner's buttons, jobButtonsV2, unavailable text in the owner's language (Codex r2, 31.10.2026).
-        "5b5c884ef097572d24eba297668dd66e2895906345407cf5d7756ce5ac7e3bba",
-        # The golden before 31.10.2026 r2: owner buttons carry the request's hold; the module decides (decideHeldJob).
-        "b6e86af82cc96e1caca7a4544b2536f181765ca912f508da581f8d86f973f6f9",
-        # The golden before plain owner notices with buttons for held requests.
-        "3fb02071cbd5153b955303f7490e16b54e7628c5826f6d8f4c611263983eeaed",
-        # 8f44955ffe05 Склейка з пересланим: файли за текстом, відповідь усередині пачки, гру
-        "c491b8bc28093378a8336e2e0e9805660596b2993855b20c36f58234bca695f7",
-        # 848a994af35a Коментар і пересланий із ним пост - один хід
-        "437eb5683ad407d17bb4b5d0aa068d63e92e356e2c495f1e9e3da92f81e08861",
-        # 6b4a0ce33a37 Альбом, надісланий відповіддю, — один хід
-        "d8973c14d57ce339c80256410141739d06ec66afcde6eb17c5af7468b53fea9e",
-        # 7c7545d8ba69 Видалене в Telegram зникає і в агента
-        "7c7e269ba5d68fdc4cef1672bc9aabfdd53f2777a49dce0e862cb0df825c8bc3",
-        # fd6e1191d810 fix: retire answered queue heads after provider stop failures
-        "614db9b9cde6a38759e028711fa869891e59bc3c99c237f52db45f7141fdbed3",
-        # Reviewed 29.10 backport: closed StopFailure/session-replaced terminal heads on the receipt-3 receiver.
-        "4295bd45a05b2f5b7fcd14e85dad3cd2df609f340542f649d10631ddc81407b2",
-        # The golden before settling confirmed answers after StopFailure.
-        "24b519be932cdc9df592391e2835830a16f9b49973420d11fbc3aafc28069ca0",
-        # Cash's receiver after the reviewed local Bot API transport overlay of 27.10.2026 (never committed).
-        "2f879a714d474b82ae2f3b3852ec44524f1e3471a3e06c0eecbe7b7f12339359",
-        # Cash's receiver before that overlay: his 15.10 access-card canary build (never committed).
-        "4bd607fb7bb6d089f91bc18bacd2d73044190ca745b7fd15062808b230b74c74",
-        # Arti's hotfix of 18.10.2026: the 15.10 golden with company chats taking any file (hotfix/arti-any-file-20261018). (main line, merged 29.10)
-        "1aadf8c4cf422289baf542e238018bee507760c73987dcec601e763157c2d9f6",
-        # Local Bot API backport on an earlier supported runtime. (main line, merged 29.10)
-        "1d0ca4b50d0aa5369fe26ee039d0e8c705d4c1b0521e9b379102aca3aa46b551",
-        # Unreleased ingress candidate before durable restart holds and cleanup isolation. (main line, merged 29.10)
-        "6c8ec6f7e1446037c6ee114776d247c2cf43ec59c5c6f5155b3b1e66908db57d",
-        # Arti's hotfix of 18.10.2026 as installed: late photos come as all pictures or all files. (main line, merged 29.10)
-        "c6c7b9b99952e1c46238a6268aca9d623bdc3fc006023c551d6d9cf8464904ca",
-        # 90ea4365698f Merge pull request #369 from kgnvsk/fix/ira-business-capabilities-2026
-        "79ad90003f08b1adb7d7d25d3f24baf576b8f3af78d443493f98fdd1fade9fbb",
-        # 907d86c05afa fix: preserve work during access widening and keep guests outside staf
-        "766d8737929ccc18d5e985c79c9064ae4b257eb17fa4db41796d65963ac22099",
-        # 4add8c91f302 fix: default admitted Claude chats to work access with explicit restri
-        "8a9ce46b1588e6cace25eba2948806118c92903f4bff535f5678d152b3580128",
-        # 55f3c531b248 Merge pull request #368 from kgnvsk/fix/background-dialogue-20261026
-        "380dcc66b72668d3d80b55cdb143f4dea498c56b36df09dc7312d48914beee76",
-        # 28c64c5965fa Recover owner sessions without interrupting employee work
-        "8492d077f8fad97c0a2e31169addb24c94721a818a4444fa6f4dd093edec59b6",
-        # 30b6fc5f64c3 Require exact video readiness and preserve scoped input provenance
-        "d14e93cb00f3239808e6cbac9cae5d14fbef55d0e5c9eaca1bc0bc24144d4bcd",
-        # 5bbfffbc4998 Merge pull request #364 from kgnvsk/fix/telegram-download-status-20261
-        "1826a3524794f2ac9eceba5743a263dccca734a56d9cca1bf15c5ae8d06636c9",
-        # ab0b3c6c13c3 Preserve Telegram albums and follow-ups without implicit topic mention
+        # The golden before download failures retain their HTTP status.
         "17405e1ec0135c295d5726e511f3db04dfd2787f9984b392eb3905a4386238f6",
-        # fd929bfa7920 fix: consume rejected album audio without repeated transcription
+        # The golden before forum text continuations avoid repeated earlier files and speech.
         "4939b88d79e10305462d4a337e032979c8dd68bff47c4cc85cab34bbd7052d54",
-        # 05556dfc57c4 fix: join brief text continuations after a group mention
+        # The golden before an admitted audio rejected after membership changes avoids ambient retranscription.
         "1ef3c4b2e516963941867aebb83e55ebc9eb18b896428165a3b4937b801151c0",
-        # 6525422fe4a5 fix: retain later audio recordings in group albums
+        # The golden before brief plain group continuations retain the original mention arrival window.
         "d8cf24fc5f9efb9d52ee4e6b768776a2fd95270190e39441f07a18878e1a07a8",
-        # 929fe4e5840b Keep album text and release owned waits after restart
+        # The golden before observed audio joins an admitted corporate album with original bytes and transcription.
         "9f751f61194963664c1fe497f5e1f2a809d22804b4323e03b1bf0cc13c63fe28",
-        # 1d07b1e39829 Preserve complete media albums and original corporate audio
+        # Unreleased ingress candidate before durable restart holds and cleanup isolation.
+        "6c8ec6f7e1446037c6ee114776d247c2cf43ec59c5c6f5155b3b1e66908db57d",
+        # Unreleased ingress candidate before accounting for the recording transcription budget.
         "9eb8f4ce2c3f23f38aec1ff781e84aa048cd6dbca78d36202dc893ff94e7dfe6",
-        # c7e4b8cbe07c fix: report credential connection and deletion outcomes truthfully
+        # The golden before original audio files, album file fallback and bounded arriving album parts.
         "ef9aae2015c02f302c0fab28c5c707a5268a7aa1b957c917378341fb1ce66e08",
-        # 18fb1121e1a0 Resume authorized group tasks after bound access confirmations
+        # The golden before truthful credential failure reasons.
         "2b29fce2c14e388cd5668fc9316596c0ca5edf4c35c5f4bcc32c6cb2f67ce4c5",
-        # 371c6919f476 The owner sends a service key to his bot's private chat; the receiver
+        # The golden before bound corporate approval continuations.
         "fa4f6a0b410a29474c98a1ffc909e55b698f028d022665878c73e6df7d29bd4b",
         # 389c700d6953 Telegram bot as a sales channel: a stranger's private message is an ex
         "d622a9346a8e8c00fc6e2dbec6465210a1fd36cf28192f6a776a73810dd8d108",
         # 375272fd77bc A later correction or cancellation retires the earlier approval card i
         "ccb6f3035cb73be119c5971ff89233327fd4b2670c55321be29a568246926f3e",
-        # c9e9e306f893 The owner's policy tool passes a refused preview's rule and hint inste
+        # c9e9e306, unreleased candidate: a card a later correction or cancellation retired answered its press with the
+        # generic «Запит недоступний або не виконаний».
         "d37321a1328012a4b4a1bb70ee7f0e06755af63e09361aac57409d4da0ac25c9",
-        # 1b336d47726a The owner's policy tool passes his request's origin and the card's own
+        # 8abadb5c, unreleased candidate C12: a refused owner policy preview said only «rejected».
         "0449257bdf9b062ff3eb36d45d2218232416b9966c68c2dfcfd45c1078d0cb3e",
-        # 9a6bf61165f0 A corporate button answers whoever pressed it with what happened, not
+        # 9a6bf611, unreleased candidate: policy cards went out with the generic confirm/cancel buttons and no request origin.
         "4a23ea547a55dda3f37abec164d03cc45555b1426f9bfa1b890d5fd3b1ce96d4",
-        # 206f2a21c3b9 An early holding line is admitted again at its send, never over a prog
+        # 206f2a21, unreleased candidate: a corporate button answered «Застосовую…» before its decision checked who
+        # pressed it.
         "44ed39df5e87ed00b4ebc8cef5db6368114c1e4a8f6779b6efd106818bb5569e",
-        # 0b0e055a27f5 A video sent without its review receipt is told so plainly, not with a
+        # 0b0e055a, unreleased candidate: an early holding line queued for background work was sent after a progress
+        # or over a final in flight (root's review P2).
         "16f077fa0da372b2766dd60e0f88a2c2fee032330a78b47450d3ec6247857091",
-        # 2265c2ef383d A turn that starts background work and says nothing is bounced once; s
+        # 2265c2ef, unreleased candidate: a video sent without its review receipt failed on a bare ENOENT.
         "1180fe408fc3f532c89b1bb5dafdcfffed663cc71c911210ebab873b879c1898",
-        # 84343bc29867 Grant only a directional destination phrase; keep a topic rename
+        # 0236c411, unreleased candidate: a turn that started background work could close without a word to its chat.
         "703847777226e2048c504a636542037307041473a6bb882a71acf32e8e77aaae",
-        # 7a8e6bbcec8a Deliver an owner-named copy to another chat by its Telegram names
+        # 7a8e6bbc, unreleased candidate: a mentioned group or topic still counted as the owner's destination.
         "8bd217ba416fa67b523344501d03fcd061a08764a58849dfd8999c25529cb378",
-        # 1cb01a2fd505 Honor structured provider resets and recover retained pauses safely
+        # The golden before host-known group and topic names and owner-named copies to another chat.
         "427ff7903d5d633111660ccc4ecaac5fab0e075707688e65777bbb30b5cb0e14",
-        # 3384d23b38e8 fix(agent): settle stopped background work and preserve safe upgrades
+        # The golden before structured provider reset recovery.
         "c80edd5d46d534f050b842e1705ea962bdf9d989972f827c9e8096866ae206a0",
-        # e0e9290b5e62 Fix live attachment delivery and add verified native task control
+        # The golden before native stop receipt settlement and bounded observations.
         "23facde4c4f26e50bc056c322a037e911da2ae6478179ea0527c2bfdd1ae393b",
-        # d71c3f8417b8 Make Novsky Agent preserve owner scope and complete delegated work
+        # d71c3f84 / 888133f9: authorized test candidate before the owner HTTP bridge correction.
         "8e181511cd12f68ed8d85e09df9807c4062f75baa079d015601355afdba2e3b8",
-        # a03a396187d7 Merge remote-tracking branch 'origin/main' into feat/pinned-no-cuts-20
+        # The golden before Novsky Agent owner groups, media completeness and durable upload receipts.
         "68c898e8027e9f32fc19d48f86efe3a6759cae87c0f427c18f1eef62d8a079ef",
-        # 4495d638fb65 Приёмник без обрезок: цитата ответа, все файлы серии, уведомления влад
+        # 4495d638 23.10: приймач без обрізань — цитата відповіді, усі файли серії, сповіщення власнику, довгі картки частинами
         "08b881acb63e35901fd4e8d57202f3fe98da244b8678b6f835d2f539a40c5101",
-        # 83b9f17c4397 Merge pull request #345 from kgnvsk/fix/worker-read-pages-20261022
+        # 0c569763 Арті, 23.10: особистий чат власника закривається мовчки, коли він нічого не просить; інструкції приймача до 2048 знаків
         "d5e1eda1114fb473579b555a2e1b7b4dc4c1259f54ad66468eb3a499c72b778b",
-        # 25c55480c9c7 Merge pull request #335 from kgnvsk/fix/arti-lean-reads-20261022
+        # 91dea36b Арті, 22.10: інструкції каналу до 2048 знаків ще не обрізані; no_reply в особистому чаті власника заборонений
         "ef3b4172813d3eaeae0bc603d042378479ea846b46ea20daa90450920046a565",
-        # c62f7dad72fb Merge pull request #334 from kgnvsk/fix/arti-group-publish-and-rule-co
+        # c62f7dad72fb Арті, 22.10: контекст цілим через read_answer_context (до читання без повторів і збереження за темою)
         "06bf5fc622284d1ccb01948b5462d5083e48c6ea01e2561fd77d1e5547eec469",
-        # b7e33a303ffe Codex, круг 2: повний звід через інструмент (full), суворі параметри,
+        # b7e33a30 read_answer_context with full and strict selectors (null and stray full still accepted)
         "adb39457f54ddda99a0e131ee46c9d11d702abe3d022fafe9658757c7cf6433c",
-        # 26889902606d Арті читає контекст інструментом read_answer_context: сторінка ціла, о
+        # 26889902 read_answer_context, first revision of this branch (before the full read and strict selectors)
         "655f10a6ca2c4e462e6db3ef0eab6150b027e9a1b9bfcc256725063396eb0d31",
-        # aeb525f5ec73 Merge pull request #331 from kgnvsk/fix/arti-fix-all-20261021
+        # de76853ea0d0 Арті, 22.10: правила як навички, меню власних агентів (до інструмента read_answer_context)
         "73dd9d424855b1738fb6029bb1f6838dd8ec16cd1a6376d6f6bcf7702c580e16",
         # eed9046c2412 Арти, пакет 2: одна розмова в групі, спільна тека, сторож фільтра безп
         "261e747aa729b874cadcc9ca07c0d9c7d94d93245585212f6eb2d655461720bf",
-        # d72bac34496d Merge pull request #330 from kgnvsk/codex/local-botapi-20261021
+        # 36bfc39bf1ef Merge reviewed corporate recovery into local Bot API candidate
         "1210ed621b94cf0d967f37cba1b2ae6d3ec76dd620bd6fcc356347328d694ea5",
-        # a8a197713229 Merge pull request #329 from kgnvsk/fix/arti-20261021
-        "dbcb1c0c96061e5a444100ae9ff3c6097ff0706103d865f0d4ea8c1e9c7f2fe8",
-        # ef231bccb00b fix(telegram): advertise the active file transport limits
+        # The golden before combining local Bot API with reviewed corporate recovery.
         "5256731c1a0e698c915a00bc4fbe40e373c39af3c0c1c56cf032805443a5642b",
-        # 4a15a952ad37 feat(telegram): prepare optional local Bot API transport
+        # Reviewed corporate recovery receiver, retained across local API merge.
+        "dbcb1c0c96061e5a444100ae9ff3c6097ff0706103d865f0d4ea8c1e9c7f2fe8",
         "5cbdab2dd2333601cc8db93322b449badd2230abbc35d4b44ccdff3056b355d6",
-        # 518a6c7fe577 Одна розмова в групі, крок 1 (#328)
+        # Local Bot API backport on an earlier supported runtime.
+        "1d0ca4b50d0aa5369fe26ee039d0e8c705d4c1b0521e9b379102aca3aa46b551",
+        # The golden before optional local Bot API and disk-backed large attachments.
         "d091168a7cdbf9c290f214b6df89e4dad8727b8727c120f961999dbc2a53dd85",
-        # b8d4d91b098c Одна розмова: наступний запит групи — лише після публікації попередньо
+        # The golden before one chat is one conversation (history, strict company journal).
         "c3ffbe5d4f52cba468a6ed3bc7585267779f8bdab9100f09bd0990046062f369",
         # 147a1594466d Один чат — одна розмова: група бачить усю свою історію
         "348d272ee741e2b30a13739ce76b549ca6ad68db4a17d6d69b3109776f47f6f5",
-        # ec5859a04415 Merge pull request #315 from kgnvsk/fix/corporate-any-file-20261018
+        # Release 3 of 20.10.2026 (fcb527aa), before one chat became one visible conversation.
         "a075ed65d000e7adbd449cc59512019c4eacec50f964c9b2bf5d2283537dab20",
-        # ee6ee3f970bb Codex PR 315: short staged suffix; replied and late-bound pictures com
+        # The second head of PR 315, before late photos came as all pictures or all files.
         "0384aff0a52144756d7f9d4c6894befbe5358b11939067b4e90a6389aa2591f0",
-        # 936156b60867 Company chats take any file, like the owner's chat
+        # Arti's hotfix of 18.10.2026 as installed: late photos come as all pictures or all files.
+        "c6c7b9b99952e1c46238a6268aca9d623bdc3fc006023c551d6d9cf8464904ca",
+        # Arti's hotfix of 18.10.2026: the 15.10 golden with company chats taking any file (hotfix/arti-any-file-20261018).
+        "1aadf8c4cf422289baf542e238018bee507760c73987dcec601e763157c2d9f6",
+        # The first head of PR 315 (any file), before the reply and late-bound pictures came as files too.
         "958428dfb368c81451dc4ed019cfb948a13cc39037e9872718fa4bced0151f28",
-        # 2244f876595a Integrate reviewed-scope Telegram calls for reconciliation
+        # The golden before company chats took any file (owner, 18.10.2026).
         "375f3748e783ba9913ec03fa542307cd606702dd552c7dddd696203d25ca6044",
-        # 229677dd0ade fix(premium): persist reconciled rules and require fresh scoped contex
+        # The golden before full scoped rules and conversation required before delivery.
         "ffa07c1bd79bb5097d12479babb37458c03fb3ba4a60c395f47ba3e1c92a2fb6",
-        # c6d874fe27af Merge pull request #307 from kgnvsk/codex/manzik-admin-any-chat-202610
+        # Reviewed main: administrator management from the current chat.
         "c9bf64d8cea0cc979528db07ccd98211908f087cfd45aebd512ca3a97bfa6622",
-        # 61dc662f238a Merge pull request #303 from kgnvsk/fix/access-request-cards-20261015
+        # The golden before complete scoped rules and conversation before model delivery.
         "c701e186f207be9ae1343b36572d6dbf2e3c3441a4a3be22f637f19fc9bc5926",
-        # 43e64facfff8 Merge pull request #296 from kgnvsk/fix/video-edit-single-cpu-20261015
+        # The golden before Readable access cards and native continuation of owner decisions.
         "1ba611f6b1da654d421d1ca5a084eb3c06cd0a867b37a81688eb5f2c56e1f76d",
-        # ea8928fb3995 Merge pull request #286 from kgnvsk/feat/corporate-parity-3-20261013
+        # The golden before typed Analytics Search Console SQL and hosting resource controls.
         "f81a212961077538f5f2aa9aaff7b6f50859f4625f581f25587dc63aa052781b",
-        # aafc5c58d7a3 Company sessions: owner-switched Claude connectors, voice answers and
+        # The golden before the owner's resource tool took the meeting recorder (connector=recall kind=recorder).
         "2f36dc31a5a5f2890770b6512e6e2e56cec95a84bf05cd5c2e6fea4e7bd1132f",
-        # 4336a065af82 Merge pull request #282 from kgnvsk/feat/corporate-google-switch-20261
+        # The golden before the owner's resource tool took a Claude connector (connector=mcp kind=connector).
         "aefc79a34567625dca08c1a77f16ea3e2935ceb94994792e1aab1dbda6dbca1b",
-        # 7838b9a399f9 Merge PR #262 (5d0b61ba) into the third Premium release of 12.10.2026
+        # The golden before the owner's resource tool took kind=drive (the whole Google Drive as one switch).
         "166bed10c6914e982e9ba2a76eb35b1de2ea642a3028c8aac6ac269540bfcfc3",
-        # c79762987cb1 Compose task review with the accepted group and integration release
+        # The golden before the lazy video-only helper path after the quality gate.
         "156ea60caf1f2a7e0952c551c7c15ea69c0301962abda4656b40e7a653f34edc",
-        # 9a6f57f9ef85 Merge pull request #268 from kgnvsk/integration/premium-20261012
+        # Accepted quality and group-migration heads before composition.
         "132c9f586fff8af4cd9777dd4039ded84f286cff16bc7820c2e5da1d7f3c0e4c",
-        # 1e8d83aadb8e Review task results and edited video before delivery
         "61fb6a92ee5a84cfba8eb1b85934e4113c0e2bc448639e68d1b5ccc49398390d",
-        # ddf045598b44 Receiver: the owner's group messages without a mention; a group moved
+        # The golden before a moved group's settings copy was awaited and tried again after a failure, and before a
+        # redirected send dropped the old chat's quote.
         "8441ec88c761a15310feda53c701f9c8079657c6b97350323b1d3fc281f19b82",
-        # 49ce47eb3d67 Merge pull request #257 from kgnvsk/fix/quota-null-shares-20261011
+        # The golden before a group could hand the bot the owner's own messages without a mention and before a send
+        # to a group Telegram moved to a supergroup went on to its new id.
         "9a04daa13572782bd0a1d5757b5efc8953e0e91ba2af78cc9800449aef2dead9",
-        # 693ecd3cab63 Merge pull request #253 from kgnvsk/fix/phantom-task-registration-2026
+        # The golden before background-task notices named the chat, the request and its time.
         "a9c1852dccf0eec9e1d7366e040228c419ba7a4229ed54ff1804e827b2751676",
-        # b72d5689ec1d Рев'ю Codex: підпис поста не ріжеться, кожна спроба файлу рахується, ч
-        "9a73615e71a251013ea28d1ec6ba8e81d9777f9bee64550541e74380c4d6da4c",
-        # 5c055dc96602 Готовий результат одним постом, людяне повідомлення про хід задачі, бе
-        "02234108898d0b57eedf3f3196c8f29b8d7b30ec9f9973c6d7c49996b8809841",
-        # 1117e22cc64b Компанійні чати на локальному Bot API: файли до 2000 МБ і будь-якого т
-        "a02c4c783b54f831a9813c19978b1958046b674ef26ba6dd26c5e8daaa7bb181",
-        # The 28.10.2026 backport before company chats took local files of any size (Arthur's agents).
-        "56878b2bf2edbca53373611a1950c17fadfd7dc61ee899197e16dc4877221ff8",
-        # Release 2026-10-11.6fc7d3f10200 before its local Bot API backport (Arthur's agents, 28.10.2026).
+        # The golden before refusing unrecorded task IDs in sessions with launch-hook evidence.
         "be6db90670ed94a7566b36fad7b8ca6be2df635ee3da6fe45362b8c751247b27",
         # The golden before background workers release the closed carrier without completing its result.
         "7a994af355c3601eb1e331ae92f987c30d7aa0cfecedf7bdc15e8a6540069e77",
@@ -878,6 +756,16 @@ UPSTREAM_FILE_SHA256 = {
     "skills/configure/SKILL.md": "16b06bf2ac5ede250d0c620ce4e6cf3878c9704246b8f52390fde5f280a17f73",
 }
 DYNAMIC_ROOTS = {".in_use", "node_modules"}
+# Official 0.0.6 at 7e401edac7ca6449c4f549fda9e1b43385496bef. The
+# maintenance upgrade accepts this exact source (or a reviewed kit server).
+LEGACY_FILES = {**UPSTREAM_FILE_SHA256,
+    ".claude-plugin/plugin.json": "034ac185f5790fab4127ba5b8c3ece4b9df1bf3b3f0dd1c98062dc3c18bd3b2a",
+    "README.md": "137bbbfd3a4961e84ab58100f27d7af1f18d5e497f53405c64e021b72f93f654",
+    "package.json": "364a9286a10497daeecce94607682f31de522413252209dd82778d8d9fff2b47",
+    "server.ts": "8f20ec0c96ab0a257424d882760b33f1312575524f4ba0803102d468605b7a0b",
+    "skills/access/SKILL.md": "c499635ef8a9a68cb166bb737a7f4d0620154d1bc9e96934cb8b630fadf22c86",
+    "skills/configure/SKILL.md": "7a58fa4efd09dd8323894e0e505bc21de11e657994710a3c535f9f5072fe36b3",
+}
 RUNTIME_ORPHAN_MARKER = ".orphaned_at"
 MAX_JSON_BYTES = 256 * 1024
 MAX_SERVER_BYTES = 4 * 1024 * 1024
@@ -909,7 +797,7 @@ class ActiveInstall:
 
 @dataclass(frozen=True)
 class ReconcileResult:
-    status: Literal["official", "golden", "patched"]
+    status: Literal["official", "golden", "patched", "upgrade-ready", "upgraded"]
     version: str
     changed: bool
 
@@ -1163,7 +1051,7 @@ def load_contract(path: Path) -> CompatibilityContract:
     return _contract_for_home(home.parent, path)
 
 
-def _contract_for_home(home: Path, path: Path) -> CompatibilityContract:
+def _contract_for_home(home: Path, path: Path, *, allow_previous_golden: bool = False) -> CompatibilityContract:
     resolved_home, uid = _home_identity(home)
     value = _read_json_file(
         resolved_home,
@@ -1195,7 +1083,8 @@ def _contract_for_home(home: Path, path: Path) -> CompatibilityContract:
         or upstream.get("serverSha256") != UPSTREAM_SERVER_SHA256
         or upstream.get("packageStart") != UPSTREAM_PACKAGE_START
         or upstream.get("files") != UPSTREAM_FILE_SHA256
-        or golden.get("serverSha256") != GOLDEN_SERVER_SHA256
+        or (golden.get("serverSha256") != GOLDEN_SERVER_SHA256 and not (
+            allow_previous_golden and golden.get("serverSha256") in PREVIOUS_GOLDEN_SERVER_SHA256S))
     ):
         raise _fail("контракт Telegram не відповідає підтримуваній версії")
     upstream_sha = upstream.get("serverSha256")
@@ -1276,7 +1165,7 @@ def _validate_source_tree(
         else:
             raise _fail("дерево Telegram plugin містить неочікуваний тип шляху")
     if actual_files != expected_files or actual_directories != expected_directories:
-        raise _fail("дерево Telegram plugin не відповідає official 0.0.7")
+        raise _fail(f"дерево Telegram plugin не відповідає official {contract.supported_version}")
 
     server_status: Literal["official", "previous-golden", "golden"] = "official"
     for relative, expected_digest in contract.upstream_files.items():
@@ -1335,7 +1224,7 @@ def _validate_plugin_files(
         uid,
         label="package Telegram plugin",
     )
-    if manifest.get("name") != "telegram" or manifest.get("version") != SUPPORTED_VERSION:
+    if manifest.get("name") != "telegram" or manifest.get("version") != contract.supported_version:
         raise _fail("установлена версія Telegram plugin не підтримується")
     scripts = package.get("scripts")
     if (
@@ -1365,7 +1254,7 @@ def resolve_active_install(
     record = records[0]
     if not isinstance(record, dict):
         raise _fail("ledger Telegram plugin має некоректний запис")
-    if record.get("scope") != "user" or record.get("version") != SUPPORTED_VERSION:
+    if record.get("scope") != "user" or record.get("version") != contract.supported_version:
         raise _fail("активний Telegram plugin не має підтримуваної user-версії")
     raw_install = record.get("installPath")
     if not isinstance(raw_install, str) or not raw_install:
@@ -1375,7 +1264,7 @@ def resolve_active_install(
         resolved_home
         / ".claude/plugins/cache/claude-plugins-official/telegram"
     )
-    if install_root.parent != expected_parent or install_root.name != SUPPORTED_VERSION:
+    if install_root.parent != expected_parent or install_root.name != contract.supported_version:
         raise _fail("installPath Telegram plugin не відповідає активному cache")
     install, _status = _validate_plugin_files(
         resolved_home,
@@ -1660,6 +1549,109 @@ def reconcile(
     return result
 
 
+def _require_upgrade_window(home: Path, uid: int) -> None:
+    if os.environ.get("CLAUDE_UPDATE_MAINTENANCE") != "1":
+        raise _fail("перехід версії Telegram дозволено лише у вікні обслуговування")
+    hold = _read_regular(home, home / "logs/restart-hold.until", uid, label="restart hold", limit=32)
+    try:
+        until = int(hold.strip())
+        service = "claude-telegram.service" if home.name == "claude" else f"claude-telegram@{home.name}.service"
+        status = subprocess.run(["systemctl", "is-active", service], capture_output=True, text=True, timeout=10,
+                                env={"PATH": "/usr/bin:/bin"})
+    except (ValueError, OSError, subprocess.TimeoutExpired):
+        raise _fail("не вдалося довести зупинку служби для переходу Telegram") from None
+    if not time.time() < until <= time.time() + 86400 or status.returncode != 3 or status.stdout.strip() != "inactive":
+        raise _fail("перехід Telegram потребує зупиненої служби та чинного restart hold")
+
+
+def upgrade_legacy(home: Path, golden: Path, contract_path: Path, *, apply: bool):
+    """Only the reviewed 0.0.6 → 0.0.7 transition; no network/source discovery."""
+    home, uid = _home_identity(home)
+    ledger_path = home / ".claude/plugins/installed_plugins.json"
+    before = _read_regular(home, ledger_path, uid, label="plugin ledger", limit=MAX_JSON_BYTES)
+    ledger = _strict_json(before, "plugin ledger")
+    records = ledger.get("plugins", {}).get(PLUGIN_ID) if isinstance(ledger.get("plugins"), dict) else None
+    if not isinstance(records, list) or len(records) != 1 or not isinstance(records[0], dict):
+        raise _fail("неоднозначний запис Telegram plugin")
+    if records[0].get("version") == SUPPORTED_VERSION:
+        return _reconcile_detailed(home, golden, contract_path, apply=apply)
+    if records[0].get("version") != "0.0.6":
+        raise _fail("немає перевіреного переходу для цієї версії Telegram")
+    contract = _contract_for_home(home, contract_path, allow_previous_golden=True)
+    golden_bytes = _read_regular(home, golden, uid, label="golden Telegram", limit=MAX_SERVER_BYTES)
+    if hashlib.sha256(golden_bytes).hexdigest() != contract.golden_server_sha256:
+        raise _fail("живий golden Telegram має невідоме походження")
+    legacy = replace(contract, supported_version="0.0.6", upstream_files=LEGACY_FILES,
+                     upstream_server_sha256=LEGACY_FILES["server.ts"],
+                     upstream_package_start="bun install --no-summary && bun server.ts")
+    old = resolve_active_install(home, legacy)
+    source = home / ".claude/plugins/marketplaces/claude-plugins-official/external_plugins/telegram"
+    _validate_plugin_files(home, uid, source, contract, source_only=True)
+    target = old.root.with_name(SUPPORTED_VERSION)
+    if os.path.lexists(target):
+        _validate_plugin_files(home, uid, target, contract, source_only=False)
+    if not apply:
+        return ReconcileResult("upgrade-ready", SUPPORTED_VERSION, False), old
+    _require_upgrade_window(home, uid)
+    lock = _lock(home, uid)
+    try:
+        # Both old and new code are proven before dependency installation. Copy
+        # only pinned files, never marketplace node_modules, .in_use or extras.
+        resolve_active_install(home, legacy)
+        payloads = {}
+        for name, digest in contract.upstream_files.items():
+            data = _read_regular(home, source / name, uid, label=name, limit=MAX_SERVER_BYTES)
+            if hashlib.sha256(data).hexdigest() != digest:
+                raise _fail("джерело Telegram змінилося")
+            payloads[name] = data
+        if not os.path.lexists(target):
+            with tempfile.TemporaryDirectory(prefix=".telegram-upgrade-", dir=target.parent) as temporary:
+                prepared = Path(temporary) / SUPPORTED_VERSION
+                prepared.mkdir(mode=0o700)
+                for name, data in payloads.items():
+                    path = prepared / name
+                    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                    path.write_bytes(data)
+                    path.chmod(0o644)
+                if os.path.lexists(target):
+                    raise _fail("цільовий кеш Telegram з’явився під час підготовки")
+                os.rename(prepared, target)
+        _validate_plugin_files(home, uid, target, contract, source_only=False)
+        bun = home / ".local/bin/bun"
+        if not bun.is_file(): bun = home / ".bun/bin/bun"
+        try:
+            installed = subprocess.run([str(bun), "install", "--frozen-lockfile", "--ignore-scripts"],
+                cwd=target, env={"HOME": str(home), "PATH": f"{home}/.local/bin:{home}/.bun/bin:/usr/bin:/bin"},
+                capture_output=True, timeout=120)
+            if installed.returncode != 0:
+                raise _fail("залежності Telegram не встановлено; активним лишився старий кеш")
+        except (OSError, subprocess.TimeoutExpired):
+            raise _fail("залежності Telegram не встановлено; активним лишився старий кеш") from None
+        _validate_plugin_files(home, uid, target, contract, source_only=False)
+        resolve_active_install(home, legacy)
+        _require_upgrade_window(home, uid)
+        records[0].update(version=SUPPORTED_VERSION, installPath=str(target), gitCommitSha=UPSTREAM_COMMIT)
+        payload = (json.dumps(ledger, ensure_ascii=False, indent=2) + "\n").encode()
+        directory = _open_directory_chain_fd(home, ledger_path.parent, uid)
+        temporary = ".installed_plugins." + uuid.uuid4().hex
+        try:
+            fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory)
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(payload); handle.flush(); os.fsync(handle.fileno())
+            if _read_regular_at(directory, ledger_path.name, uid, label="plugin ledger", limit=MAX_JSON_BYTES) != before:
+                raise _fail("plugin ledger змінився; перемикання скасовано")
+            os.replace(temporary, ledger_path.name, src_dir_fd=directory, dst_dir_fd=directory)
+            os.fsync(directory)
+        finally:
+            try: os.unlink(temporary, dir_fd=directory)
+            except FileNotFoundError: pass
+            os.close(directory)
+        return ReconcileResult("upgraded", SUPPORTED_VERSION, True), ActiveInstall(
+            target, target / "server.ts", target / "package.json", target / ".claude-plugin/plugin.json")
+    finally:
+        os.close(lock)
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Перевіряє сумісність Telegram plugin 0.0.7 і golden patch.",
@@ -1670,6 +1662,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--marketplace-source-check", action="store_true")
+    parser.add_argument("--upgrade-legacy", action="store_true")
     return parser
 
 
@@ -1697,6 +1690,10 @@ def main(arguments: list[str] | None = None) -> int:
                 package=marketplace_root / "package.json",
                 manifest=marketplace_root / ".claude-plugin/plugin.json",
             )
+        elif options.upgrade_legacy:
+            result, install = upgrade_legacy(home, golden, contract_path, apply=options.apply)
+            if options.apply and result.status == "upgraded":
+                result, install = _reconcile_detailed(home, golden, contract_path, apply=True)
         else:
             result, install = _reconcile_detailed(
                 home,

@@ -7,7 +7,6 @@ from datetime import datetime
 import json
 import os
 from pathlib import Path
-import re
 import secrets
 import time
 from zoneinfo import ZoneInfo
@@ -58,7 +57,7 @@ def save(path: Path, row: dict) -> None:
 
 
 class Receipt:
-    def __init__(self, home: Path, via: str, peer, text: str, source: str, name: str = '', caller: str = ''):
+    def __init__(self, home: Path, via: str, peer, text: str, source: str, name: str = ''):
         outbox = home / '.claude/personal-inbox/outbox'
         outbox.mkdir(parents=True, mode=0o700, exist_ok=True)
         self.journal = outbox / 'sent.jsonl'
@@ -71,14 +70,12 @@ class Receipt:
         folder = outbox / 'receipts'
         folder.mkdir(mode=0o700, exist_ok=True)
         self.path = folder / (secrets.token_hex(16) + '.json')
-        # caller: which agent path sent (owner-send's caller(), '' unknown), so another path can tell its send apart.
         self.row = dict(ts=time.time(), via=via, peer=peer, name=name, chars=len(text), actor='agent',
-                        source=source, caller=caller, message_id='', state='uncertain', uncertain=True)
+                        source=source, message_id='', state='uncertain', uncertain=True)
         save(self.path, self.row)  # process death after handoff remains an uncertain attempt
 
     def finish(self, state: str, message_id: str = '') -> None:
-        # done: when the send ended; ts stays its start (a slow WhatsApp send can land long after it, Codex 10.11.2026).
-        self.row.update(state=state, message_id=str(message_id), uncertain=state == 'uncertain', done=time.time())
+        self.row.update(state=state, message_id=str(message_id), uncertain=state == 'uncertain')
         save(self.path, self.row)  # authoritative even if appending the shared index fails
         if state == 'failed':
             return
@@ -90,7 +87,7 @@ class Receipt:
 
 @contextmanager
 def attempt(home: Path, via: str, pending: dict, source: str, unknown):
-    receipt = Receipt(home, via, pending['peer'], pending['text'], source, pending.get('name', ''), pending.get('caller', ''))
+    receipt = Receipt(home, via, pending['peer'], pending['text'], source, pending.get('name', ''))
     result = {'message_id': ''}
     try:
         yield result
@@ -135,33 +132,3 @@ def known_ids(home: Path, via: str, peer=None) -> set[str]:
         except (OSError, ValueError, AttributeError):
             pass
     return found
-
-
-SETTLE = 180  # seconds a WhatsApp bridge must run before its archive has caught up with what the owner wrote meanwhile
-
-
-def bridge_settled(folder: Path) -> bool:
-    """WhatsApp, for owner-send, wa-digest and wa-chat alike: the bridge's archive answers «whose word is the newest»
-    only while the bridge runs and has run SETTLE seconds. Every bridge build since 19.08 rewrites status.json every
-    15 s: under 45 s old, and running by what that build reports — `connected: true` since 07.11.2026, or, from an
-    older build without that field, `linked: true` (11.11.2026: a tools refresh beside an older bridge read every
-    status as down and switched WhatsApp off). Its last start is the «[start] N.EPOCH.PID» line with the highest run
-    number in bridge.log or link.log; no such line, or a log that cannot be read — not settled."""
-    try:
-        state = json.loads((Path(folder) / 'status.json').read_text(encoding='utf-8'))
-        running = state['connected'] if 'connected' in state else state.get('linked')
-        if running is not True or time.time() - state.get('updated', 0) >= 45:
-            return False
-    except (OSError, ValueError, TypeError, AttributeError, KeyError):
-        return False
-    starts = []
-    for name in ('bridge.log', 'link.log'):
-        try:
-            with open(Path(folder) / name, 'rb') as log:
-                log.seek(max(0, os.fstat(log.fileno()).st_size - (1 << 20)))
-                starts += re.findall(rb'(?:^|\n)\[start\] ([0-9]+)\.([0-9]+)\.', log.read())
-        except FileNotFoundError:
-            continue
-        except OSError:
-            return False  # the log is there but unreadable: the fresh start may be in it
-    return bool(starts) and time.time() - max((int(run), int(at)) for run, at in starts)[1] >= SETTLE

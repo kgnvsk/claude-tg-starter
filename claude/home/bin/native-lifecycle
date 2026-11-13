@@ -357,6 +357,28 @@ def main():
     if owner not in map(str, access.get('admins', [])):
         raise ValueError('owner required')
     operation, args, message_id = request['operation'], request['args'], request.get('messageId')
+    if operation == 'whatsapp':
+        fields(args, 'action')
+        if args != {'action': 'resume'}:
+            raise ValueError('unsupported WhatsApp action')
+        source_message(owner, message_id)
+        with sqlite3.connect(regular(HOME / '.claude/channels/telegram/messages.db', 2**40).as_uri() + '?mode=ro', uri=True) as db:
+            row = db.execute("SELECT text FROM messages WHERE chat_id=? AND user_id=? AND message_id=? AND direction='in'",
+                             (owner, owner, message_id)).fetchone()
+        if not row or row[0].strip() != '/whatsapp_resume':
+            raise ValueError('exact owner resume command required')
+        import contextlib
+        import io
+        # A host call reads the protected native request; it is not a model-supplied environment proof.
+        os.environ['PERSONAL_INBOX_REEXEC'] = '1'
+        helper = module('owner-send')
+        output = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(output):
+                helper.resume_whatsapp_state()
+        except SystemExit as exc:
+            return {'status': 'paused', 'message': str(exc)}
+        return {'status': 'resumed', 'message': output.getvalue().strip()}
     if operation == 'reminder':
         return reminder(args, owner, message_id)
     if operation in ('due', 'settle'):

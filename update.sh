@@ -16,6 +16,8 @@
 # Usage: follow the stopped transaction in UPGRADING.md. The outer transaction
 # creates restart-hold.until, drains every worker, and invokes this script with
 # CLAUDE_UPDATE_MAINTENANCE=1. Direct execution is intentionally refused.
+# `--preflight-all`, run on the live agent from a staged kit, changes nothing and
+# names every check the window would stop on, not only the first one.
 set -euo pipefail
 
 [ "$(id -u)" -eq 0 ] || { echo "FATAL: цей скрипт потрібно запускати від root" >&2; exit 1; }
@@ -60,8 +62,14 @@ CORPORATE_STATE_DIR="$H/.claude/channels/telegram"
 CORPORATE_DB="$CORPORATE_STATE_DIR/messages.db"
 CORPORATE_MARKER="$CORPORATE_STATE_DIR/corporate-isolation-activated"
 CORPORATE_ISOLATION_ACTIVATED=0
+CORPORATE_PARKED_OWNER_PAUSES=0
 TG_CORPORATE_SESSIONS_LIVE=""
 CLAUDE_UPDATE_MAINTENANCE="${CLAUDE_UPDATE_MAINTENANCE:-0}"
+RUNTIME_RESOLUTION_ARGS=()
+if [ -n "${NOVSKY_UPDATE_RESOLUTIONS:-}" ]; then
+  RUNTIME_RESOLUTION_ARGS=(--resolutions "$NOVSKY_UPDATE_RESOLUTIONS")
+  export NOVSKY_UPDATE_RESOLUTIONS
+fi
 case "$CLAUDE_UPDATE_MAINTENANCE" in
   0|1) ;;
   *)
@@ -87,10 +95,31 @@ export NOVSKY_ALLOW_PINNED_LEGACY_SHARED_CONTEXT
 
 UPDATE_ACTION="${1:-}"
 case "${1:-}" in
-  ""|--license-preflight) ;;
+  ""|--license-preflight|--preflight-all) ;;
   *) echo "FATAL: unknown update option" >&2; exit 1 ;;
 esac
 [ "$#" -le 1 ] || { echo "FATAL: unexpected update arguments" >&2; exit 1; }
+# The update never asks the operator anything. Run as `bash -s` from a script, every child (install-core, the
+# video-edit doctor and its ffmpeg) inherited the rest of that script on stdin and could eat it (partner, 16.10).
+exec </dev/null
+# --preflight-all keeps going after a failed check and counts it here.
+WALLS=0
+wall() {
+  echo "WALL: $*" >&2
+  WALLS=$((WALLS + 1))
+}
+# BEGIN check runner
+# A function run after || or inside if has errexit switched off for every command in it, even under its own
+# set -e, so a failed first check is lost when a later one passes (Codex K262-P1-1). A check that must stop
+# the window runs as a plain command here, and its status is read afterwards.
+CHECK_STATUS=0
+run_check() {
+  set +e
+  "$@"
+  CHECK_STATUS=$?
+  set -e
+}
+# END check runner
 
 require_primary_service_stopped() {
   local state status=0
@@ -156,7 +185,11 @@ remove_maintenance_dropin() {
 }
 
 require_corporate_stopped_preflight() {
-  local receipt_digest
+  local receipt_digest fresh_preflight
+  CORPORATE_PARKED_OWNER_PAUSES=0
+  [ "$CLAUDE_UPDATE_MAINTENANCE" = 1 ] || return 1
+  require_valid_restart_hold || return 1
+  require_primary_service_stopped || return 1
   receipt_digest="$(python3 - "$CORPORATE_STOPPED_PREFLIGHT" <<'PY'
 import json
 import os
@@ -237,16 +270,41 @@ PY
     echo "FATAL: комплект оновлення не має corporate-control" >&2
     return 1
   }
-  runuser -u "$AGENT_USER" -- env HOME="$H" \
+  fresh_preflight="$(runuser -u "$AGENT_USER" -- env HOME="$H" \
     TELEGRAM_STATE_DIR="$CORPORATE_STATE_DIR" \
     CORPORATE_MODULE_DIR="$KIT/modules/telegram-corporate" \
     PATH="$H/.local/bin:$H/.bun/bin:/usr/local/bin:/usr/bin:/bin" \
     "$KIT/modules/telegram-corporate/bin/corporate-control" \
-    preflight --json --expect-digest "$receipt_digest" --expect-paused \
-    >/dev/null || {
+    preflight --json --expect-digest "$receipt_digest" --expect-paused)" || {
       echo "FATAL: stopped-preflight receipt більше не відповідає live-стану" >&2
       return 1
     }
+  # Only the staged stock controller classifies a retained provider refusal.
+  # The root-owned receipt's digest pins configuration; fresh output proves
+  # current DB quiescence. Never classify or rewrite FIFO rows in the updater.
+  CORPORATE_PARKED_OWNER_PAUSES="$(printf '%s' "$fresh_preflight" | python3 -c '
+import json, sys
+try:
+    value=json.load(sys.stdin)
+    runtime=value["plan"]["runtime"]
+    work=value["workStatus"]
+    if (type(value.get("schemaVersion")) is not int or value["schemaVersion"] != 1
+        or value.get("digest") != sys.argv[1] or value.get("digestMatches") is not True
+        or value.get("safeToMaintain") is not True or value.get("quiescent") is not True
+        or runtime.get("isolationActivated") is not True or runtime.get("phase2Enabled") is not True
+        or runtime.get("admissionState") != "paused" or work.get("ownerFifoStarted") is not False):
+        raise ValueError("unsafe current proof")
+    for key in ("unfinishedJobs","unfinishedChunks","sendingActions"):
+        if type(work.get(key)) is not int or work[key] != 0: raise ValueError("unfinished work")
+    count=work.get("parkedOwnerProviderPauses")
+    if type(count) is not int or not 0 <= count <= 100: raise ValueError("invalid retained count")
+    print(count)
+except (ValueError, TypeError, KeyError, AttributeError):
+    raise SystemExit(2)
+' "$receipt_digest")" || {
+    echo "FATAL: stopped-preflight не довів поточну безпечну паузу" >&2
+    return 1
+  }
 }
 
 validate_kit_checkout() {
@@ -264,7 +322,7 @@ validate_kit_checkout() {
   # /opt/claude-tg-starter, a targeted instance from /opt/claude-tg-starter@<user>.
   # Only the licence preflight runs from a staged kit beside the live one. This
   # runs before any kit code, so a refusal leaves the folder untouched.
-  if [ "$UPDATE_ACTION" != --license-preflight ]; then
+  if [ "$UPDATE_ACTION" != --license-preflight ] && [ "$UPDATE_ACTION" != --preflight-all ]; then
     own_kit=/opt/claude-tg-starter
     [ "$AGENT_USER" = claude ] || own_kit="$own_kit@$AGENT_USER"
     # /opt itself may be a symlink; the kit must be the real folder under it.
@@ -364,7 +422,11 @@ require_instance_service_target
 # Wrappers call --license-preflight while the agent is still running. Applying
 # an update always verifies again, including retries on existing installations.
 python3 "$KIT/assets/lib/agent-license.py" --saved-env "$ENV_SAVED" \
-  --bot-env "$H/.claude/channels/telegram/.env"
+  --bot-env "$H/.claude/channels/telegram/.env" || {
+    status=$?
+    [ "$UPDATE_ACTION" = --preflight-all ] || exit "$status"
+    wall "licence"
+  }
 # BEGIN pre-stop persona preflight
 # The outer updater runs --license-preflight while the service is still alive.
 # Check the same rendered personas install-core will check after the stop, using
@@ -404,17 +466,16 @@ preflight_personas_before_stop() (
   check_persona() {
     local source="$1" destination="$2" baseline="$3"
     render_template() {
-      local template="$1" output="$2" persona_tmp copy status
+      local template="$1" output="$2" persona_copy status
       shift 2
       # The agent renders a copy root made: Novsky keeps an old install's previous kit in its root-only
       # transaction folder, which the agent cannot open (AALL, 11.10.2026). The copy is root's and
       # read-only in a root folder, so the agent cannot change what was checked (Codex K255-P1-1).
-      persona_tmp="$(mktemp -d)"
-      [ -d "$persona_tmp" ] || return 1
-      chmod 0755 "$persona_tmp" || { rm -rf -- "$persona_tmp"; return 1; }
-      copy="$persona_tmp/template"
-      if ! install -m 0644 -- "$template" "$copy"; then
-        rm -rf -- "$persona_tmp"
+      persona_copy="$(mktemp -d)"
+      [ -d "$persona_copy" ] || return 1
+      chmod 0755 "$persona_copy" || { rm -rf -- "$persona_copy"; return 1; }
+      if ! install -m 0644 -- "$template" "$persona_copy/template"; then
+        rm -rf -- "$persona_copy"
         return 1
       fi
       status=0
@@ -424,8 +485,8 @@ preflight_personas_before_stop() (
         BOT_USERNAME="${BOT_USERNAME:-}" TIMEZONE="${TIMEZONE:-}" \
         CALENDAR_EMAIL="${CALENDAR_EMAIL:-}" DEPLOY_DATE="$(date +%F)" \
         AGENT_HOME="$H" AGENT_SERVICE="$AGENT_SERVICE" AGENT_USER="$AGENT_USER" \
-        python3 "$KIT/assets/lib/render-template.py" "$@" "$copy" "$output" || status=$?
-      rm -rf -- "$persona_tmp"
+        python3 "$KIT/assets/lib/render-template.py" "$@" "$persona_copy/template" "$output" || status=$?
+      rm -rf -- "$persona_copy"
       return "$status"
     }
     guard_managed_persona "$action" "$source" "$destination" "$baseline"
@@ -435,16 +496,160 @@ preflight_personas_before_stop() (
   check_persona "$role_profile" \
     "$H/.claude/CLAUDE.product.md" "$H/.claude/product/CLAUDE.product.sha256"
 )
-preflight_personas_before_stop
+run_check preflight_personas_before_stop
+if [ "$CHECK_STATUS" -ne 0 ]; then
+  status=$CHECK_STATUS
+  [ "$UPDATE_ACTION" = --preflight-all ] || exit "$status"
+  wall "managed persona"
+fi
 # END pre-stop persona preflight
-# BEGIN owner rules preflight
-# An agent from main's line keeps its owner rules in a library CLAUDE.md only names; install-core puts them back
-# in CLAUDE.md. A rule for a company chat cannot go there, so the update stops before the agent does.
-runuser -u "$AGENT_USER" -- python3 "$KIT/assets/lib/owner-rules-restore.py" --check "$H" >/dev/null || exit 2
-# END owner rules preflight
+# The same system unit/logrotate checks run before maintenance stops the agent.
+preflight_system_context_before_stop() (
+  CLAUDE_UPDATE_MAINTENANCE=1
+  source "$KIT/assets/lib/install-system-context.sh"
+  verify_instance_system_context
+)
+run_check preflight_system_context_before_stop
+if [ "$CHECK_STATUS" -ne 0 ]; then
+  status=$CHECK_STATUS
+  [ "$UPDATE_ACTION" = --preflight-all ] || exit "$status"
+  wall "system unit/logrotate requires reviewed migration"
+fi
 if [ "${1:-}" = --license-preflight ]; then
   exit 0
 fi
+# BEGIN all-walls preflight
+# AALL, 11.10.2026: one rollback after another, each on a wall found only after the stop (module file modes, the plugin
+# policy, skill and subagent baselines); Yuriy asked for this on 08.10. The window's own checks, read-only, on the live agent.
+if [ "$UPDATE_ACTION" = --preflight-all ]; then
+  for optional_name in MODULE_CHANNEL_PUBLISH MODULE_INSTAGRAM_DM MODULE_YOUTUBE_COMMENTS; do
+    optional_value="$(python3 "$KIT/assets/bin/saved-env-export" --value "$ENV_SAVED" "$optional_name")" || {
+      wall "$optional_name unreadable in $ENV_SAVED"
+      continue
+    }
+    case "$optional_value" in
+      ""|0) ;;
+      *) wall "$optional_name=$optional_value: the module needs its own reviewed migration" ;;
+    esac
+  done
+  feature_status=0
+  python3 "$KIT/assets/lib/product-config.py" --file "$KIT/assets/product/runtime.json" \
+    has-feature telegram-corporate-sessions || feature_status=$?
+  if [ "$feature_status" -eq 0 ]; then
+    runuser -u "$AGENT_USER" -- env HOME="$H" python3 \
+      "$KIT/modules/telegram-corporate/module-update-guard.py" check \
+      "$KIT/modules/telegram-corporate" \
+      "$H/.local/share/claude-telegram-corporate" \
+      "$H/.claude/product/corporate-module-baseline.json" "$KIT" || wall "corporate module"
+  elif [ "$feature_status" -ne 1 ]; then
+    wall "corporate module feature unreadable"
+  fi
+  python3 -B "$KIT/assets/lib/install-backup-context.py" --check-current \
+    --allow-maintenance-hold "${legacy_context_args[@]}" \
+    --home "$H" --user "$AGENT_USER" --unit "$AGENT_SERVICE" --engine claude >/dev/null \
+    || wall "backup context needs its migration"
+  env AGENT_USER="$AGENT_USER" bash "$KIT/assets/bin/update-agent-clis" --check || wall "Claude Code / Codex CLI"
+  # The window keeps the owner's tools and never downloads them, so each missing one stopped it after the stop
+  # (partner, 16.10: gh, then ~/.venvs/heif). The checks install-core runs right after the stop, read-only here.
+  preflight_window_dependencies() (
+    set -euo pipefail
+    local status=0
+    CLAUDE_UPDATE_MAINTENANCE=1
+    MODULE_TELEGRAM_CORPORATE="$(python3 "$KIT/assets/bin/saved-env-export" --value "$ENV_SAVED" MODULE_TELEGRAM_CORPORATE)"
+    MODULE_TELEGRAM_CORPORATE="${MODULE_TELEGRAM_CORPORATE:-1}"
+    MODULE_INSTAGRAM_DM="$(python3 "$KIT/assets/bin/saved-env-export" --value "$ENV_SAVED" MODULE_INSTAGRAM_DM)"
+    MODULE_INSTAGRAM_DM="${MODULE_INSTAGRAM_DM:-0}"
+    product_has_feature() {
+      local feature_status=0
+      python3 "$KIT/assets/lib/product-config.py" --file "$KIT/assets/product/runtime.json" \
+        has-feature "$1" || feature_status=$?
+      if [ "$feature_status" -eq 2 ]; then
+        echo "FATAL: конфігурація продукту некоректна" >&2
+        exit 2
+      fi
+      return "$feature_status"
+    }
+    source "$KIT/assets/lib/maintenance-preflight.sh"
+    verify_preserved_vercel_cli || status=1
+    verify_maintenance_dependencies || status=1
+    verify_external_side_effects || status=1
+    return "$status"
+  )
+  run_check preflight_window_dependencies
+  [ "$CHECK_STATUS" -eq 0 ] || wall "window dependencies: restore each missing one named above before the window"
+  plugin_drops="$(python3 "$KIT/assets/lib/preflight-maintenance-plugins.py" "$KIT" "$H")" || wall "managed plugin policy"
+  [ -z "${plugin_drops:-}" ] || echo "plugin policy: the window switches off $plugin_drops"
+  if cmp -s "$KIT/assets/product/telegram-plugin-compat.json" \
+      "$H/.claude/product/telegram-plugin-compat.json"; then
+    PREFLIGHT_RECONCILER="$KIT/assets/bin/reconcile-telegram-plugin"
+  else
+    PREFLIGHT_RECONCILER="$H/bin/reconcile-telegram-plugin"
+  fi
+  runuser -u "$AGENT_USER" -- env HOME="$H" /usr/bin/timeout --foreground 30s \
+    "$KIT/assets/bin/plugin-doctor" --json >/dev/null || wall "installed plugins (plugin-doctor)"
+  runuser -u "$AGENT_USER" -- env HOME="$H" /usr/bin/timeout --foreground 30s \
+    "$PREFLIGHT_RECONCILER" --marketplace-source-check >/dev/null || wall "Telegram plugin source"
+  runuser -u "$AGENT_USER" -- env HOME="$H" /usr/bin/timeout --foreground 30s \
+    "$PREFLIGHT_RECONCILER" --json >/dev/null 2>&1 || \
+    runuser -u "$AGENT_USER" -- env HOME="$H" /usr/bin/timeout --foreground 30s \
+      "$KIT/assets/bin/reconcile-telegram-plugin" --json --upgrade-legacy >/dev/null \
+    || wall "Telegram plugin receiver"
+  plan_status=0
+  plan_json="$(python3 "$KIT/assets/bin/update-safety-check" plan --home "$H" --kit "$KIT" \
+    --policy "$KIT/assets/product/managed-runtime.json" \
+    --baseline "$H/.claude/product/managed-runtime-baseline.json" \
+    --owner "$AGENT_USER" "${RUNTIME_RESOLUTION_ARGS[@]}" --json)" || plan_status=$?
+  [ "$plan_status" -eq 0 ] || wall "managed files: $(printf '%s' "$plan_json" | python3 -c '
+import json, sys
+try:
+    actions = json.load(sys.stdin).get("actions", [])
+except ValueError:
+    actions = []
+print(", ".join(a["path"] + " (" + a["action"] + ")" for a in actions if a.get("action") == "conflict")
+      or "update-safety-check plan refused")')"
+  preflight_managed_copies() (
+    set -euo pipefail
+    local exports_file
+    exports_file="$(mktemp)"
+    trap 'rm -f "${exports_file:-}"' EXIT
+    python3 "$KIT/assets/bin/saved-env-export" "$ENV_SAVED" \
+      AGENT_NAME OWNER_NAME OWNER_TG_USERNAME OWNER_CHAT_ID BOT_USERNAME \
+      TIMEZONE CALENDAR_EMAIL ACTIVE_ROLES > "$exports_file"
+    while IFS= read -r -d '' name && IFS= read -r -d '' value; do
+      printf -v "$name" '%s' "$value"
+      export "$name"
+    done < "$exports_file"
+    python3 "$KIT/assets/bin/update-safety-check" profile-export --home "$H" > "$exports_file"
+    while IFS= read -r -d '' name && IFS= read -r -d '' value; do
+      printf -v "$name" '%s' "$value"
+      export "$name"
+    done < "$exports_file"
+    case "$1" in
+      skills)
+        env DEPLOY_DATE="$(date +%F)" AGENT_HOME="$H" AGENT_SERVICE="$AGENT_SERVICE" AGENT_USER="$AGENT_USER" \
+          python3 "$KIT/assets/lib/reconcile-managed-skills.py" \
+          "$H/.claude/skills" "$KIT/assets/product/managed-skills.json" \
+          "$H/.claude/product/managed-skills.json" \
+          --source "$KIT/assets/skills" --external-source "$KIT/assets/external-skills" \
+          --baseline "$H/.claude/product/managed-skills-baseline.json" --check >/dev/null ;;
+      agents)
+        python3 "$KIT/assets/lib/reconcile-managed-skills.py" agents \
+          "$H/.claude/agents" "$KIT/assets/agents" "$H/.claude/product/managed-agents-baseline.json" \
+          --active-roles "${ACTIVE_ROLES:-}" --check >/dev/null ;;
+    esac
+  )
+  run_check preflight_managed_copies skills
+  [ "$CHECK_STATUS" -eq 0 ] || wall "managed skills changed on this server"
+  run_check preflight_managed_copies agents
+  [ "$CHECK_STATUS" -eq 0 ] || wall "managed subagents changed on this server"
+  if [ "$WALLS" -eq 0 ]; then
+    echo "preflight-all: no walls; the window may start"
+    exit 0
+  fi
+  echo "preflight-all: $WALLS wall(s); the window would stop on them, nothing was changed" >&2
+  exit 2
+fi
+# END all-walls preflight
 if [ "$CLAUDE_UPDATE_MAINTENANCE" != 1 ]; then
   echo "FATAL: update.sh працює лише всередині перевіреного maintenance-вікна з UPGRADING.md" >&2
   exit 1
@@ -510,7 +715,9 @@ require_primary_service_stopped
 # A changed managed-plugin policy needs a separate migration with its own
 # rollback plan. A normal kit update keeps the installed CLI/plugin cache and
 # checks the local pinned source before install-core changes any live file.
-python3 "$KIT/assets/lib/preflight-maintenance-plugins.py" "$KIT" "$H"
+# The one migration it takes, an earlier kit's pair switching plugins off, names
+# those plugins here; they are removed after install-core (plugin policy migration).
+PLUGIN_POLICY_DROPS="$(python3 "$KIT/assets/lib/preflight-maintenance-plugins.py" "$KIT" "$H")"
 # With an unchanged golden, use the staged verifier. When this kit advances
 # only its reviewed golden, the installed verifier must inspect the old local
 # contract before install-core installs the new one.
@@ -534,7 +741,9 @@ runuser -u "$AGENT_USER" -- env HOME="$H" \
   }
 runuser -u "$AGENT_USER" -- env HOME="$H" \
   /usr/bin/timeout --foreground 30s \
-  "$PREFLIGHT_RECONCILER" --json >/dev/null || {
+  "$PREFLIGHT_RECONCILER" --json >/dev/null 2>&1 || \
+  runuser -u "$AGENT_USER" -- env HOME="$H" /usr/bin/timeout --foreground 30s \
+    "$KIT/assets/bin/reconcile-telegram-plugin" --json --upgrade-legacy >/dev/null || {
     echo "FATAL: встановлений Telegram plugin не сумісний із комплектом" >&2
     exit 2
   }
@@ -570,6 +779,7 @@ agent_sqlite() {
   runuser -u "$AGENT_USER" -- sqlite3 -readonly "$CORPORATE_DB" "$@"
 }
 
+owner_fifo_pending=0
 if [ -L "$CORPORATE_DB" ]; then
   echo "FATAL: база Telegram не може бути символьним посиланням" >&2
   exit 2
@@ -626,15 +836,15 @@ elif [ -e "$CORPORATE_DB" ]; then
       owner_fifo_pending="$(agent_sqlite \
         "SELECT COUNT(*) FROM pending_inbound_deliveries;")"
     fi
-    [ "$owner_fifo_pending" = 0 ] || {
-      echo "FATAL: legacy owner FIFO ще не завершив усі вхідні повідомлення" >&2
-      exit 2
-    }
   fi
 fi
 
 if [ "$CORPORATE_ISOLATION_ACTIVATED" = 1 ]; then
   require_corporate_stopped_preflight || exit 2
+  [ "$owner_fifo_pending" = "$CORPORATE_PARKED_OWNER_PAUSES" ] || {
+    echo "FATAL: legacy owner FIFO ще не завершив усі вхідні повідомлення" >&2
+    exit 2
+  }
   [ -x "$H/bin/corporate-control" ] || {
     echo "FATAL: активована корпоративна ізоляція не має corporate-control" >&2
     exit 2
@@ -655,9 +865,10 @@ if value.get("admissionState") != "paused":
 for key in ("activeWorkers", "promptSubmitted", "sendingChunks"):
     if type(value.get(key)) is not int or value[key] != 0:
         raise SystemExit(2)
-if value.get("ownerFifoStarted") is not False:
+parked=int(sys.argv[1])
+if value.get("ownerFifoStarted") is not (parked > 0):
     raise SystemExit(2)
-' || {
+' "$CORPORATE_PARKED_OWNER_PAUSES" || {
     echo "FATAL: корпоративні сесії не перебувають у безпечному paused-стані" >&2
     exit 2
   }
@@ -673,9 +884,23 @@ if value.get("ownerFifoStarted") is not False:
     exit 2
   }
 else
+  [ "$owner_fifo_pending" = 0 ] || {
+    echo "FATAL: legacy owner FIFO ще не завершив усі вхідні повідомлення" >&2
+    exit 2
+  }
   # A stale saved/profile flag is never activation authority. Legacy routing
   # stays legacy until the owner completes the explicit paused cutover.
   TG_CORPORATE_SESSIONS_LIVE=0
+fi
+
+# Revalidate the candidate's current DB/digest immediately before the first
+# backup/code mutation; neither an earlier receipt nor an earlier count suffices.
+if [ "$CORPORATE_ISOLATION_ACTIVATED" = 1 ]; then
+  require_corporate_stopped_preflight || exit 2
+  [ "$owner_fifo_pending" = "$CORPORATE_PARKED_OWNER_PAUSES" ] || {
+    echo "FATAL: збережена черга власника змінилася перед оновленням" >&2
+    exit 2
+  }
 fi
 
 # Keep one transaction-local, root-only SQLite recovery source before the first
@@ -760,6 +985,19 @@ cleanup_exports() {
   rm -f "$SAVED_EXPORTS"
 }
 trap 'cleanup_exports; remove_maintenance_dropin' EXIT
+# The seller changes an agent's paid modules in Novsky; the request outranks the saved list (owner, 19.10.2026).
+_requested_modules_set=0
+_requested_modules=""
+if [ "${NOVSKY_MODULES_REQUEST+x}" = x ]; then
+  _requested_modules_set=1
+  _requested_modules="$NOVSKY_MODULES_REQUEST"
+fi
+_requested_contact_set=0
+_requested_contact=""
+if [ "${NOVSKY_MODULES_CONTACT_REQUEST+x}" = x ]; then
+  _requested_contact_set=1
+  _requested_contact="$NOVSKY_MODULES_CONTACT_REQUEST"
+fi
 python3 "$KIT/assets/bin/saved-env-export" "$ENV_SAVED" > "$SAVED_EXPORTS"
 # Novsky can supply a new key privately when migrating an older saved config.
 _requested_license_key="${NOVSKY_LICENSE_KEY:-}"
@@ -771,6 +1009,12 @@ done < "$SAVED_EXPORTS"
 [ -z "$_requested_license_key" ] || export NOVSKY_LICENSE_KEY="$_requested_license_key"
 [ -z "$_requested_bot_token" ] || export TELEGRAM_BOT_TOKEN="$_requested_bot_token"
 unset _requested_license_key _requested_bot_token
+if [ "${_requested_modules_set:-0}" = 1 ]; then
+  export NOVSKY_MODULES="$_requested_modules"
+  [ "${_requested_contact_set:-0}" = 1 ] || export NOVSKY_MODULES_CONTACT="${NOVSKY_MODULES_CONTACT:-}"
+fi
+[ "${_requested_contact_set:-0}" = 0 ] || export NOVSKY_MODULES_CONTACT="$_requested_contact"
+unset _requested_modules_set _requested_modules _requested_contact_set _requested_contact NOVSKY_MODULES_REQUEST NOVSKY_MODULES_CONTACT_REQUEST
 rm -f "$SAVED_EXPORTS"
 SAVED_EXPORTS=""
 
@@ -845,7 +1089,22 @@ else
   }
 fi
 
-# ---- 3. converge only the reviewed official Telegram 0.0.7 boundary ----
+# BEGIN plugin policy migration
+# The preflight allowed the installed earlier pair only to switch these plugins off
+# (Yuriy, 08.10.2026: a 14.08 install still had example-skills, dropped on 15.08).
+# install-core wrote the new policy and settings; the stale plugins themselves go
+# before the plugin check. The window snapshot holds ~/.claude/plugins, so a later
+# failure restores them with everything else.
+if [ -n "${PLUGIN_POLICY_DROPS:-}" ]; then
+  echo "[4/5] прибираю плагіни, яких комплект більше не постачає: $PLUGIN_POLICY_DROPS"
+  runuser -u "$AGENT_USER" -- env HOME="$H" "$H/bin/install-plugins" --stale-only || {
+    echo "FATAL: не вдалося прибрати застарілі плагіни" >&2
+    exit 2
+  }
+fi
+# END plugin policy migration
+
+# ---- 3. migrate a proven legacy cache, then converge the reviewed golden ----
 echo "[4/5] перевіряю Telegram plugin 0.0.7 і накладаю сумісний golden"
 require_primary_service_stopped
 runuser -u "$AGENT_USER" -- env HOME="$H" \
@@ -855,7 +1114,7 @@ runuser -u "$AGENT_USER" -- env HOME="$H" \
   }
 TELEGRAM_RECONCILE_RECEIPT="$(
   runuser -u "$AGENT_USER" -- env HOME="$H" \
-    "$H/bin/reconcile-telegram-plugin" --apply --json
+    "$H/bin/reconcile-telegram-plugin" --apply --json --upgrade-legacy
 )"
 schema_relative="$(
   printf '%s' "$TELEGRAM_RECONCILE_RECEIPT" | python3 -c '

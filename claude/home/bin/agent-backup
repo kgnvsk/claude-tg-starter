@@ -62,14 +62,8 @@ SECRET_SUFFIXES = (".key", ".pem", ".p12", ".pfx")
 MAX_FILE_BYTES = 100 * 1024 * 1024
 MANAGED_PATH = re.compile(r"^bin/[a-z0-9][a-z0-9_.-]*$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
-# For refusing a file, an «sk-» key starts a word (or follows - or _) and holds a run of 20+ letters and digits, as old
-# sk- keys and the sk-proj-, sk-ant-, sk-svcacct- and sk-or- ones do; agent-github-backup reads keys the same way.
-# «sk-» inside a word is not one: a news link «…zapusk-eksportu…» or a note «war-risk-…» refused every backup of
-# Руфус's vault (02.11.2026). Masking settings values still takes every match.
-OPENAI_KEY = re.compile(rb"sk-(?:proj-|ant-)?[A-Za-z0-9_-]{20,}")
-KEY_RUN = re.compile(rb"[A-Za-z0-9]{20,}")
 SECRET_PATTERNS = (
-    OPENAI_KEY,
+    re.compile(rb"sk-(?:proj-|ant-)?[A-Za-z0-9_-]{20,}"),
     re.compile(rb"\b\d{8,12}:AA[A-Za-z0-9_-]{20,}\b"),
     re.compile(rb"(?:ghp_|github_pat_)[A-Za-z0-9_]{20,}"),
     re.compile(rb"xox[baprs]-[A-Za-z0-9-]{20,}"),
@@ -115,21 +109,8 @@ def connection_literals(home: str, fingerprint: tuple) -> frozenset[bytes]:
     return frozenset(sanitizer.known_secret_literals(Path(home), include_paths=[".config/novsky/secrets.json"]))
 
 
-def key_shaped(data: bytes, match: re.Match) -> bool:
-    """Any «sk-» in the match that starts a word or follows - or _, with a 20+ run after it; linear in the match."""
-    token = match.group(0)
-    runs = [run.start() for run in KEY_RUN.finditer(token)]
-    at = 0
-    while runs and at >= 0:
-        if runs[-1] >= at + 3 and not data[match.start() + at - 1:match.start() + at].isalnum():
-            return True
-        at = token.find(b"sk-", at + 1)
-    return False
-
-
 def contains_secret(data: bytes) -> bool:
-    if any(key_shaped(data, match) for match in OPENAI_KEY.finditer(data)): return True
-    if any(pattern.search(data) for pattern in SECRET_PATTERNS[1:]): return True
+    if any(pattern.search(data) for pattern in SECRET_PATTERNS): return True
     private = HOME / ".config/novsky/secrets.json"
     for candidate in (private, private.parent, private.parent.parent):
         if candidate.is_symlink(): raise ValueError("unsafe connection store")

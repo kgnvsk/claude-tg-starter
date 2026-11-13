@@ -25,31 +25,6 @@ the latter is what killed Cash on 2026-06-25.
 The matching CLAUDE.md rule ("НИКОГДА не запускай claude mcp …") is the soft
 guard; this hook is the hard backstop the model can't talk itself past.
 
-It also blocks a wait loop that can never end: `while pgrep -f X` / `until ! pgrep -f X` whose own
-command line contains X. The CLI runs the command through `bash -c "<command>"`, so `pgrep -f X` finds that
-very shell and the loop spins for days, keeping the agent «busy» so its update and receipts switch never
-start (Руфус 6 days, Сорька 9 days, Провік, 01.11.2026). Such a pgrep always finds its own shell, so inside a
-loop (condition, body or $( )) it never ends or ends at once; it is refused in any syntax. The bracket form
-`[x]yz`, a PID wait, an exact `-x` command line and `-P "$$"` in a command that is just the loop pass.
-
-It also keeps the session that answers people from waiting in the foreground. A while/until/for loop that
-sleeps, or sleeps adding up to more than a minute, keep the turn open, and the receiver holds every new message
-until the turn ends: Руфус polled his own background retry for up to 10 minutes and his owner's five messages
-waited (01–02.11.2026). Such a wait is refused there with the way out: the same command with
-run_in_background=true, then end the turn and answer on the task notification. A worker's call (agent_id), a
-headless scheduled or nested run (ATARAX_SUPPRESS_TELEGRAM=1), a background command, a Bash timeout of at most
-60000 ms and a shell ended by `timeout` of at most a minute pass. A function only defined runs nothing; a called one
-counts. It reads sleep polling only, not every wait: `tail -f`, `read -t`, `wait` or a path-qualified timeout pass.
-
-An rm target that the CLI stops on for dangerous-delete confirmation in an unseen terminal is refused first, so
-the chat does not go silent (Mani, 03.11.2026). Measured on CLI 2.1.317: a bare `*` (the current folder),
-`$VAR/` followed by a glob, another variable, a slash or nothing (`"$OUT"/*`, `"$DIR/$FILE"`), `$VAR/` plus a
-top-level folder name (`"$X"/tmp`), a whole `$(…)` or backtick target, a relative `…/*` with `..`, and a
-relative `…/*` after a `cd` the CLI cannot follow (an expansion, `~`, `..`, a glob, a flag or a folder that does not exist yet). `"$OUT"/frames/*`, `~/x/*`,
-`./v/*`, `*.png` and `frames/*` after `cd` into an existing folder run without a question and pass. The way out
-is a new `mktemp -d` directory, or the full path in rm itself with every variable as `${VAR:?}`. Other targets
-still go through Claude's own deletion checks; this is a narrow liveness guard, not a replacement for them.
-
 Bypass (rarely needed): touch ~/.claude/state/no-nested-claude-guard.bypass
 """
 import json
@@ -64,35 +39,83 @@ MAX_UNWRAP_DEPTH = 4  # `bash -c "bash -c …"` must still terminate
 
 
 def segments(cmd: str):
-    """Split a command line into pipeline/sequence segments on ; | & (incl && ||)."""
-    return re.split(r"&&|\|\||[;|&]", cmd)
+    """Split actual shell separators, preserving quoted text for shell -c."""
+    start = 0
+    quote = None
+    escaped = False
+    for i, char in enumerate(cmd):
+        if escaped:
+            escaped = False
+        elif char == "\\" and quote != "'":
+            escaped = True
+        elif quote:
+            if char == quote:
+                quote = None
+        elif char in {"'", '"'}:
+            quote = char
+        elif char in ";|&\n":
+            yield cmd[start:i]
+            start = i + 1
+    yield cmd[start:]
 
 
-def first_executable(seg: str):
-    """Return (exe_basename, rest_tokens, env_prefix) for a segment.
-    Skips VAR=val / env prefixes but hands them back, because one of them
-    decides whether a nested run is safe. Returns (None, [], {}) if empty."""
+def first_executable(seg: str, inherited=None):
+    """Unwrap common execution prefixes; apply their real env reset/unset rules.
+
+    This is a guard for literal commands, not a shell interpreter or sandbox.
+    Reads such as command -v, grep and pgrep do not execute their arguments.
+    """
     try:
         toks = shlex.split(seg)
     except ValueError:
         toks = seg.split()
-    i = 0
-    assigned = {}
-    while i < len(toks):
-        t = toks[i]
-        if t == "env":          # `env claude …`
-            i += 1
-            continue
-        if re.match(r"^\w+=", t):  # `VAR=val claude …`
-            key, _, value = t.partition("=")
+    assigned = dict(inherited or {})
+    while toks:
+        if re.match(r"^[A-Za-z_][A-Za-z_0-9]*=", toks[0]):
+            key, _, value = toks.pop(0).partition("=")
             assigned[key] = value
-            i += 1
             continue
-        break
-    if i >= len(toks):
-        return None, [], {}
-    exe = os.path.basename(toks[i])
-    return exe, toks[i + 1:], assigned
+        exe = os.path.basename(toks[0])
+        if exe not in {"env", "timeout", "nice", "command", "exec", "nohup"}:
+            return exe, toks[1:], assigned
+        rest = toks[1:]
+        if exe == "command" and any(t in {"-v", "-V"} for t in rest):
+            return exe, rest, assigned
+        i = 0
+        while i < len(rest) and rest[i].startswith("-"):
+            option = rest[i]
+            i += 1
+            if option == "--":
+                break
+            if exe == "env":
+                if option in {"-i", "-", "--ignore-environment"}:
+                    assigned.clear()
+                elif option in {"-u", "--unset"} and i < len(rest):
+                    assigned.pop(rest[i], None)
+                    i += 1
+                elif option.startswith("--unset="):
+                    assigned.pop(option.split("=", 1)[1], None)
+                elif option.startswith("-u"):
+                    assigned.pop(option[2:], None)
+                elif option in {"-C", "--chdir"}:
+                    i += 1
+                elif option in {"-S", "--split-string"} and i < len(rest):
+                    rest[i:i + 1] = shlex.split(rest[i])
+                elif option.startswith("--split-string="):
+                    rest[i:i] = shlex.split(option.split("=", 1)[1])
+            elif exe == "timeout" and option in {"-s", "--signal", "-k", "--kill-after"}:
+                i += 1
+            elif exe == "nice" and option in {"-n", "--adjustment"}:
+                i += 1
+            elif exe == "exec":
+                if option == "-a":
+                    i += 1
+                elif "c" in option[1:]:
+                    assigned.clear()
+        if exe == "timeout":
+            i += 1  # duration precedes the executable
+        toks = rest[i:]
+    return None, [], assigned
 
 
 def effective_commands(seg: str, inherited=None, depth: int = 0):
@@ -102,8 +125,7 @@ def effective_commands(seg: str, inherited=None, depth: int = 0):
     scanned by the same rule as a bare command; VAR=val prefixes on the
     wrapper stay in force inside it, which keeps the suppressed headless form
     allowed through a shell as well."""
-    exe, rest, assigned = first_executable(seg)
-    env = {**(inherited or {}), **assigned}
+    exe, rest, env = first_executable(seg, inherited)
     if exe in SHELL_WRAPPERS and depth < MAX_UNWRAP_DEPTH:
         for i, tok in enumerate(rest[:-1]):
             if re.fullmatch(r"-[a-zA-Z]*c", tok):
@@ -111,720 +133,6 @@ def effective_commands(seg: str, inherited=None, depth: int = 0):
                     yield from effective_commands(sub, env, depth + 1)
                 return
     yield exe, rest, env
-
-
-PGREP_SHORT_VALUES = set("dgGPstuUFrO")
-PGREP_LONG_VALUES = {"--delimiter", "--pgroup", "--group", "--parent", "--session", "--terminal", "--euid", "--uid",
-                     "--pidfile", "--runstates", "--ns", "--nslist", "--older", "--signal", "--cgroup", "--env"}
-OPERATORS = ("&&", "||", ";;", "|&", ";", "&", "|", "(", ")")
-REDIRECT = re.compile(r"\d*(?:<<<|<<-|<<|&>>|&>|>>|>&|<&|>\||<>|>|<)")
-KEYWORDS = {"if", "then", "elif", "else", "fi", "do", "done", "while", "until", "for", "case", "esac", "{", "}", "!"}
-PASS_THROUGH = {"env", "command", "builtin", "nohup", "exec", "time", "sudo", "nice"}
-
-
-class Script(str):
-    """A here-document a shell reads as its script, with the simple command that reads it (for its `timeout`)."""
-
-    def __new__(cls, value, command=()):
-        script = super().__new__(cls, value)
-        script.command = list(command)
-        return script
-
-
-class Word(str):
-    """A shell word as the shell passes it on: quotes removed, a `$$` this shell expands marked.
-
-    `subs` are the $(...) and backtick bodies the shell runs; `quoted` tells a keyword from data; `star`: the last
-    character other than `/` is an unquoted `*`, so the shell globs it (`"frames"/*` yes, `"frames/*"` no)."""
-
-    def __new__(cls, value, subs=(), quoted=False, star=False):
-        word = super().__new__(cls, value)
-        word.subs, word.quoted, word.star = list(subs), quoted, star
-        return word
-
-
-def pid_marker(depth: int) -> str:
-    return f"\x00pid{depth}\x00"
-
-
-HEREDOC_IN_TEXT = re.compile(r"(?<!<)<<(?!<)(-?)[ \t]*")
-
-
-def closing(text: str, i: int, opening: str, close: str) -> int:
-    """Index of the bracket that closes an expansion opened just before i, skipping quoted text.
-    Inside $( ) a comment or here-document data is skipped too (an apostrophe there is no quote);
-    inside ${ } a # is part of the expansion (${#value})."""
-    command = opening == "("
-    level, pending, start = 1, [], i
-    while i < len(text):
-        c = text[i]
-        if c == "\n" and pending:
-            i += 1
-            for delimiter, strip in pending:
-                ended = False
-                while i < len(text):
-                    j = text.find("\n", i)
-                    j = len(text) if j < 0 else j
-                    line, i = text[i:j], j + 1
-                    if (line.lstrip("\t") if strip else line) == delimiter:
-                        ended = True
-                        break
-                if not ended:
-                    raise ValueError("here-document without its delimiter line")
-            pending = []
-            continue
-        if c == "\\":
-            i += 2
-            continue
-        if command and c == "#" and (i == start or text[i - 1] in " \t\n;&|("):
-            j = text.find("\n", i)
-            i = len(text) if j < 0 else j
-            continue
-        heredoc = HEREDOC_IN_TEXT.match(text, i) if command and c == "<" else None
-        if heredoc:
-            delimiter, i = read_word(text, heredoc.end(), 0, literal=True)
-            pending.append((str(delimiter), heredoc.group(1) == "-"))
-            continue
-        if c in "'\"":
-            j = i + 1
-            while j < len(text) and text[j] != c:
-                j += 2 if c == '"' and text[j] == "\\" else 1
-            i = j + 1
-            continue
-        level += (c == opening) - (c == close)
-        if level == 0:
-            return i
-        i += 1
-    raise ValueError("unclosed expansion")
-
-
-def expansion(text: str, i: int, depth: int, value: list, subs: list, literal: bool = False) -> int:
-    """Append what the shell makes of text[i] (a character or one whole expansion); return the next index.
-    `literal` (a here-document delimiter): the same word boundaries, but nothing expands or runs."""
-    if text.startswith("$(", i):
-        j = closing(text, i + 2, "(", ")")
-        if not literal:
-            subs.append(text[i + 2:j])
-        value.append(text[i:j + 1])
-        return j + 1
-    if text[i] == "`":
-        j = i + 1
-        while j < len(text) and text[j] != "`":
-            j += 2 if text[j] == "\\" else 1
-        if j >= len(text):
-            raise ValueError("unclosed backtick")
-        if not literal:
-            subs.append(text[i + 1:j])
-        value.append(text[i:j + 1])
-        return j + 1
-    if text.startswith("${", i):
-        j = closing(text, i + 2, "{", "}")
-        value.append(text[i:j + 1])
-        return j + 1
-    if text.startswith("$$", i):
-        value.append("$$" if literal else pid_marker(depth))
-        return i + 2
-    value.append(text[i])
-    return i + 1
-
-
-def read_word(text: str, i: int, depth: int, literal: bool = False):
-    value, subs, quoted, star, n = [], [], False, False, len(text)
-    while i < n and text[i] not in " \t\r\n;&|()<>":
-        c, mark = text[i], len(value)
-        bare = c not in "\\'\"" and not text.startswith("$'", i)
-        if c == "\\":
-            value.append(text[i + 1:i + 2] if text[i + 1:i + 2] != "\n" else "")
-            i, quoted = i + 2, True
-        elif c == "'" or text.startswith("$'", i):
-            start = i + (2 if c == "$" else 1)
-            j = start
-            while j < n and text[j] != "'":
-                j += 2 if c == "$" and text[j] == "\\" else 1
-            if j >= n:
-                raise ValueError("unclosed quote")
-            value.append(text[start:j])  # literal: nothing in it runs or expands
-            i, quoted = j + 1, True
-        elif c == '"':
-            i, quoted = i + 1, True
-            while i < n and text[i] != '"':
-                if text[i] == "\\" and i + 1 < n:
-                    value.append(text[i + 1] if text[i + 1] in '"\\$`' else text[i:i + 2])
-                    i += 2
-                else:
-                    i = expansion(text, i, depth, value, subs, literal)
-            if i >= n:
-                raise ValueError("unclosed quote")
-            i += 1
-        else:
-            i = expansion(text, i, depth, value, subs, literal)
-        added = "".join(value[mark:]).rstrip("/")
-        if added:
-            star = bare and added.endswith("*")
-    return Word("".join(value), subs, quoted, star), i
-
-
-def is_operator(token) -> bool:
-    return not isinstance(token, Word)
-
-
-def keyword(token, *names) -> bool:
-    return isinstance(token, Word) and not token.quoted and str(token) in (names or KEYWORDS)
-
-
-def command_start(tokens, i) -> bool:
-    previous = tokens[i - 1] if i else None
-    return previous is None or keyword(previous) or (is_operator(previous) and not REDIRECT.fullmatch(previous))
-
-
-def simple_commands(tokens):
-    words = []
-    for k, token in enumerate(tokens):
-        if is_operator(token) or (keyword(token) and command_start(tokens, k)):
-            if words:
-                yield words
-            words = []
-        else:
-            words.append(token)
-    if words:
-        yield words
-
-
-def executed(words):
-    """(executable basename, its arguments) after assignments and pass-through words like sudo or timeout."""
-    i = 0
-    while i < len(words):
-        if re.match(r"^[A-Za-z_]\w*=", words[i]) or words[i] in PASS_THROUGH \
-                or (i and words[i - 1] in PASS_THROUGH and words[i].startswith("-")):
-            i += 1
-        elif words[i] == "timeout":  # timeout [-s SIG] [-k T] DURATION COMMAND
-            i += 1
-            while i < len(words) and words[i].startswith("-"):
-                i += 2 if words[i] in ("-s", "-k", "--signal", "--kill-after") else 1
-            i += 1
-        else:
-            break
-    return (os.path.basename(words[i]), words[i + 1:]) if i < len(words) else (None, [])
-
-
-def runs_shell_script(words) -> bool:
-    exe, rest = executed(words)
-    return exe in SHELL_WRAPPERS and not any(re.fullmatch(r"-[a-zA-Z]*c", word) for word in rest)
-
-
-def lex(text: str, depth: int = 0):
-    """(tokens, scripts): operators as str and words as Word, comments and here-document data left out;
-    `scripts` are here-documents a shell reads as its script, with the `$$` this shell expands marked."""
-    tokens, scripts, pending, i, n = [], [], [], 0, len(text)
-    while i < n:
-        c = text[i]
-        if c == "\n":
-            tokens.append("\n")
-            i += 1
-            for command, delimiter, strip, expands in pending:
-                lines, ended = [], False
-                while i < n:
-                    j = text.find("\n", i)
-                    j = n if j < 0 else j
-                    line, i = text[i:j], j + 1
-                    if (line.lstrip("\t") if strip else line) == delimiter:
-                        ended = True
-                        break
-                    lines.append(line)
-                if not ended:
-                    raise ValueError("here-document without its delimiter line")
-                if command is not None:
-                    body = "\n".join(lines)
-                    scripts.append(Script(body.replace("$$", pid_marker(depth)) if expands else body, command))
-            pending = []
-        elif c in " \t\r":
-            i += 1
-        elif text.startswith("\\\n", i):
-            i += 2
-        elif c == "#":  # only at a word start: the rest of the line, never its newline
-            j = text.find("\n", i)
-            i = n if j < 0 else j
-        elif REDIRECT.match(text, i):
-            op = REDIRECT.match(text, i).group(0)
-            words = list(simple_commands(tokens[len(tokens) - next(
-                (k for k, t in enumerate(reversed(tokens)) if is_operator(t) and t in OPERATORS + ("\n",)), len(tokens)):]))
-            tokens.append(op)
-            i += len(op)
-            if re.fullmatch(r"\d*<<-?", op):
-                while i < n and text[i] in " \t":
-                    i += 1
-                word, i = read_word(text, i, depth, literal=True)
-                tokens.append(word)
-                pending.append((words[0] if words and runs_shell_script(words[0]) else None, str(word),
-                                op.endswith("-"), not word.quoted))
-        else:
-            op = next((o for o in OPERATORS if text.startswith(o, i)), None)
-            if op:
-                tokens.append(op)
-                i += len(op)
-            else:
-                word, i = read_word(text, i, depth)
-                tokens.append(word)
-    return tokens, scripts
-
-
-def loop_end(tokens, do: int) -> int:
-    nested = 1
-    for k in range(do + 1, len(tokens)):
-        if keyword(tokens[k], "do", "done") and command_start(tokens, k):
-            nested += 1 if tokens[k] == "do" else -1
-            if nested == 0:
-                return k
-    return len(tokens)
-
-
-def wait_loops(tokens):
-    """(start, done) of every while/until loop."""
-    loops = []
-    for i, token in enumerate(tokens):
-        if keyword(token, "while", "until") and command_start(tokens, i):
-            do = next((j for j in range(i + 1, len(tokens)) if keyword(tokens[j], "do") and command_start(tokens, j)), len(tokens))
-            loops.append((i, loop_end(tokens, do)))
-    return loops
-
-
-def only_loop(tokens, start: int, done: int) -> bool:
-    """The whole script is this one loop, run by the shell that parses it (nothing piped, chained,
-    grouped or sent to the background around it), so its `$$` is the loop's own shell."""
-    def separator(t):
-        return is_operator(t) and t in ("\n", ";")
-    return all(map(separator, tokens[:start])) and all(map(separator, tokens[done + 1:]))
-
-
-def loop_pgreps(tokens, depth: int, in_subshell: bool = False):
-    """(arguments, runs in a child shell) of every pgrep the tokens run, $( ) included."""
-    for start, end, words in spans(tokens):
-        level = sum(is_operator(t) and t == "(" for t in tokens[:start]) - sum(is_operator(t) and t == ")" for t in tokens[:start])
-        exe, args = executed(words)
-        if exe == "pgrep":
-            yield args, in_subshell or level > 0
-        for word in words:
-            for body in word.subs:  # $(...) runs in a child of this shell and shares its $$
-                inner, _ = lex(body, depth)
-                yield from loop_pgreps(inner, depth, True)
-
-
-def spans(tokens):
-    """(start, end, words) of every simple command, end exclusive."""
-    start, words = None, []
-    for k, token in enumerate(tokens):
-        if is_operator(token) or (keyword(token) and command_start(tokens, k)):
-            if words:
-                yield start, k, words
-            start, words = None, []
-        else:
-            start = k if start is None else start
-            words.append(token)
-    if words:
-        yield start, len(tokens), words
-
-
-def pgrep_options(args):
-    """(pattern if -f, exact -x, parent -P) of one pgrep call."""
-    full = exact = False
-    parent = None
-    j = 0
-    while j < len(args) and args[j].startswith("-") and args[j] not in ("-", "--"):
-        flag = args[j]
-        if flag.startswith("--"):
-            name, eq, value = flag.partition("=")
-            if name in PGREP_LONG_VALUES and not eq:
-                value = args[j + 1] if j + 1 < len(args) else ""
-                j += 1
-            full = full or name == "--full"
-            exact = exact or name == "--exact"
-            parent = value if name == "--parent" else parent
-        else:
-            for k, letter in enumerate(flag[1:], 1):
-                if letter in PGREP_SHORT_VALUES:
-                    value = flag[k + 1:]
-                    if not value:
-                        value = args[j + 1] if j + 1 < len(args) else ""
-                        j += 1
-                    parent = value if letter == "P" else parent
-                    break
-                full = full or letter == "f"
-                exact = exact or letter == "x"
-        j += 1
-    if j < len(args) and args[j] == "--":
-        j += 1
-    return (str(args[j]) if full and j < len(args) else None), exact, parent
-
-
-def pgrep_matches_own_shell(args, cmd: str, script: str, here: bool, depth: int):
-    pattern, exact, parent = pgrep_options(args)
-    if pattern is None:
-        return None
-    if here and parent == pid_marker(depth):
-        return None  # only children of the very shell running the loop: never that shell
-    try:
-        if exact:
-            # -x must match a whole command line: the shell's own is `bash -c <command>` with the CLI's wrapping.
-            lines = [f"{shell} -c {text}" for shell in ("bash", "/bin/bash", "/usr/bin/bash", "sh", "/bin/sh")
-                     for text in {cmd, script}]
-            found = any(re.fullmatch(pattern, line, re.S) for line in lines + [f"wrapper {cmd} wrapper"])
-        else:
-            found = re.search(pattern, cmd) is not None
-    except re.error:
-        return None
-    return pattern if found else None
-
-
-RAW_PGREP = re.compile(r"\bpgrep\b([^\n;|&)]*)")
-
-
-def raw_self_matching_wait(cmd: str):
-    """Fallback when the command cannot be read: any loop word plus a pgrep -f matching the text."""
-    if not re.search(r"\b(?:while|until)\b", cmd):
-        return None
-    for match in RAW_PGREP.finditer(cmd):
-        try:
-            words = shlex.split(match.group(1))
-        except ValueError:
-            words = [w.strip("'\"") for w in match.group(1).split()]
-        found = pgrep_matches_own_shell(words, cmd, cmd, False, 0)
-        if found:
-            return found
-    return None
-
-
-def self_matching_wait(cmd: str, script: str = None, depth: int = 0):
-    """The pattern of a `pgrep -f` inside a while/until loop that matches its own shell, or None.
-
-    Such a pgrep always finds that shell, so the loop never ends or ends at once, whatever the
-    syntax: condition, body or $( ). It passes only when pgrep cannot see the shell: an exact -x
-    pattern that cannot match its command line, or -P "$$" in a script that is just that loop.
-    Comments and here-document data are not run; a script given to a shell is read too. A command
-    that cannot be read falls back to the plain text check instead of passing."""
-    if "pgrep" not in cmd:
-        return None
-    script = cmd if script is None else script
-    try:
-        tokens, scripts = lex(script, depth)
-        for start, done in wait_loops(tokens):
-            alone = only_loop(tokens, start, done)
-            for args, child in loop_pgreps(tokens[start + 1:done], depth):
-                found = pgrep_matches_own_shell(args, cmd, script, alone and not child, depth)
-                if found:
-                    return found
-        if depth < MAX_UNWRAP_DEPTH:
-            for words in simple_commands(tokens):
-                exe, rest = executed(words)
-                if exe in SHELL_WRAPPERS:
-                    for k, word in enumerate(rest[:-1]):
-                        if re.fullmatch(r"-[a-zA-Z]*c", word):
-                            scripts.append(str(rest[k + 1]))
-                            break
-            for inner in scripts:
-                found = self_matching_wait(cmd, inner, depth + 1)
-                if found:
-                    return found
-    except (ValueError, RecursionError):
-        return raw_self_matching_wait(script)
-    return None
-
-
-WAIT_BOUND = 60  # seconds the session that answers people may wait in the foreground
-DURATION = re.compile(r"(\d+(?:\.\d*)?|\.\d+)([smhd]?)")
-UNITS = {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}
-RAW_SLEEP = re.compile(r"\bsleep\s+([^\s;&|)]+)")
-
-
-def seconds(words) -> float:
-    """Seconds of a sleep or timeout duration (GNU sleep adds its arguments); inf when unknown ($x, infinity)."""
-    total = 0.0
-    for word in words:
-        match = DURATION.fullmatch(str(word))
-        if not match:
-            return float("inf")
-        total += float(match.group(1)) * UNITS[match.group(2)]
-    return total
-
-
-# A timeout ends the command only with a signal that ends it by default (CONT or STOP do not) and a nonzero
-# duration (0 turns the timer off); a --kill-after adds its delay, because the first signal may be ignored.
-ENDING_SIGNALS = {"TERM", "KILL", "INT", "HUP", "QUIT", "ALRM", "15", "9", "2", "1", "3", "14"}
-
-
-def time_limit(words) -> float:
-    """The shortest `timeout` that surely ends this simple command, inf when none does."""
-    limit, i = float("inf"), 0
-    while i < len(words):
-        if re.match(r"^[A-Za-z_]\w*=", words[i]) or words[i] in PASS_THROUGH \
-                or (i and words[i - 1] in PASS_THROUGH and words[i].startswith("-")):
-            i += 1
-        elif words[i] == "timeout":
-            i += 1
-            signal, grace = "TERM", 0.0
-            while i < len(words) and words[i].startswith("-") and words[i] != "--":
-                name, eq, value = str(words[i]).partition("=")
-                if name in ("-s", "--signal", "-k", "--kill-after") and not eq:
-                    value = str(words[i + 1]) if i + 1 < len(words) else ""
-                    i += 1
-                elif re.fullmatch(r"-[sk].+", name):
-                    name, value = name[:2], name[2:]
-                if name in ("-s", "--signal"):
-                    signal = value
-                elif name in ("-k", "--kill-after"):
-                    grace = seconds([value])
-                i += 1
-            if i < len(words) and words[i] == "--":
-                i += 1
-            if i < len(words):
-                duration = seconds([words[i]])
-                ending = signal.upper().removeprefix("SIG")
-                if duration > 0 and ending in ENDING_SIGNALS:
-                    limit = min(limit, duration if ending in ("KILL", "9") else duration + grace)
-            i += 1
-        else:
-            break
-    return limit
-
-
-def loops(tokens):
-    """(start, done) of every while/until/for loop, outer loops first."""
-    found = []
-    for i, token in enumerate(tokens):
-        if keyword(token, "while", "until", "for") and command_start(tokens, i):
-            do = next((j for j in range(i + 1, len(tokens)) if keyword(tokens[j], "do") and command_start(tokens, j)), len(tokens))
-            found.append((i, loop_end(tokens, do)))
-    return found
-
-
-def bracket_end(tokens, j: int):
-    """Index of the `}` or `)` that closes the function body opening at j, or None."""
-    if j < len(tokens) and keyword(tokens[j], "{"):
-        brace = True
-    elif j < len(tokens) and is_operator(tokens[j]) and tokens[j] == "(":
-        brace = False
-    else:
-        return None
-    level = 1
-    for k in range(j + 1, len(tokens)):
-        if brace and command_start(tokens, k):
-            level += keyword(tokens[k], "{") - keyword(tokens[k], "}")
-        elif not brace and is_operator(tokens[k]):
-            level += (tokens[k] == "(") - (tokens[k] == ")")
-        if level == 0:
-            return k
-    return None
-
-
-def functions(tokens):
-    """(start, end, name, body) of each function definition: `name() { …; }`, `name() ( … )`, `function name …`."""
-    found, i, n = [], 0, len(tokens)
-    paren = lambda k: k + 1 < n and is_operator(tokens[k]) and tokens[k] == "(" and is_operator(tokens[k + 1]) and tokens[k + 1] == ")"
-    while i < n:
-        name = None
-        if command_start(tokens, i) and keyword(tokens[i], "function") and i + 1 < n and not is_operator(tokens[i + 1]):
-            name, j = str(tokens[i + 1]), i + 2
-            j += 2 if paren(j) else 0
-        elif command_start(tokens, i) and not is_operator(tokens[i]) and not tokens[i].quoted and paren(i + 1):
-            name, j = str(tokens[i]), i + 3
-        if name is not None:
-            while j < n and is_operator(tokens[j]) and tokens[j] == "\n":
-                j += 1
-            end = bracket_end(tokens, j)
-            if end is not None:
-                found.append((i, end, name, tokens[j + 1:end]))
-                i = end + 1
-                continue
-        i += 1
-    return found
-
-
-def blocking_seconds(tokens, scripts, depth: int, funcs=None, calling=frozenset(), cycles=None) -> float:
-    """How long these tokens can keep the session waiting on sleep, read in the order the shell runs them. A loop that
-    sleeps is inf: nothing bounds it but its own condition. Sleeps outside loops add up; $( ) bodies, here-documents
-    and shells a command starts count with it (a shell at most for the `timeout` that ends it), and a call runs the
-    function defined before it. A function only defined runs nothing; a recursion that sleeps never provably ends."""
-    cycles = set() if cycles is None else cycles
-    visible = dict(funcs or {})
-    position = {id(token): k for k, token in enumerate(tokens)}
-    consumed = {}  # where the command reading each here-document starts (None: not found, counted anyway)
-    for script in scripts:
-        command = getattr(script, "command", [])
-        consumed.setdefault(position.get(id(command[0])) if command else None, []).append(script)
-    inside = lambda lo, hi: [s for k, items in consumed.items() if k is not None and lo <= k < hi for s in items]
-    events, covered = [], []
-    for start, end, name, body in functions(tokens):
-        events.append((start, "function", (end, name, body)))
-        covered.append((start, end + 1))
-    for start, done in loops(tokens):
-        if not any(a <= start < b for a, b in covered):
-            events.append((start, "loop", done))
-            covered.append((start, done + 1))
-    for start, _, words in spans(tokens):
-        if not any(a <= start < b for a, b in covered):
-            events.append((start, "command", words))
-    total = 0.0
-    for start, kind, value in sorted(events, key=lambda event: event[0]):
-        if kind == "function":
-            end, name, body = value
-            visible[name] = (body, inside(start, end + 1))
-        elif kind == "loop":
-            if blocking_seconds(tokens[start + 1:value], inside(start, value + 1), depth, visible, calling, cycles) > 0:
-                return float("inf")
-        else:
-            total += command_seconds(value, depth, visible, calling, cycles)
-            if depth < MAX_UNWRAP_DEPTH:
-                for script in consumed.get(start, []):  # bounded by the timeout of the shell that reads it
-                    total += min(time_limit(value), blocking_seconds(*lex(script, depth + 1), depth + 1))
-    if depth < MAX_UNWRAP_DEPTH:
-        for script in consumed.get(None, []):
-            total += min(time_limit(getattr(script, "command", [])), blocking_seconds(*lex(script, depth + 1), depth + 1))
-    return total
-
-
-def command_seconds(words, depth: int, funcs=None, calling=frozenset(), cycles=None) -> float:
-    exe, args = executed(words)
-    funcs = funcs or {}
-    cycles = set() if cycles is None else cycles
-    own = seconds(args) if exe == "sleep" else 0.0
-    if exe in funcs:
-        body, body_scripts = funcs[exe]
-        key = (exe, id(body))  # this definition: a later one of the same name starts clean (Codex #423 r3 N1)
-        if key in calling:
-            cycles.add(key)  # analysis stops here; the outermost call decides
-        else:
-            cost = blocking_seconds(body, body_scripts, depth, funcs, calling | {key}, cycles)
-            own += float("inf") if cost > 0 and key in cycles else cost
-    elif exe in SHELL_WRAPPERS and depth < MAX_UNWRAP_DEPTH:
-        for k, word in enumerate(args[:-1]):
-            if re.fullmatch(r"-[a-zA-Z]*c", word):
-                own += blocking_seconds(*lex(str(args[k + 1]), depth + 1), depth + 1)
-                break
-    total = min(time_limit(words), own)
-    for word in words:
-        for body in word.subs:  # $(...) runs before the command and the session waits for it too
-            total += blocking_seconds(*lex(body, depth), depth, funcs, calling, cycles)
-    return total
-
-
-def foreground_wait(cmd: str) -> bool:
-    """The command can keep the session waiting on sleep for more than WAIT_BOUND seconds.
-    A command that cannot be read falls back to the plain text check instead of passing."""
-    try:
-        return blocking_seconds(*lex(cmd), 0) > WAIT_BOUND
-    except (ValueError, RecursionError):
-        if re.search(r"\b(?:while|until|for)\b", cmd) and RAW_SLEEP.search(cmd):
-            return True
-        return sum(seconds([m.group(1).strip("'\"")]) for m in RAW_SLEEP.finditer(cmd)) > WAIT_BOUND
-
-
-def waits_in_chat(data: dict, tool_input: dict) -> bool:
-    """A foreground Bash of the session that answers people, without a short timeout of its own.
-    A worker's call (agent_id), a headless scheduled or nested run and a background command keep no chat waiting."""
-    if data.get("agent_id") or os.environ.get("ATARAX_SUPPRESS_TELEGRAM") == "1":
-        return False
-    if tool_input.get("run_in_background") is True:
-        return False
-    limit = tool_input.get("timeout")
-    return not (isinstance(limit, (int, float)) and not isinstance(limit, bool) and 0 < limit <= WAIT_BOUND * 1000)
-
-
-CHANGE_DIR = {"cd", "pushd", "popd", "chdir"}
-VARIABLE = (r"\$(?:\{(?:[A-Za-z_]\w*|[0-9]+|[@*!])(?::?-(?:\"\"|''|\"?\$\{?[A-Za-z_]\w*\}?\"?)?)?\}"
-            r"|[A-Za-z_]\w*|[0-9@*!])")
-TOP_LEVEL = (r"bin|boot|dev|etc|home|lib|lib32|lib64|libx32|media|mnt|opt|proc|root|run|sbin|srv|sys|tmp|usr|var"
-             r"|snap|nix|lost\+found|private|cores|Applications|Library|System|Users|Volumes|Windows|ProgramData"
-             r"|cygdrive")
-# An empty variable would turn the target into `/`, `/*` or a top-level folder, so the CLI asks whatever the quoting.
-EMPTY_VARIABLE_ROOT = re.compile(VARIABLE + r"/(?:[*?\[{$/]|$|(?:" + TOP_LEVEL + r")(?:/+\*+)*/?$)", re.I)
-WHOLE_FOLDER = re.compile(r"(?:^|/)\*+/*$")
-PARENT = re.compile(r"(?:^|/)\.\.(?:/|$)")
-
-
-def changed_dir(here: str, words, pushed: list):
-    """Folder after this cd/pushd/popd, or None when the CLI cannot follow it statically: an expansion,
-    ~, .., a glob, a flag, a wrapper or env word in front, or a folder that does not exist yet."""
-    name, args = str(words[0]), [str(word) for word in words[1:]]
-    if name == "popd":
-        return pushed.pop() if not args and pushed else None
-    args = args[1:] if args[:1] == ["--"] else args
-    if name not in CHANGE_DIR or len(args) != 1 or re.match(r"[-+~]", args[0]) \
-            or re.search(r"[$`*?[{\x00]", args[0]) or PARENT.search(args[0]):
-        return None
-    target = os.path.normpath(os.path.join(here, args[0]))
-    if not os.path.isdir(target):
-        return None
-    if name == "pushd":
-        pushed.append(here)
-    return target
-
-
-def whole_substitution(word) -> bool:
-    """Only command substitutions (plus `/`, `*`, `.`): the CLI cannot check such a target before it runs.
-    `$((…))` is arithmetic, not a command; a backtick body is always a command."""
-    rest, found = str(word), False
-    for body in word.subs:
-        for wrapped in ("$(" + body + ")", "`" + body + "`"):
-            if not wrapped.startswith("$((") and wrapped in rest:
-                rest, found = rest.replace(wrapped, "", 1), True
-                break
-    return found and re.fullmatch(r"[/*.]*", rest) is not None
-
-
-def asks_in_terminal(word, lost: bool) -> bool:
-    """An rm target the CLI stops on for confirmation; `lost` = a cd before it that the CLI could not follow."""
-    text = str(word)
-    if EMPTY_VARIABLE_ROOT.match(text) or whole_substitution(word):
-        return True
-    if not word.star or text.startswith(("/", "~", "$")) or not WHOLE_FOLDER.search(text):
-        return False
-    return lost or re.fullmatch(r"(?:\./)*\*+/*", text) is not None or PARENT.search(text) is not None
-
-
-def cwd_wide_cleanup(cmd: str, state: dict, depth: int = 0) -> bool:
-    """Find an rm target that waits on a confirmation in the CLI terminal, in shell code, not comments or data.
-
-    `state["here"]` is the folder, None for good once a cd the CLI cannot follow has run. One state serves the
-    whole command in written order, nested code included: CLI 2.1.317 still asked after an untraceable cd inside
-    ( … ), { …; } | cat, a background `&`, bash -c or $(…), and after a later cd into an existing folder (probe
-    03.11.2026). A redirection's target is no command word, but its $(…) runs.
-    The CLI asks even with bypassPermissions, and before a background/timeout applies. Do not suggest an approval
-    bypass: generated files need a new work directory. Parser gaps still reach the CLI's unchanged safeguard.
-    """
-    if depth > MAX_UNWRAP_DEPTH:
-        return False
-    tokens, scripts = lex(cmd)
-    unread, words = list(scripts), []
-
-    def asks(words) -> bool:
-        nonlocal unread
-        mine = [script for script in unread if script.command and script.command[0] is words[0]]
-        unread = [script for script in unread if all(script is not read for read in mine)]
-        if any(cwd_wide_cleanup(code, state, depth + 1) for code in [*(sub for w in words for sub in w.subs), *mine]):
-            return True
-        exe, rest = executed(words)
-        if exe in CHANGE_DIR:
-            state["here"] = state["here"] and changed_dir(state["here"], words, state["pushed"])
-            return False
-        if exe == "rm":
-            return any(asks_in_terminal(word, state["here"] is None) for word in rest)
-        return exe in SHELL_WRAPPERS and any(
-            re.fullmatch(r"-[a-zA-Z]*c", word) and cwd_wide_cleanup(rest[i + 1], state, depth + 1)
-            for i, word in enumerate(rest[:-1]))
-
-    for k, token in enumerate([*tokens, ";"]):
-        if isinstance(token, Word) and not (keyword(token) and command_start(tokens, k)):
-            if not (k and is_operator(tokens[k - 1]) and REDIRECT.fullmatch(tokens[k - 1])):
-                words.append(token)
-            elif any(cwd_wide_cleanup(sub, state, depth + 1) for sub in token.subs):
-                return True
-            continue
-        if is_operator(token) and REDIRECT.fullmatch(token):
-            continue
-        if words and asks(words):
-            return True
-        words = []
-    # ponytail: a script whose reader the walk did not see is read after the whole line.
-    return any(cwd_wide_cleanup(script, state, depth + 1) for script in unread)
 
 
 def main() -> None:
@@ -839,52 +147,7 @@ def main() -> None:
     if (data.get("tool_name") or "") != "Bash":
         sys.exit(0)
 
-    tool_input = data.get("tool_input") or {}
-    cmd = tool_input.get("command") or ""
-
-    cwd = data.get("cwd")
-    try:
-        cleanup = cwd_wide_cleanup(cmd, {"here": cwd if isinstance(cwd, str) and cwd else os.getcwd(), "pushed": []})
-    except Exception:  # a parser gap must never block or break a command
-        cleanup = False
-    if cleanup:
-        deny(
-            "🚫 НЕВИЗНАЧЕНА ПАПКА ВИДАЛЕННЯ: на цьому `rm` Claude зупиниться на підтвердженні в терміналі, якого "
-            "людина в чаті не бачить, і чат замовкне. Так буває з `rm … *` у поточній папці, з `\"$змінна\"/*` "
-            "чи `\"$папка/$файл\"`, з `rm \"$(…)\"`, з `../…/*` і з `папка/*` після `cd`, який Claude не може простежити "
-            "(змінна, `~`, ще не створена папка). Фон і timeout цього не усувають.\n\n"
-            "Для сканів, рендерів і чернеток створи нову папку: `work=$(mktemp -d)`, а результати пиши в неї. "
-            "Не очищай стару папку перед початком і не повторюй цю команду. Якщо справді треба видалити файли, "
-            "назви їх повним шляхом прямо в `rm`, без `cd` перед ним, а кожну змінну пиши як `${змінна:?}`: "
-            "`rm -f \"${work:?}\"/frames/*`, `rm -f \"${dir:?}/${file:?}\"`; підстановку `$(…)` виконай окремо й "
-            "видали надруковані шляхи явно. Захист видалення не вимикай і не обходь."
-        )
-
-    try:
-        pattern = self_matching_wait(cmd)
-    except Exception:  # a parser gap must never block or break a command
-        pattern = None
-    if pattern is not None:
-        deny(
-            f"🚫 ВІЧНИЙ ЦИКЛ: `pgrep -f '{pattern}'` знаходить саму цю команду (її текст теж містить цей шаблон), "
-            "тож цикл не закінчиться ніколи й триматиме агента зайнятим.\n\n"
-            "Чекай на номер процесу, а саме очікування запускай у фоні (Bash з run_in_background=true), щоб не "
-            "тримати хід: `while kill -0 <pid> 2>/dev/null; do sleep 10; done`.\n"
-            "Або зроби шаблон, що не збігається сам із собою: `pgrep -f '[f]etch.py'` замість `pgrep -f 'fetch.py'`."
-        )
-
-    try:
-        waiting = waits_in_chat(data, tool_input) and foreground_wait(cmd)
-    except Exception:  # a parser gap must never block or break a command
-        waiting = False
-    if waiting:
-        deny(
-            "🚫 ОЧІКУВАННЯ В ГОЛОВНІЙ СЕСІЇ: ця команда чекає (цикл зі sleep або паузи довші за хвилину) і тримає "
-            "хід відкритим. Поки вона чекає, нові повідомлення людей стоять у черзі й до тебе не доходять.\n\n"
-            "Запусти очікування у фоні — той самий Bash з run_in_background=true — і заверши хід. Коли фонова "
-            "задача скінчиться, прийде сповіщення, тоді й відповіси.\n"
-            "Коротку перевірку до хвилини можна лишити тут: задай цьому Bash timeout не більше 60000."
-        )
+    cmd = (data.get("tool_input") or {}).get("command") or ""
 
     for exe, rest, assigned in (
         run for seg in segments(cmd) for run in effective_commands(seg)
@@ -895,7 +158,7 @@ def main() -> None:
         # A suppressed headless run is the one nested form that is safe: the
         # telegram plugin stays inert, so the live poller is never touched.
         # This is what auto-publisher and scheduled agent tasks rely on.
-        if assigned.get("ATARAX_SUPPRESS_TELEGRAM") == "1" and (
+        if nxt != "mcp" and assigned.get("ATARAX_SUPPRESS_TELEGRAM") == "1" and (
             "-p" in rest or "--print" in rest
         ):
             continue

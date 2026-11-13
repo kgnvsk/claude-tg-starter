@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render one workspace Office/PDF file offline, without access to the host's data."""
+"""Render one workspace Office/HTML/PDF file offline, without access to the host's data."""
 from __future__ import annotations
 import argparse,hashlib,json,os,pathlib,resource,signal,stat,subprocess,tempfile
 PUBLIC=pathlib.Path('/usr/local/lib/novsky-artifacts')
@@ -87,7 +87,7 @@ def render(name,cwd=None,public=PUBLIC):
  cwd=pathlib.Path.cwd() if cwd is None else pathlib.Path(cwd)
  if cwd.is_symlink() or cwd.resolve()!=cwd or cwd.stat().st_uid!=os.geteuid():raise RenderError('workspace is not owned by the caller')
  source=relative_source(cwd,name);ext=source.suffix.lower()
- if ext not in ['.docx','.pptx','.xlsx','.pdf']:raise RenderError('use docx, pptx, xlsx or pdf')
+ if ext not in ['.docx','.pptx','.xlsx','.html','.htm','.pdf']:raise RenderError('use docx, pptx, xlsx, html, htm or pdf')
  data=workspace_source(cwd,name);config=public_configuration(public)
  work=pathlib.Path(tempfile.mkdtemp(prefix='.artifact-render-',dir=cwd));os.chmod(work,0o700)
  for name in ['tmp','cache','out']:(work/name).mkdir(mode=0o700)

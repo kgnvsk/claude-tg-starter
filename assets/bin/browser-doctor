@@ -2,9 +2,31 @@
 # Redacted browser health report. Safe to run as root or claude.
 set -uo pipefail
 
+# Private installations never probe, recover or borrow the legacy HTTP browser.
+browser_user="$(id -un)"
+if [ "$(id -u)" -eq 0 ]; then
+  browser_home="${CLAUDE_AGENT_HOME:-/home/claude}"
+  browser_user="${AGENT_USER:-${browser_home##*/}}"
+  browser_user="${browser_user:-claude}"
+fi
+browser_uid="$(id -u "$browser_user" 2>/dev/null || true)"
+if [ -n "$browser_uid" ] && { [ -e "/etc/claude-browser-private/$browser_uid.json" ] || [ -L "/etc/claude-browser-private/$browser_uid.json" ]; }; then
+  if [ "$(id -u)" -eq 0 ]; then
+    exec runuser -u "$browser_user" -- env HOME="/home/$browser_user" "/home/$browser_user/bin/browser-mcp" --check
+  fi
+  exec "$HOME/bin/browser-mcp" --check
+fi
+if [ "$browser_user" != "${CLAUDE_PRIMARY_USER:-claude}" ]; then
+  printf '%s\n' 'INFO  this agent has no browser of its own configured; the legacy shared HTTP browser is not per-agent isolation'
+  exit 0
+fi
+
 failures=0
 pass() { printf 'PASS  %s\n' "$*"; }
 fail() { printf 'FAIL  %s\n' "$*"; failures=$((failures + 1)); }
+info() { printf 'INFO  %s\n' "$*"; }
+SHARE="${CLAUDE_BROWSER_SHARE:-/srv/claude-browser-share}"
+info "legacy unauthenticated HTTP browser: this report does not establish per-agent isolation; scoped migration is separate"
 
 if systemctl is-active --quiet claude-browser.service; then
   pass "claude-browser.service active"
@@ -27,35 +49,73 @@ case "$http_code" in
   *) fail "MCP HTTP endpoint unreachable (HTTP ${http_code:-none})" ;;
 esac
 
-if [ -r /srv/claude-browser-share/browser-smoke.png ] && [ -s /srv/claude-browser-share/browser-smoke.png ]; then
-  pass "DOM and screenshot smoke artifact exists"
-else
-  fail "browser smoke screenshot missing"
-fi
+# The install-time smoke left these pictures; this check navigates nothing and takes no screenshot (root, 24.10.2026). A
+# picture that is gone or not readable by this user (the shared folder is the browser group's) leaves the browser
+# unverified here, never failed: only an operation that ran and failed is a failure.
+smoke_artifact() {
+  case "$(python3 - "$SHARE/$1" <<'PY' 2>/dev/null
+import sys
+try:
+    with open(sys.argv[1], "rb") as handle:
+        print("ok" if handle.read(1) else "empty")
+except FileNotFoundError:
+    print("missing")
+except PermissionError:
+    print("denied")
+except OSError:
+    print("unreadable")
+PY
+)" in
+    ok) pass "$2 smoke artifact exists" ;;
+    missing) info "$2 smoke artifact is not here; this check navigates nothing, so the browser is unverified, not failed" ;;
+    denied) info "$2 smoke artifact is not readable by this user (shared folder permissions); the browser is unverified, not failed" ;;
+    *) info "$2 smoke artifact is empty or unreadable; the browser is unverified, not failed" ;;
+  esac
+}
+smoke_artifact browser-smoke.png "DOM and screenshot"
+smoke_artifact mcp-tool-smoke.png "MCP navigation and screenshot"
 
-if [ -r /srv/claude-browser-share/mcp-tool-smoke.png ] && [ -s /srv/claude-browser-share/mcp-tool-smoke.png ]; then
-  pass "MCP navigation and screenshot smoke artifact exists"
-else
-  fail "MCP tool smoke screenshot missing"
-fi
-
+# The state file the launcher gives the CLI (an isolated CLAUDE_CONFIG_DIR reads .config.json first), and the vault the
+# agent works in: a user, local or project registration all load the browser tools.
 if [ "$(id -u)" -eq 0 ]; then
-  claude_state="${CLAUDE_AGENT_HOME:-/home/claude}/.claude.json"
+  claude_home="${CLAUDE_AGENT_HOME:-/home/claude}"
+  claude_state="$claude_home/.claude.json"
 else
+  claude_home="$HOME"
   claude_state="${CLAUDE_CONFIG_DIR:-$HOME}/.claude.json"
+  if [ -n "${CLAUDE_CONFIG_DIR:-}" ] && [ -f "$CLAUDE_CONFIG_DIR/.config.json" ]; then
+    claude_state="$CLAUDE_CONFIG_DIR/.config.json"
+  fi
 fi
-if python3 - "$claude_state" <<'PY' >/dev/null 2>&1
+if python3 - "$claude_state" "$claude_home/obsidian-vault" <<'PY' >/dev/null 2>&1
 import json
 import sys
 from pathlib import Path
 
-data = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-playwright = data.get("mcpServers", {}).get("playwright", {})
-if playwright.get("type") != "http" or playwright.get("url") != "http://localhost:8931/mcp":
+
+def read(path):
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def registered(servers):
+    playwright = (servers or {}).get("playwright") or {}
+    return playwright.get("type") == "http" and playwright.get("url") == "http://localhost:8931/mcp"
+
+
+data, project = read(sys.argv[1]), sys.argv[2]
+if not (registered(data.get("mcpServers")) or registered((data.get("projects") or {}).get(project, {}).get("mcpServers"))
+        or registered(read(Path(project, ".mcp.json")).get("mcpServers"))):
     raise SystemExit(1)
 PY
 then
   pass "Claude user has Playwright MCP registered"
+elif [ "$(id -u)" -ne 0 ] && [ "$(id -un)" != "${CLAUDE_PRIMARY_USER:-claude}" ]; then
+  # A second agent on this server: the shared browser and its profile are the primary agent's, and install-browser.sh
+  # registers it for that agent only (root, 24.10.2026: a child gets no upward access). Nothing is broken here.
+  info "this agent has no browser of its own: the shared browser serves the primary agent, so browsing is not configured here (not a failure)"
 else
   fail "Playwright MCP is not registered for this Claude user"
 fi

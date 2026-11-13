@@ -74,7 +74,7 @@ def login(backup, owner, nonce):
                 output = (output + chunk)[-8192:]
                 match = re.search(r'one-time code:\s*([A-Z0-9]{4}-[A-Z0-9]{4})', output)
                 if match and not sent:
-                    emit({'progress': True, 'text': backend.notice('backup.chat_device_code', 'Відкрий https://github.com/login/device і введи код {code}. Увійди у свій GitHub та підтвердь доступ GitHub CLI. Пароль або токен сюди надсилати не потрібно. Після входу я сам створю приватний репозиторій.', backup.home, code=match[1])})
+                    emit({'progress': True, 'text': 'Відкрий https://github.com/login/device і введи код ' + match[1] + '. Увійди у свій GitHub та підтвердь доступ GitHub CLI. Пароль або токен сюди надсилати не потрібно. Після входу я сам створю приватний репозиторій.'})
                     sent = True
         if process.returncode:
             raise backend.BackupError('github-login-failed')
@@ -122,8 +122,8 @@ def login(backup, owner, nonce):
     state.pop('nonce', None)
     backup.save(backup.directory / 'chat.json', state)
     if prepared.get('keySaved'):
-        return chat.reply(backend.notice('backup.chat_github_ready', 'GitHub підключено. Приватний репозиторій: https://github.com/{repo}. Запускаю автоматичний бекап.', backup.home, repo=repository), enable=True)
-    return chat.reply(backend.notice('backup.chat_github_key', 'GitHub підключено. Приватний репозиторій: https://github.com/{repo}. Збережи файл ключа відновлення окремо від сервера й напиши «ключ збережено».', backup.home, repo=repository), recoveryKey=True)
+        return chat.reply('GitHub підключено. Приватний репозиторій: https://github.com/' + repository + '. Запускаю автоматичний бекап.', enable=True)
+    return chat.reply('GitHub підключено. Приватний репозиторій: https://github.com/' + repository + '. Збережи файл ключа відновлення окремо від сервера й напиши «ключ збережено».', recoveryKey=True)
 
 
 def main():

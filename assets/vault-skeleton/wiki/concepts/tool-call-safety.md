@@ -43,8 +43,8 @@ status: evergreen
 
 ## WRONG → RIGHT
 
-- ❌ `codex exec "Use gpt-image-2 ... довгий промпт з лапками ..."`
-  ✅ `Write /tmp/prompt.txt` → `codex exec "$(cat /tmp/prompt.txt)"`
+- ❌ `codex exec -m gpt-6.1-sol "Use gpt-image-2 ... довгий промпт з лапками ..."`
+  ✅ `Write /tmp/prompt.txt` → `codex exec -m gpt-6.1-sol "$(cat /tmp/prompt.txt)"`
 - ❌ `python3 -c "import json; d=json.load(open('x')); print(d['url'])"`
   ✅ `Write /tmp/x.py` → `python3 /tmp/x.py`
 - ❌ `curl -X POST ... -d '{"a":"b","c":{"d":1}}'`

@@ -72,6 +72,6 @@ RESP=$(curl -sS -X POST -K - \
 if echo "$RESP" | jq -e '.ok' >/dev/null 2>&1; then
   echo "voice sent (message_id: $(echo "$RESP" | jq -r '.result.message_id'))"
 else
-  echo "sendVoice failed: $(echo "$RESP" | head -c 300)" >&2
+  echo "sendVoice failed: $RESP" >&2  # whole (owner, 23.10.2026: its first 300 bytes)
   exit 1
 fi

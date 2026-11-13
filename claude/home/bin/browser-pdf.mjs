@@ -14,7 +14,7 @@ const input = resolve(inputArg);
 const output = resolve(outputArg || input.replace(/\.html?$/i, '') + '.pdf');
 await mkdir(dirname(output), { recursive: true });
 
-const require = createRequire('/opt/claude-browser/package.json');
+const require = createRequire(`${process.env.CLAUDE_BROWSER_PDF_RUNTIME || '/opt/claude-browser'}/package.json`);
 const { chromium } = require('playwright');
 const browser = await chromium.launch({ headless: true });
 try {

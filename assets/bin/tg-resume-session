@@ -7,43 +7,36 @@ import os
 from pathlib import Path
 import re
 import sqlite3
+import stat
 import sys
 
 
-class LegacySession(Exception):
-    """The last session is not proven to belong to callback tracking; the receiver would refuse its background work."""
+UUID = re.compile(r'[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}')
 
 
-def proven_current(connection: sqlite3.Connection, session: str) -> bool:
-    """True only when neither of the receiver's two startup rules (telegram-server-fixed.ts,
-    delivery_legacy_native_sessions: by results and by origins) would mark this session, and it is not marked. No such
-    evidence, as before the first receiver with callback tracking ever started, is no proof (Codex 01.11: the first update
-    resumed such a session, and a result adopted under a newer stamp kept its older turn; both were then refused)."""
+def retired_sessions(state: Path) -> set[str] | None:
+    """Sessions the receiver retired (Anthropic's safety classifier kept stopping them, Арти 21.10.2026).
+
+    None when the list exists but cannot be trusted: the launch then starts fresh rather than resume a session the
+    list may name (Codex review of b2e9d280, W6). Only a missing list means none is retired."""
+    path = state / 'retired-sessions'
     try:
-        return connection.execute(
-            "SELECT 1 FROM delivery_native_session_origins o "
-            "LEFT JOIN delivery_runtime e ON e.key='callback_ledger_epoch:' || o.stamp "
-            "WHERE o.session_id=? AND NOT (o.source IN ('resume','compact') AND o.inherited=0) "
-            "AND ((o.source IS 'startup' AND o.inherited=0 AND e.value IS NOT NULL AND CAST(e.value AS INTEGER)>0) "
-            "OR (o.stamp IS NOT NULL AND e.value IS NOT NULL AND CAST(e.value AS INTEGER)>0 "
-            "AND o.started_at IS NOT NULL AND o.started_at>CAST(e.value AS INTEGER))) "
-            "AND NOT EXISTS (SELECT 1 FROM delivery_legacy_native_sessions l WHERE l.session_id=o.session_id) "
-            "AND NOT EXISTS (SELECT 1 FROM delivery_results r "
-            "LEFT JOIN delivery_runtime re ON re.key='callback_ledger_epoch:' || r.stamp "
-            "LEFT JOIN delivery_turns t ON t.turn_id=r.turn_id AND t.session_id=r.session_id "
-            "WHERE r.session_id=o.session_id AND (r.stamp IS NULL OR re.value IS NULL "
-            "OR CAST(re.value AS INTEGER)<=0 "
-            "OR (t.turn_id IS NULL AND r.state NOT IN ('complete','no_reply','cancelled','failed')) "
-            "OR (t.turn_id IS NOT NULL AND (t.opened_at IS NULL OR t.opened_at<=CAST(re.value AS INTEGER))))) "
-            "LIMIT 1", (session,)
-        ).fetchone() is not None
-    except sqlite3.OperationalError as error:
-        if 'no such table' not in str(error):
-            raise
-        return False
+        info = path.lstat()
+    except FileNotFoundError:
+        return set()
+    except OSError:
+        return None
+    if not stat.S_ISREG(info.st_mode) or info.st_size > 1024 * 1024:
+        return None
+    try:
+        names = path.read_text(encoding='ascii').split()
+    except (OSError, UnicodeError):
+        return None
+    # An existing list always names a session; an empty one was truncated (Codex review of dfdb5dc7, P1-3).
+    return set(names) if names and all(UUID.fullmatch(name) for name in names) else None
 
 
-def select_session(config: Path, state: Path, workspace: Path, *, receiver: bool = False) -> str | None:
+def select_session(config: Path, state: Path, workspace: Path) -> str | None:
     connection = sqlite3.connect(f'file:{state / "messages.db"}?mode=ro', uri=True, timeout=3)
     try:
         row = connection.execute(
@@ -53,10 +46,6 @@ def select_session(config: Path, state: Path, workspace: Path, *, receiver: bool
             "(SELECT 1 FROM delivery_turn_messages m WHERE m.turn_id=t.turn_id) "
             "ORDER BY t.opened_at DESC,t.turn_id DESC LIMIT 1"
         ).fetchone()
-        # Under the receiver only a session proven current resumes; any other starts fresh (an update moves earlier
-        # agents to the receiver, owner 01.11.2026).
-        if receiver and row and isinstance(row[0], str) and not proven_current(connection, row[0]):
-            raise LegacySession
     finally:
         connection.close()
     if not row or not isinstance(row[0], str) or not re.fullmatch(
@@ -64,6 +53,9 @@ def select_session(config: Path, state: Path, workspace: Path, *, receiver: bool
     ) or not row[1]:
         return None
     session, raw_path = row
+    retired = retired_sessions(state)
+    if retired is None or session in retired:
+        return None
     projects = (config / 'projects').resolve(strict=True)
     transcript = Path(raw_path).resolve(strict=True)
     transcript.relative_to(projects)
@@ -97,11 +89,7 @@ def main() -> None:
     config = Path(os.environ.get('CLAUDE_CONFIG_DIR') or Path.home() / '.claude')
     state = Path(os.environ.get('TELEGRAM_STATE_DIR') or config / 'channels/telegram')
     try:
-        session = select_session(config, state, Path.cwd(),
-                                 receiver=os.environ.get('TG_DELIVERY_AUTHORITY') == 'receiver')
-    except LegacySession:
-        print('telegram launcher: the last session predates delivery receipts; starting fresh', file=sys.stderr)
-        return
+        session = select_session(config, state, Path.cwd())
     except (OSError, ValueError, sqlite3.Error):
         session = None
     if session:

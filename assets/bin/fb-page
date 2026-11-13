@@ -4,31 +4,30 @@
 Арти, 10.10.2026: the page was run through a person's saved browser login, and Facebook blocked that person. A Page
 token from Meta Business (a system user's token does not expire) is the official way; it lives in a file named by
 ~/.config/facebook-page/config.env and never leaves this helper.
-
-Videos and reels (03.11.2026: GRANT AUTO could post only text and photos): a local file goes up in the chunks Facebook
-asks for (a video) or in one stream to Facebook's upload host (a reel); a public URL is handed to Facebook to fetch.
-Meta's own error text is shown, so the agent can name the missing permission; the token is cut out of it.
 """
 
 from __future__ import annotations
 
 import argparse
-from http.client import HTTPException
-import itertools
 import json
+import mimetypes
 import os
 from pathlib import Path
 import re
+import secrets
 import sys
+import tempfile
 from urllib import error, parse, request
 
 
 CONFIG = Path(os.environ.get("FB_PAGE_CONFIG", str(Path.home() / ".config/facebook-page/config.env")))
 GRAPH_BASE = os.environ.get("FB_GRAPH_BASE", "https://graph.facebook.com").rstrip("/")
-GRAPH_VIDEO_BASE = os.environ.get("FB_GRAPH_VIDEO_BASE", "https://graph-video.facebook.com").rstrip("/")
-UPLOAD_BASE = os.environ.get("FB_UPLOAD_BASE", "https://rupload.facebook.com/")
-VIDEO_LIMIT = 10 * 1024 ** 3
-BLOCK = 8 * 1024 * 1024
+VIDEO_BASE = os.environ.get("FB_GRAPH_VIDEO_BASE", "https://graph-video.facebook.com").rstrip("/")
+# Арти, 13.10.2026: the page took only text and a photo by public link; a post now carries what the owner posts by
+# hand: photos from local files (one, or an album of up to ten) or one video.
+MAX_MEDIA = 10
+MAX_PHOTO = 10 * 1024 * 1024
+MAX_VIDEO = 1024 * 1024 * 1024
 DEFAULT_VERSION = "v25.0"
 MAX_ROWS = 100
 OBJECT_ID = re.compile(r"^[0-9]{5,30}(?:_[0-9]{5,30})?$")
@@ -38,16 +37,6 @@ COMMENT_FIELDS = "id,message,from,created_time,parent"
 
 class CliError(Exception):
     """Expected failure without credential disclosure."""
-
-
-class NoRedirect(request.HTTPRedirectHandler):
-    """Meta's endpoints answer directly. A redirect is refused, never followed: urllib would carry the Authorization
-    header (the Page token) to wherever it points."""
-    def redirect_request(self, *args, **kwargs):
-        return None
-
-
-OPENER = request.build_opener(NoRedirect)
 
 
 def load_env() -> dict[str, str]:
@@ -75,44 +64,6 @@ def load_env() -> dict[str, str]:
     return {"page": page, "token": token, "version": values.get("FB_GRAPH_VERSION") or DEFAULT_VERSION}
 
 
-def meta_error(raw: bytes, token: str) -> str:
-    """Meta's own explanation (message, code, subcode): it names a missing permission. Never the token."""
-    try:
-        value = json.loads(raw)
-    except (UnicodeError, ValueError):
-        return ""
-    found = value.get("error") if isinstance(value, dict) else None
-    if not isinstance(found, dict):
-        return ""
-    codes = ", ".join(f"{name} {found[key]}" for name, key in (("code", "code"), ("subcode", "error_subcode"))
-                      if isinstance(found.get(key), (int, str)))
-    text = str(found.get("message") or "").strip()
-    text = f"{text} ({codes})" if text and codes else text or codes
-    return text.replace(token, "<token>") if token else text
-
-
-def fetch(req: request.Request, config: dict[str, str], timeout: int) -> dict[str, object]:
-    try:
-        with OPENER.open(req, timeout=timeout) as response:
-            raw = response.read()
-    except error.HTTPError as exc:
-        try:
-            detail = meta_error(exc.read(), config["token"])
-        except OSError:
-            detail = ""
-        raise CliError(f"Facebook API returned HTTP {exc.code}" + (f": {detail}" if detail else "")) from exc
-    except (OSError, HTTPException) as exc:
-        raise CliError("Facebook API is unavailable or timed out") from exc
-    try:
-        value = json.loads(raw)
-    except (UnicodeError, json.JSONDecodeError) as exc:
-        raise CliError("Facebook API returned invalid JSON") from exc
-    if not isinstance(value, dict) or "error" in value:
-        detail = meta_error(raw, config["token"])
-        raise CliError("Facebook API rejected the request" + (f": {detail}" if detail else ""))
-    return value
-
-
 def graph_request(
     config: dict[str, str],
     method: str,
@@ -122,9 +73,8 @@ def graph_request(
     form: dict[str, object] | None = None,
     json_body: dict[str, object] | None = None,
     timeout: int = 30,
-    base: str | None = None,
 ) -> dict[str, object]:
-    url = f"{base or GRAPH_BASE}/{config['version']}/{path.lstrip('/')}"
+    url = f"{GRAPH_BASE}/{config['version']}/{path.lstrip('/')}"
     if query:
         url = f"{url}?{parse.urlencode(query)}"
     headers = {"Authorization": f"Bearer {config['token']}", "Accept": "application/json",
@@ -136,203 +86,83 @@ def graph_request(
     elif form is not None:
         data = parse.urlencode(form).encode("utf-8")
         headers["Content-Type"] = "application/x-www-form-urlencoded"
-    return fetch(request.Request(url, data=data, headers=headers, method=method), config, timeout)
-
-
-def upload_request(config: dict[str, str], url: str, headers: dict[str, str], body, length: int,
-                   timeout: int) -> dict[str, object]:
-    """A raw upload (a video chunk or a reel) streamed from the file, never held in memory."""
-    headers = {**headers, "Content-Length": str(length), "Accept": "application/json",
-               "User-Agent": "claude-premium-facebook-page/1"}
-    return fetch(request.Request(url, data=body, headers=headers, method="POST"), config, timeout)
-
-
-def file_blocks(path: Path, offset: int, length: int):
-    # Raised as CliError, not OSError: urllib would report a local file error as an unreachable Facebook.
+    req = request.Request(url, data=data, headers=headers, method=method)
     try:
-        with path.open("rb") as handle:
-            handle.seek(offset)
-            left = length
-            while left > 0:
-                block = handle.read(min(BLOCK, left))
-                if not block:
-                    raise CliError("the video file changed while it was being sent")
-                left -= len(block)
-                yield block
-    except OSError as exc:
-        raise CliError(f"cannot read the video file: {exc.strerror or exc}") from exc
+        with request.urlopen(req, timeout=timeout) as response:
+            raw = response.read()
+    except error.HTTPError as exc:
+        raise CliError(f"Facebook API returned HTTP {exc.code}") from exc
+    except (error.URLError, TimeoutError) as exc:
+        raise CliError("Facebook API is unavailable or timed out") from exc
+    try:
+        value = json.loads(raw)
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise CliError("Facebook API returned invalid JSON") from exc
+    if not isinstance(value, dict) or "error" in value:
+        raise CliError("Facebook API rejected the request")
+    return value
 
 
-PHOTO_SUFFIXES = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
-MAX_PHOTO_BYTES = 25 * 1024 * 1024
-MESSENGER_KINDS = {"image", "video", "audio", "file"}
-
-
-def photo_source(value: str) -> str | Path:
-    """A photo as a public https link or a local .jpg/.png/.gif/.webp file (owner, 05.11.2026: never a link only)."""
-    if value.startswith("https://"):
-        return public_url(value)
-    path = Path(value).expanduser()
-    if path.is_symlink() or not path.is_file() or path.suffix.lower() not in PHOTO_SUFFIXES \
-            or not 0 < path.stat().st_size <= MAX_PHOTO_BYTES:
-        raise argparse.ArgumentTypeError("a photo must be a public https link or a regular .jpg/.png/.gif/.webp file of at most 25 MB")
-    return path
-
-
-def attachment(value: str) -> tuple[str, str | Path]:
-    """One Messenger attachment: image=SOURCE, video=SOURCE, audio=SOURCE or file=SOURCE (a link or a local file)."""
-    kind, separator, source = value.partition("=")
-    if not separator or kind not in MESSENGER_KINDS or not source:
-        raise argparse.ArgumentTypeError("an attachment is image=SOURCE, video=SOURCE, audio=SOURCE or file=SOURCE")
-    if source.startswith("https://"):
-        return kind, public_url(source)
-    path = Path(source).expanduser()
-    if path.is_symlink() or not path.is_file() or path.stat().st_size <= 0:
-        raise argparse.ArgumentTypeError(f"attachment file not found: {path.name}")
-    return kind, path
-
-
-def multipart(fields: dict[str, str], name: str, path: Path) -> tuple[object, int, str]:
-    """A multipart body of these fields and one file, the file read from disk while it is sent; body, length, type."""
-    boundary = "fbp-" + os.urandom(12).hex()
-    head = b"".join(f"--{boundary}\r\nContent-Disposition: form-data; name=\"{key}\"\r\n\r\n".encode() + value.encode() + b"\r\n"
-                    for key, value in fields.items())
-    # The file's own name (a document reaches Messenger as «Прайс.pdf»), quoted the way browsers quote it.
-    filename = path.name.replace('"', "%22").replace("\r", "%0D").replace("\n", "%0A")
-    head += (f"--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"; filename=\"{filename}\"\r\n"
-             "Content-Type: application/octet-stream\r\n\r\n").encode()
-    tail = f"\r\n--{boundary}--\r\n".encode()
-    size = path.stat().st_size
-
-    def body():
-        yield head
-        yield from file_blocks(path, 0, size)
-        yield tail
-    return body(), len(head) + size + len(tail), f"multipart/form-data; boundary={boundary}"
-
-
-def upload_photo(config: dict[str, str], source: str | Path, caption: str | None, published: bool) -> dict[str, object]:
-    """One photo on the page: from a link Facebook fetches, or a local file sent from disk."""
-    fields = {"published": "true" if published else "false", **({"caption": caption} if caption else {})}
-    if isinstance(source, str):
-        return graph_request(config, "POST", f"{config['page']}/photos", form={"url": source, **fields}, timeout=60)
-    body, length, content_type = multipart(fields, "source", source)
-    return upload_request(config, f"{GRAPH_BASE}/{config['version']}/{config['page']}/photos",
-                          {"Authorization": f"Bearer {config['token']}", "Content-Type": content_type}, body, length, 300)
-
-
-def remove_photos(config: dict[str, str], photo_ids: list[str]) -> None:
-    """Unpublished album photos of a post that never went out: nobody saw them, and they do not stay."""
-    for photo_id in photo_ids:
+def graph_upload(config: dict[str, str], path: str, fields: dict[str, str], file: Path, *,
+                 base: str = GRAPH_BASE, timeout: int = 180) -> dict[str, object]:
+    """POST one local file as multipart/form-data. The body is spooled to a private temporary file, so a video of up to
+    1 GB never sits in memory; errors read like graph_request's, without the token."""
+    boundary = "fb-page-" + secrets.token_hex(16)
+    name = file.name.encode("ascii", "replace").decode().replace('"', "_") or "file"
+    content_type = mimetypes.guess_type(file.name)[0] or "application/octet-stream"
+    with tempfile.TemporaryFile() as body:
+        for key, value in fields.items():
+            body.write(f'--{boundary}\r\nContent-Disposition: form-data; name="{key}"\r\n\r\n{value}\r\n'.encode())
+        body.write(f'--{boundary}\r\nContent-Disposition: form-data; name="source"; filename="{name}"\r\n'
+                   f"Content-Type: {content_type}\r\n\r\n".encode())
         try:
-            graph_request(config, "DELETE", photo_id)
-        except CliError:
-            pass
-
-
-def send_attachment(config: dict[str, str], recipient: str, kind: str, source: str | Path) -> str:
-    """One attachment in the page's Messenger: Facebook fetches a link; a local file goes up with the message."""
-    message = {"attachment": {"type": kind, "payload": {"is_reusable": False, **({"url": source} if isinstance(source, str) else {})}}}
-    if isinstance(source, str):
-        sent = graph_request(config, "POST", f"{config['page']}/messages", json_body={
-            "recipient": {"id": recipient}, "messaging_type": "RESPONSE", "message": message}, timeout=120)
-    else:
-        body, length, content_type = multipart({"recipient": json.dumps({"id": recipient}), "messaging_type": "RESPONSE",
-                                                "message": json.dumps(message)}, "filedata", source)
-        sent = upload_request(config, f"{GRAPH_BASE}/{config['version']}/{config['page']}/messages",
-                              {"Authorization": f"Bearer {config['token']}", "Content-Type": content_type}, body, length, 300)
-    if not isinstance(sent.get("message_id"), str):
-        raise CliError("Facebook did not return the message ID")
-    return sent["message_id"]
-
-
-def video_file(value: str) -> Path:
-    path = Path(value).expanduser()
+            with file.open("rb") as source:
+                while chunk := source.read(8 * 1024 * 1024):
+                    body.write(chunk)
+        except OSError as exc:
+            raise CliError(f"cannot read file: {file.name}") from exc
+        body.write(f"\r\n--{boundary}--\r\n".encode())
+        size = body.tell()
+        body.seek(0)
+        req = request.Request(f"{base}/{config['version']}/{path.lstrip('/')}", data=body, method="POST", headers={
+            "Authorization": f"Bearer {config['token']}", "Accept": "application/json",
+            "User-Agent": "claude-premium-facebook-page/1", "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "Content-Length": str(size)})
+        try:
+            with request.urlopen(req, timeout=timeout) as response:
+                raw = response.read()
+        except error.HTTPError as exc:
+            raise CliError(f"Facebook API returned HTTP {exc.code}") from exc
+        except (error.URLError, TimeoutError) as exc:
+            raise CliError("Facebook API is unavailable or timed out") from exc
     try:
-        size = path.stat().st_size if path.is_file() else -1
-        with path.open("rb"):
-            pass
-    except OSError:
-        size = -1
-    if not 0 < size <= VIDEO_LIMIT:
-        raise argparse.ArgumentTypeError("video must be a readable file of at most 10 GB")
-    return path
+        value = json.loads(raw)
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise CliError("Facebook API returned invalid JSON") from exc
+    if not isinstance(value, dict) or "error" in value:
+        raise CliError("Facebook API rejected the request")
+    return value
 
 
-def offsets(reply: dict[str, object]) -> tuple[int, int]:
+def media_kind(file: Path) -> str:
+    """photo or video by the file's own bytes, within Facebook's limits; anything else is refused before any call."""
     try:
-        return int(str(reply["start_offset"])), int(str(reply["end_offset"]))
-    except (KeyError, ValueError) as exc:
-        raise CliError("Facebook did not return the next chunk of the upload") from exc
-
-
-def upload_video(config: dict[str, str], path: Path, description: str, title: str | None) -> str:
-    """Facebook's resumable upload for a Page video: start, the chunks it asks for, finish."""
-    page, size = config["page"], path.stat().st_size
-    start = graph_request(config, "POST", f"{page}/videos", base=GRAPH_VIDEO_BASE,
-                          form={"upload_phase": "start", "file_size": size}, timeout=60)
-    session, video = start.get("upload_session_id"), start.get("video_id")
-    if not isinstance(session, str) or not isinstance(video, str):
-        raise CliError("Facebook did not open a video upload")
-    begin, end = offsets(start)
-    sent = 0
-    while begin < end:
-        # Only the next bytes of this file: a reply that skips, repeats or runs past the file stops the upload.
-        if begin != sent or end > size:
-            raise CliError("Facebook asked for a part of the video that does not follow")
-        boundary = "fbpage" + os.urandom(12).hex()
-        fields = {"upload_phase": "transfer", "upload_session_id": session, "start_offset": str(begin)}
-        head = "".join(f"--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
-                       for name, value in fields.items())
-        head = (head + f"--{boundary}\r\nContent-Disposition: form-data; name=\"video_file_chunk\"; filename=\"chunk\"\r\n"
-                       "Content-Type: application/octet-stream\r\n\r\n").encode("utf-8")
-        tail = f"\r\n--{boundary}--\r\n".encode("utf-8")
-        chunk = itertools.chain([head], file_blocks(path, begin, end - begin), [tail])
-        reply = upload_request(config, f"{GRAPH_VIDEO_BASE}/{config['version']}/{page}/videos",
-                               {"Authorization": f"Bearer {config['token']}",
-                                "Content-Type": f"multipart/form-data; boundary={boundary}"},
-                               chunk, len(head) + end - begin + len(tail), 600)
-        sent = end
-        begin, end = offsets(reply)
-        if begin != sent:
-            raise CliError("Facebook did not take the video chunk")
-    if sent != size:
-        raise CliError("Facebook ended the upload before the whole video was sent")
-    done = graph_request(config, "POST", f"{page}/videos", base=GRAPH_VIDEO_BASE, timeout=120, form={
-        "upload_phase": "finish", "upload_session_id": session, "description": description,
-        **({"title": title} if title else {})})
-    if done.get("success") is not True:
-        raise CliError("Facebook did not finish the video upload")
-    return video
-
-
-def publish_reel(config: dict[str, str], path: Path | None, url: str | None, description: str) -> dict[str, object]:
-    """A Page reel: open it, send the file (or let Facebook fetch the URL), then publish it with its text."""
-    page = config["page"]
-    start = graph_request(config, "POST", f"{page}/video_reels", form={"upload_phase": "start"}, timeout=60)
-    video, target = start.get("video_id"), start.get("upload_url")
-    if not isinstance(video, str) or not OBJECT_ID.fullmatch(video) or not isinstance(target, str) \
-            or not target.startswith(UPLOAD_BASE):
-        raise CliError("Facebook did not open a reel upload")
-    headers = {"Authorization": f"OAuth {config['token']}", "Content-Type": "application/octet-stream"}
-    if path is not None:
-        size = path.stat().st_size
-        sent = upload_request(config, target, {**headers, "offset": "0", "file_size": str(size)},
-                              file_blocks(path, 0, size), size, 600)
-    else:
-        sent = upload_request(config, target, {**headers, "file_url": url or ""}, b"", 0, 600)
-    if sent.get("success") is not True:
-        raise CliError("Facebook did not take the reel file")
-    done = graph_request(config, "POST", f"{page}/video_reels", timeout=120, form={
-        "upload_phase": "finish", "video_id": video, "video_state": "PUBLISHED", "description": description})
-    if done.get("success") is not True:
-        raise CliError("Facebook did not publish the reel")
-    try:
-        found = graph_request(config, "GET", video, query={"fields": "status,permalink_url"})
-    except CliError:
-        found = {}
-    link, status = found.get("permalink_url"), found.get("status")
-    return {"ok": True, "id": video, **({"permalink_url": link} if isinstance(link, str) else {}), **({"status": status} if status else {})}
+        size = file.stat().st_size
+        with file.open("rb") as handle:
+            head = handle.read(16)
+    except OSError as exc:
+        raise CliError(f"cannot read file: {file.name}") from exc
+    if size <= 0:
+        raise CliError(f"file is empty: {file.name}")
+    if head[:3] == b"\xff\xd8\xff" or head[:8] == b"\x89PNG\r\n\x1a\n" or (head[:4] == b"RIFF" and head[8:12] == b"WEBP"):
+        if size > MAX_PHOTO:
+            raise CliError(f"photo is larger than 10 MB: {file.name}")
+        return "photo"
+    if head[4:8] == b"ftyp":
+        if size > MAX_VIDEO:
+            raise CliError(f"video is larger than 1 GB: {file.name}")
+        return "video"
+    raise CliError(f"only photos (JPEG, PNG, WebP) and videos (MP4, MOV) can be posted: {file.name}")
 
 
 def object_id(value: str) -> str:
@@ -351,27 +181,12 @@ def bounded_limit(value: str) -> int:
     return parsed
 
 
-PUBLIC_HOST = re.compile(r"(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z][a-z0-9-]*", re.I)
-LOCAL_HOST = re.compile(r"(?:^|\.)(?:localhost|local|internal|lan|home|test|invalid|arpa)$", re.I)
-
-
 def public_url(value: str) -> str:
-    """An https address Facebook can fetch from the internet, judged as the company mode's publicImageUrl judges it: a
-    DNS name whose last label starts with a letter (no IP literal in any spelling: 127.1 and 0177.0.0.1 are loopback),
-    no local suffix, no credentials, the standard port."""
     parsed = parse.urlparse(value)
-    host = parsed.hostname or ""
-    try:
-        port = parsed.port
-    except ValueError:
-        port = -1
-    if (parsed.scheme != "https" or len(value) > 2048 or re.search(r"[\x00-\x20\x7f]", value) or parsed.username
-            or parsed.password or parsed.fragment or "#" in value or port not in (None, 443) or not PUBLIC_HOST.fullmatch(host)
-            or LOCAL_HOST.search(host)):
-        raise argparse.ArgumentTypeError("URL must be a public HTTPS URL without credentials or a #fragment")
-    # The ASCII form, as the company mode's URL.href gives it: a Cyrillic path goes out percent-encoded, never as raw
-    # bytes in a header that cannot carry them.
-    return re.sub(r"[^\x21-\x7e]+", lambda found: parse.quote(found.group(0), safe=""), value)
+    if (parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password
+            or parsed.hostname in {"localhost", "127.0.0.1", "::1"}):
+        raise argparse.ArgumentTypeError("URL must be a public HTTPS URL without credentials")
+    return value
 
 
 def read_text(path: Path, max_chars: int) -> str:
@@ -446,39 +261,22 @@ def build_parser() -> argparse.ArgumentParser:
     publish.add_argument("--message-file", type=Path, required=True)
     publish.add_argument("--link", type=public_url)
     publish.add_argument("--confirm", action="store_true")
-    photo = commands.add_parser("photo", help="publish a photo from a public URL or a local file")
-    source = photo.add_mutually_exclusive_group(required=True)
-    source.add_argument("--url", type=public_url)
-    source.add_argument("--file", type=photo_source)
+    media = commands.add_parser("media", help="publish local files: 1-10 photos as one post, or one video")
+    media.add_argument("--file", type=Path, action="append", required=True)
+    media.add_argument("--message-file", type=Path)
+    media.add_argument("--confirm", action="store_true")
+    photo = commands.add_parser("photo", help="publish a photo from a public URL")
+    photo.add_argument("--url", type=public_url, required=True)
     photo.add_argument("--message-file", type=Path, required=True)
     photo.add_argument("--confirm", action="store_true")
-    album = commands.add_parser("album", help="publish one post of 2 to 10 photos (links or local files)")
-    album.add_argument("--item", type=photo_source, action="append", default=[])
-    album.add_argument("--message-file", type=Path, required=True)
-    album.add_argument("--confirm", action="store_true")
-    video = commands.add_parser("video", help="publish a video from a local file or a public URL")
-    source = video.add_mutually_exclusive_group(required=True)
-    source.add_argument("--file", type=video_file)
-    source.add_argument("--url", type=public_url)
-    video.add_argument("--message-file", type=Path, required=True)
-    video.add_argument("--title")
-    video.add_argument("--confirm", action="store_true")
-    reel = commands.add_parser("reel", help="publish a reel (vertical video) from a local file or a public URL")
-    source = reel.add_mutually_exclusive_group(required=True)
-    source.add_argument("--file", type=video_file)
-    source.add_argument("--url", type=public_url)
-    reel.add_argument("--message-file", type=Path, required=True)
-    reel.add_argument("--confirm", action="store_true")
-    reply = commands.add_parser("reply", help="reply to one comment under one of the page's posts: text, a photo or both")
+    reply = commands.add_parser("reply", help="reply to one comment under one of the page's posts")
     reply.add_argument("post_id", type=object_id)
     reply.add_argument("comment_id", type=object_id)
-    reply.add_argument("--message-file", type=Path)
-    reply.add_argument("--photo", type=photo_source)
+    reply.add_argument("--message-file", type=Path, required=True)
     reply.add_argument("--confirm", action="store_true")
-    message = commands.add_parser("message", help="answer a person in the page's Messenger inbox: text, attachments or both")
+    message = commands.add_parser("message", help="answer a person in the page's Messenger inbox")
     message.add_argument("recipient_id", type=object_id)
-    message.add_argument("--message-file", type=Path)
-    message.add_argument("--attachment", type=attachment, action="append", default=[])
+    message.add_argument("--message-file", type=Path, required=True)
     message.add_argument("--confirm", action="store_true")
     return parser
 
@@ -509,96 +307,64 @@ def main() -> int:
         if args.command == "photo":
             text = read_text(args.message_file, 5000)
             writing("photo")
-            created = upload_photo(config, args.file or args.url, text, True)
+            created = graph_request(config, "POST", f"{page}/photos", form={"url": args.url, "caption": text}, timeout=60)
             post = created.get("post_id") or created.get("id")
             if not isinstance(post, str):
                 raise CliError("Facebook did not return the photo post ID")
             return print_json({"ok": True, **permalink(config, post)})
-        if args.command == "album":
-            text = read_text(args.message_file, 5000)
-            if not 2 <= len(args.item) <= 10:
-                raise CliError("an album post takes 2 to 10 photos")
-            uploaded: list[str] = []
-            try:
-                # The photos go up unpublished first: until the post below, nothing is on the page for anyone.
-                for item in args.item:
-                    created = upload_photo(config, item, None, False)
-                    if not isinstance(created.get("id"), str):
-                        raise CliError("Facebook did not return an uploaded photo's ID")
-                    uploaded.append(created["id"])
-            except (CliError, ValueError, OSError) as exc:
-                remove_photos(config, uploaded)
-                # Nothing is on the page: the post below never went. A photo whose upload answer was lost may stay
-                # unpublished in the page's library, seen by nobody; a new try makes a new post, never a second one.
-                raise CliError(f"{exc}; nothing was posted to the page") from exc
-            writing("album")
-            post = graph_request(config, "POST", f"{page}/feed", timeout=60, form={
-                "message": text, **{f"attached_media[{index}]": json.dumps({"media_fbid": photo})
-                                    for index, photo in enumerate(uploaded)}})
-            if not isinstance(post.get("id"), str):
-                raise CliError("Facebook did not return the album post ID")
-            return print_json({"ok": True, **permalink(config, post["id"])})
-        if args.command == "video":
-            text = read_text(args.message_file, 5000)
-            title = (args.title or "").strip() or None
-            if title is not None and len(title) > 255:
-                raise CliError("title exceeds 255 characters")
-            writing("video")
-            if args.file is not None:
-                video = upload_video(config, args.file, text, title)
-            else:
-                created = graph_request(config, "POST", f"{page}/videos", base=GRAPH_VIDEO_BASE, timeout=600, form={
-                    "file_url": args.url, "description": text, **({"title": title} if title else {})})
-                video = created.get("id")
-                if not isinstance(video, str):
+        if args.command == "media":
+            text = read_text(args.message_file, 5000) if args.message_file else ""
+            if not 1 <= len(args.file) <= MAX_MEDIA:
+                raise CliError(f"a post takes 1-{MAX_MEDIA} files")
+            kinds = [media_kind(file) for file in args.file]
+            if "video" in kinds:
+                if len(args.file) != 1:
+                    raise CliError("a video goes as its own post, without other files")
+                writing("video")
+                created = graph_upload(config, f"{page}/videos", {"description": text} if text else {}, args.file[0],
+                                       base=VIDEO_BASE, timeout=900)
+                if not isinstance(created.get("id"), str):
                     raise CliError("Facebook did not return the video ID")
-            return print_json({"ok": True, **permalink(config, video)})
-        if args.command == "reel":
-            text = read_text(args.message_file, 5000)
-            writing("reel")
-            return print_json(publish_reel(config, args.file, args.url, text))
+                return print_json({"ok": True, "kind": "video", **permalink(config, created["id"])})
+            if len(args.file) == 1:
+                writing("photo")
+                created = graph_upload(config, f"{page}/photos", {"caption": text} if text else {}, args.file[0])
+                post = created.get("post_id") or created.get("id")
+                if not isinstance(post, str):
+                    raise CliError("Facebook did not return the photo post ID")
+                return print_json({"ok": True, "kind": "photo", **permalink(config, post)})
+            # An album: unpublished photos nobody sees, then one post that shows them in this order.
+            photos = []
+            for file in args.file:
+                created = graph_upload(config, f"{page}/photos", {"published": "false"}, file)
+                if not isinstance(created.get("id"), str):
+                    raise CliError("Facebook did not return a photo ID")
+                photos.append(created["id"])
+            form: dict[str, object] = {"message": text} if text else {}
+            for index, photo_id in enumerate(photos):
+                form[f"attached_media[{index}]"] = json.dumps({"media_fbid": photo_id})
+            writing("album post")
+            created = graph_request(config, "POST", f"{page}/feed", form=form, timeout=60)
+            if not isinstance(created.get("id"), str):
+                raise CliError("Facebook did not return the post ID")
+            return print_json({"ok": True, "kind": "album", "photos": len(photos), **permalink(config, created["id"])})
         if args.command == "reply":
-            if args.message_file is None and args.photo is None:
-                raise CliError("a reply takes --message-file, --photo or both")
-            text = read_text(args.message_file, 2000) if args.message_file is not None else None
+            text = read_text(args.message_file, 2000)
             page_post(config, args.post_id)
             comment_under(config, args.post_id, args.comment_id)
             writing("comment reply")
-            fields = {"message": text} if text else {}
-            if isinstance(args.photo, Path):
-                body, length, content_type = multipart(fields, "source", args.photo)
-                created = upload_request(config, f"{GRAPH_BASE}/{config['version']}/{args.comment_id}/comments",
-                                         {"Authorization": f"Bearer {config['token']}", "Content-Type": content_type}, body, length, 300)
-            else:
-                created = graph_request(config, "POST", f"{args.comment_id}/comments", timeout=60,
-                                        form={**fields, **({"attachment_url": args.photo} if args.photo else {})})
+            created = graph_request(config, "POST", f"{args.comment_id}/comments", form={"message": text})
             if not isinstance(created.get("id"), str):
                 raise CliError("Facebook did not return the reply ID")
             return print_json({"ok": True, "id": created["id"]})
-        if args.message_file is None and not args.attachment:
-            raise CliError("a message takes --message-file, --attachment or both")
-        if len(args.attachment) > 10:
-            raise CliError("a message takes at most 10 attachments")
-        text = read_text(args.message_file, 2000) if args.message_file is not None else None
+        text = read_text(args.message_file, 2000)
         writing("message")
-        # Messenger carries text and an attachment as separate messages: the text first, then each attachment in order.
-        def send_text() -> str:
-            sent = graph_request(config, "POST", f"{page}/messages", json_body={
-                "recipient": {"id": args.recipient_id}, "messaging_type": "RESPONSE", "message": {"text": text}})
-            if not isinstance(sent.get("message_id"), str):
-                raise CliError("Facebook did not return the message ID")
-            return sent["message_id"]
-        steps = ([send_text] if text is not None else []) + [
-            (lambda kind=kind, source=source: send_attachment(config, args.recipient_id, kind, source)) for kind, source in args.attachment]
-        ids = []
-        for step in steps:
-            try:
-                ids.append(step())
-            except (CliError, ValueError, OSError) as exc:
-                # The person already has what went before: the agent must not send it again.
-                raise CliError(f"{len(ids)} of {len(steps)} messages were delivered before this error: {exc}") from exc
-        return print_json({"ok": True, "messageId": ids[0], **({"messageIds": ids} if len(ids) > 1 else {})})
-    except (CliError, ValueError, OSError) as exc:
+        sent = graph_request(config, "POST", f"{page}/messages", json_body={
+            "recipient": {"id": args.recipient_id}, "messaging_type": "RESPONSE", "message": {"text": text}})
+        if not isinstance(sent.get("message_id"), str):
+            raise CliError("Facebook did not return the message ID")
+        return print_json({"ok": True, "messageId": sent["message_id"]})
+    except (CliError, ValueError) as exc:
         print(f"fb-page: {exc}", file=sys.stderr)
         return 2
 

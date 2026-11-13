@@ -13,9 +13,6 @@ import tempfile
 # These are the old kit registrations, including their event and matcher.
 # A user's command may mention one of the same helpers for a different job.
 DEPRECATED_HOOKS = (
-    # Owner, 04.11.2026: the note also meets a background loop in Bash; the Monitor-only entry gives way to Monitor|Bash.
-    ("PostToolUse", "Monitor", "{H}/bin/monitor-wakeup-note"),
-    ("SessionStart", None, "{H}/bin/answer-context scheduled-hook"),
     ("SessionStart", None, "{H}/bin/vault-index"),
     ("UserPromptSubmit", None, "{H}/bin/cash-thread-capture"),
     ("PostToolUse", "mcp__plugin_telegram_telegram__(reply|edit_message)",
@@ -24,34 +21,33 @@ DEPRECATED_HOOKS = (
      "jq -r '.tool_input.file_path // .tool_response.filePath // \"\"' "
      "| grep -q \"^{H}/obsidian-vault/\" && {H}/bin/vault-sync &"),
     ("SessionStart", None, "/opt/claude-graphify/bin/graphify hook-guard read"),
+    # The secrets guard covers every tool since 20.10.2026; this was its shell-and-files matcher.
+    ("PreToolUse", "Bash|Read|Edit|Write|MultiEdit", "{H}/bin/no-secrets-guard"),
 )
 MANAGED_HOOKS = (
     ("PreCompact", None, "{H}/bin/tg-compaction-notice", 10),
     ("SessionStart", None, "{H}/bin/wiki-hot-inject", 10),
+    ("SessionStart", None, "{H}/bin/answer-context scheduled-hook", 5),
     ("SessionStart", "compact", "{H}/bin/tg-context-inject", 5),
     ("UserPromptSubmit", None, "{H}/bin/tg-context-inject", 5),
-    # In the template since 18.08.2026 and missing here until 10.11.2026: an agent installed earlier had the file and
-    # no registration, so its subagent results were never checked.
-    ("UserPromptSubmit", None, "{H}/bin/subagent-result-nudge", 5),
-    ("UserPromptSubmit", None, "{H}/bin/tg-confirm-press", 5),
     ("PreToolUse", "Bash", "{H}/bin/no-nested-claude-guard", 5),
     ("PreToolUse", "mcp__plugin_telegram_telegram__reply", "{H}/bin/tg-format-enforcer", 5),
-    # Product owner, 13.11.2026: a reply that claims what the turn did not do goes back once (tg-answer-check).
-    ("PreToolUse", "mcp__plugin_telegram_telegram__reply|mcp__plugin_telegram_telegram__edit_message",
-     "{H}/bin/tg-answer-check", 10),
-    ("PreToolUse", "Bash|Read|Edit|Write|MultiEdit", "{H}/bin/no-secrets-guard", 5),
+    ("PreToolUse", None, "{H}/bin/no-secrets-guard", 5),
     ("PreToolUse", "Bash|Edit|Write|MultiEdit", "{H}/bin/memory-budget-guard", 5),
     ("PreToolUse", "Bash|Edit|Write|MultiEdit", "{H}/bin/settings-model-guard", 90),
     ("PreToolUse", "Bash|Agent|SendMessage", "{H}/bin/tg-native-task", 10),
     ("PostToolUse", "Bash|Agent|SendMessage|TaskStop", "{H}/bin/tg-native-task", 10),
-    ("PostToolUse", "Monitor|Bash", "{H}/bin/monitor-wakeup-note", 5),
     ("PostToolUseFailure", "Bash|Agent|SendMessage|TaskStop", "{H}/bin/tg-native-task", 10),
     ("PostToolBatch", None, "{H}/bin/tg-native-task", 10),
+    ("PermissionRequest", None, "{H}/bin/tg-native-task", 10),
     ("Stop", None, "{H}/bin/tg-reply-stop-guard", 35),
     ("Stop", None, "{H}/bin/tg-turn-end", 5),
     ("StopFailure", None, "{H}/bin/tg-turn-end", 5),
     ("SessionStart", None, "{H}/bin/tg-turn-end", 5),
 )
+
+# A hook that must cover its exact matcher whatever an owner added: the secrets guard watches every tool.
+EXACT_MATCHER_HOOKS = ("{H}/bin/no-secrets-guard",)
 
 PROTECTED_DENY_RULES = (
     "Read({H}/.claude/channels/telegram/.env)",
@@ -151,6 +147,7 @@ def migrate(
         (event, matcher, command.format(H=home), timeout)
         for event, matcher, command, timeout in MANAGED_HOOKS
     )
+    exact_matcher_hooks = {command.format(H=home) for command in EXACT_MATCHER_HOOKS}
     protected_deny_rules = tuple(v.format(H=home) for v in PROTECTED_DENY_RULES)
     deprecated_deny_rules = tuple(dict.fromkeys(
         [v.format(H=home) for v in DEPRECATED_DENY_RULES]
@@ -202,6 +199,7 @@ def migrate(
         entries = hooks.setdefault(event, [])
         already_present = any(
             command == hook_command(action)
+            and (command not in exact_matcher_hooks or entry.get("matcher") == matcher)
             for entry in entries
             if isinstance(entry, dict)
             for action in entry.get("hooks", [])
@@ -317,8 +315,7 @@ def migrate(
                 data["skillOverrides"] = live_skill_overrides
             live_skill_overrides = skill_overrides(live_skill_overrides)
             for name, state in managed_skill_overrides.items():
-                # The retired name-only default takes the kit's current state (owner, 29.10.2026: off for the video duplicates).
-                if name in RETIRED_NAME_ONLY and live_skill_overrides.get(name) == "name-only":
+                if name in RETIRED_NAME_ONLY and state == "on" and live_skill_overrides.get(name) == "name-only":
                     live_skill_overrides[name] = state
                 live_skill_overrides.setdefault(name, state)
 

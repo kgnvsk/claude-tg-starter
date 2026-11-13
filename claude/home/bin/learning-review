@@ -36,7 +36,6 @@ LOCK_DIR = LEARNING_ROOT / "locks"
 VALID_CLASSES = {"semantic", "procedure"}
 VALID_KINDS = {"duplicate", "refinement", "fix", "exception", "new-skill"}
 MAX_FIELD_CHARS = 4_000
-MAX_EVIDENCE_CHARS = 1_000
 MAX_PENDING_CANDIDATES = 100
 MEMORY_LIMITS = {"memory/USER.md": 1_375, "memory/MEMORY.md": 2_200}
 SECRET_PATTERNS = (
@@ -174,7 +173,7 @@ def load_message(chat_id: str, message_id: str) -> dict:
         raise ValueError("Не вдалося прочитати базу повідомлень Telegram") from error
     if row is None:
         raise ValueError("Вихідне повідомлення Telegram не знайдено")
-    evidence = str(row["text"] or "").strip()[:MAX_EVIDENCE_CHARS]
+    evidence = str(row["text"] or "").strip()  # whole (owner, 23.10.2026): it was its first 1 000 characters
     if not evidence:
         raise ValueError("Вихідне повідомлення Telegram не містить текстового доказу")
     reject_secrets(evidence, "вихідний доказ")
@@ -1006,7 +1005,9 @@ def digest(arguments: argparse.Namespace) -> dict:
     if not candidates:
         return {"status": "empty", "count": 0, "sent": False}
     lines = [f"Кандидатів на навчання в очікуванні: {len(candidates)}"]
-    for candidate in candidates[:20]:
+    # Every candidate (owner, 23.10.2026: the first 20 came and newer ones never did); tg-send sends a long list as
+    # several messages.
+    for candidate in candidates:
         source = candidate["source"]
         expiry = str(candidate["expiresAt"])[:10]
         line = (
@@ -1020,8 +1021,6 @@ def digest(arguments: argparse.Namespace) -> dict:
                 expiry,
             )
         )
-        if len("\n".join([*lines, line])) > 3_350:
-            break
         lines.append(line)
     lines.append("Відповідай командою: /learn_preview <id>")
     message = "\n".join(lines)

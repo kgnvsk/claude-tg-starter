@@ -36,6 +36,17 @@
   "skillListingMaxDescChars": 10000,
   "bashOutputMaxChars": 128000,
   "hooks": {
+    "PermissionRequest": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "{{AGENT_HOME}}/bin/tg-native-task",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
     "PreToolUse": [
       {
         "matcher": "Bash",
@@ -58,24 +69,13 @@
         ]
       },
       {
-        "matcher": "mcp__plugin_telegram_telegram__reply|mcp__plugin_telegram_telegram__edit_message",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "{{AGENT_HOME}}/bin/tg-answer-check",
-            "timeout": 10
-          }
-        ]
-      },
-      {
         "hooks": [
           {
             "type": "command",
             "command": "{{AGENT_HOME}}/bin/no-secrets-guard",
             "timeout": 5
           }
-        ],
-        "matcher": "Bash|Read|Edit|Write|MultiEdit"
+        ]
       },
       {
         "hooks": [
@@ -116,16 +116,6 @@
             "type": "command",
             "command": "{{AGENT_HOME}}/bin/tg-native-task",
             "timeout": 10
-          }
-        ]
-      },
-      {
-        "matcher": "Monitor|Bash",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "{{AGENT_HOME}}/bin/monitor-wakeup-note",
-            "timeout": 5
           }
         ]
       }
@@ -205,11 +195,6 @@
           {
             "type": "command",
             "command": "{{AGENT_HOME}}/bin/subagent-result-nudge",
-            "timeout": 5
-          },
-          {
-            "type": "command",
-            "command": "{{AGENT_HOME}}/bin/tg-confirm-press",
             "timeout": 5
           }
         ]

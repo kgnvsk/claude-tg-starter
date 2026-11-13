@@ -15,7 +15,6 @@ MANAGED_BIN_NAMES = frozenset(
     {
         "access-update",
         "agent-backup",
-        "agent-rules",
         "agent-backup-chat",
         "agent-backup-github-login",
         "agent-github-backup",
@@ -29,6 +28,7 @@ MANAGED_BIN_NAMES = frozenset(
         "agent_notice_locale.py",
         "agent-provider-run",
         "fb-page",
+        "group-folder",
         "yt-channel",
         "mail-watch-check",
         "gh",
@@ -38,6 +38,7 @@ MANAGED_BIN_NAMES = frozenset(
         "apify-social",
         "asana-tasks",
         "browser-doctor",
+        "browser-mcp",
         "browser-pdf.mjs",
         "cal-event-time",
         "cash-doctor",
@@ -54,6 +55,7 @@ MANAGED_BIN_NAMES = frozenset(
         "claude-telegram-bot",
         "codex-image-generate",
         "codex-image-result",
+        "credential-intake",
         "delivery-shadow-report",
         "findata",
         "gog",
@@ -65,6 +67,7 @@ MANAGED_BIN_NAMES = frozenset(
         "icloud-mail",
         "inbox-secretary",
         "owner_outbound.py",
+        "owner_approval.py",
         "install-plugins",
         "kit-module",
         "learning-review",
@@ -77,9 +80,9 @@ MANAGED_BIN_NAMES = frozenset(
         "memory-open",
         "memory-search",
         "meta-ads",
-        "monitor-wakeup-note",
         "no-nested-claude-guard",
         "no-secrets-guard",
+        "onboarding-checkins",
         "onboarding-reminder",
         "onboarding-status",
         "plugin-doctor",
@@ -111,15 +114,14 @@ MANAGED_BIN_NAMES = frozenset(
         "telegram-backup-chat.ts",
         "telegram-inbox-prune",
         "tender-watch",
-        "tg-answer-check",
         "tg-context-inject",
         "tg-compaction-notice",
-        "tg-confirm-press",
         "tg-resume-session",
         "tg-escape",
         "tg-fallback-outbound",
         "tg-format-enforcer",
         "tg-native-task",
+        "native-task-control",
         "tg-reply-stop-guard",
         "tg-rich",
         "tg-send",
@@ -139,9 +141,14 @@ MANAGED_BIN_NAMES = frozenset(
         "vault-sync",
         "vc",
         "verify-telegram-bot",
-        "video-check",
         "video-edit",
         "video-ingest",
+        "work-tools",
+        "video-check-overlay",
+        "task-review",
+        "owner-rules",
+        "answer-context",
+        "plan-item",
         "wiki-hot-inject",
         "yt-dl",
     }
@@ -169,18 +176,6 @@ APPROVED_MANAGED_PATHS = frozenset(
 )
 
 
-# Tools main's line managed until 28.10.2026 and V2 does not ship. update-safety-check has already removed or kept
-# those bin files, so an agent's previous state from that line may name them; the kit's own policy may not.
-RETIRED_MANAGED_PATHS = frozenset(
-    f"bin/{name}"
-    for name in (
-        "answer-context", "browser-mcp", "credential-intake", "group-folder", "native-task-control",
-        "onboarding-checkins", "owner-rules", "owner_approval.py", "plan-item", "task-review",
-        "video-check-overlay", "work-tools",
-    )
-)
-
-
 class PolicyError(ValueError):
     pass
 
@@ -197,11 +192,7 @@ def validate_v2_path(value: str) -> str:
     return value
 
 
-def validate_previous_path(value: str) -> str:
-    return value if value in RETIRED_MANAGED_PATHS else validate_v2_path(value)
-
-
-def load_policy(path: Path, *, previous: bool = False) -> dict[str, object]:
+def load_policy(path: Path) -> dict[str, object]:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, ValueError) as error:
@@ -233,8 +224,6 @@ def load_policy(path: Path, *, previous: bool = False) -> dict[str, object]:
                 f"поле {field} політики керованих компонентів має містити унікальні шляхи"
             )
         validator = normalize_v1_name if schema_version == 1 else validate_v2_path
-        if previous and schema_version == 2:
-            validator = validate_previous_path
         normalized[field] = [validator(value) for value in values]
     if not set(normalized["selected"]).issubset(set(normalized["managed"])):
         raise PolicyError("вибрані шляхи мають бути підмножиною керованих шляхів")
@@ -291,7 +280,7 @@ def reconcile(home_root: Path, policy_path: Path, state_path: Path) -> None:
     policy = load_policy(policy_path)
     previous_managed: set[str] = set()
     if state_path.exists():
-        previous = load_policy(state_path, previous=True)
+        previous = load_policy(state_path)
         previous_managed = set(previous["managed"])
 
     selected = set(policy["selected"])

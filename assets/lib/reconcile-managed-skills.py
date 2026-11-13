@@ -29,110 +29,6 @@ class PolicyError(ValueError):
     pass
 
 
-HYPERFRAMES_SKILLS = frozenset((
-    "embedded-captions", "faceless-explainer", "figma", "general-video", "hyperframes",
-    "hyperframes-animation", "hyperframes-cli", "hyperframes-core", "hyperframes-creative",
-    "hyperframes-keyframes", "hyperframes-registry", "media-use", "motion-graphics",
-    "music-to-video", "pr-to-video", "product-launch-video", "remotion-to-hyperframes",
-    "slideshow", "talking-head-recut",
-))
-HYPERFRAMES_KIT_NOTICE = (
-    "> **Kit-managed HyperFrames:** Read the bundled workflow and domain skills. "
-    "Do not install, refresh, or prune skills with HyperFrames or a generic skill installer, "
-    "including when CLI output suggests it. Prefix project initialization with "
-    "`HYPERFRAMES_SKIP_SKILLS=1`; `--skip-skills` alone is ignored. "
-    "If a workflow is missing, follow `/hyperframes` → `references/skill-lifecycle.md`; "
-    "do not reconstruct it from memory."
-)
-HYPERFRAMES_KIT_LIFECYCLE = """# Kit-managed skill lifecycle
-
-The kit bundles the selected HyperFrames workflows and domain skills together.
-Read those installed files before starting a task; first use requires no skill download.
-The kit installer records and reconciles their baseline, preserving owner edits and disabled skills.
-
-## Project initialization
-
-Prefix every init command with HYPERFRAMES_SKIP_SKILLS=1, for example:
-
-```bash
-HYPERFRAMES_SKIP_SKILLS=1 npx hyperframes init my-video --non-interactive --example blank
-```
-
-The --skip-skills flag alone is ignored by this CLI. The environment variable prevents
-init from replacing the installed skill set. It does not skip project scaffolding.
-Ignore standalone skill-install, freshness, or recovery suggestions printed by the CLI;
-they describe an upstream installation, not this kit-managed installation.
-Do not run HyperFrames skill installers, updates, pruning, or generic skill installers.
-
-## Missing workflow or incomplete bundled assets
-
-Check the selected kit/module and the installed and disabled skill lists first.
-Do not silently enable a deliberately disabled skill or overwrite owner modifications.
-For a selected, enabled skill that is missing or incomplete, use the normal kit update
-or repair route with the kit's verified package and managed-skill reconciliation.
-Novsky's existing Skills/module controls govern selection; there is no separate
-HyperFrames setup module. If this kit does not include the requested workflow, report
-that missing capability and use the existing kit/module selection route. Do not fetch
-an upstream replacement, copy files over a managed baseline, or invent a setup command.
-"""
-
-
-def claude_managed_skill(name: str, relative: str, payload: bytes) -> bytes:
-    """Project pinned upstream skills into Claude's kit-owned installation.
-
-    Leave the shared upstream tree and the frozen Codex builder untouched. This
-    same projection is used before server baseline hashing and native payload hashing.
-    """
-    if name not in HYPERFRAMES_SKILLS:
-        return payload
-    if name == "media-use" and relative in {
-        "scripts/lib/bundled-sfx-provider.mjs", "scripts/lib/bundled-sfx-provider.test.mjs",
-        "scripts/resolve.test.mjs",
-    }:
-        return payload.replace(b"npx hyperframes skills update media-use", b"normal kit update or repair of media-use").replace(
-            b"hyperframes skills update media-use", b"normal kit update or repair of media-use")
-    if not relative.endswith(".md"):
-        return payload
-    text = payload.decode("utf-8")
-    if name == "hyperframes" and relative == "references/skill-lifecycle.md":
-        return HYPERFRAMES_KIT_LIFECYCLE.encode()
-    if name == "hyperframes" and relative == "SKILL.md":
-        text = text.replace("selects and installs", "selects and reads")
-        text = text.replace("available before lazy-installed workflow skills are present", "included with the bundled workflow skills")
-        text = re.sub(r"## 4\. Install and enter the workflow\n.*?(?=\n## 5\.)",
-            "## 4. Read and enter the bundled workflow\n\nRead the selected installed workflow and its core domain skills. "
-            "No first-task installation or freshness check is needed. For missing files, follow "
-            "`references/skill-lifecycle.md` and the normal kit update or repair route.\n", text, flags=re.S)
-    text = re.sub(r"^> \*\*First, keep this skill fresh.*$", "", text, flags=re.M)
-    text = re.sub(r"Before relying on this workflow, run:\n\n```bash\nnpx hyperframes skills update general-video\n```\n\n"
-        r"A successful no-op means the skill is current\. Surface an update failure instead of continuing from memory\.",
-        "Read this bundled workflow before relying on it; no first-task skill installation is required.", text)
-    text = text.replace("First run `npx hyperframes skills update <workflow-name>`.", "First read that bundled workflow.")
-    text = text.replace("and workflow skills install lazily. Before reaching across, run `npx hyperframes skills update <that-workflow>` with the bare name.",
-        "and are bundled by the kit. Before reaching across, read that installed workflow; use the kit lifecycle route if it is missing.")
-    text = text.replace("installing it first per the SKILL.md's install step", "reading its bundled files per SKILL.md's entry step")
-    text = text.replace("`init` checks the installed skills against the latest on GitHub and updates the global set if any are out of date.",
-        "Guarded `init` scaffolds the project and leaves kit-managed skills unchanged.")
-    if name == "hyperframes-cli" and relative == "references/init-and-scaffold.md":
-        text = text.replace("and install AI coding skills", "without replacing kit-managed AI coding skills")
-        text = re.sub(r"^- `--skip-skills` .*?$", "- `--skip-skills` alone is ignored; always set `HYPERFRAMES_SKIP_SKILLS=1` for kit-managed skills.", text, flags=re.M)
-        if "## skills\n" in text:
-            text = text.split("## skills\n", 1)[0] + "## Kit-managed skills\n\nRead `/hyperframes` → `references/skill-lifecycle.md`. " \
-                "Use the bundled skills; standalone CLI installation or recovery hints do not apply.\n"
-    if name == "hyperframes-animation" and relative == "adapters/animate-text.md":
-        text = text.replace("When a beat needs a deterministic text animation, load the upstream skill alongside this one:",
-            "Use this optional skill only if it is already available and permitted by the kit or owner. Otherwise use the bundled motion techniques below.")
-        text = text.replace("```bash\n# In your project root, install the upstream skill into .agents/skills/\nnpx skills add pixel-point/animate-text\n```\n\n", "")
-    # Per-command prefix works even when each Bash tool call starts a new shell.
-    text = re.sub(r"\b(?:(HYPERFRAMES_SKIP_SKILLS=1) )?(?:npx )?hyperframes init\b",
-        lambda match: match.group() if match.group(1) else "HYPERFRAMES_SKIP_SKILLS=1 " + match.group(), text)
-    if relative == "SKILL.md" and HYPERFRAMES_KIT_NOTICE not in text:
-        text = re.sub(r"\A(---\n.*?\n---\n)", lambda match: match.group() + "\n" + HYPERFRAMES_KIT_NOTICE + "\n", text, count=1, flags=re.S)
-    if re.search(r"npx\s+(?:hyperframes(?:@\S+)?\s+skills\b|skills\s+add\b)", text):
-        raise PolicyError(f"unadapted upstream skill installer: {name}/{relative}")
-    return text.encode("utf-8")
-
-
 def check_path(path: Path) -> None:
     """Do not read/write through symlinked roots, parents, or metadata files."""
     absolute = path.absolute()
@@ -241,7 +137,7 @@ def load_baseline(path: Path, *, agent_files: bool = False) -> dict[str, str]:
     return data["entries"]
 
 
-def snapshot(path: Path, *, render: bool = False, claude_external: bool = False) -> Snapshot | None:
+def snapshot(path: Path, *, render: bool = False) -> Snapshot | None:
     check_path(path)
     if not path.exists():
         return None
@@ -258,8 +154,6 @@ def snapshot(path: Path, *, render: bool = False, claude_external: bool = False)
             flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
             with os.fdopen(os.open(item, flags), "rb") as handle:
                 payload = handle.read()
-            if claude_external:
-                payload = claude_managed_skill(path.name, relative, payload)
             if render and re.search(rb"\{\{[A-Z_]+\}\}", payload):
                 for name in PLACEHOLDERS:
                     payload = payload.replace(
@@ -368,7 +262,7 @@ def reconcile(
         for name in sorted(selected):
             # External skills contain their own example/template markers. Only
             # first-party sources use this installer's profile substitutions.
-            value = snapshot(external_root / name, claude_external=True)
+            value = snapshot(external_root / name)
             if value is not None:
                 if name in targets:
                     raise PolicyError(f"навичка оголошена у двох джерелах: {name}")
@@ -588,10 +482,10 @@ def seed_baseline(
     if unknown or keep_live & take_kit:
         raise PolicyError("рішення лише для керованих навичок і одне на навичку: " + ", ".join(unknown or sorted(keep_live & take_kit)))
 
-    def candidate(name: str, first_party: Path, third_party: Path | None, *, current: bool = False) -> Snapshot | None:
+    def candidate(name: str, first_party: Path, third_party: Path | None) -> Snapshot | None:
         value = snapshot(first_party / name, render=True)
         if value is None and third_party is not None and name != "manifest.json":
-            value = snapshot(third_party / name, claude_external=current)
+            value = snapshot(third_party / name)
         return value
 
     entries: dict[str, str] = {}
@@ -608,7 +502,7 @@ def seed_baseline(
         if live_snapshot is None:
             continue
         live = checksum(live_snapshot)
-        target = candidate(name, source, external, current=True)
+        target = candidate(name, source, external)
         old = candidate(name, old_source, old_external)
         if target is not None and checksum(target) == live:
             kind, value = "same", live
@@ -629,8 +523,61 @@ def seed_baseline(
     return report, True
 
 
+def seed_agents(agents_root: Path, baseline_path: Path, old_source: Path,
+                source: Path) -> tuple[dict[str, list[str]], bool]:
+    """Complete missing provenance from exact shipped bytes, without touching agents."""
+    existing = load_baseline(baseline_path, agent_files=True)
+
+    def catalog(root: Path) -> dict[str, Snapshot]:
+        check_path(root)
+        if not root.is_dir():
+            raise PolicyError("немає довіреного каталогу субагентів")
+        check_path(root / "roles")
+        entries = {}
+        for path in (*sorted(root.glob("*.md")), *sorted((root / "roles").glob("*.md"))):
+            if path.name != "README.md" and not AGENT_FILE.fullmatch(path.name):
+                raise PolicyError("некоректне ім’я субагента")
+            if path.name in entries:
+                raise PolicyError("повторне ім’я субагента")
+            entries[path.name] = snapshot(path)
+        if (root / "roles").is_dir():
+            entries["roles"] = snapshot(root / "roles")
+        return entries
+
+    old, targets = catalog(old_source), catalog(source)
+    entries = dict(existing)
+    report: dict[str, list[str]] = {"kit": [], "unresolved": []}
+    for name in sorted((set(old) | set(targets)) - set(existing)):
+        live = checksum(snapshot(agents_root / name))
+        if live is None:
+            continue
+        if live in {checksum(old.get(name)), checksum(targets.get(name))}:
+            entries[name] = live
+            report["kit"].append(name)
+        else:
+            report["unresolved"].append(name)
+    if report["unresolved"]:
+        return report, False
+    write_policy(baseline_path, {"schemaVersion": 1, "entries": entries})
+    return report, True
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
+    if argv and argv[0] == "seed-agents":
+        parser = argparse.ArgumentParser(description="База субагентів із точної довіреної версії старого кита")
+        parser.add_argument("agents_root", type=Path)
+        parser.add_argument("baseline_path", type=Path)
+        parser.add_argument("--old-source", type=Path, required=True)
+        parser.add_argument("--source", type=Path, required=True)
+        args = parser.parse_args(argv[1:])
+        try:
+            report, written = seed_agents(args.agents_root, args.baseline_path, args.old_source, args.source)
+        except (PolicyError, OSError) as error:
+            print(f"помилка засіву субагентів: {error}", file=sys.stderr)
+            return 2
+        print(json.dumps({"written": written, **report}, ensure_ascii=False, sort_keys=True))
+        return 0 if written else 1
     if argv and argv[0] == "seed":
         parser = argparse.ArgumentParser(description="Перша база навичок для інсталяції, старшої за неї")
         parser.add_argument("skills_root", type=Path)

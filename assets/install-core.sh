@@ -52,8 +52,8 @@ case "$AGENT_USER" in
 esac
 H=/home/$AGENT_USER
 # Owner, 05.10.2026: receipts are the kit's foundation. Taken before this run writes anything: a new agent starts with
-# the receiver deciding delivery and the whole agent on the live engines. Owner, 01.11.2026: an agent that already
-# runs moves to the receiver on its update too (its engines stay as they are); RECEIPTS_UPGRADE.md covers the rest.
+# the receiver deciding delivery and the whole agent on the live engines; an agent that already runs keeps its mode
+# and moves on by RECEIPTS_UPGRADE.md (scripts/receipts-switch).
 NEW_AGENT=0
 [ -e "$H/.claude/product/runtime.json" ] || [ -e "$H/CLAUDE.md" ] || [ -e "$H/.claude/channels/telegram/messages.db" ] \
   || NEW_AGENT=1
@@ -103,6 +103,20 @@ case "$OWNER_NOTICE_LOCALE" in
   uk|ru|pl|en) ;;
   *) echo "FATAL: OWNER_NOTICE_LOCALE має бути uk, ru, pl або en" >&2; exit 1 ;;
 esac
+# Paid modules (owner, 19.10.2026). Novsky writes the bought modules for a new agent; an agent without
+# NOVSKY_MODULES predates them and keeps everything it has (nothing is gated, no licence file is written).
+NOVSKY_MODULES_GATED=0
+if [ "${NOVSKY_MODULES+x}" = x ]; then
+  NOVSKY_MODULES_GATED=1
+  NOVSKY_MODULES_CONTACT="${NOVSKY_MODULES_CONTACT:-}"
+  NOVSKY_MODULES="$(python3 "$KIT/assets/lib/product_modules.py" validate \
+    --catalog "$KIT/assets/product/modules.json" --modules "$NOVSKY_MODULES" \
+    --contact "$NOVSKY_MODULES_CONTACT")" || {
+    echo "FATAL: список модулів NOVSKY_MODULES або контакт NOVSKY_MODULES_CONTACT некоректні" >&2
+    exit 1
+  }
+  NOVSKY_MODULES_CONTACT="$(printf '%s' "$NOVSKY_MODULES_CONTACT" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+fi
 if [ -z "${VOICE_SETUP_STATUS:-}" ]; then
   if [ -n "$OPENAI_API_KEY" ]; then
     VOICE_SETUP_STATUS=configured
@@ -293,48 +307,7 @@ fi
 # END shared browser helper preflight
 
 # BEGIN instance system context preflight
-SYSTEMD_DIR=/etc/systemd/system
-INSTANCE_UNIT_TARGET="$SYSTEMD_DIR/$AGENT_SERVICE"
-INSTANCE_LOGROTATE_TARGET="/etc/logrotate.d/cash-$AGENT_USER"
-# The template the kit shipped before, byte for byte and never edited: an update may move past it. Only this
-# instance's concrete unit is written afterwards; the shared template, its drop-ins and its neighbours stay as they
-# are. 7d6b3d80 (22.07.2026) up to OOMPolicy=continue (10.10.2026).
-STOCK_INSTANCE_UNIT_SHA256="ba1286760bd4cf6119ec3c00f41a4aaccc68411567535c5599c313e07de434d7"
-stock_instance_unit() {
-  local sum
-  [ -f "$1" ] && [ ! -L "$1" ] || return 1
-  cmp -s "$KIT/assets/systemd/claude-telegram@.service" "$1" && return 0
-  sum="$(sha256sum "$1" 2>/dev/null)" || return 1
-  case " $STOCK_INSTANCE_UNIT_SHA256 " in *" ${sum%% *} "*) return 0 ;; esac
-  return 1
-}
-verify_instance_system_context() {
-  [ "$CLAUDE_UPDATE_MAINTENANCE" = 1 ] && [ "$AGENT_USER" != claude ] || return 0
-  local fragment
-  fragment="$(systemctl show "$AGENT_SERVICE" --property=FragmentPath --value --no-pager 2>/dev/null)" || return 1
-  case "$fragment" in
-    "$SYSTEMD_DIR/claude-telegram@.service"|"$INSTANCE_UNIT_TARGET") ;;
-    *) echo "FATAL: служба instance має неочікуване джерело" >&2; return 1 ;;
-  esac
-  if ! stock_instance_unit "$fragment"; then
-    echo "FATAL: unit instance відрізняється від комплекту; потрібне ручне узгодження" >&2
-    return 1
-  fi
-  if [ -e "$INSTANCE_UNIT_TARGET" ] || [ -L "$INSTANCE_UNIT_TARGET" ]; then
-    if ! stock_instance_unit "$INSTANCE_UNIT_TARGET"; then
-      echo "FATAL: налаштування unit instance змінено; перезапис заборонено" >&2
-      return 1
-    fi
-  fi
-  if [ -e "$INSTANCE_LOGROTATE_TARGET" ] || [ -L "$INSTANCE_LOGROTATE_TARGET" ]; then
-    if [ ! -f "$INSTANCE_LOGROTATE_TARGET" ] || [ -L "$INSTANCE_LOGROTATE_TARGET" ] \
-        || ! sed "s|/home/claude|$H|g" "$KIT/assets/systemd/logrotate-cash" \
-             | cmp -s - "$INSTANCE_LOGROTATE_TARGET"; then
-      echo "FATAL: налаштування logrotate instance змінено; перезапис заборонено" >&2
-      return 1
-    fi
-  fi
-}
+source "$KIT/assets/lib/install-system-context.sh"
 verify_instance_system_context
 # END instance system context preflight
 
@@ -365,20 +338,26 @@ NOVSKY_LICENSE_KEY="${NOVSKY_LICENSE_KEY:-$(python3 "$KIT/assets/lib/merge-env.p
 # starts inherits it: package installs run third-party scripts, and the key is reusable.
 export -n NOVSKY_LICENSE_KEY
 NOVSKY_LICENSE_KEY="$NOVSKY_LICENSE_KEY" python3 "$KIT/assets/lib/agent-license.py" --saved-env "$CONFIG_FILE"
-# Main's line (until 28.10.2026) keeps four owner settings only in the profile; saved settings do not carry them.
-# V2 does not read them yet, and an update must not drop them (Codex, cross-line review 29.10.2026): each keeps the
-# profile's own value, an explicit empty value clears it, anything invalid is dropped, as main's installer does.
+# Арти, 22.10.2026: company workers say the agent's grammatical gender (male|female) from the profile. Saved settings do
+# not carry it (their export refuses unknown names), so an update keeps the profile's own value, read by the update
+# checker's profile reader; an explicit empty value clears it, anything else is dropped.
 AGENT_GENDER="${AGENT_GENDER-$(python3 "$KIT/assets/bin/update-safety-check" profile-value --home "$H" AGENT_GENDER 2>/dev/null || true)}"
 case "$AGENT_GENDER" in
   ''|male|female) ;;
   *) echo "WARN: AGENT_GENDER має бути male або female; значення не збережено" >&2; AGENT_GENDER= ;;
 esac
+# Артур, 22.10.2026: OWNER_PROGRESS_NOTICES=off (no interim line on the owner's own company requests) and
+# SECURITY_NOTICE_CHAT (a group id that gets privacy alerts instead of his private chat) live only in the profile too;
+# an update keeps them the same way, an explicit empty value clears them, anything else is dropped.
 OWNER_PROGRESS_NOTICES="${OWNER_PROGRESS_NOTICES-$(python3 "$KIT/assets/bin/update-safety-check" profile-value --home "$H" OWNER_PROGRESS_NOTICES 2>/dev/null || true)}"
 SECURITY_NOTICE_CHAT="${SECURITY_NOTICE_CHAT-$(python3 "$KIT/assets/bin/update-safety-check" profile-value --home "$H" SECURITY_NOTICE_CHAT 2>/dev/null || true)}"
+# Владелець, 22.10.2026: READ_CONTEXT_BEFORE_ANSWER=off — the main session answers from its own context, no read per answer.
+# Novsky Agent defaults to no per-answer reread, including old profiles without an explicit choice.
+# A saved empty/on/off value and an explicit installer override remain authoritative.
 READ_CONTEXT_BEFORE_ANSWER="${READ_CONTEXT_BEFORE_ANSWER-$(python3 "$KIT/assets/bin/update-safety-check" profile-value --home "$H" --default off READ_CONTEXT_BEFORE_ANSWER 2>/dev/null || true)}"
 case "$OWNER_PROGRESS_NOTICES" in
-  ''|off|on) ;;
-  *) echo "WARN: OWNER_PROGRESS_NOTICES може бути лише on або off; значення не збережено" >&2; OWNER_PROGRESS_NOTICES= ;;
+  ''|off) ;;
+  *) echo "WARN: OWNER_PROGRESS_NOTICES може бути лише off; значення не збережено" >&2; OWNER_PROGRESS_NOTICES= ;;
 esac
 case "$READ_CONTEXT_BEFORE_ANSWER" in
   ''|off|on) ;;
@@ -394,113 +373,22 @@ if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "$AGENT_S
   exit 1
 fi
 
+# Checks a kit update runs right after the stop; update.sh --preflight-all runs the same ones before it.
+source "$KIT/assets/lib/maintenance-preflight.sh"
+
 # BEGIN Vercel maintenance preflight
-# A kit update preserves the owner's installed CLI. Check it before package or
-# runtime writes; replacing a missing/broken executable is a separate operation.
-verify_preserved_vercel_cli() {
-  [ "$CLAUDE_UPDATE_MAINTENANCE" = 1 ] || return 0
-  local feature_status=0 version cli="$H/.npm-global/bin/vercel"
-  if product_has_feature vercel; then
-    :
-  else
-    feature_status=$?
-    [ "$feature_status" -eq 1 ] && return 0
-    return "$feature_status"
-  fi
-  [ -x "$cli" ] || {
-    echo "FATAL: встановлений Vercel CLI відсутній або не виконується; оновлення комплекту зупинено" >&2
-    return 1
-  }
-  version="$(runuser -u "$AGENT_USER" -- "$KIT/assets/lib/install-env" "$H" \
-    VERCEL_TELEMETRY_DISABLED=1 NO_UPDATE_NOTIFIER=1 \
-    /usr/bin/timeout --foreground 30s "$cli" --version 2>/dev/null)" || {
-      echo "FATAL: встановлений Vercel CLI не відповідає; оновлення комплекту зупинено" >&2
-      return 1
-    }
-  [[ "$version" =~ [0-9]+\.[0-9]+\.[0-9]+ ]] || {
-    echo "FATAL: версію встановленого Vercel CLI не вдалося перевірити" >&2
-    return 1
-  }
-}
+# A kit update preserves the owner's installed CLI; the check is shared with update.sh --preflight-all.
 verify_preserved_vercel_cli
 # END Vercel maintenance preflight
 
 # BEGIN maintenance dependency preflight
-# Maintenance keeps the owner's installed tools. A missing dependency is a
-# separate repair, not a reason to fetch a moving package halfway through an
-# agent update. Run this before any runtime or configuration writes.
-maintenance_require_command() {
-  command -v "$1" >/dev/null 2>&1 || {
-    echo "FATAL: для оновлення відсутня команда $1; віднови її окремо і повтори" >&2
-    return 1
-  }
-}
-maintenance_require_python() {
-  local name="$1" import_check="$2" python="$H/.venvs/$1/bin/python"
-  [ -x "$python" ] || {
-    echo "FATAL: для оновлення відсутнє середовище $name; віднови його окремо і повтори" >&2
-    return 1
-  }
-  runuser -u "$AGENT_USER" -- "$KIT/assets/lib/install-env" "$H" "$python" -I -B -c "$import_check" >/dev/null 2>&1 || {
-    echo "FATAL: середовище $name не працює; оновлення комплекту зупинено" >&2
-    return 1
-  }
-}
-verify_maintenance_dependencies() {
-  [ "$CLAUDE_UPDATE_MAINTENANCE" = 1 ] || return 0
-  maintenance_require_command gh || return 1
-  maintenance_require_command sqlite3 || return 1
-  "$KIT/assets/lib/install-env" /root /usr/bin/python3 -B -c 'import numpy, markdown' >/dev/null 2>&1 || {
-    echo "FATAL: системні Python-залежності пам’яті відсутні; оновлення комплекту зупинено" >&2
-    return 1
-  }
-  if product_has_feature telegram-corporate-sessions; then
-    maintenance_require_python heif 'from PIL import Image; from pillow_heif import register_heif_opener' || return 1
-    if [ "$MODULE_TELEGRAM_CORPORATE" = 1 ]; then
-      maintenance_require_command bwrap || return 1
-      maintenance_require_command socat || return 1
-    fi
-  fi
-  if product_has_feature sql-readonly; then
-    maintenance_require_python bigquery 'from google.cloud import bigquery' || return 1
-  fi
-  if product_has_feature finance-data; then
-    maintenance_require_python finance 'import yfinance' || return 1
-  fi
-  if product_has_feature spreadsheets; then
-    maintenance_require_python spreadsheets 'import openpyxl, xlsxwriter' || return 1
-  fi
-  if product_has_feature media-downloads; then
-    [ -x "$H/.local/bin/yt-dlp" ] && [ -x "$H/.local/bin/deno" ] || {
-      echo "FATAL: yt-dlp або Deno відсутній; оновлення комплекту зупинено" >&2
-      return 1
-    }
-  fi
-  if [ "$MODULE_INSTAGRAM_DM" = 1 ]; then
-    maintenance_require_python instagram-dm 'import fastapi, uvicorn' || return 1
-  fi
-  if product_has_feature video-edit; then
-    AGENT_USER="$AGENT_USER" CLAUDE_UPDATE_MAINTENANCE=1 \
-      bash "$KIT/scripts/install-video-edit.sh" --preflight-maintenance || return 1
-  fi
-}
+# A missing dependency is a separate repair; run this before any runtime or configuration writes.
 verify_maintenance_dependencies
 # END maintenance dependency preflight
 
 # BEGIN external side-effect maintenance preflight
-# The retired Graphify extension may contain owner data, and a missing gog
-# would make the installer download into /usr/local/bin. Neither action belongs
-# to a kit update. Decide before package, runtime, or configuration writes.
-if [ "$CLAUDE_UPDATE_MAINTENANCE" = 1 ]; then
-  if [ -e /opt/claude-graphify ] || [ -L /opt/claude-graphify ]; then
-    echo "FATAL: Graphify вже встановлено; перевір його дані окремо перед оновленням комплекту" >&2
-    exit 1
-  fi
-  if product_has_feature google-workspace && ! command -v gog >/dev/null 2>&1 && [ ! -x "$H/.local/lib/novsky-gog/gog" ]; then
-    echo "FATAL: gog відсутній; віднови Google CLI окремо перед оновленням комплекту" >&2
-    exit 1
-  fi
-fi
+# Graphify data and a missing gog are separate repairs, decided before any writes.
+verify_external_side_effects
 # END external side-effect maintenance preflight
 
 # BEGIN Starter foundation preflight
@@ -530,50 +418,34 @@ validate_starter_foundation() {
 # END Starter foundation preflight
 validate_starter_foundation
 
-# BEGIN saved input preflight
-# Novsky runs this installer itself for a second agent, without update.sh's preflight, so a saved value it refuses
-# further down must be refused here, before the first write (Арти, 03.11.2026: a refusal after the writes left the
-# update in recovery-hold with the bot stopped). Same reading as below, nothing written: the channel file must parse,
-# and the memory and delivery values this run would take from it must be ones this installer accepts.
-_preflight_channel="$H/.claude/channels/telegram/.env"
-if [ -e "$_preflight_channel" ]; then
-  _preflight_empty="$(mktemp)"
-  _preflight_out="$(mktemp)"
-  if ! python3 "$KIT/assets/lib/merge-env.py" "$_preflight_channel" "$_preflight_empty" "$_preflight_out" >/dev/null 2>&1; then
-    rm -f "$_preflight_empty" "$_preflight_out"
-    echo "FATAL: наявний файл середовища каналу містить небезпечні присвоєння" >&2
-    exit 1
-  fi
-  rm -f "$_preflight_empty" "$_preflight_out"
+# BEGIN skill conflict precheck
+# A skill or subagent conflict stops the update before this installer writes anything (Codex review 21.10.2026,
+# P1-3): found only after the managed resources, it left the bot stopped with new files the rollback could not prove
+# (Кристоф 21.10.2026, recovery-hold). It writes nothing in the agent's home, removes its temporary policy on every
+# path, and on a first install finds nothing to conflict.
+PRECHECK_SKILLS_POLICY="$KIT/assets/product/managed-skills.json"
+if [ "$NOVSKY_MODULES_GATED" = 1 ]; then
+  PRECHECK_SKILLS_POLICY="$(mktemp /tmp/novsky-managed-skills.XXXXXX)"
+  python3 "$KIT/assets/lib/product_modules.py" policy --catalog "$KIT/assets/product/modules.json" \
+    --modules "$NOVSKY_MODULES" --policy "$KIT/assets/product/managed-skills.json" --out "$PRECHECK_SKILLS_POLICY" \
+    || { rm -f "$PRECHECK_SKILLS_POLICY"; exit 2; }
 fi
-_preflight_memory="$MEMORY_EMBEDDINGS_OPENAI"
-if [ -z "$MEMORY_EMBEDDINGS_OPENAI_INPUT" ] && [ -r "$_preflight_channel" ]; then
-  _preflight_value="$(python3 "$KIT/assets/lib/merge-env.py" --value "$_preflight_channel" MEMORY_EMBEDDINGS_OPENAI)"
-  [ -z "$_preflight_value" ] || _preflight_memory="$_preflight_value"
-fi
-case "$_preflight_memory" in
-  enabled|disabled) ;;
-  *)
-    echo "FATAL: MEMORY_EMBEDDINGS_OPENAI містить недопустиме значення" >&2
-    exit 2
-    ;;
-esac
-_preflight_authority="$TG_DELIVERY_AUTHORITY"
-if [ -z "$TG_DELIVERY_AUTHORITY_INPUT" ] && [ "$NEW_AGENT" = 1 ]; then
-  _preflight_authority=receiver
-elif [ -z "$TG_DELIVERY_AUTHORITY_INPUT" ] && [ -r "$_preflight_channel" ]; then
-  _preflight_value="$(python3 "$KIT/assets/lib/merge-env.py" --value "$_preflight_channel" TG_DELIVERY_AUTHORITY)"
-  [ -z "$_preflight_value" ] || _preflight_authority="$_preflight_value"
-fi
-case "$_preflight_authority" in
-  guard|shadow|receiver) ;;
-  *)
-    echo "FATAL: TG_DELIVERY_AUTHORITY містить недопустиме значення «${_preflight_authority}» (очікується guard, shadow або receiver)" >&2
-    exit 2
-    ;;
-esac
-unset _preflight_channel _preflight_memory _preflight_authority _preflight_value _preflight_empty _preflight_out
-# END saved input preflight
+precheck_status=0
+env AGENT_NAME="$AGENT_NAME" OWNER_NAME="$OWNER_NAME" \
+  OWNER_TG_USERNAME="$OWNER_TG_USERNAME" OWNER_CHAT_ID="$OWNER_CHAT_ID" \
+  BOT_USERNAME="$BOT_USERNAME" TIMEZONE="$TIMEZONE" \
+  CALENDAR_EMAIL="$CALENDAR_EMAIL" DEPLOY_DATE="$DEPLOY_DATE" \
+  AGENT_HOME="$H" AGENT_SERVICE="$AGENT_SERVICE" AGENT_USER="$AGENT_USER" \
+  python3 "$KIT/assets/lib/reconcile-managed-skills.py" \
+  "$H/.claude/skills" "$PRECHECK_SKILLS_POLICY" "$H/.claude/product/managed-skills.json" \
+  --source "$KIT/assets/skills" --external-source "$KIT/assets/external-skills" \
+  --baseline "$H/.claude/product/managed-skills-baseline.json" --check >/dev/null || precheck_status=$?
+[ "$precheck_status" -ne 0 ] || python3 "$KIT/assets/lib/reconcile-managed-skills.py" agents \
+  "$H/.claude/agents" "$KIT/assets/agents" "$H/.claude/product/managed-agents-baseline.json" \
+  --active-roles "${ACTIVE_ROLES:-}" --check >/dev/null || precheck_status=$?
+case "$PRECHECK_SKILLS_POLICY" in /tmp/novsky-managed-skills.*) rm -f "$PRECHECK_SKILLS_POLICY" ;; esac
+[ "$precheck_status" -eq 0 ] || exit "$precheck_status"
+# END skill conflict precheck
 
 # Declared document tools work in personal and isolated company workspaces.
 # This exports only root-managed package configuration, never an agent's venv.
@@ -653,27 +525,16 @@ fi
 }
 
 write_shell_value() {
-  local file="$1" name="$2" value quoted rest out=
+  local file="$1" name="$2" value
   value="${!name-}"
-  printf -v quoted '%q' "$value"
-  # An update runs this under `env -i`, where %q writes non-ASCII as $'\320…' (Cash, 29.10.2026): that form alone
-  # becomes POSIX single quotes, which keep the bytes; every other value stays as %q wrote it (raw readers expect
-  # `0`, `Europe/Lisbon`). Every line boundary Python's splitlines() knows keeps %q, which the readers now decode:
-  # inside quotes it would split their line.
-  case "$value" in
-    *[$'\n\r\v\f\x1c\x1d\x1e']*|*$'\xc2\x85'*|*$'\xe2\x80\xa8'*|*$'\xe2\x80\xa9'*)
-      printf '%s=%s\n' "$name" "$quoted" >> "$file"; return ;;
-  esac
-  if [[ $quoted != \$\'* ]]; then
-    printf '%s=%s\n' "$name" "$quoted" >> "$file"
-    return
+  # %q under LC_ALL=C emits ANSI-C octal for Unicode, which the data-only
+  # channel/profile reader rightly refuses. Keep literal UTF-8 in POSIX quotes.
+  if [[ "$value" == *$'\n'* || "$value" == *$'\r'* ]]; then
+    echo "FATAL: $name містить недопустимий перенос рядка" >&2
+    return 1
   fi
-  rest=$value
-  while [[ $rest == *\'* ]]; do
-    out+=${rest%%\'*}\'\\\'\'
-    rest=${rest#*\'}
-  done
-  printf "%s='%s'\n" "$name" "$out$rest" >> "$file"
+  printf '%s' "$value" | python3 -c \
+    'import shlex,sys; print(sys.argv[1]+"="+shlex.quote(sys.stdin.read()))' "$name" >> "$file"
 }
 
 read_channel_value() {
@@ -723,8 +584,10 @@ initialize_limit_recovery_mode() {
 }
 
 initialize_limit_recovery_state() {
-  initialize_limit_recovery_mode --initialize || return $?
-  initialize_limit_recovery_mode --initialize-notices
+  # Existing provider deadlines, transcript checkpoints and notice latches
+  # survive upgrades. Explicit --initialize remains an operator repair/reset.
+  initialize_limit_recovery_mode --ensure || return $?
+  initialize_limit_recovery_mode --ensure-notices
 }
 # END limit recovery initialization helpers
 
@@ -739,10 +602,14 @@ install -d -o "$AGENT_USER" -g "$AGENT_USER" -m 700 \
   "$H/.cache" "$H/.cache/codex-image" "$H/.cache/codex-image/prompts" \
   "$H/.cache/video-edit" \
   "$H/obsidian-vault/learning/pending" "$H/obsidian-vault/learning/history"
-install -d -m 700 "$CONFIG_DIR"
-# An agent on the live engines reads root's marker in this folder as its own user. An update that left the folder
-# at 700 started it in the interactive session instead of its live engine, with no alarm (Cash, 11.10 and 10.11.2026).
-[ ! -e "$CONFIG_DIR/live-engines-allowed" ] || chmod 755 "$CONFIG_DIR"
+# The launcher runs as the agent and must see root's live-engines marker in this folder. Keep the folder readable
+# while the marker is there: a root-only folder silently returned a live-engine agent to the interactive owner
+# session on its update (Manzik, 11.10.2026). The saved settings inside stay 0600.
+if [ -f "$CONFIG_DIR/live-engines-allowed" ] && [ ! -L "$CONFIG_DIR/live-engines-allowed" ]; then
+  install -d -m 755 "$CONFIG_DIR"
+else
+  install -d -m 700 "$CONFIG_DIR"
+fi
 if [ "$PERSONA_EXISTING" = 1 ]; then
   # Preflight proved both files before the first managed runtime write. Seed
   # hashes only from an exact former kit render, then let the normal guard
@@ -789,19 +656,40 @@ for runtime in bun claude; do
 done
 
 echo "[2/7] керовані ресурси; дані власника зберігаються"
+RUNTIME_RESOLUTION_ARGS=()
+if [ -n "${NOVSKY_UPDATE_RESOLUTIONS:-}" ]; then
+  [ "$CLAUDE_UPDATE_MAINTENANCE" = 1 ] || {
+    echo "FATAL: рішення конфліктів застосовуються лише у вікні обслуговування" >&2
+    exit 2
+  }
+  RUNTIME_RESOLUTION_ARGS=(--resolutions "$NOVSKY_UPDATE_RESOLUTIONS")
+fi
 python3 "$KIT/assets/bin/update-safety-check" apply \
   --home "$H" \
   --kit "$KIT" \
   --policy "$KIT/assets/product/managed-runtime.json" \
   --baseline "$H/.claude/product/managed-runtime-baseline.json" \
   --owner "$AGENT_USER" \
+  "${RUNTIME_RESOLUTION_ARGS[@]}" \
   --defer-baseline
 # BEGIN browser helper install
 if product_has_feature browser; then
+  # Refresh only this agent's existing private browser. No onboarding/download,
+  # no migration or restart of the legacy host-wide browser during an update.
+  browser_config="/etc/claude-browser-private/$(id -u "$AGENT_USER").json"
+  if [ -e "$browser_config" ] || [ -L "$browser_config" ]; then
+    python3 "$KIT/assets/browser/private-browser.py" refresh --kit "$KIT" --agent "$AGENT_USER"
+  fi
   # Only the primary writes the shared helper; another bot keeps its sudoers line.
-  if [ "$AGENT_USER" = claude ]; then
+  if [ "$AGENT_USER" = claude ] && [ "$CLAUDE_UPDATE_MAINTENANCE" != 1 ] \
+    && [ ! -e "$browser_config" ] && [ ! -L "$browser_config" ]; then
     install -d -m 700 -o root -g root /var/lib/claude-browser/recovery
     install -m 755 -o root -g root "${KIT}/assets/bin/claude-browser-recover" /usr/local/sbin/claude-browser-recover
+    # An installed browser takes the kit's network deny and limits in an update too, not only from install-browser.sh.
+    if [ -f /etc/systemd/system/claude-browser.service ]; then
+      . "$KIT/assets/lib/browser-dropins.sh"
+      refresh_browser_dropins "$CLAUDE_UPDATE_MAINTENANCE" || true
+    fi
   fi
 fi
 # END browser helper install
@@ -810,21 +698,7 @@ python3 "$KIT/assets/lib/reconcile-managed-runtime.py" \
   "$H/.claude/product/managed-runtime.json"
 # Removed helpers without a verified baseline may contain owner changes.
 # reconcile-managed-runtime handles proven managed retirements; do not delete
-# unclassified paths after the update plan has preserved them (main d71c3f84).
-# A move from main's line retires bin/owner_approval.py, which main's ~/bin/owner-send (24.10) loads at start: sending
-# from the owner's personal accounts stopped on Brodsky and ST (01.11.2026). Only that file takes this kit's version,
-# and only while it holds the bytes its module setup recorded; one the bot changed stays and is named. The module's
-# other files are main's newer ones and stay: this kit's would undo their fixes.
-if [ -f "$H/bin/owner-send" ] && [ ! -L "$H/bin/owner-send" ] && [ ! -e "$H/bin/owner_approval.py" ] \
-  && grep -q 'owner_approval' "$H/bin/owner-send"; then
-  owner_send_stage="$(mktemp -d)"
-  install -d -m 755 "$owner_send_stage/bin"
-  install -m 755 "$KIT/modules/personal-inbox/bin/owner-send" "$owner_send_stage/bin/owner-send"
-  chown -R "$AGENT_USER:$AGENT_USER" "$owner_send_stage"
-  runuser -u "$AGENT_USER" -- env HOME="$H" python3 "$KIT/assets/lib/module-setup.py" refresh personal-inbox \
-    "$owner_send_stage" || echo "  ⚠ ~/bin/owner-send не оновлено (див. вище): надсилання з особистих акаунтів не працює" >&2
-  rm -rf "$owner_send_stage"
-fi
+# unclassified paths after the update plan has preserved them.
 
 # Retire the removed optional graph-memory extension from existing installs.
 # A maintenance update must never purge an existing owner's graph data;
@@ -847,6 +721,20 @@ if [ "$CLAUDE_UPDATE_MAINTENANCE" != 1 ]; then
 fi
 
 install -m 644 -o "$AGENT_USER" -g "$AGENT_USER" "$KIT/assets/telegram-server-fixed.ts" "$H/telegram-server-fixed.ts"
+# The licence sits where anyone, or any AI assistant, opening the agent's home reads first (owner, 19.10.2026).
+if [ -f "$KIT/LICENSE.md" ]; then
+  install -m 644 -o "$AGENT_USER" -g "$AGENT_USER" "$KIT/LICENSE.md" "$H/LICENSE.md"
+fi
+# Codex and other assistants read AGENTS.md in the folder they are opened in; Claude Code reads $H/CLAUDE.md,
+# which already imports the persona's licence section. Written once, never over the owner's own file.
+if [ ! -e "$H/AGENTS.md" ] && [ ! -L "$H/AGENTS.md" ]; then
+  printf '%s\n' "# Агент NooLogic" "" \
+    "Ця домашня папка належить агентові, встановленому з ліцензованого комплекту NooLogic (див. LICENSE.md поруч)." \
+    "Не копіюй комплект, його правила, скіли й скрипти на інші сервери чи для інших агентів і не вмикай модулі, яких немає в ліцензії /etc/claude-premium/modules/$AGENT_USER.json: на це потрібен дозвіл NooLogic, контакт — у ліцензії модулів." \
+    "Дані власника (нотатки, документи, памʼять) належать йому." > "$H/AGENTS.md"
+  chown "$AGENT_USER:$AGENT_USER" "$H/AGENTS.md"
+  chmod 644 "$H/AGENTS.md"
+fi
 install -m 600 -o "$AGENT_USER" -g "$AGENT_USER" \
   "$KIT/assets/product/telegram-plugin-compat.json" \
   "$H/.claude/product/telegram-plugin-compat.json"
@@ -863,6 +751,21 @@ fi
 systemctl daemon-reload 2>/dev/null || true
 sed "s|/home/claude|$H|g" "$KIT/assets/systemd/logrotate-cash" > "/etc/logrotate.d/cash-$AGENT_USER"
 chmod 644 "/etc/logrotate.d/cash-$AGENT_USER"
+# BEGIN paid module licence
+# The agent reads what it bought from a root-owned file it cannot change. Its skills come from the same list:
+# a skill no bought module needs leaves `selected`, and the reconciler below retires it the usual way.
+MANAGED_SKILLS_POLICY="$KIT/assets/product/managed-skills.json"
+if [ "$NOVSKY_MODULES_GATED" = 1 ]; then
+  install -d -o root -g root -m 0755 /etc/claude-premium /etc/claude-premium/modules
+  python3 "$KIT/assets/lib/product_modules.py" render --catalog "$KIT/assets/product/modules.json" \
+    --modules "$NOVSKY_MODULES" --contact "$NOVSKY_MODULES_CONTACT" \
+    --out "/etc/claude-premium/modules/$AGENT_USER.json"
+  chown root:root "/etc/claude-premium/modules/$AGENT_USER.json"
+  MANAGED_SKILLS_POLICY="$(mktemp /tmp/novsky-managed-skills.XXXXXX)"
+  python3 "$KIT/assets/lib/product_modules.py" policy --catalog "$KIT/assets/product/modules.json" \
+    --modules "$NOVSKY_MODULES" --policy "$KIT/assets/product/managed-skills.json" --out "$MANAGED_SKILLS_POLICY"
+fi
+# END paid module licence
 # BEGIN managed skill installation
 # Render the candidate before comparing it to the installed checksum. Copying
 # or rendering again below would bypass owner-edit preservation.
@@ -872,14 +775,24 @@ env AGENT_NAME="$AGENT_NAME" OWNER_NAME="$OWNER_NAME" \
   CALENDAR_EMAIL="$CALENDAR_EMAIL" DEPLOY_DATE="$DEPLOY_DATE" \
   AGENT_HOME="$H" AGENT_SERVICE="$AGENT_SERVICE" AGENT_USER="$AGENT_USER" \
   python3 "$KIT/assets/lib/reconcile-managed-skills.py" \
-  "$H/.claude/skills" "$KIT/assets/product/managed-skills.json" \
+  "$H/.claude/skills" "${MANAGED_SKILLS_POLICY:-$KIT/assets/product/managed-skills.json}" \
   "$H/.claude/product/managed-skills.json" \
   --source "$KIT/assets/skills" \
   --external-source "$KIT/assets/external-skills" \
   --baseline "$H/.claude/product/managed-skills-baseline.json"
+case "${MANAGED_SKILLS_POLICY:-}" in /tmp/novsky-managed-skills.*) rm -f "$MANAGED_SKILLS_POLICY" ;; esac
 # END managed skill installation
+# Codex r1, 23.10.2026: a first install that stops after this point leaves runtime.json or CLAUDE.md behind, and its retry
+# would no longer count as new; this marker keeps it new until the profile holds the read switch.
+[ "${NEW_AGENT:-0}" = 1 ] && install -m 600 -o "$AGENT_USER" -g "$AGENT_USER" /dev/null "$H/.claude/product/new-agent-pending"
 install -m 600 -o "$AGENT_USER" -g "$AGENT_USER" \
   "$KIT/assets/product/runtime.json" "$H/.claude/product/runtime.json"
+if [ "$NOVSKY_MODULES_GATED" = 1 ]; then
+  # A service of an unbought module is no onboarding step (owner, 19.10.2026); onboarding-status reads the lists here.
+  python3 "$KIT/assets/lib/product_modules.py" runtime --catalog "$KIT/assets/product/modules.json" \
+    --modules "$NOVSKY_MODULES" --runtime "$KIT/assets/product/runtime.json" --out "$H/.claude/product/runtime.json"
+  chown "$AGENT_USER:$AGENT_USER" "$H/.claude/product/runtime.json"
+fi
 install -m 600 -o "$AGENT_USER" -g "$AGENT_USER" \
   "$KIT/assets/product/managed-plugins.json" \
   "$H/.claude/product/managed-plugins.json"
@@ -965,6 +878,34 @@ fi
 python3 "$KIT/assets/lib/migrate-settings.py" \
   "$SETTINGS_FILE" "$KIT/assets/templates/settings.json" \
   "$KIT/assets/product/managed-plugins.json"
+if [ "$NOVSKY_MODULES_GATED" = 1 ]; then
+  # claude.ai connectors stay open on every agent (owner, 19.10.2026): the seller connects paid services through them
+  # too. The morning kit of 19.10 switched them off on agents with a module licence; this takes back exactly what it set.
+  # Older agents keep their settings as they are.
+  python3 - "$SETTINGS_FILE" <<'PY'
+import json, os, sys, tempfile
+path = sys.argv[1]
+with open(path, encoding="utf-8") as handle:
+    settings = json.load(handle)
+changed = False
+if settings.get("disableClaudeAiConnectors") is True:
+    del settings["disableClaudeAiConnectors"]
+    changed = True
+env = settings.get("env")
+if isinstance(env, dict) and env.get("ENABLE_CLAUDEAI_MCP_SERVERS") == "false":
+    del env["ENABLE_CLAUDEAI_MCP_SERVERS"]
+    changed = True
+if changed:
+    info = os.stat(path)
+    handle, temporary = tempfile.mkstemp(prefix=".settings.", dir=os.path.dirname(path))
+    with os.fdopen(handle, "w", encoding="utf-8") as stream:
+        json.dump(settings, stream, ensure_ascii=False, indent=2)
+        stream.write("\n")
+    os.chmod(temporary, info.st_mode & 0o777)
+    os.chown(temporary, info.st_uid, info.st_gid)
+    os.replace(temporary, path)
+PY
+fi
 
 for memory_file in MEMORY.md USER.md; do
   if [ ! -e "$H/.claude/memory/$memory_file" ]; then
@@ -974,6 +915,11 @@ for memory_file in MEMORY.md USER.md; do
 done
 
 copy_tree_no_clobber "$KIT/assets/vault-skeleton" "$H/obsidian-vault"
+# Only exact published stock guidance is migrated; custom notes stay untouched.
+python3 "$KIT/assets/lib/migrate-access-guide.py" \
+  "$KIT/assets/vault-skeleton/wiki/concepts/access-security.md" "$H" \
+  --user "$AGENT_USER" --engine claude \
+  || echo "WARN: міграцію довідника доступу не підтверджено; установка продовжується" >&2
 if [ ! -e "$H/.claude/onboarding-state.json" ]; then
   install -m 600 -o "$AGENT_USER" -g "$AGENT_USER" "$KIT/assets/templates/onboarding-state.json" "$H/.claude/onboarding-state.json"
   # The reminder helper spaces its first nudge from this stamp.
@@ -1040,8 +986,6 @@ else
   render_template "$ROLE_PROFILE" "$MANAGED_PRODUCT"
 fi
 set_managed_persona_mode "$MANAGED_PRODUCT"
-# An agent from main's line keeps its owner rules in a library its CLAUDE.md only names; V2 reads them in CLAUDE.md.
-[ ! -e "$H/CLAUDE.md" ] || runuser -u "$AGENT_USER" -- python3 "$KIT/assets/lib/owner-rules-restore.py" "$H" >/dev/null
 runuser -u "$AGENT_USER" -- python3 "$KIT/assets/lib/sync-managed-claude.py" \
   "$H/CLAUDE.md" "$MANAGED_IMPORT" "$PRODUCT_IMPORT"
 ACCESS_FILE="$H/.claude/channels/telegram/access.json"
@@ -1066,14 +1010,8 @@ else
 fi
 
 MANAGED_RENDERED_FILES=("$H/CLAUDE.md" "$MANAGED_CLAUDE" "$MANAGED_PRODUCT" "$ACCESS_FILE")
-while IFS= read -r -d '' source; do
-  destination="$H/bin/$(basename "$source")"
-  MANAGED_RENDERED_FILES+=("$destination")
-  if grep -q '{{[A-Z_]*}}' "$source"; then
-    render_template "$destination" "$destination"
-  fi
-  chmod 755 "$destination"
-done < <(find "$KIT/assets/bin" -maxdepth 1 -type f -print0)
+# Managed bin candidates were rendered and checked before apply. Never render
+# or chmod the live files again: they may be owner-preserved or approved merges.
 initialize_limit_recovery_state
 # Managed skills are already rendered and checked by their applicator. Owner
 # text retained there must not pass through the template renderer again.
@@ -1109,18 +1047,14 @@ GOG_KEYRING_PASSWORD="$(read_channel_value "$CHANNEL_ENV" GOG_KEYRING_PASSWORD)"
 GOG_KEYRING_BACKEND=file
 # Recall.ai meeting-bot key (optional, meet-listen skill) — preserve on re-run
 [ -z "$RECALL_API_KEY" ] && [ -r "$CHANNEL_ENV" ] && RECALL_API_KEY="$(read_channel_value "$CHANNEL_ENV" RECALL_API_KEY)"
-# BEGIN recall region preservation
 # Recall keys are region-scoped: keep the region already configured in the channel
 # .env on update (e.g. an us-west-2 account) unless the operator explicitly passed
 # RECALL_REGION this run. Without this, the eu-central-1 default would silently
 # overwrite an existing region and break that agent's meet-bot with a 401.
-# A maintenance update passes the region saved at install as if it were explicit; the
-# channel value is the live one (Cash, 29.10.2026: a saved us-west-2 replaced eu-central-1).
-if { [ -z "$RECALL_REGION_INPUT" ] || [ "$CLAUDE_UPDATE_MAINTENANCE" = 1 ]; } && [ -r "$CHANNEL_ENV" ]; then
+if [ -z "$RECALL_REGION_INPUT" ] && [ -r "$CHANNEL_ENV" ]; then
   _existing_region="$(read_channel_value "$CHANNEL_ENV" RECALL_REGION)"
   [ -n "$_existing_region" ] && RECALL_REGION="$_existing_region"
 fi
-# END recall region preservation
 # Who removes a delivered message from the queue (KTD8): keep the value the box
 # runs with unless the operator passed one explicitly this run, and refuse a
 # value the receiver would not understand. It lives in the channel file only —
@@ -1132,18 +1066,14 @@ if [ -z "$TG_DELIVERY_AUTHORITY_INPUT" ] && [ "$NEW_AGENT" = 1 ]; then
 elif [ -z "$TG_DELIVERY_AUTHORITY_INPUT" ] && [ -r "$CHANNEL_ENV" ]; then
   _existing_authority="$(read_channel_value "$CHANNEL_ENV" TG_DELIVERY_AUTHORITY)"
   [ -n "$_existing_authority" ] && TG_DELIVERY_AUTHORITY="$_existing_authority"
-fi
-# Owner, 01.11.2026: the receipts are stable, so an update moves guard and shadow to the receiver (in shadow the queue
-# waited for every background worker's final and the old Stop guard looped: Руфус, 28.10–01.11). An operator who
-# passes a value this run still gets it. A resumed session from before callback tracking would have its background
-# work refused under the receiver, so tg-resume-session starts such an agent fresh.
-if [ -z "$TG_DELIVERY_AUTHORITY_INPUT" ]; then
-  case "$TG_DELIVERY_AUTHORITY" in guard|shadow) TG_DELIVERY_AUTHORITY=receiver ;; esac
+  # Owner, 02.10.2026: every kit bot keeps the receipts in shadow. guard was only the old default, so an update
+  # moves it to shadow; shadow and receiver stay, and an operator who passes guard this run still gets guard.
+  [ "$TG_DELIVERY_AUTHORITY" = guard ] && TG_DELIVERY_AUTHORITY=shadow
 fi
 case "$TG_DELIVERY_AUTHORITY" in
   guard|shadow|receiver) ;;
   *)
-    echo "FATAL: TG_DELIVERY_AUTHORITY містить недопустиме значення «${TG_DELIVERY_AUTHORITY}» (очікується guard, shadow або receiver)" >&2
+    echo "FATAL: TG_DELIVERY_AUTHORITY містить недопустиме значення «$TG_DELIVERY_AUTHORITY» (очікується guard, shadow або receiver)" >&2
     exit 2
     ;;
 esac
@@ -1191,6 +1121,10 @@ for name in AGENT_NAME OWNER_NAME OWNER_TG_USERNAME OWNER_CHAT_ID ADDITIONAL_ADM
   CHANNEL_ID SITE_PASSWORD ACTIVE_ROLES AGENT_ROLE; do
   write_shell_value "$CONFIG_FILE" "$name"
 done
+if [ "$NOVSKY_MODULES_GATED" = 1 ]; then
+  write_shell_value "$CONFIG_FILE" NOVSKY_MODULES
+  write_shell_value "$CONFIG_FILE" NOVSKY_MODULES_CONTACT
+fi
 chmod 600 "$CONFIG_FILE"
 # The purchase key is kept nowhere: the copies older onboarding runs left in their backups go as well.
 for backup in "$CONFIG_FILE".backup.*; do
@@ -1209,6 +1143,16 @@ for name in AGENT_NAME AGENT_GENDER OWNER_NAME OWNER_TG_USERNAME OWNER_CHAT_ID A
 done
 chown "$AGENT_USER:$AGENT_USER" "$PROFILE_FILE"
 chmod 600 "$PROFILE_FILE"
+rm -f "$H/.claude/product/new-agent-pending"
+# The owner, 22.10.2026, Кнопа as the model: with READ_CONTEXT_BEFORE_ANSWER=off every owner rule is in the agent's own
+# instructions file before its service starts, so the first session after this install already has them; written after the profile,
+# which holds the switch on a fresh install (Codex r2).
+# render-rules also says «not written» while reads are on, so only an agent switched off warns (Codex r1 P2).
+if [ -x "$H/bin/answer-context" ]; then
+  rendered="$(runuser -u "$AGENT_USER" -- env HOME="$H" python3 "$H/bin/answer-context" render-rules 2>/dev/null || true)"
+  [ "$READ_CONTEXT_BEFORE_ANSWER" != off ] || [ "$rendered" = written ] \
+    || echo "  ⚠ owner rules file not written: the agent keeps reading its rules before answers"
+fi
 umask "${secrets_umask:-022}"
 if [ "$AGENT_USER" = claude ]; then
   rm -f /home/claude/.cash-agent.env
@@ -1431,24 +1375,19 @@ fi
 
 echo "[6/7] необов’язкові інструменти"
 
-if product_has_feature google-workspace; then
-  if ! command -v gog >/dev/null 2>&1 && [ ! -x "$H/.local/lib/novsky-gog/gog" ]; then
-    if [ "$CLAUDE_UPDATE_MAINTENANCE" = 1 ]; then
-      echo "FATAL: gog зник під час оновлення; не завантажую його автоматично" >&2
-      exit 1
-    fi
-    bash "$KIT/scripts/install-gog.sh"
+if product_has_feature google-workspace && ! command -v gog >/dev/null 2>&1; then
+  if [ "$CLAUDE_UPDATE_MAINTENANCE" = 1 ]; then
+    echo "FATAL: gog зник під час оновлення; не завантажую його автоматично" >&2
+    exit 1
   fi
-  # Older shared binaries can exist but reject the services needed for OAuth.
-  # Keep them for other bots; repair only this agent's managed copy, if needed.
-  runuser -u "$AGENT_USER" -- env HOME="$H" bash "$KIT/scripts/install-gog.sh" --agent
+  bash "$KIT/scripts/install-gog.sh"
 fi
 
 # The kit ships the shared Novsky OAuth client, so "підключи Google" needs only the
 # owner's consent click — no per-client Google Cloud project. An agent that already
 # configured its own client keeps it: seeding only fills an empty config.
 GOOGLE_OAUTH_CLIENT="$KIT/assets/product/google-oauth-client.json"
-if product_has_feature google-workspace && [ -x "$H/bin/gog" ] && \
+if product_has_feature google-workspace && command -v gog >/dev/null 2>&1 && \
    [ -s "$GOOGLE_OAUTH_CLIENT" ] && [ ! -s "$H/.local/share/gogcli/credentials.json" ]; then
   runuser -u "$AGENT_USER" -- env HOME="$H" \
     "$H/bin/gog" auth credentials set "$GOOGLE_OAUTH_CLIENT" >/dev/null || \
@@ -1549,6 +1488,17 @@ if product_has_feature video-edit; then
   bash "$KIT/scripts/install-video-edit.sh"
 fi
 
+# Image generation has its own reviewed client even when this product has no
+# corporate sessions. Do not update the personal/native agent CLI or another
+# agent's shared corporate executable.
+if [ -f "$KIT/assets/skills/codex-imagegen/SKILL.md" ]; then
+  IMAGE_PROVISIONER="$KIT/assets/lib/codex-image-provision.py"
+  # A repository checkout has the shared source; product archives stage it here.
+  [ -f "$IMAGE_PROVISIONER" ] || IMAGE_PROVISIONER="$KIT/modules/telegram-corporate/image/provision.py"
+  python3 "$IMAGE_PROVISIONER" --personal-only \
+    || echo "WARN: окремий клієнт картинок не встановлено (причина вище; він є лише для Linux x86-64 і береться з npm); картинки агент спробує малювати власним Codex, оновлення триває" >&2
+fi
+
 if product_has_feature telegram-corporate-sessions && [ "$MODULE_TELEGRAM_CORPORATE" = 1 ]; then
   # The module swap is two renames with a window in which the module path does
   # not exist; a running poller caches that import failure until restart and
@@ -1561,6 +1511,12 @@ if product_has_feature telegram-corporate-sessions && [ "$MODULE_TELEGRAM_CORPOR
   fi
   AGENT_USER="$AGENT_USER" H="$H" KIT="$KIT" \
     bash "$KIT/modules/telegram-corporate/install.sh"
+  # Codex r7: the module's sync copied the owner's agents into the company plugin without his rules; their own blocks
+  # (the rules for every chat) are written before the service starts.
+  if [ -x "$H/bin/answer-context" ]; then
+    runuser -u "$AGENT_USER" -- env HOME="$H" python3 "$H/bin/answer-context" render-rules >/dev/null 2>&1 \
+      || echo "  ⚠ owner rules file not written: the agent keeps reading its rules before answers"
+  fi
   # Parallel sessions are as capable as the owner's: same skills, same
   # subagents, rendered copies. A trimmed worker package stops the install.
   runuser -u "$AGENT_USER" -- env HOME="$H" \
@@ -1591,6 +1547,14 @@ if [ "$MODULE_YOUTUBE_COMMENTS" = 1 ]; then
     bash "$KIT/modules/youtube-comments/install.sh"
 fi
 
+# Root's C14 acceptance (24.10.2026): modules this agent set up itself (kit-module setup) record the files they placed,
+# and an update had never refreshed them. Those still holding the kit's own bytes now follow the kit; what the owner
+# changed stays and is named. Only files: no dependency, setting, schedule, account or listener.
+if [ -d "$H/.claude/product/modules" ] && [ -x "$H/bin/kit-module" ]; then
+  runuser -u "$AGENT_USER" -- env HOME="$H" PATH="$H/.local/bin:/usr/local/bin:/usr/bin:/bin" KIT_MODULE_KIT="$KIT" \
+    "$H/bin/kit-module" refresh || echo "  ⚠ файли модулів оновлено не повністю (див. вище); модулі працюють далі" >&2
+fi
+
 echo "[7/7] контрольна перевірка"
 if grep -lE '\{\{[A-Z_]+\}\}' "${MANAGED_RENDERED_FILES[@]}" 2>/dev/null; then
   echo "FATAL: у наведених вище файлах залишився незаповнений шаблонний маркер" >&2
@@ -1615,29 +1579,12 @@ if [ ! -d "$H/obsidian-vault/.git" ]; then
     || echo "  WARN: початковий коміт сховища не створено"
 fi
 
-# A failed check says why (31.10.2026: a too-long skill description stopped a fresh install while Novsky showed an
-# unrelated warning): its report goes to the errors, and the last error line names the problems.
-check_report() {
-  local report reason errors status=0
-  errors="$(mktemp)"
-  report="$(runuser -u "$AGENT_USER" -- env HOME="$H" "$@" 2>"$errors")" || status=$?
-  cat "$errors" >&2
-  if [ "$status" -ne 0 ]; then
-    [ -z "$report" ] || printf '%s\n' "$report" >&2
-    reason="$(printf '%s' "$report" | python3 -c 'import json, sys
-try: problems = json.load(sys.stdin).get("errors") or []
-except Exception: problems = []
-lines = [line.strip() for line in open(sys.argv[1], encoding="utf-8", errors="replace") if line.strip()]
-print("; ".join(map(str, problems)) or (lines[-1] if lines else "перевірка не пройшла, звіт вище"))' "$errors")"
-    rm -f "$errors"
-    echo "FATAL: ${1##*/}: $reason" >&2
-    exit 1
-  fi
-  rm -f "$errors"
-}
-check_report "$H/bin/memory-index" index
-check_report "$H/bin/memory-doctor"
-check_report "$H/bin/skill-doctor" --root "$H/.claude/skills"
+runuser -u "$AGENT_USER" -- env HOME="$H" \
+  "$H/bin/memory-index" index >/dev/null
+runuser -u "$AGENT_USER" -- env HOME="$H" \
+  "$H/bin/memory-doctor" >/dev/null
+runuser -u "$AGENT_USER" -- env HOME="$H" \
+  "$H/bin/skill-doctor" --root "$H/.claude/skills" >/dev/null
 if [ "$STARTER_FOUNDATION_REQUIRED" = 1 ]; then
   # memory-index deliberately falls back to keyword search on provider errors.
   # That is useful at runtime, but a fresh Starter must have real vectors before
@@ -1654,7 +1601,7 @@ python3 "$KIT/assets/bin/update-safety-check" accept \
   --kit "$KIT" \
   --policy "$KIT/assets/product/managed-runtime.json" \
   --baseline "$H/.claude/product/managed-runtime-baseline.json" \
-  --owner "$AGENT_USER"
+  --owner "$AGENT_USER" "${RUNTIME_RESOLUTION_ARGS[@]}"
 render_template "$KIT/assets/templates/CLAUDE.md.template" "$MANAGED_CLAUDE" \
   --accept-baseline "$PERSONA_BASELINE_CLAUDE"
 render_template "$ROLE_PROFILE" "$MANAGED_PRODUCT" \
