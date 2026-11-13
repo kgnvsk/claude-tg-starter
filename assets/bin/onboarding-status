@@ -39,9 +39,6 @@ GOOGLE_SERVICES = {
     "sheets",
     "tasks",
 }
-# A seller's licence (owner, 19.10.2026) opens only the Google services of bought modules, and gog refuses the
-# rest, so the check asks for those alone. Fixed root-owned path, as gog and kit-module read it.
-MODULE_LICENCE_DIR = Path("/etc/claude-premium/modules")
 DEFAULT_REQUIRED_CHECKS = (
     "core",
     "claude_auth",
@@ -369,20 +366,11 @@ def voice_runtime_ready() -> bool:
 
 
 def claude_authenticated() -> bool:
-    """Observe configured login only. The live CLI owns refresh and proves provider access.
-
-    `auth status` can consume a refresh token near expiry, then exit before saving
-    its replacement. Onboarding must not compete with the running agent for it.
-    """
-    if env_has('ANTHROPIC_API_KEY') or env_has('CLAUDE_CODE_OAUTH_TOKEN'):
-        return True
-    path = Path(os.environ.get('CLAUDE_CONFIG_DIR') or HOME / '.claude') / '.credentials.json'
+    command = str(CLAUDE_BIN) if CLAUDE_BIN.is_file() else "claude"
+    _, output = command_output([command, "auth", "status"])
     try:
-        login = json.loads(path.read_text(encoding='utf-8')).get('claudeAiOauth') or {}
-        scopes = login.get('scopes')
-        return bool(login.get('accessToken') and login.get('refreshToken') and login.get('expiresAt')
-                    and isinstance(scopes, list) and 'user:inference' in scopes)
-    except (OSError, ValueError, AttributeError, TypeError):
+        return bool(json.loads(output).get("loggedIn"))
+    except (json.JSONDecodeError, AttributeError):
         return False
 
 
@@ -411,16 +399,6 @@ def vercel_authenticated() -> bool:
     return code == 0 and bool(output.strip())
 
 
-def required_google_services() -> set[str]:
-    try:
-        licence = json.loads((MODULE_LICENCE_DIR / f"{HOME.owner()}.json").read_text(encoding="utf-8"))
-    except (OSError, ValueError, KeyError):
-        return GOOGLE_SERVICES  # no licence: an older agent with everything, as before
-    if not isinstance(licence, dict) or licence.get("kind") != "novsky-modules-licence":
-        return GOOGLE_SERVICES
-    return GOOGLE_SERVICES & set(licence.get("googleServices") or [])
-
-
 def gog_authenticated() -> bool:
     command = str(GOG_BIN) if GOG_BIN.is_file() else "gog"
     code, output = command_output([command, "auth", "list", "--json"])
@@ -432,7 +410,7 @@ def gog_authenticated() -> bool:
         return False
     return any(
         isinstance(account, dict)
-        and required_google_services().issubset(set(account.get("services", [])))
+        and GOOGLE_SERVICES.issubset(set(account.get("services", [])))
         for account in accounts
     )
 
@@ -700,21 +678,6 @@ if "memory_semantic_search" in ACTIVE_CHECKS:
     semantic_memory.update(semantic_index_details())
 
 
-def browser_ready():
-    private = Path('/etc/claude-browser-private') / (str(os.getuid()) + '.json')
-    if private.exists() or private.is_symlink():
-        try:
-            result = subprocess.run([str(HOME / 'bin/browser-mcp'), '--check'],
-                                    capture_output=True, text=True, timeout=8)
-            facts = json.loads(result.stdout)
-            return result.returncode == 0 and facts.get('pastOperationVerified') is True
-        except (OSError, ValueError, subprocess.SubprocessError):
-            return False
-    # The shared legacy service is never an installed browser for a secondary (the primary user, as browser-doctor).
-    primary = os.environ.get('CLAUDE_PRIMARY_USER', 'claude')
-    return pwd.getpwuid(os.getuid()).pw_name == primary and service_active('claude-browser.service')
-
-
 check_values = {
     "skills": skills_ready,
     "core": lambda: (
@@ -726,7 +689,7 @@ check_values = {
     "telegram_service": lambda: service_active(
         os.environ.get("CLAUDE_TELEGRAM_SERVICE", "claude-telegram.service")
     ),
-    "browser": browser_ready,
+    "browser": lambda: service_active("claude-browser.service"),
     "google_workspace": gog_authenticated,
     "growth_analytics": growth_analytics_ready,
     "vercel_cli": lambda: (

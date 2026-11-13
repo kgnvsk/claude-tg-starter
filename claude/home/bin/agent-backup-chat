@@ -18,16 +18,30 @@ loader.exec_module(backend)
 
 # A GitHub token is a word of its own: «highs_and_lows.csv» or «laughs_count» is not one.
 TOKEN = re.compile(r'(?<![A-Za-z0-9_])(?:github_pat_|gh[pousr]_)[A-Za-z0-9_]{20,}')
-INTENT = re.compile(r'(?i)(?:б[еэ]к[аі]п|backup|резервн.{0,12}коп)')
+INTENT = re.compile(r'(?i)(?:б[еэ]к[аі]п|backup|резервн.{0,12}коп|kopi\S*\s+zapasow)')
 # Only an explicit cancel ends a step («скасуй бекап», «cancel backup»): a bare «стоп» is how
 # the owner stops the agent. The same words as telegram-backup-chat.ts.
-BACKUP = r'(?:(?:мені|мне|my|the|a|токен|token)\s+)*(?:(?:авто|auto)\S*\s*)?(?:б[еэ]к[аі]п|backup|резервн\S*\s+коп)\S*'
+BACKUP = r'(?:(?:мені|мне|my|the|a|токен|token)\s+)*(?:(?:авто|auto)\S*\s*)?(?:б[еэ]к[аі]п|backup|резервн\S*\s+коп|kopi\S*\s+zapasow)\S*'
 SETUP = r'(?:налаштування|підключення|настройк\S*|подключени\S*|setup)'
-CANCEL = re.compile(r'(?i)(?:скасу|відмін|отмен|cancel|стоп|stop)\S*\s+(?:' + SETUP + r'\s+)?' + BACKUP + r'(?:\s+' + SETUP + r')?[.!\s]*')
+CANCEL = re.compile(r'(?i)(?:скасу|відмін|отмен|anul|cancel|стоп|stop)\S*\s+(?:' + SETUP + r'\s+)?' + BACKUP + r'(?:\s+' + SETUP + r')?[.!\s]*')
 # A GitHub link, or a bare owner/repo with letters and three characters on each side: not «yes/no» or «50/50».
 REPOSITORY = re.compile(r'https://github\.com/([A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9][A-Za-z0-9_.-]{0,99})/?'
                         r'|((?=[^/]*[A-Za-z])[A-Za-z0-9][A-Za-z0-9-]{2,38}/(?=[^/]*[A-Za-z])[A-Za-z0-9][A-Za-z0-9_.-]{2,99})/?')
-SAVED = re.compile(r'(?i)(?:збер[іе]г|збережено|сохранил|сохранено|saved)')
+# Only a whole short «saved» confirms the key: a question, a request quoting the phrase or a «not» goes to the
+# model (Codex, PR 421: «Как сохранить ключ?», «Напиши «ключ сохранён»» turned the backup on). As the receiver reads it.
+SAVED_FORM = (r'(?:збережено|збережений|збережена|зберіг|зберегла|зберегли|сохранил|сохранила|сохранили|сохранено|'
+              r'сохранён|сохранен|сохранена|zapisa(?:[łl](?:em|am|i[śs]my)|ny|na|ne|no)|saved)')
+KEY_WORD = r'(?:ключ|klucz|the\s+key|key|it)'
+KEY_SAVED = re.compile(r'(?i)\s*(?:(?:я|i|да|так|tak|yes|ok|окей|ок|уже|вже|już|juz|already)[\s,]+){0,2}'
+                       r'(?:' + KEY_WORD + r'\s+' + SAVED_FORM + r'|' + SAVED_FORM + r'(?:\s+' + KEY_WORD + r')?)\s*[.!]*\s*')
+# A request to renew access, in every language the receiver takes it in.
+UPDATE = re.compile(r'(?i)(?:онов|обнов|зам[іе]н|zaktualizuj|wymie[ńn]|update|renew|replace|токен|token)')
+
+
+def key_saved(text):
+    return KEY_SAVED.fullmatch(text) is not None
+
+
 TTL = 24 * 3600
 
 
@@ -37,6 +51,7 @@ def reply(text, **extra):
 
 def handle(backup, value, now=None):
     now = int(time.time()) if now is None else now
+    say = lambda key, ukrainian, **values: backend.notice(key, ukrainian, getattr(backup, 'home', None), **values)
     owner = value.get('owner', '')
     if not re.fullmatch(r'[1-9][0-9]{0,18}', owner):
         raise backend.BackupError('owner-required')
@@ -44,7 +59,7 @@ def handle(backup, value, now=None):
     state = backup.load(state_path)
     text = str(value.get('text', ''))
     if len(text) > 8192:
-        return reply('Надішли посилання або токен окремим коротким повідомленням.')
+        return reply(say('backup.chat_short', 'Надішли посилання або токен окремим коротким повідомленням.'))
     # Transport supplies exact verified owner, never a model-selected account.
     if state and (state.get('owner') != owner or now > state.get('expires', 0)):
         state = {}
@@ -75,69 +90,69 @@ def handle(backup, value, now=None):
         return {'ok': True}
     if CANCEL.fullmatch(text.strip()):
         backup.save(state_path, {})
-        return reply('Діалог налаштування закрито. Уже ввімкнений автоматичний бекап продовжує працювати.')
+        return reply(say('backup.chat_closed', 'Діалог налаштування закрито. Уже ввімкнений автоматичний бекап продовжує працювати.'))
     status = backup.status()
     tokens = TOKEN.findall(text)
     if tokens:
         if value.get('deleted') is not True:
-            return reply('Не вдалося видалити повідомлення з токеном. Видали його та відклич цей токен у GitHub. Новий надішли після повторного підключення.')
+            return reply(say('backup.chat_token_kept', 'Не вдалося видалити повідомлення з токеном. Видали його та відклич цей токен у GitHub. Новий надішли після повторного підключення.'))
         if state.get('phase') != 'token' or len(tokens) != 1:
-            return reply('Токен не використано, повідомлення видалено. Спочатку напиши «хочу підключити бекап» і надішли адресу приватного репозиторію.')
+            return reply(say('backup.chat_token_unused', 'Токен не використано, повідомлення видалено. Спочатку напиши «хочу підключити бекап» і надішли адресу приватного репозиторію.'))
         prepared = backup.prepare()
         backup.connect(state['repository'], tokens[0])
         if prepared.get('keySaved'):
             state['phase'] = 'ready'
             backup.save(state_path, state)
-            return reply('Доступ перевірено. Напиши «увімкни бекап», щоб запустити першу копію та розклад.')
+            return reply(say('backup.chat_access_ok', 'Доступ перевірено. Напиши «увімкни бекап», щоб запустити першу копію та розклад.'))
         state.update(phase='key', keyDelivered=False)
         backup.save(state_path, state)
-        return reply('Доступ до приватного репозиторію перевірено. Збережи цей файл ключа на своєму комп’ютері або в менеджері паролів. Він потрібен для відновлення після втрати сервера. Потім напиши «ключ збережено».', recoveryKey=True)
+        return reply(say('backup.chat_save_key', 'Доступ до приватного репозиторію перевірено. Збережи цей файл ключа на своєму комп’ютері або в менеджері паролів. Він потрібен для відновлення після втрати сервера. Потім напиши «ключ збережено».'), recoveryKey=True)
     if state.get('phase') == 'github':
-        return reply('Очікую підтвердження входу на сторінці GitHub. Щоб закрити налаштування, напиши «скасуй бекап».', githubLogin=True, nonce=state['nonce'])
+        return reply(say('backup.chat_wait_github', 'Очікую підтвердження входу на сторінці GitHub. Щоб закрити налаштування, напиши «скасуй бекап».'), githubLogin=True, nonce=state['nonce'])
     if state.get('phase') == 'key':
-        if SAVED.search(text) and state.get('keyDelivered'):
+        if key_saved(text) and state.get('keyDelivered'):
             backup.confirm_key_saved()
             state['phase'] = 'ready'
             backup.save(state_path, state)
-            return reply('Ключ збережено. Запускаю першу копію та автоматичний бекап. Повідомлю результат після перевірки завантаження.', enable=True)
-        return reply('Збережи файл ключа окремо від сервера та напиши «ключ збережено». Повторно надсилаю файл.', recoveryKey=True)
+            return reply(say('backup.chat_key_saved', 'Ключ збережено. Запускаю першу копію та автоматичний бекап. Повідомлю результат після перевірки завантаження.'), enable=True)
+        return reply(say('backup.chat_save_key_again', 'Збережи файл ключа окремо від сервера та напиши «ключ збережено». Повторно надсилаю файл.'), recoveryKey=True)
     if state.get('phase') == 'ready':
-        if INTENT.search(text) or SAVED.search(text):
-            return reply('Запускаю копію та автоматичний бекап. Повідомлю результат після перевірки завантаження.', enable=True)
-        return reply('Напиши «увімкни бекап» або «скасуй бекап».')
+        if INTENT.search(text) or key_saved(text):
+            return reply(say('backup.chat_starting', 'Запускаю копію та автоматичний бекап. Повідомлю результат після перевірки завантаження.'), enable=True)
+        return reply(say('backup.chat_enable_or_cancel', 'Напиши «увімкни бекап» або «скасуй бекап».'))
     if state.get('phase') in ('repository', 'token'):
         match = REPOSITORY.fullmatch(text.strip())
         if match:
             state.update(phase='token', repository=match[1] or match[2])
             backup.save(state_path, state)
-            return reply(token_guide(state['repository']))
+            return reply(token_guide(state['repository'], say))
         if state.get('phase') == 'token':
-            return reply(token_guide(state['repository']))
+            return reply(token_guide(state['repository'], say))
     if status.get('configured') and not state and not status.get('enabled'):
-        return reply('Доступ і ключ збережено, але автобекап ще не ввімкнений. Напиши «повтори бекап», щоб запустити копію та розклад.', enable=bool(re.search(r'(?i)(?:повтор|retry|увімк|включ)', text)))
+        return reply(say('backup.chat_not_enabled', 'Доступ і ключ збережено, але автобекап ще не ввімкнений. Напиши «повтори бекап», щоб запустити копію та розклад.'), enable=bool(re.search(r'(?i)(?:повтор|pon[óo]w|retry|увімк|включ|w[łl][aą]cz)', text)))
     if status.get('configured') and status.get('enabled'):
-        if re.search(r'(?i)(?:повтор|retry)', text):
-            return reply('Повторюю створення й перевірку копії.', enable=True)
+        if re.search(r'(?i)(?:повтор|pon[óo]w|retry)', text):
+            return reply(say('backup.chat_repeating', 'Повторюю створення й перевірку копії.'), enable=True)
         when = status.get('lastSuccessAt')
         if when:
             date = time.strftime('%d.%m.%Y %H:%M UTC', time.gmtime(when))
-            tail = ' Остання спроба завершилася помилкою; попередню копію збережено.' if status.get('lastError') else ''
-            if not re.search(r'(?i)(?:онов|обнов|зам[іе]н|токен|token)', text):
-                return reply('Автобекап увімкнений. Остання успішна копія: ' + date + '.' + tail)
-        elif not re.search(r'(?i)(?:онов|обнов|зам[іе]н|токен|token)', text):
-            return reply('Автобекап увімкнений, але успішну першу копію ще не підтверджено. Напиши «повтори бекап», щоб повторити перевірку.', enable=bool(re.search(r'(?i)(?:повтор|retry)', text)))
-    if not re.search(r'(?i)(?:вручн|manual|через токен)', text):
+            tail = say('backup.chat_last_failed', ' Остання спроба завершилася помилкою; попередню копію збережено.') if status.get('lastError') else ''
+            if not UPDATE.search(text):
+                return reply(say('backup.chat_enabled_last', 'Автобекап увімкнений. Остання успішна копія: {date}.{tail}', date=date, tail=tail))
+        elif not UPDATE.search(text):
+            return reply(say('backup.chat_enabled_unconfirmed', 'Автобекап увімкнений, але успішну першу копію ще не підтверджено. Напиши «повтори бекап», щоб повторити перевірку.'), enable=bool(re.search(r'(?i)(?:повтор|pon[óo]w|retry)', text)))
+    if not re.search(r'(?i)(?:вручн|r[ęe]czn|manual|через токен)', text):
         state = {'owner': owner, 'phase': 'github', 'expires': now + TTL, 'nonce': backend.secrets.token_hex(12)}
         backup.save(state_path, state)
-        return reply('Підключимо GitHub. Зараз надішлю посилання й одноразовий код для входу. Якщо акаунта ще немає, спочатку зареєструйся на https://github.com/signup. Далі я сам створю приватний репозиторій і налаштую копії.', githubLogin=True, nonce=state['nonce'])
+        return reply(say('backup.chat_github_login', 'Підключимо GitHub. Зараз надішлю посилання й одноразовий код для входу. Якщо акаунта ще немає, спочатку зареєструйся на https://github.com/signup. Далі я сам створю приватний репозиторій і налаштую копії.'), githubLogin=True, nonce=state['nonce'])
     state = {'owner': owner, 'phase': 'repository', 'expires': now + TTL}
     backup.save(state_path, state)
-    return reply('Підключимо автоматичний бекап. Якщо ще немає GitHub — зареєструйся: https://github.com/signup\n\nВідкрий https://github.com/new, назви репозиторій my-agent-backup, обери Private та додай README. Створи його й надішли сюди посилання. Далі підкажу, як дати доступ лише до цього репозиторію. Термінал не потрібен. Щоб перервати діалог, напиши «скасуй бекап».')
+    return reply(say('backup.chat_manual', 'Підключимо автоматичний бекап. Якщо ще немає GitHub — зареєструйся: https://github.com/signup\n\nВідкрий https://github.com/new, назви репозиторій my-agent-backup, обери Private та додай README. Створи його й надішли сюди посилання. Далі підкажу, як дати доступ лише до цього репозиторію. Термінал не потрібен. Щоб перервати діалог, напиши «скасуй бекап».'))
 
 
-def token_guide(repo):
+def token_guide(repo, say=lambda key, ukrainian, **values: ukrainian.format(**values)):
     url = 'https://github.com/settings/personal-access-tokens/new?' + urlencode({'name': 'Agent backup', 'target_name': repo.split('/')[0], 'expires_in': 90, 'contents': 'write'})
-    return ('Тепер створи токен доступу: ' + url + '\n\nRepository access → Only select repositories → обери лише ' + repo.split('/')[1] + '.\nPermissions → Contents: Read and write. Інші права не потрібні. Натисни Generate token, скопіюй його та надішли сюди окремим текстовим повідомленням.\n\nОбробник видалить це повідомлення та збереже токен окремо від переписки й бекапу. Не надсилай пароль GitHub. Токен діятиме 90 днів; після завершення строку його потрібно оновити.')
+    return say('backup.chat_token_guide', 'Тепер створи токен доступу: {url}\n\nRepository access → Only select repositories → обери лише {repo}.\nPermissions → Contents: Read and write. Інші права не потрібні. Натисни Generate token, скопіюй його та надішли сюди окремим текстовим повідомленням.\n\nОбробник видалить це повідомлення та збереже токен окремо від переписки й бекапу. Не надсилай пароль GitHub. Токен діятиме 90 днів; після завершення строку його потрібно оновити.', url=url, repo=repo.split('/')[1])
 
 
 def main():

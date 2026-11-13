@@ -46,6 +46,9 @@ DB=$CH/messages.db
 ENVF=$CH/.env
 GUARD=$H/bin/tg-reply-stop-guard
 SELECTOR=$H/bin/tg-resume-session
+# The launcher asks the selector from ~/obsidian-vault (claude-telegram-bot changes there first); a selector that
+# finds the session by its working directory answers nothing from HOME (Лилу and Bro, 01.11.2026).
+WS=$H/obsidian-vault; [ -d "$WS" ] || WS=$H
 MARKER=/etc/claude-tg-starter/live-engines-allowed
 IDLE_WAIT=${IDLE_WAIT:-900}
 LEAVE_WAIT=${LEAVE_WAIT:-120}
@@ -130,7 +133,7 @@ PYPROC
 }
 selected_session() {  # the session the launcher would resume now, asked of the selector as it runs
   [ -x "$SELECTOR" ] || return 0
-  (cd "$H" && $AS env HOME="$H" CLAUDE_CONFIG_DIR="$CONFIG" TELEGRAM_STATE_DIR="$CH" "$SELECTOR" 2>/dev/null || true) | head -1
+  (cd "$WS" && $AS env HOME="$H" CLAUDE_CONFIG_DIR="$CONFIG" TELEGRAM_STATE_DIR="$CH" "$SELECTOR" 2>/dev/null || true) | head -1
 }
 legacy() { [ -n "$1" ] && [ -n "$(q "SELECT 1 FROM delivery_legacy_native_sessions WHERE session_id='$1'")" ]; }
 busy_reason() {  # the installer's idle rule
@@ -266,6 +269,9 @@ switch_authority() {
   say "start $SVC"
   local t0 pid1 nr1 session1; t0=$(( $(date +%s) * 1000 ))
   systemctl start "$SVC"
+  # A manual stop and start resets systemd's restart counter (Bro, 02.11.2026: 2 → 0 rolled a healthy switch back);
+  # only automatic restarts after this start count.
+  nr0=$(systemctl show -p NRestarts --value "$SVC")
   wait_receiver_start "$t0" || fail "receiver did not start (contract 6 and a fresh start mark) within 180 s"
   [ "$(q "SELECT value FROM delivery_runtime WHERE key='authority'")" = "$TARGET" ] || fail "the receiver runs as $(q "SELECT value FROM delivery_runtime WHERE key='authority'"), not $TARGET"
   nr1=$(systemctl show -p NRestarts --value "$SVC"); pid1=$(systemctl show -p MainPID --value "$SVC")
@@ -282,7 +288,7 @@ switch_authority() {
   if [ "$FRESH" = 1 ]; then
     # The selector stays off until the fresh session has claimed a Telegram message (Codex, 30.09 P1), at most a day.
     systemd-run --collect --unit "receipts-fresh-session-$OWN" -p StandardOutput=append:"$B/fresh-session.log" \
-      python3 "$HERE/receipts-fresh-session" watch "$FRESH_RECORD" "$next" "$DB" "$H" "$OWN" 24 HOME="$H" \
+      python3 "$HERE/receipts-fresh-session" watch "$FRESH_RECORD" "$next" "$DB" "$WS" "$OWN" 24 HOME="$H" \
         CLAUDE_CONFIG_DIR="$CONFIG" TELEGRAM_STATE_DIR="$CH" >/dev/null
   fi
   trap - ERR TERM INT HUP

@@ -3,18 +3,14 @@
 
 from pathlib import Path
 import json
-import os
-import pwd
 import re
-import shlex
-import stat
 
 
 MEMORY_CHAR_LIMIT = 2200
 USER_CHAR_LIMIT = 1375
 HOT_CHAR_LIMIT = 2400
 # The CLI passes a hook's context on whole only up to 10 000 characters; a longer one becomes a 2 KB preview.
-HOOK_BUDGET = 9500  # in UTF-16 code units, as the CLI counts (an emoji is two)
+HOOK_BUDGET = 9500
 HOME = Path.home()
 
 SOURCES = (
@@ -70,7 +66,7 @@ def safe_content(path: Path) -> str:
 
 def too_long(path: Path, size: int, limit: int) -> str:
     """Owner, 23.10.2026: nothing the model reads is cut. A core that does not fit is not put in at all, and the model is
-    told where to read it whole."""
+    told where to read it whole (port of 7c6e07ee, lost with the V2 switch)."""
     return (f"[не вставлено: {size} знаків, ліміт {limit}] Прочитай файл цілком: {path}. Скажи власнику, що він більший "
             "за ліміт, і запропонуй перенести зайве у вольт.")
 
@@ -92,77 +88,18 @@ SETUP_LABELS = {
 SETUP_STATUS = {"configured": "працює", "deferred": "відкладено", "disabled": "вимкнено"}
 
 
-
-def voice_configuration_text(relative: str) -> str | None:
-    """Bounded, read-only local configuration. Never return its values to the model."""
-    path = HOME / relative
-    for parent in path.parents:
-        if parent == HOME:
-            break
-        if parent.is_symlink():
-            raise ValueError("unsafe configuration")
-    try:
-        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    except FileNotFoundError:
-        return None
-    with os.fdopen(descriptor, "rb") as source:
-        info = os.fstat(source.fileno())
-        if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid != os.getuid()
-                or info.st_mode & 0o077 or info.st_size > 1024 * 1024):
-            raise ValueError("unsafe configuration")
-        raw = source.read(1024 * 1024 + 1)
-        if len(raw) > 1024 * 1024:
-            raise ValueError("configuration too large")
-        return raw.decode("utf-8")
-
-
-def voice_setup_block() -> str:
-    """Configuration presence, not a provider check; no migration, auth or subprocess."""
-    try:
-        raw = voice_configuration_text(".config/novsky/secrets.json")
-        values = {}
-        if raw is not None:
-            store = json.loads(raw)
-            if not isinstance(store, dict) or store.get("schemaVersion") != 1 or not isinstance(store.get("values"), dict):
-                raise ValueError("invalid store")
-            values = store["values"]
-        identity = "openai:OPENAI_API_KEY"
-        if identity in values:
-            value = values[identity]
-            if value is not None and not isinstance(value, str):
-                raise ValueError("invalid key metadata")
-            configured = bool(value)  # An explicit deletion wins over stale legacy values.
-        else:
-            configured = bool(os.environ.get("OPENAI_API_KEY"))
-            for relative in (".agent-profile.env", ".claude/channels/telegram/.env"):
-                for line in (voice_configuration_text(relative) or "").splitlines():
-                    match = re.fullmatch(r"(?:export\s+)?OPENAI_API_KEY=(.*)", line.strip())
-                    if match:
-                        words = shlex.split(match[1], comments=True)
-                        if len(words) > 1:
-                            raise ValueError("invalid key metadata")
-                        configured = configured or bool(words and words[0])
-        if not configured:
-            return "Голосові: не налаштовано за поточними локальними даними. Не пропонуй надсилати голосові; текст доступний."
-        if not all(os.access(HOME / "bin" / name, os.X_OK) for name in ("transcribe", "agent-provider-run")):
-            return "Голосові: інструменти недоступні. Не обіцяй розшифровку до перевірки встановлення."
-        return "Голосові: ключ налаштований та інструменти встановлені; живу розшифровку не перевірено. Це не підтвердження доступу провайдера."
-    except (OSError, ValueError, UnicodeError, RecursionError):
-        return "Голосові: стан невідомий. Не обіцяй розшифровку без перевірки; текст доступний."
-
-
 def setup_state_block() -> str:
     """The agent introduces itself and answers "what is connected?" from the
     installer's bookkeeping, never from guesses."""
     try:
         state = json.loads(SETUP_STATE.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        state = {}
+        return ""
     features = state.get("optionalFeatures") or {}
     groups: dict[str, list[str]] = {value: [] for value in SETUP_STATUS.values()}
     for name, feature in features.items():
         status = SETUP_STATUS.get(str((feature or {}).get("status") or ""))
-        if status and not (name == "voice_transcription" and status == SETUP_STATUS["configured"]):
+        if status:
             groups[status].append(SETUP_LABELS.get(name, name))
     parts = [
         f"{status}: {', '.join(items) if status == SETUP_STATUS['configured'] else len(items)}"
@@ -170,54 +107,18 @@ def setup_state_block() -> str:
         if items
     ]
     if not parts:
-        return voice_setup_block()
+        return ""
     text = (
         "Облік необовʼязкових налаштувань (не перевірка живого доступу): "
         + "; ".join(parts)
         + "."
     )
-    return text + "\n" + voice_setup_block()
+    return text
 
 
-MODULES_LICENCE_DIR = Path("/etc/claude-premium/modules")
-
-
-def modules_licence_path() -> Path:
-    # Fixed root-owned path: no environment variable can point the hook elsewhere.
-    return MODULES_LICENCE_DIR / f"{pwd.getpwuid(os.getuid()).pw_name}.json"
-
-
-def modules_block() -> str:
-    """What the seller sold this agent (owner, 19.10.2026). No licence file: an
-    older agent with everything, so nothing is said."""
-    try:
-        raw = modules_licence_path().read_text(encoding="utf-8")
-    except FileNotFoundError:
-        return ""
-    except OSError:
-        raw = ""
-    try:
-        licence = json.loads(raw)
-        if not isinstance(licence, dict) or licence.get("kind") != "novsky-modules-licence":
-            raise ValueError
-    except ValueError:
-        return (
-            "Облік модулів цього агента пошкоджено. Працюй лише в межах бази й скажи власнику, "
-            "що підключення модулів відновить людина, яка встановила агента."
-        )
-    contact = str(licence.get("contact") or "").strip() or "людина, яка встановила агента"
-    base = licence.get("base") or {}
-    bought = [m for m in licence.get("bought") or [] if isinstance(m, dict)]
-    rest = [m for m in licence.get("notBought") or [] if isinstance(m, dict)]
-    lines = [
-        "Комплект цього агента (облік продавця; змінюється лише через Novsky, не з чату).",
-        f"{base.get('name') or 'База'} — завжди: " + "; ".join(str(item) for item in base.get("includes") or []) + ".",
-        "Куплені модулі: " + ("; ".join(f"{m.get('name')} — {m.get('pitch')}" for m in bought) if bought else "немає, лише база") + ".",
-    ]
-    if rest:
-        lines.append("Не куплені, окремі модулі: " + "; ".join(str(m.get("name")) for m in rest) + ".")
-    lines.append(f"Некуплені модулі підключає: {contact}.")
-    return "\n".join(lines)
+def units(text: str) -> int:
+    """Length as the CLI counts it (UTF-16 code units): an emoji counts twice (Codex, 01.11.2026)."""
+    return len(text.encode("utf-16-le", "surrogatepass")) // 2
 
 
 def memory_block(label: str, content: str) -> str:
@@ -230,12 +131,6 @@ for path, label, limit in SOURCES:
     if content:
         cores.append([path, label, limit, content, True])
 blocks = [memory_block(label, content) for _, label, _, content, _ in cores]
-modules = modules_block()
-if modules:
-    blocks.append(
-        "<memory-context source=\"modules\" role=\"product-facts\">\n"
-        f"{modules}\n</memory-context>"
-    )
 setup_state = setup_state_block()
 if setup_state:
     blocks.append(
@@ -244,9 +139,9 @@ if setup_state:
     )
 
 # Every core goes in whole while everything together fits the CLI's limit; past it, the largest core goes out as a line
-# to read it whole, never cut and never as the CLI's preview of the whole context. The kit's own blocks are short.
-while len("\n\n".join(blocks).encode("utf-16-le")) // 2 > HOOK_BUDGET and any(core[4] for core in cores):
-    index = max((i for i, core in enumerate(cores) if core[4]), key=lambda i: len(cores[i][3].encode("utf-16-le")))
+# to read it whole, never cut and never as the CLI's preview of the whole context. The kit's own block is short.
+while units("\n\n".join(blocks)) > HOOK_BUDGET and any(core[4] for core in cores):
+    index = max((i for i, core in enumerate(cores) if core[4]), key=lambda i: units(cores[i][3]))
     path, label, limit, content, _ = cores[index]
     cores[index][4] = False
     blocks[index] = memory_block(label, too_long(path, len(content), limit))

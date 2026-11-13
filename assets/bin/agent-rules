@@ -1,0 +1,913 @@
+#!/usr/bin/env python3
+"""Agent rules by scope: company, a person's own rules, a group, a forum topic.
+
+Plan: docs/plans/2026-10-31-2116-feat-agent-rules-by-scope-plan.md.
+
+The files live in ~/.local/share/agent-rules, never under ~/.claude: the CLI loads ~/.claude/rules by itself, so a
+person's rules there would reach every session. One rule is one header comment plus its text. A writer proves who is
+asking from the receiver's own records (an open request, or a live company job); nothing the model passes as an
+actor, a chat or a scope grants authority. Rendering never shortens a rule: a set that would not fit is refused when
+it is saved, and a hand-edited set that cannot fit goes out as a flagged pointer instead of being cut.
+"""
+from __future__ import annotations
+
+import argparse
+from contextlib import closing
+import datetime as _dt
+import fcntl
+import hashlib
+import importlib.util
+import json
+import os
+from pathlib import Path
+import re
+import sqlite3
+import subprocess
+import sys
+import tempfile
+
+# Measured 31.10.2026 on Claude Code 2.1.314 (docs/agent-rules-cli-limit.md): a hook's context up to 10 000
+# characters reaches the model whole; above that the model sees a ~2 300-character preview.
+CLI_HOOK_CONTEXT_LIMIT = 10_000
+# The whole applicable set of one conversation; the rest of the limit stays for the hook's parts that are never cut.
+RULES_BUDGET = 6_000
+ID = re.compile(r"[1-9]\d{0,19}")
+GROUP = re.compile(r"-[1-9]\d{0,19}")
+RULE_ID = re.compile(r"r[1-9]\d{0,6}")
+HEADER = re.compile(r"^<!-- rule (?P<fields>[^>]*?) -->$")
+FIELD = re.compile(r"(\w+)=(\S+)")
+LIVE_JOB_STATES = ("leased", "prompt_submitted")
+HEAD = ("AGENT RULES for this conversation (complete; follow them in this answer). Company rules and access limits "
+        "come first; a narrower rule never relaxes them.")
+# The owner hears this once per distinct oversized set; agent_notice_locale.py carries the ru/pl/en wording (rules.overflow).
+OVERFLOW_NOTICE = ("⚠️ Правила однієї з розмов агента задовгі, щоб передати їх цілком ({size} знаків). Агент читає їх "
+                   "із файлу. Розділіть ці правила: частину процедур можна перенести в навички.")
+SECTION = {"company": "Company rules:", "person": "This person's own rules (their private chat):",
+           "chat": "This group's rules:", "topic": "This topic's rules:"}
+
+
+class Refused(Exception):
+    def __init__(self, reason: str, **detail):
+        super().__init__(reason)
+        self.reason, self.detail = reason, detail
+
+
+def home() -> Path:
+    return Path(os.environ.get("HOME", "/home/claude"))
+
+
+def data_dir() -> Path:
+    return Path(os.environ.get("AGENT_RULES_DIR") or home() / ".local/share/agent-rules")
+
+
+def state_dir() -> Path:
+    return Path(os.environ.get("TELEGRAM_STATE_DIR") or home() / ".claude/channels/telegram")
+
+
+def now_iso() -> str:
+    return _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# ---------- storage ----------
+
+def scope_path(scope: str, chat: str | None = None, thread: str | None = None, person: str | None = None) -> Path:
+    if scope == "company":
+        return Path("company.md")
+    if scope == "person" and person and ID.fullmatch(person):
+        return Path("person") / f"{person}.md"
+    if scope == "chat" and chat and GROUP.fullmatch(chat):
+        return Path("chat") / f"{chat}.md"
+    if scope == "topic" and chat and GROUP.fullmatch(chat) and thread and ID.fullmatch(thread):
+        return Path("chat") / chat / "topic" / f"{thread}.md"
+    raise Refused("bad_scope", scope=scope)
+
+
+def read_bytes(path: Path) -> bytes:
+    try:
+        if path.is_symlink():
+            raise Refused("unsafe_file", file=str(path))
+        return path.read_bytes()
+    except FileNotFoundError:
+        return b""
+
+
+def parse(text: str) -> list[dict]:
+    """Rules of one file in order. Text a person wrote without a header is kept whole as an unattributed rule."""
+    rules: list[dict] = []
+    current: dict | None = None
+    loose: list[str] = []
+    for line in text.splitlines():
+        match = HEADER.match(line.strip())
+        if match:
+            if current is None and "".join(loose).strip():
+                rules.append({"id": None, "text": "\n".join(loose).strip(), "fields": {}})
+            loose = []
+            if current is not None:
+                current["text"] = current["text"].strip()
+                rules.append(current)
+            current = {"fields": dict(FIELD.findall(match.group("fields"))), "text": ""}
+            current["id"] = current["fields"].get("id")
+            continue
+        if line.startswith("<!-- agent-rules"):
+            continue
+        if current is None:
+            loose.append(line)
+        else:
+            current["text"] += line + "\n"
+    if current is not None:
+        current["text"] = current["text"].strip()
+        rules.append(current)
+    elif "".join(loose).strip():
+        rules.append({"id": None, "text": "\n".join(loose).strip(), "fields": {}})
+    return [rule for rule in rules if rule["text"]]
+
+
+def serialize(rules: list[dict], label: str) -> str:
+    out = [f"<!-- agent-rules v1 {label}: change these through ~/bin/agent-rules, not by hand -->"]
+    for rule in rules:
+        fields = rule["fields"]
+        head = " ".join(f"{key}={fields[key]}" for key in ("id", "rev", "author", "source", "at", "replaces", "adopted")
+                        if fields.get(key))
+        out += ["", f"<!-- rule {head} -->" if head else "", rule["text"]]
+    return "\n".join(line for line in out if line is not None).strip() + "\n"
+
+
+def next_id(rules: list[dict], history: str) -> str:
+    used = [int(rule["id"][1:]) for rule in rules if rule.get("id") and RULE_ID.fullmatch(rule["id"])]
+    used += [int(value) for value in re.findall(r"\bid=r(\d+)\b", history)]
+    return f"r{max(used, default=0) + 1}"
+
+
+def write_atomic(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def append_history(relative: Path, rule: dict, event: str) -> None:
+    target = data_dir() / "history" / relative
+    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fields = " ".join(f"{key}={value}" for key, value in rule["fields"].items())
+    with open(target, "a", encoding="utf-8") as handle:
+        handle.write(f"\n<!-- {event} at={now_iso()} {fields} -->\n{rule['text']}\n")
+    os.chmod(target, 0o600)
+
+
+class Lock:
+    def __enter__(self):
+        root = data_dir()
+        root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(root, 0o700)
+        self.handle = open(root / ".lock", "a")
+        fcntl.flock(self.handle, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc):
+        fcntl.flock(self.handle, fcntl.LOCK_UN)
+        self.handle.close()
+
+
+# ---------- who is asking ----------
+
+def owner_id() -> str:
+    config = state_dir() / ".env"
+    if config.is_symlink():
+        raise Refused("owner_unknown")
+    try:
+        owners = [line.split("=", 1)[1].strip().strip("\"'") for line in config.read_text(encoding="utf-8").splitlines()
+                  if line.startswith("OWNER_CHAT_ID=")]
+    except OSError:
+        raise Refused("owner_unknown") from None
+    if len(owners) != 1 or not ID.fullmatch(owners[0]):
+        raise Refused("owner_unknown")
+    return owners[0]
+
+
+def access() -> dict:
+    path = state_dir() / "access.json"
+    try:
+        if path.is_symlink() or path.stat().st_size > 1_000_000:
+            return {}
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def admins() -> set[str]:
+    return {str(item) for item in access().get("admins", []) if ID.fullmatch(str(item))}
+
+
+def request_context(delivery: str) -> dict:
+    """The sender, chat and topic of a still-open request of this session, taken from the receiver ledger.
+
+    The barrier is access-update's current_owner_request for any sender: the request must be open in this
+    session's stamp, every message of its turn must come from that sender, and nothing forwarded or posted as a
+    channel counts as the sender's own instruction.
+    """
+    if not re.fullmatch(r"-?[1-9]\d{0,19}:[1-9]\d{0,19}", delivery):
+        raise Refused("bad_request")
+    stamp = os.environ.get("TG_DELIVERY_STAMP")
+    ledger = state_dir() / "messages.db"
+    if not stamp or ledger.is_symlink():
+        raise Refused("request_unverified")
+    try:
+        with closing(sqlite3.connect(f"file:{ledger}?mode=ro", uri=True, timeout=5)) as db:
+            row = db.execute(
+                "SELECT r.chat_id,r.thread_id,r.request_payload,r.turn_id,t.turn_id FROM delivery_results r "
+                "JOIN delivery_sessions s ON s.session_id=r.session_id AND s.stamp=r.stamp "
+                "JOIN delivery_turns t ON t.turn_id=coalesce(r.response_turn_id,r.turn_id) AND t.session_id=r.session_id "
+                "JOIN delivery_turn_messages m ON m.turn_id=r.turn_id AND m.delivery_id=r.delivery_id "
+                "WHERE r.delivery_id=? AND r.stamp=? AND r.state IN ('pending','deferred') AND t.closed_at IS NULL",
+                (delivery, stamp)).fetchone()
+            if row is None:
+                raise Refused("request_unverified")
+            chat, thread, payload = row[:3]
+            meta = json.loads(payload).get("params", {}).get("meta", {})
+            sender = meta.get("user_id") if isinstance(meta, dict) else None
+            if (not isinstance(sender, str) or not ID.fullmatch(sender) or meta.get("chat_id") != chat
+                    or meta.get("delivery_id") != delivery or str(meta.get("message_id")) != delivery.rsplit(":", 1)[1]
+                    or delivery.rsplit(":", 1)[0] != chat
+                    or meta.get("forward_from") is not None or meta.get("sender_chat_id") is not None):
+                raise Refused("request_unverified")
+            for (other,) in db.execute(
+                    "SELECT r.request_payload FROM delivery_turn_messages m "
+                    "LEFT JOIN delivery_results r ON r.delivery_id=m.delivery_id WHERE m.turn_id IN (?,?)", row[3:]):
+                peer = json.loads(other).get("params", {}).get("meta", {})
+                if (peer.get("user_id") != sender or peer.get("forward_from") is not None
+                        or peer.get("sender_chat_id") is not None):
+                    raise Refused("request_unverified")
+    except Refused:
+        raise
+    except (OSError, sqlite3.Error, ValueError, TypeError, AttributeError):
+        raise Refused("request_unverified") from None
+    if chat == sender:
+        if thread is not None or meta.get("thread_id") is not None:
+            raise Refused("request_unverified")
+        return {"actor": sender, "chat": chat, "thread": None, "source": delivery}
+    if not GROUP.fullmatch(chat) or chat not in (access().get("groups") or {}) or meta.get("addressed") == "false":
+        raise Refused("request_unverified")
+    if thread is None:
+        if meta.get("thread_id") is not None or meta.get("conversation_key") != f"group:{chat}":
+            raise Refused("request_unverified")
+    elif (not ID.fullmatch(str(thread)) or str(meta.get("thread_id")) != str(thread)
+          or meta.get("conversation_key") != f"topic:{chat}:{thread}"):
+        raise Refused("request_unverified")
+    return {"actor": sender, "chat": chat, "thread": None if thread is None else str(thread), "source": delivery}
+
+
+def job_context(job: str, fencing: str) -> dict:
+    """The verified person, chat and topic of a company job that is running right now under this fencing token."""
+    if not re.fullmatch(r"[0-9a-fA-F-]{8,64}", job) or not re.fullmatch(r"\d{1,19}", fencing):
+        raise Refused("bad_job")
+    ledger = state_dir() / "messages.db"
+    try:
+        with closing(sqlite3.connect(f"file:{ledger}?mode=ro", uri=True, timeout=5)) as db:
+            row = db.execute("SELECT actor_user_id, chat_id, thread_id, conversation_key, state, fencing_token "
+                             "FROM conversation_jobs WHERE job_id=?", (job,)).fetchone()
+    except (OSError, sqlite3.Error):
+        raise Refused("job_unverified") from None
+    if row is None or row[4] not in LIVE_JOB_STATES or str(row[5]) != fencing:
+        raise Refused("job_unverified")
+    actor, chat, thread, key = (str(row[0]), str(row[1]), row[2], str(row[3]))
+    if not ID.fullmatch(actor):
+        raise Refused("job_unverified")
+    if chat == actor:
+        if thread is not None or key != f"user:{actor}":
+            raise Refused("job_unverified")
+        return {"actor": actor, "chat": chat, "thread": None, "source": f"job:{job}"}
+    if not GROUP.fullmatch(chat):
+        raise Refused("job_unverified")
+    return {"actor": actor, "chat": chat, "thread": None if thread is None else str(thread), "source": f"job:{job}"}
+
+
+def open_request_context() -> dict | None:
+    """The one open request of this session, verified like any other; None when there is none or several (a
+    scheduled task then keeps its destination as its origin)."""
+    stamp = os.environ.get("TG_DELIVERY_STAMP")
+    ledger = state_dir() / "messages.db"
+    if not stamp or ledger.is_symlink() or not ledger.exists():
+        return None
+    try:
+        with closing(sqlite3.connect(f"file:{ledger}?mode=ro", uri=True, timeout=5)) as db:
+            rows = db.execute(
+                "SELECT DISTINCT r.delivery_id FROM delivery_results r "
+                "JOIN delivery_sessions s ON s.session_id=r.session_id AND s.stamp=r.stamp "
+                "JOIN delivery_turns t ON t.turn_id=coalesce(r.response_turn_id,r.turn_id) AND t.session_id=r.session_id "
+                "WHERE r.stamp=? AND r.state IN ('pending','deferred') AND t.closed_at IS NULL LIMIT 2", (stamp,)).fetchall()
+    except (OSError, sqlite3.Error):
+        return None
+    if len(rows) != 1:
+        return None
+    try:
+        return request_context(rows[0][0])
+    except Refused:
+        return None
+
+
+def proven(args) -> dict:
+    if bool(args.delivery) == bool(args.job):
+        raise Refused("proof_required")
+    if args.delivery:
+        return request_context(args.delivery)
+    return job_context(args.job, args.fencing or "")
+
+
+def target_for(scope: str, context: dict) -> Path:
+    """Where this request may write, decided by the verified context and the owner's decisions of 31.10.2026:
+    company rules only by the owner in his private chat; a person's own rules only by that person in their private
+    chat; group and topic rules by the owner or an agent admin from within that group."""
+    owner, actor, chat, thread = owner_id(), context["actor"], context["chat"], context["thread"]
+    private = chat == actor
+    if scope == "company":
+        if actor != owner or not private:
+            raise Refused("not_allowed", scope=scope)
+        return scope_path("company")
+    if scope == "person":
+        if not private:
+            raise Refused("private_chat_needed", scope=scope)
+        return scope_path("person", person=actor)
+    if private:
+        raise Refused("group_needed", scope=scope)
+    if actor != owner and actor not in admins():
+        raise Refused("not_allowed", scope=scope)
+    if scope == "chat":
+        return scope_path("chat", chat=chat)
+    if thread is None:
+        raise Refused("topic_needed", scope=scope)
+    return scope_path("topic", chat=chat, thread=thread)
+
+
+# ---------- rendering ----------
+
+def active(rule: dict, kind: str, owner: str, admin_ids: set[str]) -> bool:
+    """A group or topic rule holds while its author is the owner or an admin, or the owner adopted this revision."""
+    if kind not in ("chat", "topic"):
+        return True
+    author = rule["fields"].get("author")
+    if author is None or author == owner or author in admin_ids:
+        return True
+    adopted = rule["fields"].get("adopted", "")
+    return bool(adopted) and adopted.split(":")[1:2] == [rule["fields"].get("rev")]
+
+
+def sources(chat: str, thread: str | None) -> list[tuple[str, Path]]:
+    found = [("company", scope_path("company"))]
+    if ID.fullmatch(chat):
+        found.append(("person", scope_path("person", person=chat)))
+    elif GROUP.fullmatch(chat):
+        found.append(("chat", scope_path("chat", chat=chat)))
+        if thread is not None and ID.fullmatch(str(thread)):
+            found.append(("topic", scope_path("topic", chat=chat, thread=str(thread))))
+    else:
+        raise Refused("bad_chat")
+    return found
+
+
+def compose(blocks: list[tuple[str, list[str]]]) -> str:
+    sections = [SECTION[kind] + "\n" + "\n\n".join(texts) for kind, texts in blocks if texts]
+    return HEAD + "\n\n" + "\n\n".join(sections) if sections else ""
+
+
+def render(chat: str, thread: str | None, overrides: dict[Path, str] | None = None) -> str:
+    owner = owner_id()
+    admin_ids = admins()
+    blocks = []
+    for kind, relative in sources(chat, thread):
+        text = overrides[relative] if overrides and relative in overrides else read_bytes(data_dir() / relative).decode("utf-8")
+        blocks.append((kind, [rule["text"] for rule in parse(text) if active(rule, kind, owner, admin_ids)]))
+    return compose(blocks)
+
+
+def affected_contexts(relative: Path) -> list[tuple[str, str | None]]:
+    """Every conversation whose set includes this file, for the whole-set budget."""
+    root = data_dir()
+    if relative == Path("company.md"):
+        contexts = [(path.stem, None) for path in (root / "person").glob("*.md")]
+        contexts += [(path.stem, None) for path in (root / "chat").glob("*.md")]
+        contexts += [(topic.parent.parent.name, topic.stem) for topic in (root / "chat").glob("*/topic/*.md")]
+        return contexts or [("1", None)]
+    parts = relative.parts
+    if parts[0] == "person":
+        return [(relative.stem, None)]
+    chat = parts[1].removesuffix(".md")
+    if len(parts) == 2:
+        return [(chat, None)] + [(chat, topic.stem) for topic in (root / "chat" / chat / "topic").glob("*.md")]
+    return [(chat, relative.stem)]
+
+
+def check_budget(relative: Path, new_text: str) -> dict:
+    sizes = {}
+    for chat, thread in affected_contexts(relative):
+        size = len(render(chat, thread, {relative: new_text}))
+        sizes[f"{chat}:{thread}" if thread else chat] = size
+        if size > RULES_BUDGET:
+            raise Refused("over_budget", context=chat if thread is None else f"{chat}:{thread}", size=size,
+                          budget=RULES_BUDGET, over_by=size - RULES_BUDGET)
+    return sizes
+
+
+# ---------- commands ----------
+
+def change(relative: Path, mutate) -> dict:
+    """Read, change and write one file under the lock. A file that changed between our read and our write (a hand
+    edit outside this protocol) is refused, so nothing a person typed is lost silently."""
+    path = data_dir() / relative
+    with Lock():
+        require_migrated()  # a rollback holds this lock while it removes the marker (Codex r2)
+        before = read_bytes(path)
+        history = read_bytes(data_dir() / "history" / relative).decode("utf-8")
+        rules = parse(before.decode("utf-8"))
+        for rule in rules:
+            if not rule.get("id"):  # text a person wrote by hand keeps its place and gets a header of its own
+                rule["id"] = next_id(rules, history)
+                rule["fields"] = {"id": rule["id"], "rev": "1", "source": "hand"}
+        receipt, events = mutate(rules, history)
+        text = serialize(rules, "/".join(relative.parts))
+        sizes = check_budget(relative, text)
+        if read_bytes(path) != before:
+            raise Refused("changed_meanwhile", file=str(relative))
+        for rule, event in events:
+            append_history(relative, rule, event)
+        write_atomic(path, text)
+    receipt.update({"file": str(relative), "sizes": sizes, "budget": RULES_BUDGET})
+    return receipt
+
+
+def text_of(args) -> str:
+    text = Path(args.text_file).read_text(encoding="utf-8") if args.text_file else (args.text or "")
+    text = text.strip()
+    if not text or "<!-- rule " in text or "<!-- agent-rules" in text:
+        raise Refused("bad_text")
+    return text
+
+
+def require_migrated() -> None:
+    """Rules are written only on an agent moved to rules by scope: before the move nothing would apply them, and
+    after a rollback a worker that still holds save_rule until its restart must not write either."""
+    marker = data_dir() / "MIGRATED"
+    if not marker.is_file() or marker.is_symlink():
+        raise Refused("not_migrated")
+
+
+def command_save(args) -> dict:
+    require_migrated()
+    context = proven(args)
+    relative, text = target_for(args.scope, context), text_of(args)
+
+    def mutate(rules, history):
+        rule = {"id": None, "text": text, "fields": {"rev": "1", "author": context["actor"],
+                                                   "source": context["source"], "at": now_iso()}}
+        rule["id"] = rule["fields"]["id"] = next_id(rules, history)
+        rules.append(rule)
+        return {"status": "saved", "scope": args.scope, "rule": rule["id"], "rev": 1}, []
+
+    return change(relative, mutate)
+
+
+def find(rules: list[dict], rule_id: str) -> dict:
+    for rule in rules:
+        if rule.get("id") == rule_id:
+            return rule
+    raise Refused("no_such_rule", rule=rule_id)
+
+
+def command_replace(args) -> dict:
+    require_migrated()
+    context = proven(args)
+    relative, text = target_for(args.scope, context), text_of(args)
+
+    def mutate(rules, history):
+        old = find(rules, args.id)
+        new = {"id": next_id(rules, history), "text": text,
+               "fields": {"rev": "1", "author": context["actor"], "source": context["source"], "at": now_iso(),
+                          "replaces": f"{args.id}"}}
+        new["fields"]["id"] = new["id"]
+        rules[rules.index(old)] = new  # a new text never inherits an earlier adoption
+        return ({"status": "replaced", "scope": args.scope, "rule": new["id"], "replaced": args.id},
+                [(old, "replaced")])
+
+    return change(relative, mutate)
+
+
+def command_retire(args) -> dict:
+    require_migrated()
+    context = proven(args)
+    relative = target_for(args.scope, context)
+
+    def mutate(rules, history):
+        old = find(rules, args.id)
+        rules.remove(old)
+        return {"status": "retired", "scope": args.scope, "retired": args.id}, [(old, "retired")]
+
+    return change(relative, mutate)
+
+
+def command_adopt(args) -> dict:
+    """The owner makes a group or topic rule hold regardless of what happens to its author's rights later."""
+    require_migrated()
+    context = proven(args)
+    if context["actor"] != owner_id():
+        raise Refused("not_allowed", scope="adopt")
+    chat = args.chat or context["chat"]
+    relative = scope_path("topic" if args.thread else "chat", chat=chat, thread=args.thread)
+
+    def mutate(rules, history):
+        rule = find(rules, args.id)
+        rule["fields"]["adopted"] = f"owner:{rule['fields'].get('rev', '1')}:{context['source']}"
+        return {"status": "adopted", "rule": args.id}, []
+
+    return change(relative, mutate)
+
+
+def command_list(args) -> dict:
+    owner, admin_ids, result = owner_id(), admins(), []
+    for kind, relative in sources(args.chat, args.thread):
+        for rule in parse(read_bytes(data_dir() / relative).decode("utf-8")):
+            result.append({"scope": kind, "file": str(relative), "id": rule.get("id"),
+                           "active": active(rule, kind, owner, admin_ids), "text": rule["text"],
+                           **{key: rule["fields"].get(key) for key in ("rev", "author", "adopted") if rule["fields"].get(key)}})
+    return {"status": "ok", "rules": result}
+
+
+def notice(key: str, ukrainian: str) -> str:
+    helper = Path(__file__).resolve().with_name("agent_notice_locale.py")
+    try:
+        spec = importlib.util.spec_from_file_location("agent_notice_locale", helper)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module.notice_text(key, ukrainian, home=home())
+    except Exception:
+        return ukrainian
+
+
+def overflow(chat: str, thread: str | None, text: str) -> str:
+    """A hand-edited set too long for the channel goes out as a pointer to a private snapshot, and the owner hears
+    about it once per distinct set. This is a flagged degraded state, never a successful delivery."""
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+    key = f"{chat}:{thread or '-'}:{digest}"
+    root = data_dir()
+    snapshot = root / "overflow" / f"{chat}{'-' + thread if thread else ''}-{digest}.md"
+    with Lock():
+        write_atomic(snapshot, text)
+        state_path = root / "state.json"
+        try:
+            state = json.loads(read_bytes(state_path) or b"{}")
+        except ValueError:
+            state = {}
+        told = state.setdefault("overflow_told", {})
+        if key not in told:
+            message = notice("rules.overflow", OVERFLOW_NOTICE).replace("{size}", str(len(text)))
+            try:
+                sent = subprocess.run([str(home() / "bin" / "tg-send"), "--no-watchdog-credit", owner_id(), message],
+                                      capture_output=True, text=True, timeout=60).returncode
+            except (OSError, subprocess.SubprocessError, Refused):
+                sent = 1
+            if sent == 0:
+                told[key] = now_iso()
+                write_atomic(state_path, json.dumps(state, ensure_ascii=False, indent=2))
+    return (f"AGENT RULES for this conversation are longer than this channel can carry whole ({len(text)} characters). "
+            f"The complete text is in {snapshot}. The owner has been told the set needs splitting.")
+
+
+def command_render(args) -> str:
+    text = render(args.chat, args.thread)
+    if args.max_chars and len(text) > args.max_chars:
+        return overflow(args.chat, args.thread, text)
+    return text
+
+
+# ---------- migration of one agent (plan, apply, rollback) ----------
+
+POINTER = ("Правила цього агента зберігаються через ~/bin/agent-rules: спільні для компанії, особисті для кожної людини, "
+           "для груп і тем. Щоходу вони приходять у контекст цілком. Нове правило, зміну чи зняття роби командою "
+           "`~/bin/agent-rules save|replace|retire --scope company|person|chat|topic --delivery <delivery_id запиту>`.")
+RULE_HEADING = re.compile(r"(?i)^#{1,6}\s.*(правил|rules)")
+
+
+def owner_section(text: str) -> tuple[int, int, list[str]] | None:
+    """Line span of «# Правила власника» and its rules, one per top-level item. Novsky's managed blocks are not
+    rules, except text typed before the contacts heading inside its installation block (tg-context-inject reads
+    the section the same way)."""
+    lines = text.splitlines()
+    try:
+        start = next(i for i, line in enumerate(lines) if line.strip() == "# Правила власника")
+    except StopIteration:
+        return None
+    end, body, block = len(lines), [], None
+    for index in range(start + 1, len(lines)):
+        line = lines[index]
+        if line.startswith("<!-- /novsky-"):
+            block = None
+            continue
+        if line.startswith("<!-- novsky-"):
+            block = "contacts-preamble" if line.strip() == "<!-- novsky-installation-people -->" else "skip"
+            continue
+        if block == "contacts-preamble" and line.strip() == "## Installation contacts":
+            block = "skip"
+        if block == "skip":
+            continue
+        if line.startswith("# "):
+            end = index
+            break
+        body.append(line)
+    rules, current = [], []
+    for line in body:
+        top = line.strip() and not line[0].isspace()
+        if top and current and (line.lstrip().startswith("#") or not current[-1].lstrip().startswith("#")):
+            rules.append("\n".join(current).strip())
+            current = []
+        if line.strip():
+            current.append(line.rstrip())
+    if current:
+        rules.append("\n".join(current).strip())
+    return start, end, [rule for rule in rules if rule]
+
+
+def worker_candidates() -> list[dict]:
+    """Rule-like sections of company workers' notes, each mapped to its person or group through the jobs that ran
+    there (folder = sha256 of native:<conversation>:<policy key>), old epochs included. Never moved by themselves."""
+    ledger = state_dir() / "messages.db"
+    folders: dict[str, str] = {}
+    try:
+        with closing(sqlite3.connect(f"file:{ledger}?mode=ro", uri=True, timeout=5)) as db:
+            for conversation, policy in db.execute(
+                    "SELECT DISTINCT conversation_key, runtime_policy_key FROM conversation_jobs WHERE runtime_policy_key IS NOT NULL"):
+                folders[hashlib.sha256(f"native:{conversation}:{policy}".encode()).hexdigest()] = conversation
+    except (OSError, sqlite3.Error):
+        pass
+    found = []
+    for notes in sorted((home() / "corporate-workspaces").glob("*/MEMORY.md")):
+        conversation = folders.get(notes.parent.name)
+        text = notes.read_text(encoding="utf-8", errors="replace")
+        section, items = None, []
+        for line in text.splitlines() + ["# end"]:
+            if line.startswith("#"):
+                if section is not None and items:
+                    found.append({"notes": str(notes.relative_to(home())), "conversation": conversation,
+                                  "heading": section, "text": "\n".join(items).strip()})
+                section, items = (line.strip() if RULE_HEADING.match(line) else None), []
+            elif section is not None and line.strip():
+                items.append(line.rstrip())
+    return found
+
+
+def candidate_target(conversation: str | None) -> Path | None:
+    if not conversation:
+        return None
+    kind, _, rest = conversation.partition(":")
+    if kind == "user" and ID.fullmatch(rest):
+        return scope_path("person", person=rest)
+    if kind == "group" and GROUP.fullmatch(rest):
+        return scope_path("chat", chat=rest)
+    chat, _, thread = rest.partition(":")
+    if kind == "topic":
+        return scope_path("topic", chat=chat, thread=thread)
+    return None
+
+
+def file_digest(path: Path) -> str:
+    return hashlib.sha256(read_bytes(path)).hexdigest()
+
+
+def compute_plan(company: set[int], take: set[int], groups: set[str]) -> dict:
+    root, owner = data_dir(), owner_id()
+    known_groups = {str(group) for group in access().get("groups", {})}
+    for group in groups:
+        if not GROUP.fullmatch(group) or group not in known_groups:
+            raise Refused("unknown_group", group=group)
+    claude_md = home() / "CLAUDE.md"
+    text = read_bytes(claude_md).decode("utf-8")
+    section = owner_section(text)
+    moves: dict[str, list[str]] = {}
+    numbered = []
+    for number, rule_text in enumerate(section[2] if section else [], 1):
+        # A group the main session answers sees the whole owner section today. Listed groups keep the owner's own
+        # rules too, so nobody gains or loses a rule by the move (owner, 01.11.2026).
+        targets = ([scope_path("company")] if number in company
+                   else [scope_path("person", person=owner)] + [scope_path("chat", chat=group) for group in sorted(groups)])
+        for target in targets:
+            moves.setdefault(str(target), []).append(rule_text)
+        numbered.append({"n": number, "to": str(targets[0]), "text": rule_text,
+                         **({"also": [str(target) for target in targets[1:]]} if len(targets) > 1 else {})})
+    candidates = worker_candidates()
+    sources = {"CLAUDE.md": file_digest(claude_md)}
+    for number, candidate in enumerate(candidates, 1):
+        target = candidate_target(candidate["conversation"])
+        candidate.update({"n": number, "to": str(target) if target else None, "taken": number in take and target is not None})
+        if candidate["taken"]:
+            moves.setdefault(str(target), []).append(candidate["text"])
+            sources[candidate["notes"]] = file_digest(home() / candidate["notes"])
+    overrides = {}
+    for relative, texts in moves.items():
+        existing = parse(read_bytes(root / relative).decode("utf-8"))
+        rules = existing + [{"id": None, "text": item, "fields": {}} for item in texts]
+        for rule in rules:
+            if not rule.get("id"):
+                rule["id"] = next_id(rules, "")
+                rule["fields"] = {"id": rule["id"], "rev": "1", "source": "migration"}
+        overrides[Path(relative)] = serialize(rules, relative)
+    over = []
+    for relative in overrides:
+        for chat, thread in affected_contexts(relative):
+            size = len(render(chat, thread, overrides))
+            if size > RULES_BUDGET:
+                over.append({"context": chat if thread is None else f"{chat}:{thread}", "size": size})
+    body = json.dumps({"moves": {str(k): v for k, v in overrides.items()}, "sources": sources,
+                       "company": sorted(company), "take": sorted(take), "groups": sorted(groups)},
+                      sort_keys=True, ensure_ascii=False)
+    sha = hashlib.sha256(body.encode()).hexdigest()[:16]
+    return {"plan": sha, "company": sorted(company), "take": sorted(take), "groups": sorted(groups),
+            "owner_rules": numbered,
+            "candidates": candidates, "files": {str(k): v for k, v in overrides.items()}, "sources": sources,
+            "over_budget": over, "ready": not over and section is not None}
+
+
+def migrate_plan(company: set[int], take: set[int], groups: set[str]) -> dict:
+    plan = compute_plan(company, take, groups)
+    root, sha = data_dir(), plan["plan"]
+    plans = root / "plans"
+    plans.mkdir(parents=True, exist_ok=True, mode=0o700)
+    write_atomic(plans / f"{sha}.json", json.dumps(plan, ensure_ascii=False, indent=2))
+    return plan
+
+
+def migrate_apply(sha: str) -> dict:
+    root = data_dir()
+    if not re.fullmatch(r"[0-9a-f]{16}", sha):
+        raise Refused("bad_plan")
+    try:
+        saved = json.loads(read_bytes(root / "plans" / f"{sha}.json") or b"{}")
+        decisions = ({int(n) for n in saved.get("company", [])}, {int(n) for n in saved.get("take", [])},
+                     {str(group) for group in saved.get("groups", [])})
+    except (ValueError, TypeError):
+        raise Refused("bad_plan") from None
+    if not saved:
+        raise Refused("no_such_plan")
+    if (root / "MIGRATED").exists():
+        raise Refused("already_migrated")
+    with Lock():
+        plan = compute_plan(*decisions)
+        if plan["plan"] != sha:
+            raise Refused("plan_changed", now=plan["plan"])
+        if not plan["ready"]:
+            raise Refused("plan_not_ready", over_budget=plan["over_budget"])
+        backup = root / "backup" / now_iso().replace(":", "")
+        backup.mkdir(parents=True, mode=0o700)
+        claude_md = home() / "CLAUDE.md"
+        (backup / "CLAUDE.md").write_bytes(read_bytes(claude_md))
+        os.chmod(backup / "CLAUDE.md", 0o600)
+        written = []
+        for relative, text in plan["files"].items():
+            target = root / relative
+            if target.exists():
+                (backup / "rules").mkdir(exist_ok=True, mode=0o700)
+                (backup / "rules" / relative.replace("/", "__")).write_bytes(read_bytes(target))
+            write_atomic(target, text)
+            written.append(relative)
+        text = read_bytes(claude_md).decode("utf-8")
+        start, end, _ = owner_section(text)
+        lines = text.splitlines()
+        managed, block = [], None
+        for line in lines[start + 1:end]:
+            if line.startswith("<!-- novsky-") and not line.startswith("<!-- /novsky-"):
+                block = "preamble" if line.strip() == "<!-- novsky-installation-people -->" else "keep"
+                managed.append(line)
+                continue
+            if line.startswith("<!-- /novsky-"):
+                block = None
+                managed.append(line)
+                continue
+            if block == "preamble" and line.strip() == "## Installation contacts":
+                block = "keep"
+            if block == "keep":
+                managed.append(line)
+        new = lines[:start + 1] + ["", POINTER, ""] + managed + lines[end:]
+        original_mode = claude_md.stat().st_mode & 0o777
+        write_atomic(claude_md, "\n".join(new).rstrip("\n") + "\n")
+        os.chmod(claude_md, original_mode)
+        (backup / "written.json").write_text(json.dumps(written))
+        write_atomic(root / "MIGRATED", json.dumps({"plan": sha, "at": now_iso(), "backup": backup.name}) + "\n")
+    return {"status": "migrated", "plan": sha, "files": written, "backup": str(backup.relative_to(root)),
+            "restart_required": True}
+
+
+def migrate_rollback() -> dict:
+    root = data_dir()
+    try:
+        marker = json.loads(read_bytes(root / "MIGRATED") or b"{}")
+    except ValueError:
+        marker = {}
+    backup = root / "backup" / str(marker.get("backup", ""))
+    if not marker or not (backup / "CLAUDE.md").exists():
+        raise Refused("nothing_to_roll_back")
+    with Lock():
+        claude_md = home() / "CLAUDE.md"
+        original_mode = claude_md.stat().st_mode & 0o777
+        write_atomic(claude_md, (backup / "CLAUDE.md").read_text(encoding="utf-8"))
+        os.chmod(claude_md, original_mode)
+        aside = root / "backup" / f"rolled-back-{now_iso().replace(':', '')}"
+        aside.mkdir(parents=True, mode=0o700)
+        for relative in json.loads((backup / "written.json").read_text()):
+            target = root / relative
+            if target.exists():
+                os.replace(target, aside / relative.replace("/", "__"))
+            saved = backup / "rules" / relative.replace("/", "__")
+            if saved.exists():
+                write_atomic(target, saved.read_text(encoding="utf-8"))
+        os.replace(root / "MIGRATED", aside / "MIGRATED")
+    return {"status": "rolled_back", "restored": "CLAUDE.md", "aside": str(aside.relative_to(root)),
+            "restart_required": True}
+
+
+# Python before 3.13 (Ubuntu 24.04 has 3.12) reads a value that starts with «-» as another option: a group's delivery id
+# (-100…:7), a group chat id or a rule written as «- item» stopped with «expected one argument». Every option here takes
+# exactly one value, so each value is bound to its option before parsing.
+VALUE_OPTIONS = frozenset({"--chat", "--company", "--delivery", "--fencing", "--groups", "--id", "--job", "--max-chars",
+                           "--plan", "--scope", "--take", "--text", "--text-file", "--thread"})
+
+
+def bound_values(argv: list[str]) -> list[str]:
+    bound, rest = [], list(argv)
+    while rest:
+        item = rest.pop(0)
+        if item in VALUE_OPTIONS and rest:
+            item = f"{item}={rest.pop(0)}"
+        bound.append(item)
+    return bound
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="agent-rules", description="Rules of this agent, by scope.")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    def proof(p):
+        p.add_argument("--delivery", help="delivery id of the current request (main session)")
+        p.add_argument("--job", help="company job id (set by the company runtime)")
+        p.add_argument("--fencing", help="fencing token of that job")
+
+    for name in ("save", "replace"):
+        p = sub.add_parser(name)
+        p.add_argument("--scope", required=True, choices=("company", "person", "chat", "topic"))
+        if name == "replace":
+            p.add_argument("--id", required=True)
+        p.add_argument("--text")
+        p.add_argument("--text-file")
+        proof(p)
+    p = sub.add_parser("retire")
+    p.add_argument("--scope", required=True, choices=("company", "person", "chat", "topic"))
+    p.add_argument("--id", required=True)
+    proof(p)
+    p = sub.add_parser("adopt")
+    p.add_argument("--id", required=True)
+    p.add_argument("--chat")
+    p.add_argument("--thread")
+    proof(p)
+    migrate = sub.add_parser("migrate")
+    steps = migrate.add_subparsers(dest="step", required=True)
+    plan = steps.add_parser("plan")
+    plan.add_argument("--company", default="", help="owner-section rule numbers the owner made company-wide")
+    plan.add_argument("--take", default="", help="worker-note candidate numbers the owner agreed to move")
+    plan.add_argument("--groups", default="",
+                      help="--groups=-100123,-100456: groups the main session answers today keep the owner's own rules")
+    apply = steps.add_parser("apply")
+    apply.add_argument("--plan", required=True)
+    steps.add_parser("rollback")
+    for name in ("list", "render"):
+        p = sub.add_parser(name)
+        p.add_argument("--chat", required=True)
+        p.add_argument("--thread")
+        if name == "render":
+            p.add_argument("--max-chars", type=int)
+    args = parser.parse_args(bound_values(argv))
+    try:
+        if args.command == "render":
+            sys.stdout.write(command_render(args))
+            return 0
+        if args.command == "migrate":
+            numbers = lambda value: {int(item) for item in value.split(",") if item.strip().isdigit()}
+            groups = {item.strip() for item in getattr(args, "groups", "").split(",") if item.strip()}
+            result = (migrate_plan(numbers(args.company), numbers(args.take), groups) if args.step == "plan"
+                      else migrate_apply(args.plan) if args.step == "apply" else migrate_rollback())
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            return 0
+        handler = {"save": command_save, "replace": command_replace, "retire": command_retire,
+                   "adopt": command_adopt, "list": command_list}[args.command]
+        print(json.dumps(handler(args), ensure_ascii=False))
+        return 0
+    except Refused as refusal:
+        print(json.dumps({"status": "refused", "reason": refusal.reason, **refusal.detail}, ensure_ascii=False))
+        return 3
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

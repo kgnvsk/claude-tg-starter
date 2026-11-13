@@ -3,7 +3,7 @@
 
   module-setup.py install НАЗВА КАТАЛОГ   поставити підготовлені файли в дім агента — усі або жодного
   module-setup.py check НАЗВА КАТАЛОГ     те саме порівняння без запису: чи стане install, перш ніж щось качати
-  module-setup.py refresh НАЗВА КАТАЛОГ   звичайне оновлення комплекту: лише файли, які досі такі, як їх поставив комплект
+  module-setup.py refresh НАЗВА КАТАЛОГ   оновлення комплекту: лише файли, які досі такі, як їх поставив комплект
   module-setup.py crontab ВИРАЗ           замінити власні рядки модуля в розкладі агента (нові — зі stdin)
   module-setup.py env-add КОНФІГ ШАБЛОН   додати в наявний конфіг налаштування шаблону, яких у ньому немає
 
@@ -104,11 +104,10 @@ def install(name: str, staged: Path, check: bool = False) -> int:
 
 
 def refresh(name: str, staged: Path) -> int:
-    """A normal kit update of a module this agent set up (kit-module refresh), by install's own rule: a file missing,
-    already the same or still the bytes the kit put there takes the kit's current bytes. A file the owner changed stays
-    as he left it and is named, its kit version kept beside the record; once he removes it, the next update puts the
-    kit's back. Without a record nothing is touched: an update never sets a module up. 0: every file current; 3: an
-    owner's file stayed."""
+    """A kit update of files a module set up here placed, by install's own rule: a file missing, already the same or
+    still the bytes the kit put there takes the kit's current bytes. A file the owner changed stays as he left it and
+    is named, its kit version kept beside the record. Without a record nothing is touched: an update never sets a
+    module up. 0: every staged file current; 3: an owner's file stayed, or the module was never set up here."""
     home = Path.home()
     record = STATE / f"{name}.files.json"
     try:
@@ -118,7 +117,7 @@ def refresh(name: str, staged: Path) -> int:
     if not isinstance(accepted, dict) or not accepted:
         print(f"Модуль «{name}» тут не ставили (немає запису його файлів), тому оновлення його не чіпає.", file=sys.stderr)
         return 3
-    kept = []
+    planned, kept = STATE / f"{name}.planned", []
     for source in sorted(path for path in staged.rglob("*") if path.is_file() and not path.is_symlink()):
         relative = source.relative_to(staged).as_posix()
         target = home / relative
@@ -128,19 +127,18 @@ def refresh(name: str, staged: Path) -> int:
             continue
         if target.exists():
             current = digest(target)
-            if current == new:
-                accepted[relative] = new
-                continue
-            if current != accepted.get(relative):
+            if current != new and current != accepted.get(relative):
                 kept.append(relative)  # the owner's own version
                 continue
-        write(target, source.read_bytes(), stat.S_IMODE(source.stat().st_mode))
+            if current != new:
+                write(target, source.read_bytes(), stat.S_IMODE(source.stat().st_mode))
+        else:
+            write(target, source.read_bytes(), stat.S_IMODE(source.stat().st_mode))
         accepted[relative] = new
+        (planned / relative).unlink(missing_ok=True)
     write(record, (json.dumps(accepted, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode(), 0o600)
-    shutil.rmtree(STATE / f"{name}.planned", ignore_errors=True)
     if not kept:
         return 0
-    planned = STATE / f"{name}.planned"
     for relative in kept:
         write(planned / relative, (staged / relative).read_bytes(), 0o600)
     print(f"Модуль «{name}» оновлено, крім файлів, які змінив власник, — вони лишилися як є:", file=sys.stderr)

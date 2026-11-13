@@ -25,6 +25,14 @@ import urllib.request
 
 MAX_BYTES = 49 * 1024 * 1024
 LOCAL_MAX_BYTES = 2000 * 1024 * 1024
+# Telegram's cloud API at times takes tens of seconds to accept one bot's file while its text goes at once
+# (Руфус 01–02.11.2026: 10–18 s for 1.8 KB, a 93 KB PDF past 20 s four times). A 20 s bound turned that into
+# «delivery state unknown», blind retries and a silent chat. urllib applies it to each blocking socket step, so it is
+# no wall-clock deadline for the whole request; the group check keeps 20 s and the local Bot API its 30 minutes.
+CLOUD_UPLOAD_SECONDS = 90
+# The scheduler tick (960 s) drains saved scheduled files before it reads reminders. A cloud upload starts only while
+# a whole slow one (upload and group check) still fits this share; the rest stay ready for the next tick.
+QUIET_DRAIN_SECONDS = 240
 
 
 def max_file_bytes():
@@ -296,9 +304,8 @@ def multipart(
 ) -> tuple[bytes, str]:
     boundary = f"tg-send-file-{secrets.token_hex(16)}"
     marker = boundary.encode("ascii")
-    # Bot API URL-decodes filename and ignores filename* (RFC7578 form-data).
-    safe_name = re.sub(r"[\x00-\x1f\x7f]", "_", filename) or "document"
-    encoded_name = urllib.parse.quote(safe_name, safe="")
+    ascii_name = re.sub(r"[^A-Za-z0-9._-]", "_", filename) or "document"
+    encoded_name = urllib.parse.quote(filename, safe="")
     parts = [
         b"--" + marker,
         b'Content-Disposition: form-data; name="chat_id"',
@@ -322,7 +329,7 @@ def multipart(
             b"--" + marker,
             (
                 f'Content-Disposition: form-data; name="{file_field}"; '
-                f'filename="{encoded_name}"'
+                f'filename="{ascii_name}"; filename*=UTF-8\'\'{encoded_name}'
             ).encode("ascii"),
             f"Content-Type: {mimetypes.guess_type(filename)[0] or 'application/octet-stream'}".encode("ascii"),
             b"",
@@ -383,15 +390,16 @@ def send(chat_id: str, filename: str, data: bytes, caption: str, thread_id: int 
         chat_id, filename, data, caption, file_field=field, thread_id=thread_id
     )
     base = test_setting("TG_SEND_FILE_API_BASE", telegram_api_base()).rstrip("/")
-    timeout_text = test_setting("TG_SEND_FILE_TIMEOUT", "1800" if base != "https://api.telegram.org" else "20")
+    cloud = base == "https://api.telegram.org"
+    timeout_text = test_setting("TG_SEND_FILE_TIMEOUT", str(CLOUD_UPLOAD_SECONDS) if cloud else "1800")
     try:
         timeout = float(timeout_text)
-        if not 0 < timeout <= (1800 if base != "https://api.telegram.org" else 30):
+        if not 0 < timeout <= (CLOUD_UPLOAD_SECONDS if cloud else 1800):
             raise ValueError
     except ValueError:
-        timeout = 1800.0 if base != "https://api.telegram.org" else 20.0
+        timeout = float(CLOUD_UPLOAD_SECONDS) if cloud else 1800.0
     bot_token = read_token()
-    ensure_destination(chat_id, thread_id, general_topic, base, bot_token, timeout)
+    ensure_destination(chat_id, thread_id, general_topic, base, bot_token, min(timeout, 20) if cloud else timeout)
     request = urllib.request.Request(
         f"{base}/bot{bot_token}/{method}",
         data=body,
@@ -620,9 +628,6 @@ def quiet_file_send(root: Path, path: Path, record: dict, helpers: dict) -> str:
     if record["state"] == "sending":
         record["state"] = "uncertain"  # the prior process could have reached Telegram
         write(path, record)
-    if record['state']=='blocked' and isinstance(record.get('context_fallback'),str):
-        helpers['quiet_file_context_notice'](path.stem,record,record['context_fallback'])
-        return 'blocked'
     if record["state"] != "ready" or record.get("retry_at", 0) > time.time():
         return record["state"]
     try:
@@ -642,14 +647,6 @@ def quiet_file_send(root: Path, path: Path, record: dict, helpers: dict) -> str:
         record["retry_at"] = 0 if destination is False else int(time.time()) + 1
         write(path, record)
         return record["state"]
-    valid,fallback=helpers['saved_context_current'](record,record['caption'] or '',record['sha256'])
-    if not valid:
-        # Record the fallback obligation before any send; a crash between this
-        # write and queueing the text resumes that same notice on the next tick.
-        record['state']='blocked';record['context_fallback']=fallback
-        write(path,record)
-        helpers['quiet_file_context_notice'](path.stem,record,fallback)
-        return 'blocked'
     photo = Path(record["filename"]).suffix.lower() in PHOTO_SUFFIXES and (telegram_api_base() == "https://api.telegram.org" or len(data) <= 10 * 1024 * 1024)
     body, boundary = multipart(record["chat"], record["filename"], data,
                                record["caption"], file_field="photo" if photo else "document",
@@ -661,7 +658,7 @@ def quiet_file_send(root: Path, path: Path, record: dict, helpers: dict) -> str:
     record["state"] = "sending"
     write(path, record)
     try:
-        with urllib.request.urlopen(request, timeout=1800 if base != "https://api.telegram.org" else 20) as response:
+        with urllib.request.urlopen(request, timeout=1800 if base != "https://api.telegram.org" else CLOUD_UPLOAD_SECONDS) as response:
             payload = json.loads(response.read())
     except urllib.error.HTTPError as error:
         try:
@@ -709,9 +706,16 @@ def quiet_file_main(argv: list[str]) -> None:
         fcntl.flock(lock, fcntl.LOCK_EX)
         if argv[1:] == ["--drain-quiet"]:
             counts = {"delivered": 0, "ready": 0, "uncertain": 0, "blocked": 0}
+            cloud = test_setting("TG_SEND_FILE_API_BASE", telegram_api_base()).rstrip("/") == "https://api.telegram.org"
+            started = time.monotonic()
             for path in sorted(root.glob("*.json")):
                 try:
-                    state = quiet_file_send(root, path, quiet_file_load(path), helpers)
+                    record = quiet_file_load(path)
+                    sends = record.get("state") == "ready" and record.get("retry_at", 0) <= time.time()
+                    if cloud and sends and time.monotonic() - started + CLOUD_UPLOAD_SECONDS + 20 > QUIET_DRAIN_SECONDS:
+                        counts["ready"] += 1  # not started: the next tick sends it
+                        continue
+                    state = quiet_file_send(root, path, record, helpers)
                     counts[state] += 1
                 except (OSError, ValueError, TypeError, KeyError, SendError):
                     counts["uncertain"] += 1
@@ -741,20 +745,16 @@ def quiet_file_main(argv: list[str]) -> None:
                         run_key, task, occurrence, chat_id, thread_id, source, caption, general_topic):
                 raise SendError("tg-send-file: quiet file record does not match this request")
         else:
-            context=helpers['require_answer_context'](chat_id,thread_id,caption or '',file=True)
             filename, data = read_outbox_file(source)
             if not data:
                 raise SendError("tg-send-file: file is empty")
-            check_video_review(chat_id, thread_id, source, filename, data)
             blob_name = f"{digest}.blob"
             quiet_copy_blob(root, blob_name, data)
-            proof=(context or {}).get('proof')
-            if isinstance(proof,dict):proof={**proof,'fileSha256':data_sha256(data)}
             record = {"version": 1, "kind": "file", "run_key": run_key, "task": task,
                       "occurrence": occurrence, "chat": chat_id, "thread": thread_id,
                       "general_topic": general_topic,
                       "source": source, "filename": filename, "caption": caption,
-                      "size": len(data), "sha256": data_sha256(data), 'context_proof':proof,
+                      "size": len(data), "sha256": data_sha256(data),
                       "blob": blob_name, "state": "ready", "retry_at": 0, "receipt": None}
             helpers["quiet_write"](path, record)
         state = quiet_file_send(root, path, record, helpers)
@@ -764,26 +764,6 @@ def quiet_file_main(argv: list[str]) -> None:
             print(f"delivery {state}: saved scheduled file; do not send it again")
     finally:
         os.close(lock)
-
-
-def check_video_review(chat_id, thread_id, path, filename, data):
-    helper=Path.home()/'bin/task-review'
-    if Path(filename).suffix.lower() not in ('.mp4','.mov','.webm','.mkv') or not helper.is_file():return
-    quality=runpy.run_path(str(helper))
-    try:
-        if not quality['video_required'](chat_id,thread_id,os.environ.get('TG_DELIVERY_ID')):return
-        try:_,receipt=read_outbox_file(path+'.review.json')
-        except SendError:receipt=None  # missing beside the video: said plainly below
-        if receipt is not None:
-            if len(receipt)>64000:raise ValueError('video review receipt too large')
-            verdict=quality['video_receipt'](data_sha256(data),json.loads(receipt))
-            if not verdict['ok']:raise ValueError(verdict['message'])
-    except (ValueError,OSError,sqlite3.Error,SendError):
-        raise SendError('tg-send-file: check the exact final video with video-check-overlay before sending; nothing was sent') from None
-    if receipt is None:
-        raise SendError(f'tg-send-file: the review receipt {Path(path).name}.review.json is not beside this video. '
-                        'video-check-overlay writes it beside the file it checked: copy it into the outbox with the video, '
-                        'or check this exact file; nothing was sent')
 
 
 def main(argv: list[str]) -> None:
@@ -809,9 +789,7 @@ def main(argv: list[str]) -> None:
         filename, data = read_outbox_file(path)
         if not data:
             raise SendError("tg-send-file: file is empty")
-        check_video_review(chat_id, thread_id, path, filename, data)
         delivery = runpy.run_path(str(Path(__file__).with_name('tg-send')))
-        delivery['require_answer_context'](chat_id,thread_id,caption or '',os.environ.get('TG_DELIVERY_ID'),file=True)
         context = delivery['capture_delivery'](chat_id, thread_id)
         delivery['settle_on_signals'](context, [])
         try:

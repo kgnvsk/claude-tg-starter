@@ -9,6 +9,7 @@ the Telegram gateway without spending a model turn.
 from __future__ import annotations
 
 import http.client
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -17,6 +18,12 @@ import time
 import urllib.parse
 import urllib.error
 import urllib.request
+
+_NOTICE_SPEC = importlib.util.spec_from_file_location(
+    "agent_notice_locale", Path(__file__).with_name("agent_notice_locale.py")
+)
+_NOTICE_MODULE = importlib.util.module_from_spec(_NOTICE_SPEC)
+_NOTICE_SPEC.loader.exec_module(_NOTICE_MODULE)
 
 HOME = Path(os.environ.get("HOME", "/home/claude"))
 ENV_FILE = Path(os.environ.get("TELEGRAM_STATE_DIR")
@@ -34,6 +41,9 @@ COMMANDS = [
     {"command": "restart",
      "description": "Перезапустити бота (потрібен активний бот)"},
 ]
+# The owner's notice language (OWNER_NOTICE_LOCALE in the profile); Ukrainian when it is not set.
+COMMANDS = [{**command, "description": _NOTICE_MODULE.notice_text(
+    f"menu.{command['command']}", command["description"], home=HOME)} for command in COMMANDS]
 
 
 

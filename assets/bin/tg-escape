@@ -43,13 +43,14 @@ TOKEN_RE = re.compile(
     r'(?P<escaped>\\[' + re.escape(RESERVED + '\\') + r'])'
     r'|(?P<pre>```.*?```)'
     r'|(?P<code>`[^`\n]*?`)'
-    r'|(?P<link>\[(?:\\[^\n]|[^\]\\\n])*?\]\([^)\n]*?\))'
+    r'|(?P<link>\[[^\]\n]*?\]\([^)\n]*?\))'
     r'|(?P<bold>\*[^*\n]+?\*)'
     r'|(?P<underline>(?<!\w)__[^_\n]+?__(?!\w))'
     r'|(?P<italic>(?<!\w)_[^_\n]+?_(?!\w))'
     r'|(?P<spoiler>\|\|[^|\n]+?\|\|)'
-    # «~750 м», «~1,4 км» is «about», not strikethrough (Арти, 22.10.2026: prices went out struck through).
-    r'|(?P<strike>~(?![\d\s])[^~\n]+?(?<!\s)~)',
+    # «~700 € … ~11 350» means «about», not strike (Arthur, 29.10.2026): strike only hugs its text on both sides,
+    # and no letter or digit touches its tildes from outside (an underscore may: it is a neighbouring entity).
+    r'|(?P<strike>(?<![^\W_])~(?=[^\s~])[^~\n]*?(?<=[^\s~])~(?![^\W_]))',
     re.DOTALL,
 )
 
@@ -102,7 +103,7 @@ def process(text: str) -> str:
             inner = raw[1:-1]
             result.append('`' + escape_code_inner(inner) + '`')
         elif kind == 'link':
-            lm = re.match(r'\[((?:\\[^\n]|[^\]\\\n])*?)\]\(([^)\n]*?)\)', raw)
+            lm = re.match(r'\[([^\]]*)\]\(([^)]*)\)', raw)
             label, url = lm.group(1), lm.group(2)
             result.append('[' + escape_plain(label) + '](' + escape_link_url(url) + ')')
         elif kind == 'bold':

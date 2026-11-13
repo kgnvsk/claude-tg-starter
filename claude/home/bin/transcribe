@@ -2,7 +2,9 @@
 # Transcribe audio via OpenAI gpt-4o-mini-transcribe
 # Handles: .ogg .oga .opus .mp3 .m4a .wav .webm
 # Auto-fallback to OPENAI_API_KEY_FALLBACK if primary returns quota/billing/auth error
-# Usage: transcribe <audio_file>
+# Usage: transcribe [--words] [--language xx] <audio_file>
+#   --words: each word with its start and end, one JSON object per line — whisper-1, the only OpenAI model that returns
+#   word timings (owner, 28.10.2026: subtitles in staff sessions exactly as the old Arti made them)
 set -e
 
 # Re-enter once with the current store value; the parent bot need not restart.
@@ -16,6 +18,20 @@ else
   fi
   exec python3 "$(dirname "$0")/agent-provider-run" openai /bin/bash "$0" --novsky-provider-ready "$@"
 fi
+
+# Detection can hear a short Ukrainian voice as Belarusian (owner, 29.10.2026): an agent whose
+# people speak one language names it in .env (TRANSCRIBE_LANGUAGE=uk); empty keeps detection.
+# --language overrides it for one call.
+WORDS=0
+LANGUAGE="${TRANSCRIBE_LANGUAGE:-}"
+FLAG=0
+while [ $# -gt 1 ]; do
+  case "$1" in
+    --words) WORDS=1; shift ;;
+    --language) LANGUAGE="$2"; FLAG=1; shift 2 ;;
+    *) break ;;
+  esac
+done
 
 [ -z "$1" ] && { echo "Usage: transcribe <audio>" >&2; exit 1; }
 [ ! -f "$1" ] && { echo "Not found: $1" >&2; exit 1; }
@@ -33,13 +49,31 @@ if [ "$EXT" = "oga" ]; then
   trap 'rm -f "$TMP"' EXIT
 fi
 
+# Only a language OpenAI transcribes is sent: a rejected code (ua for uk) would lose every voice.
+LANGUAGE_FIELD=()
+PROMPT=""
+case "$LANGUAGE" in
+  '') if [ "$FLAG" = 1 ]; then echo "Invalid language: (empty)" >&2; exit 1; fi ;;
+  # The language alone is only a hint to this model: with language=uk the same voice still came back
+  # Belarusian; a prompt written in Ukrainian holds it (checked on Bukhtych's box, 29.10.2026).
+  uk) PROMPT="Голосове повідомлення українською мовою."
+      LANGUAGE_FIELD=(-F "language=uk" -F "prompt=$PROMPT") ;;
+  af|ar|az|be|bg|bs|ca|cs|cy|da|de|el|en|es|et|fa|fi|fr|gl|he|hi|hr|hu|hy|id|is|it|ja|kk|kn|ko|lt|lv|mi|mk|mr|ms|ne|nl|no|pl|pt|ro|ru|sk|sl|sr|sv|sw|ta|th|tl|tr|ur|vi|zh)
+    LANGUAGE_FIELD=(-F "language=$LANGUAGE") ;;
+  *) if [ "$FLAG" = 1 ]; then echo "Invalid language: $LANGUAGE" >&2; exit 1; fi
+     echo "TRANSCRIBE_LANGUAGE=$LANGUAGE is not a language code OpenAI transcribes (uk, ru, en…); the language is detected instead" >&2 ;;
+esac
+
+FIELDS=(-F "model=gpt-4o-mini-transcribe" -F "response_format=json")
+[ "$WORDS" = 1 ] && FIELDS=(-F "model=whisper-1" -F "response_format=verbose_json" -F "timestamp_granularities[]=word")
+FIELDS+=("${LANGUAGE_FIELD[@]}")
+
 try_key() {
   printf 'Authorization: Bearer %s\n' "$1" | curl -H @- -sS -X POST "https://api.openai.com/v1/audio/transcriptions" \
     --connect-timeout "${TRANSCRIBE_CONNECT_TIMEOUT_SECONDS:-10}" \
     --max-time "${TRANSCRIBE_MAX_TIME_SECONDS:-120}" \
     -F "file=@$SRC" \
-    -F "model=gpt-4o-mini-transcribe" \
-    -F "response_format=json"
+    "${FIELDS[@]}"
 }
 
 RESP=$(try_key "$OPENAI_API_KEY")
@@ -63,4 +97,11 @@ if echo "$RESP" | jq -e '.error' >/dev/null 2>&1; then
   exit 1
 fi
 
-echo "$RESP" | jq -r '.text'
+TEXT=$(echo "$RESP" | jq -r '.text')
+# Silence comes back as the prompt itself: no speech, as detection would say.
+if [ -n "$PROMPT" ] && [ "$TEXT" = "$PROMPT" ]; then exit 0; fi
+if [ "$WORDS" = 1 ]; then
+  echo "$RESP" | jq -c '.words[] | {word, start, end}'
+else
+  printf '%s\n' "$TEXT"
+fi

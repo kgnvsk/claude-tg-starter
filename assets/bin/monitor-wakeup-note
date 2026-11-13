@@ -1,0 +1,205 @@
+#!/usr/bin/env python3
+"""A Monitor is not an alarm clock: say so the moment one is armed.
+
+Арти, 03.11.2026: his montage helper watched an 85-minute render with Monitor. The watch ended by itself after
+30 minutes, the helper had already ended its turn and never heard of it, so nobody ran the last step and the owner
+had no link until he asked in the morning. Claude Code limits a Monitor in time and tells about its end only with
+the next message; a background Bash ends with its process and always reports. This PostToolUse hook (matcher
+Monitor|Bash) puts that in front of the model right after it arms a watch: the main session and every subagent, the
+bot's own included. Prints nothing for any other call and never blocks.
+"""
+import json
+import re
+import shlex
+import sys
+
+NOTE = (
+    "Цей Monitor не будильник. Він живе обмежений час (дивись його відповідь) і може зупинитися раніше, ніж "
+    "скінчиться робота. Звістка про це не будить: вона приходить лише з наступним повідомленням, а субагент, "
+    "що вже закінчив хід, її не отримує. Якщо після цієї роботи має бути ще крок, а вона може тривати довше, "
+    "ніж ти зараз працюєш:\n"
+    "1) допиши наступні кроки в той самий відокремлений запуск (`крок1 && крок2`), щоб готовий результат "
+    "зʼявився без тебе;\n"
+    "2) запусти фоновий Bash (run_in_background: true), що чекає на PID цієї роботи: "
+    "`tail --pid=<pid> -f /dev/null; tail -5 <лог>`. Він не обмежений у часі й сповістить тебе, коли процес "
+    "скінчиться, успішно чи ні. Чекай кінця процесу, а не появи готового файлу: якщо крок не відбувся, "
+    "очікувач на файл простоїть до свого дедлайну."
+)
+
+
+# Owner, 04.11.2026: every alarm survives restarts. Арти kept his inbox and day-plan alarms as background loops in his
+# session: a restart lost them, and while they ran Novsky saw him busy and could not update him. The shape is a
+# while/until loop with a sleep in it, read word by word as the shell reads it: quoted words stay quoted, operators
+# stay operators (`);` is two), and keywords count only where a command starts (`echo done` ends nothing). A loop whose
+# own condition is a process check (pgrep, kill -0, ps -p, a test of /proc/PID), or whose body breaks out in the same
+# command list as such a check, only waits for that process (Codex review, 04.11.2026).
+OPERATORS = (";;", "&&", "||", "|&", ">>", "<<", ">&", "<&", ";", "&", "|", "(", ")", "<", ">")
+REDIRECTIONS = {">>", "<<", ">&", "<&", "<", ">"}
+STARTERS = {";", "&", "&&", "||", "|", "|&", "(", ")", ";;", "{", "!", "do", "then", "else", "elif", "while", "until",
+            "if"}
+ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
+
+
+HEREDOC = re.compile(r"<<-?[ \t]*(['\"]?)([A-Za-z_][A-Za-z0-9_.-]*)\1([^\n]*)\n.*?\n[ \t]*\2[ \t]*(?=\n|$)", re.S)
+
+
+def without_stream_numbers(command: str) -> str:
+    """`2>/dev/null` is `>/dev/null` here: digits that start a word right before < or > name a stream (POSIX
+    IO_NUMBER). Only outside quotes, and never a redirection's own target (`>2 >x`: 2 is a file name)."""
+    out, quote, i = [], None, 0
+    while i < len(command):
+        c = command[i]
+        if quote:
+            out.append(command[i:i + 2] if c == "\\" and quote == '"' else c)
+            i += 2 if c == "\\" and quote == '"' else 1
+            quote = None if c == quote else quote
+            continue
+        if c in "'\"":
+            quote = c
+        elif c == "\\":
+            out.append(command[i:i + 2])
+            i += 2
+            continue
+        elif c.isdigit() and (i == 0 or command[i - 1] in " \t\n;&|()"):
+            end = i
+            while end < len(command) and command[end].isdigit():
+                end += 1
+            if end < len(command) and command[end] in "<>":
+                i = end
+                continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def words(command: str) -> list[str] | None:
+    command = without_stream_numbers(HEREDOC.sub(lambda m: "<<" + m.group(2) + m.group(3), command.replace("\\\n", " ")))
+    lexer = shlex.shlex(command.replace("\n", " ; "), posix=False, punctuation_chars=True)
+    lexer.whitespace_split, lexer.commenters = True, ""
+    try:
+        tokens = list(lexer)
+    except ValueError:  # an unclosed quote: nothing this hook can read
+        return None
+    out = []
+    for token in tokens:
+        while token and set(token) <= set("();<>|&"):
+            operator = next((op for op in OPERATORS if token.startswith(op)), token[0])
+            out.append(operator)
+            token = token[len(operator):]
+        if token:
+            out.append(token)
+    return out
+
+
+def plain(word: str) -> str:
+    """A word as the command sees it, every quoted part joined (`/proc/"$PID"` is /proc/$PID). Keywords are still
+    matched on the word as written."""
+    try:
+        parts = shlex.split(word)
+    except ValueError:
+        return word
+    return parts[0] if len(parts) == 1 else word
+
+
+def commands(part: list[tuple[str, bool]]) -> list[list[str]]:
+    """The simple commands of a part of a loop: each starts at a command position and runs to the next separator; a
+    redirection and its target stay inside it without being one of its words."""
+    out, current, target = [], None, False
+    for word, start in part:
+        if word in REDIRECTIONS:
+            target = True
+        elif target:
+            target = False
+        elif word in OPERATORS or (start and word in STARTERS | {"fi", "done", "esac", "}"}):
+            current = None
+        elif start:
+            current = [plain(word)]
+            out.append(current)
+        elif current is not None:
+            current.append(plain(word))
+    return out
+
+
+def checks_a_process(command: list[str]) -> bool:
+    name, arguments = command[0], command[1:]
+    return (name == "pgrep" or (name == "kill" and "-0" in arguments)
+            or (name == "ps" and any(a == "-p" or a.startswith("-p") for a in arguments))
+            or (name in ("test", "[", "[[") and any(re.match(r"/proc/[0-9$]", a) for a in arguments)))
+
+
+def breaks_on_a_process(body: list[tuple[str, bool]]) -> bool:
+    """A command list of the loop body (an if … fi counts as one) that checks a process and breaks out."""
+    group, depth = [], 0
+    for word, start in body + [(";", True)]:
+        depth += (start and word == "if") - (start and word == "fi")
+        if word in (";", "&", ";;") and depth <= 0:
+            found = commands(group)
+            if any(checks_a_process(c) for c in found) and any(c[0] == "break" for c in found):
+                return True
+            group = []
+        else:
+            group.append((word, start))
+    return False
+
+
+def standing(command: str) -> bool:
+    frames, start, target = [], True, False
+    for word in words(command) or []:
+        if target or word in REDIRECTIONS:
+            # A redirection and its target change nothing about where the command starts (`>/dev/null ps -p 77`).
+            target = not target and word in REDIRECTIONS
+            if frames:
+                frames[-1][frames[-1]["part"]].append((word, False))
+            continue
+        if start and word in ("while", "until", "for", "select"):
+            frames.append({"loop": word in ("while", "until"), "part": "condition", "condition": [], "body": [],
+                           "sleeps": False})
+        elif start and word == "do" and frames:
+            frames[-1]["part"] = "body"
+        elif start and word == "done" and frames:
+            frame = frames.pop()
+            if frame["loop"] and frame["sleeps"] and not any(checks_a_process(c) for c in commands(frame["condition"])) \
+                    and not breaks_on_a_process(frame["body"]):
+                return True
+        elif frames:
+            if start and plain(word) == "sleep":
+                for frame in frames: frame["sleeps"] = True
+            frames[-1][frames[-1]["part"]].append((word, start))
+        start = word in STARTERS or bool(start and ASSIGNMENT.match(word))
+    return False
+
+
+LOOP_NOTE = (
+    "Цей фоновий цикл живе лише до перезапуску служби, а поки працює, тримає тебе «зайнятим» для оновлень. Якщо це "
+    "будильник чи стеження, що має пережити перезапуск, постав його через `~/bin/reminder-task` (стеження — `repeat "
+    "--run --check '<перевірка>'`), а цей зупини. Якщо ти лише чекаєш кінця процесу, який щойно запустив, усе гаразд."
+)
+
+
+def note(data) -> str | None:
+    if not isinstance(data, dict) or data.get("hook_event_name") != "PostToolUse":
+        return None
+    if data.get("tool_name") == "Monitor":
+        return NOTE
+    arguments = data.get("tool_input")
+    if data.get("tool_name") == "Bash" and isinstance(arguments, dict) and arguments.get("run_in_background") is True:
+        command = arguments.get("command")
+        if isinstance(command, str) and standing(command):
+            return LOOP_NOTE
+    return None
+
+
+def main() -> int:
+    try:
+        data = json.load(sys.stdin)
+    except Exception:
+        return 0
+    text = note(data)
+    if text:
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": text}},
+                         ensure_ascii=False))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

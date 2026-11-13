@@ -1,0 +1,289 @@
+#!/usr/bin/env python3
+"""UserPromptSubmit hook: a press of the reply tool's confirm button reaches the session that asked.
+
+Owner, 10.11.2026: an agent asks its person «записать правило?»-type questions, and in a stream of voice messages the
+«да» got lost (19 of 88 such questions in five days). The question now carries a one-tap button (`reply` with
+confirm_button). The receiver records a press as that person's ✅ reaction row and starts no turn, and nothing else in
+the kit reads that table. This hook hands the press over with the next prompt of the session that sent the
+question: its transcript holds the `reply` call into that chat whose result names the message. A live agent runs a
+hundred other sessions a day on the same hooks; without that check the first of them would swallow the press. A task
+run (ATARAX_SUPPRESS_TELEGRAM=1) never opens the database. A press nobody took for a day (the asking session is gone)
+goes to the session whose prompt is a Telegram message from the same chat.
+
+A printed note is not a delivered one: the CLI drops what a hook printed when it stops the hook at its timeout, and a
+prompt another hook blocks never reaches the model. The proof is the session's own transcript: there the CLI writes
+what a UserPromptSubmit hook added to an accepted prompt as a `hook_additional_context` attachment, and nothing in
+those two cases (CLI 2.1.317, 10.11.2026). So every note opens with the marker of its press, an offer is recorded
+before its note is printed, and a press is settled only when a transcript shows that marker; until then the next
+prompt offers it again, OFFERS times in all.
+
+The database is only read, and a prompt is never blocked: a failure means no output.
+"""
+import calendar
+import contextlib
+import fcntl
+import json
+import mmap
+import os
+import re
+import sqlite3
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+AGENT_ROOT = Path(os.environ.get("AGENT_ROOT") or Path.home())
+TELEGRAM_STATE = Path(os.environ.get("TELEGRAM_STATE_DIR")
+                      or Path(os.environ.get("CLAUDE_CONFIG_DIR") or AGENT_ROOT / ".claude") / "channels" / "telegram")
+DB = TELEGRAM_STATE / "messages.db"
+STATE = AGENT_ROOT / ".claude" / "state" / "tg-confirm-press.json"  # press → {offers, at, session, settled}
+LOG = STATE.with_suffix(".log")  # a line per offer and per settled press: ids and reasons, never a message's text
+PRESS = "✅"  # not among Telegram's reactions: such a row is the button and nothing else
+WINDOW = 14 * 86400  # a press waits this long for a session that may take it
+ORPHAN = 86400  # a press its asking session has not taken for this long goes to the session of the same chat
+OFFERS = 3  # a note no transcript shows is printed this many times in all
+LOG_ROOM = 256 * 1024  # a log past this keeps only the lines of the last two windows
+CONTEXT_ROOM = 9500  # the CLI hands a hook's context on whole only up to 10 000 characters (tg-context-inject's margin)
+MARK = "[confirm-press "  # with «<chat>:<message_id>]» it opens a note: plain ASCII, a transcript holds it as printed
+# The emoji and the action are literals, as in the WHERE of the receiver's idx_reaction_confirm: SQLite then knows
+# that index of presses alone holds every row asked for, and an ordinary prompt reads it instead of the whole table.
+WAITING = (
+    "SELECT r.chat_id, r.message_id, MIN(r.ts), r.user_id, r.username, m.text, m.ts FROM reactions r "
+    "JOIN messages m ON m.chat_id = r.chat_id AND m.message_id = r.message_id AND m.direction = 'out' "
+    f"WHERE r.emoji = '{PRESS}' AND r.action = 'add' AND r.ts > ? GROUP BY r.chat_id, r.message_id ORDER BY MIN(r.ts)")
+
+CHANNEL_OPEN = re.compile(
+    r"\A<channel(?P<attrs>(?:\s+[A-Za-z_:][A-Za-z0-9_.:-]*\s*=\s*(?:\"[^\"]*\"|'[^']*'))+)\s*>", re.DOTALL)
+CHANNEL_ATTR = re.compile(r"\s+([A-Za-z_:][A-Za-z0-9_.:-]*)\s*=\s*(?:\"([^\"]*)\"|'([^']*)')")
+
+
+def prompt_chat(prompt):
+    """The chat of the Telegram message that opens this prompt, by tg-context-inject's rules for a verified envelope:
+    a whole opening tag, no attribute twice, the Telegram plugin as its source. A task notice, another channel or
+    quoted text has none."""
+    opening = CHANNEL_OPEN.match(prompt) if isinstance(prompt, str) else None
+    attrs = {}
+    for attr in CHANNEL_ATTR.finditer(opening.group("attrs")) if opening else ():
+        if attr.group(1) in attrs:
+            return None
+        attrs[attr.group(1)] = attr.group(2) if attr.group(2) is not None else attr.group(3)
+    chat = attrs.get("chat_id", "")
+    verified = attrs.get("source") == "plugin:telegram:telegram" and re.fullmatch(r"-?[1-9]\d{0,19}", chat)
+    return chat if verified else None
+
+
+def sent_here(transcript, chat, message_id):
+    """The message ids of the answer when this session itself sent message_id into the chat: its transcript holds a
+    `…__reply` call into that chat whose result says «sent (id: N)» or «sent K parts (ids: a, b, N)». The same words
+    in other text, in a command's output or in a broken line are not a send."""
+    result = re.compile(rb"\(ids?: (?:\d+, )*%d(?:, \d+)*\)" % int(message_id))
+
+    def blocks(mm, start, end):
+        content = json.loads(mm[start:end])["message"]["content"]
+        return [block for block in content if isinstance(block, dict)] if isinstance(content, list) else []
+
+    def call(mm, use_id, at):
+        """The tool call a result answers. Between the two the CLI writes service lines that carry the same id."""
+        for _ in range(40):
+            at = mm.rfind(use_id.encode(), 0, at)
+            if at < 0:
+                break
+            at = mm.rfind(b"\n", 0, at) + 1
+            with contextlib.suppress(Exception):
+                for block in blocks(mm, at, mm.find(b"\n", at)):
+                    if block.get("type") == "tool_use" and block.get("id") == use_id:
+                        return block
+        return {}
+
+    try:
+        with open(transcript, "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+            end = 0
+            for hit in result.finditer(mm):
+                if hit.start() < end:
+                    continue  # this line is already read
+                start, end = mm.rfind(b"\n", 0, hit.start()) + 1, mm.find(b"\n", hit.start())
+                end = len(mm) if end < 0 else end
+                try:
+                    found = blocks(mm, start, end)
+                except Exception:
+                    continue
+                for block in found:  # the CLI may write the results of parallel calls in one line
+                    said = result.search(json.dumps(block.get("content")).encode())
+                    use = call(mm, str(block.get("tool_use_id")), start) if said else {}
+                    reply = use.get("input") if str(use.get("name", "")).endswith("__reply") else None
+                    if isinstance(reply, dict) and str(reply.get("chat_id")) == str(chat):
+                        return [int(part) for part in re.findall(rb"\d+", said.group())]
+    except Exception:
+        pass
+    return []
+
+
+def seen(transcript, key, pressed):
+    """Whether this session's transcript shows the note of this press: the line the CLI writes for what a
+    UserPromptSubmit hook added to a prompt it accepted, with a text that opens with a marker (this hook's output and
+    no other's) and has this press's marker at the head of a note. The marker in a prompt, in an answer, in a
+    command's output, in a chat line another hook copied or in a broken line shows nothing. Neither does a line
+    written before the press: that note was of an earlier message with the same ids (a replaced bot counts its
+    messages from one again, and a transcript keeps every line)."""
+    mark = f"{MARK}{key}]"
+
+    def earlier(written):
+        """A line's «2026-11-10T06:44:12.421Z» against the press, by the second; a line without one is not earlier."""
+        with contextlib.suppress(Exception):
+            return calendar.timegm(time.strptime(written[:19], "%Y-%m-%dT%H:%M:%S")) < pressed // 1000
+        return False
+    try:
+        with open(transcript, "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+            at = mm.find(mark.encode())
+            while at >= 0:
+                start, end = mm.rfind(b"\n", 0, at) + 1, mm.find(b"\n", at)
+                end = len(mm) if end < 0 else end
+                with contextlib.suppress(Exception):
+                    row = json.loads(mm[start:end])
+                    added = row["attachment"]
+                    if ((added["type"], added["hookEvent"]) == ("hook_additional_context", "UserPromptSubmit")
+                            and any(text.startswith(MARK) and "\n\n" + mark in "\n\n" + text
+                                    for text in added["content"])
+                            and not earlier(row.get("timestamp"))):
+                        return True
+                at = mm.find(mark.encode(), end)
+    except Exception:
+        pass
+    return False
+
+
+def logged(row):
+    """What a line of the log says and when it was written; a torn line says nothing."""
+    with contextlib.suppress(Exception):
+        row = json.loads(row)
+        return row, calendar.timegm(time.strptime(row["t"], "%Y-%m-%dT%H:%M:%SZ"))
+    return {}, 0
+
+
+def records():
+    """Press → {offers, at, session, settled}: how many notes were printed for it, when and to which session the last
+    one, and whether it is over. The state file says so; when that is lost or unreadable the log does, and there the
+    newest word about a press wins whatever the order of the lines: a settled press stays settled, the largest count
+    and the latest offer stand. With neither it is a first run, and seen() still knows a note a transcript shows."""
+    with contextlib.suppress(Exception):
+        state = json.loads(STATE.read_text(encoding="utf-8"))
+        if all(type(known["offers"]) is int and isinstance(known["at"], (int, float))
+               and isinstance(known["session"], str) and isinstance(known["settled"], bool)
+               for known in state.values()):
+            return state
+    state = {}
+    with contextlib.suppress(Exception):  # no log either
+        for row in LOG.read_bytes().splitlines():
+            row, at = logged(row)
+            with contextlib.suppress(Exception):
+                known = state.setdefault(str(row["press"]), {"offers": 0, "at": 0, "session": "", "settled": False})
+                if row["event"] == "offered":
+                    known["offers"] = max(known["offers"], int(row["offers"]))
+                    if at >= known["at"]:
+                        known["at"], known["session"] = at, str(row["session"])
+                elif row["event"] in ("settled", "gave-up"):
+                    known["settled"] = True
+    return state
+
+
+def note(chat, message_id, pressed, user_id, username, text, sent, parts):
+    def moment(at):
+        return datetime.fromtimestamp(at / 1000).strftime("%d.%m %H:%M")
+    split = (f" The message is the last of {len(parts)} parts of your answer (message ids "
+             f"{', '.join(map(str, parts))})." if len(parts) > 1 else "")
+    return (f"{MARK}{chat}:{message_id}] CONFIRM BUTTON: {username or 'user'} (user_id={user_id or 'unknown'}) "
+            f"pressed the «{PRESS}» button under your message {message_id} in chat {chat} (sent {moment(sent)}, "
+            f"pressed {moment(pressed)}). This is that person's «yes» to the question in that message: act on it now "
+            f"and tell them the result in one line in that chat.{split}\n"
+            f'<confirmed-message chat_id="{chat}" message_id="{message_id}">\n{text or ""}\n</confirmed-message>')
+
+
+def main():
+    if os.environ.get("ATARAX_SUPPRESS_TELEGRAM") == "1":
+        return
+    data = json.loads(sys.stdin.read() or "{}")
+    if data.get("hook_event_name") != "UserPromptSubmit" or not DB.exists():
+        return
+    now, transcript, me = time.time(), data.get("transcript_path") or "", str(data.get("session_id") or "")[:8]
+    with contextlib.closing(sqlite3.connect(f"file:{DB}?mode=ro", uri=True, timeout=1.0)) as db:
+        rows = db.execute(WAITING, ((now - WINDOW) * 1000,)).fetchall()  # a double tap is two rows and one press
+    state = records() if rows else {}  # the records are read only when there is a press to look up
+    mine = []
+    for chat, message_id, pressed, user_id, username, text, sent in rows:
+        key = f"{chat}:{message_id}"
+        if state.get(key, {}).get("settled"):
+            continue
+        if seen(transcript, key, pressed):
+            mine.append((key, "seen", None))
+            continue
+        parts = sent_here(transcript, chat, message_id)
+        if parts:
+            why = "asked-here"
+        elif now - pressed / 1000 > ORPHAN and prompt_chat(data.get("prompt")) == str(chat):
+            why = "same-chat-after-a-day"
+        else:
+            continue
+        mine.append((key, why, note(chat, message_id, pressed, user_id, username, text, sent, parts)))
+    if not mine:
+        return
+    # ponytail: at least once and at most OFFERS times, not exactly once. An offer is recorded before its note is
+    # printed, so a run stopped in between, a note the CLI dropped and a prompt another hook blocked each spend an
+    # offer, and the next prompt makes another. After OFFERS notes that no transcript showed the press is given up:
+    # settled though nobody is known to have read it, with one «gave-up» line in the log; the person's ✅ row stays in
+    # the database. A session that takes the note with its last prompt never shows it either: a day later the next
+    # session of that chat is told once more. A CLI that records a hook's context in another shape ends every press
+    # as «gave-up»: teach seen() that shape then.
+    STATE.parent.mkdir(parents=True, exist_ok=True)
+    notes, lines, full = [], [], False
+    with LOG.open("ab", buffering=0) as log:
+        fcntl.flock(log, fcntl.LOCK_EX)  # two sessions' hooks at once: no offer twice, no record of the other lost
+        state = records()
+        for key, why, text in mine:
+            known = state.get(key) or {"offers": 0, "at": 0, "session": me, "settled": False}
+            if known["settled"]:
+                continue
+            if text is None:
+                event = "settled"
+            elif known["session"] != me and now - known["at"] < ORPHAN:
+                continue  # offered to another session less than a day ago: its transcript may yet show the note
+            elif known["offers"] >= OFFERS:
+                event = "gave-up"
+            elif full or (notes and len("\n\n".join(notes + [text]).encode("utf-16-le", "surrogatepass")) // 2
+                          > CONTEXT_ROOM):
+                full = True  # nothing a model reads is cut: this note and the later ones come whole, next prompt
+                continue
+            else:
+                event = "offered"
+                notes.append(text)
+            state[key] = {"offers": known["offers"] + (event == "offered"), "at": int(now),
+                          "session": me if event == "offered" else known["session"], "settled": event != "offered"}
+            lines.append({"t": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)), "session": me, "press": key,
+                          "event": event, "why": why, "offers": state[key]["offers"]})
+        if not lines:
+            return
+        # A press out of its two weeks is never asked about again, so its record goes. One written within the hour
+        # stays: it may be another session's, of a press that came while this run was reading the database.
+        window = {f"{row[0]}:{row[1]}" for row in rows}
+        state = {key: known for key, known in state.items() if key in window or now - known["at"] < 3600}
+        temporary = STATE.with_suffix(".tmp")
+        temporary.write_text(json.dumps(state), encoding="utf-8")
+        os.replace(temporary, STATE)  # a state that cannot be written: nothing offered, nothing printed
+        with contextlib.suppress(Exception):  # the log is the spare record: the state file alone holds what it missed
+            # The newline goes first: a line torn by a full disk does not take the next one with it.
+            log.write(b"".join(b"\n" + json.dumps(line).encode() for line in lines))
+            if os.fstat(log.fileno()).st_size > LOG_ROOM:
+                old = LOG.read_bytes()
+                young = b"".join(b"\n" + row for row in old.splitlines() if now - logged(row)[1] < 2 * WINDOW)
+                if len(young) < len(old):
+                    os.ftruncate(log.fileno(), 0)
+                    log.write(young)
+    if notes:  # last of all: every note printed is an offer already on record
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit",
+                                                 "additionalContext": "\n\n".join(notes)}}), flush=True)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:  # a hook must not break the turn
+        pass

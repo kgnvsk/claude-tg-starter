@@ -536,6 +536,231 @@ def require_remote_access(remote: str, environment: dict[str, str]) -> None:
         raise BackupError("remote-unavailable")
 
 
+# The agent's own work outside the kit, for the GitHub projection only (the ZIP archive and its restore keep their
+# fixed list). Cash's server was wiped on 06.11.2026 and every script the agent had written in ~/bin, its scheduled
+# tasks, its rules and its tool folders were gone: the projection carried none of them. Each file is read once beneath
+# HOME without following a link, and one that looks like a credential is left out alone, never the whole backup.
+# agent-backup is pinned by Novsky's readiness manifest, so this lives here and joins its projection payload through
+# load_backup_module.
+OWN_BIN_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+OWN_COPY = re.compile(r"\.(?:bak|orig|old|tmp|swp|part)(?:[-._]|$)", re.IGNORECASE)
+OWN_CREDENTIAL_NAME = re.compile(
+    r"(?i)(?:^|[._-])(?:tokens?|secrets?|passwords?|passwd|credentials?|cookies?|sessions?|auth|apikey|api[_-]?key|"
+    r"private[_-]?key|keyring)(?:$|[._-])|^\.env|\.session$")
+# NAME=value, NAME: value or "name": "value" with any value of 6+ characters, quoted or not.
+OWN_ASSIGNED = re.compile(rb"[\"']?([A-Za-z_][A-Za-z0-9_.-]*)[\"']?[\t ]*[:=][\t ]*(?:\"([^\"\n]{6,})\"|'([^'\n]{6,})'|([^\s\"',;]{6,}))")
+OWN_SECRET_SHAPES = (
+    re.compile(rb"\s*[A-Za-z0-9_+/=.:-]{20,}\s*"),                                       # a file that is one token
+    re.compile(rb"(?i)authorization[\"']?[\t ]*[:=][\t ]*[\"']?(?:basic|bearer|token)[\t ]+[A-Za-z0-9._~+/=-]{4,}"),
+    re.compile(rb"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}"),          # JWT
+    re.compile(rb"(?im)^[\t ]*(?:(?:machine[\t ]+\S+|default)[\t ]+)?(?:login[\t ]+\S+[\t ]+)?password[\t ]+\S+"),  # .netrc
+)
+CAMEL = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+# A value that is wholly a pointer to a secret: $VAR, ${VAR}, ${VAR:?message}, $(command), %VAR%, <placeholder>.
+# ${VAR:-literal} or ${VAR}literal still carry a literal and stay secret-like.
+REFERENCE = re.compile(rb"\$\{[A-Za-z_][A-Za-z0-9_]*(?::?\?[^}]*)?\}|\$[A-Za-z_][A-Za-z0-9_]*|\$\([^)]*\)"
+                       rb"|%[A-Za-z_][A-Za-z0-9_]*%|<[A-Za-z_ -]+>")
+OWN_MAX_SCANNED = 20000
+OWN_MAX_BYTES = 1024 * 1024
+OWN_MAX_FILES = 2000
+OWN_MAX_TOTAL = 50 * 1024 * 1024
+BACKUP_INCLUDE = Path(".claude/product/backup-include.txt")
+OWN_ROOTS = (Path(".local/share/agent-rules"),)
+OWN_SENSITIVE = (Path(".ssh"), Path(".gnupg"), Path(".claude/channels"), Path(".claude/personal-inbox"),
+                 Path(".local/state/agent-full-backup"), Path(".local/state/agent-github-backup"), Path(".config/novsky"),
+                 Path(".config/gh"), Path(".config/gogcli"), Path(".local/share/gogcli"))
+CRONTAB_NAME = "home/.local/state/agent-backup/crontab.txt"
+
+
+def kit_owned_bin(home: Path) -> set[str]:
+    """~/bin names the kit and its modules install: they come back with a reinstall, not from this backup (an old copy
+    restored over a newer kit would roll it back)."""
+    names = set()
+    for kit in (Path("/opt/claude-tg-starter"), Path(f"/opt/claude-tg-starter@{home.name}")):
+        for folder in [kit / "assets/bin", *sorted(kit.glob("modules/*/bin"))]:
+            if folder.is_dir():
+                names.update("bin/" + entry.name for entry in folder.iterdir())
+    for record in [home / ".claude/product/managed-runtime-baseline.json",
+                   *sorted((home / ".claude/product/modules").glob("*.files.json"))]:
+        try:
+            data = json.loads(record.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        files = data.get("files") if isinstance(data, dict) and isinstance(data.get("files"), dict) else data
+        if isinstance(files, dict):
+            names.update(name for name in files if isinstance(name, str))
+    return names
+
+
+def own_secret(backup: ModuleType, data: bytes) -> bool:
+    """contains_secret, plus what a credential looks like without a known vendor shape: a file that is one long token,
+    or a NAME=value / "name": "value" whose name says key, token, secret or password."""
+    if backup.contains_secret(data) or backup.URL_LOGIN.search(data) or OWN_SECRET_SHAPES[0].fullmatch(data):
+        return True
+    if any(shape.search(data) for shape in OWN_SECRET_SHAPES[1:]):
+        return True
+    for match in OWN_ASSIGNED.finditer(data):
+        value = match.group(2) or match.group(3) or match.group(4) or b""
+        if REFERENCE.fullmatch(value.rstrip(b"}") if value.count(b"}") > value.count(b"{") else value):
+            continue  # ${API_TOKEN:?missing}, $(cat file), %TOKEN%: a pointer to a secret, not the secret
+        name = CAMEL.sub("_", match.group(1).decode("utf-8", "replace")).upper().replace("-", "_").replace(".", "_")
+        if backup.CREDENTIAL_ENV_NAME.search(name):
+            return True
+    return False
+
+
+def read_beneath(home: Path, relative: Path) -> tuple[bytes, int] | None:
+    """A small regular UTF-8 text file read through directory descriptors opened without following links."""
+    directory = os.open(home, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in relative.parts[:-1]:
+            inner = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+            os.close(directory)
+            directory = inner
+        descriptor = os.open(relative.parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+    except OSError:
+        os.close(directory)
+        return None
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > OWN_MAX_BYTES:
+            return None
+        chunks, size = [], 0
+        while size <= OWN_MAX_BYTES:
+            chunk = os.read(descriptor, 65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+        data = b"".join(chunks)
+        if len(data) > OWN_MAX_BYTES or b"\0" in data:
+            return None
+        data.decode("utf-8")
+        return data, stat.S_IMODE(info.st_mode)
+    except (OSError, UnicodeDecodeError):
+        return None
+    finally:
+        os.close(descriptor)
+        os.close(directory)
+
+
+def agent_crontab(home: Path) -> bytes | None:
+    """The agent's own crontab, read only as the agent itself; it goes to the projection, nothing is written."""
+    if os.geteuid() != home.stat().st_uid:
+        return None
+    if os.environ.get("AGENT_BACKUP_TESTING") == "1":
+        fixture = home / ".test-crontab"
+        return fixture.read_bytes() if fixture.is_file() else None
+    try:
+        result = subprocess.run(["crontab", "-l"], capture_output=True, timeout=30, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return result.stdout if result.returncode == 0 and result.stdout.strip() else None
+
+
+class ScanBudget(Exception):
+    """The own-work scan saw more than OWN_MAX_SCANNED directory entries."""
+
+
+def own_candidates(backup: ModuleType, listed_bytes: bytes | None):
+    """Own-work paths, lazily: ~/bin outside the kit, reminder tasks, then the rules store and the listed folders.
+    Every directory entry seen counts toward OWN_MAX_SCANNED, so one huge folder cannot make the walk unbounded; when
+    the budget is spent it yields None once and stops."""
+    home, seen = backup.HOME, 0
+
+    def entries(base: Path):
+        nonlocal seen
+        try:
+            with os.scandir(base) as found:
+                for entry in found:
+                    seen += 1
+                    if seen > OWN_MAX_SCANNED:
+                        raise ScanBudget
+                    yield entry
+        except OSError:
+            return
+
+    kit = kit_owned_bin(home)
+    try:
+        for folder in (Path("bin"), Path(".atarax/reminders")):
+            base = home / folder
+            if base.is_symlink() or not base.is_dir():
+                continue
+            for entry in entries(base):
+                if not entry.is_file(follow_symlinks=False):
+                    continue
+                if folder == Path("bin") and (not OWN_BIN_NAME.fullmatch(entry.name) or "bin/" + entry.name in kit):
+                    continue
+                if folder != Path("bin") and not entry.name.endswith(".rem"):
+                    continue
+                yield folder / entry.name
+        roots = list(OWN_ROOTS)
+        for line in (listed_bytes or b"").decode("utf-8").splitlines():
+            entry = line.split("#", 1)[0].strip()
+            relative = Path(entry)
+            if entry and not relative.is_absolute() and ".." not in relative.parts and not entry.startswith("~"):
+                roots.append(relative)
+        for root in roots:
+            if any(root == place or place in root.parents or root in place.parents for place in OWN_SENSITIVE):
+                continue
+            base = home / root
+            if base.is_symlink() or not base.exists():
+                continue
+            if base.is_file():
+                yield root
+                continue
+            pending = [base]
+            while pending:
+                folder = pending.pop()
+                for entry in entries(folder):
+                    if entry.is_dir(follow_symlinks=False):
+                        if entry.name not in backup.EXCLUDED_DIRS:
+                            pending.append(Path(entry.path))
+                    elif entry.is_file(follow_symlinks=False):
+                        yield Path(entry.path).relative_to(home)
+    except ScanBudget:
+        yield None
+
+
+def own_work_payload(backup: ModuleType, taken: set[str]) -> list[tuple[str, bytes, int]]:
+    listed = read_beneath(backup.HOME, BACKUP_INCLUDE)
+    payload, total, cut = [], 0, None
+    if listed is not None and not own_secret(backup, listed[0]):
+        payload.append(("home/" + BACKUP_INCLUDE.as_posix(), listed[0], listed[1]))
+        taken.add(payload[-1][0])
+        total += len(listed[0])
+    crontab = agent_crontab(backup.HOME)
+    if crontab is not None and CRONTAB_NAME not in taken and not own_secret(backup, crontab) and len(crontab) <= OWN_MAX_BYTES:
+        payload.append((CRONTAB_NAME, crontab, 0o600))
+        taken.add(CRONTAB_NAME)
+        total += len(crontab)
+    name = "(the start)"
+    for relative in own_candidates(backup, listed[0] if listed else None):
+        if relative is None:
+            cut = f"scanned more than {OWN_MAX_SCANNED} paths"
+            break
+        name = "home/" + relative.as_posix()
+        if (name in taken or OWN_COPY.search(relative.name) or OWN_CREDENTIAL_NAME.search(relative.name)
+                or backup.is_excluded(relative)):
+            continue
+        read = read_beneath(backup.HOME, relative)
+        if read is None or own_secret(backup, read[0]):
+            continue
+        if len(payload) >= OWN_MAX_FILES or total + len(read[0]) > OWN_MAX_TOTAL:
+            cut = f"over {OWN_MAX_FILES} files or {OWN_MAX_TOTAL // (1024 * 1024)} MB"
+            break
+        payload.append((name, read[0], read[1]))
+        taken.add(name)
+        total += len(read[0])
+    if cut:
+        # A cut backup says so inside itself, so nobody takes it for the whole of the agent's own work.
+        note = (f"The agent's own work was cut at {name}: {cut}. Files after it in ~/bin, reminders, rules or the "
+                f"listed folders are not in this backup.\n").encode()
+        payload.append(("home/.local/state/agent-backup/own-work-incomplete.txt", note, 0o600))
+        print("agent-github-backup: own work cut: " + cut, file=sys.stderr)
+    return payload
+
+
 def load_backup_module() -> ModuleType:
     path = Path(__file__).with_name("agent-backup")
     loader = importlib.machinery.SourceFileLoader("agent_backup_projection", str(path))
@@ -547,7 +772,90 @@ def load_backup_module() -> ModuleType:
         loader.exec_module(module)
     except (OSError, ValueError) as error:
         raise BackupError("projection-unavailable") from error
+    # A Python environment (any folder with pyvenv.cfg) is rebuilt by whatever made it and never backed up: a skill's
+    # 623 MB .venv held a library over GitHub's file limit and stopped every nightly backup (Cash, 29.10.2026).
+    # agent-backup's own exclusions are pinned by Novsky's readiness manifest, so the rule lives here.
+    # Only outside the vault (its tracked files keep their old rule), and only a real marker file: a linked
+    # pyvenv.cfg must not hide a folder's own files (Codex review).
+    listed = module.is_excluded
+    home = module.HOME
+
+    def environment_marker(folder: Path) -> bool:
+        try:
+            return stat.S_ISREG((home / folder / "pyvenv.cfg").lstat().st_mode)
+        except OSError:
+            return False
+
+    def is_excluded(relative: Path) -> bool:
+        if listed(relative):
+            return True
+        if relative.parts[:1] == ("obsidian-vault",):
+            return False
+        return any(environment_marker(Path(*relative.parts[:depth])) for depth in range(1, len(relative.parts)))
+
+    module.is_excluded = is_excluded
+    read_safe_file = module.read_safe_file
+
+    def read_masked(source: Path, archive_name: str) -> tuple[bytes, int]:
+        if archive_name != SETTINGS_NAME:
+            return read_safe_file(source, archive_name)
+        check = module.contains_secret
+        module.contains_secret = lambda _data: False  # the masked bytes are checked right below
+        try:
+            data, mode = read_safe_file(source, archive_name)
+        finally:
+            module.contains_secret = check
+        data = masked_settings(data, module.SECRET_PATTERNS)
+        if check(data):
+            raise ValueError(f"secret-like content detected: {archive_name}")
+        return data, mode
+
+    module.read_safe_file = read_masked
+    selected_payload = module.selected_payload
+
+    def with_own_work(*, include_vault: bool) -> list[tuple[str, bytes, int]]:
+        payload = selected_payload(include_vault=include_vault)
+        if not include_vault:  # create_projection; the ZIP archive keeps its fixed list
+            payload += own_work_payload(module, {name for name, _, _ in payload})
+        return payload
+
+    module.selected_payload = with_own_work
     return module
+
+
+# settings.json env holds a process's credentials under any vendor's name (FAL_KEY, a custom token, a password inside a
+# database URL), which agent-backup's patterns do not know, so the value went to the GitHub copy (audit 20.10.2026; the
+# fix 31fc079c was lost in the V2 switch of 29.10, partner report 31.10). agent-backup masks them again since 01.11.2026
+# (its released bytes of 20.10, which Novsky's readiness manifest already accepts); this copy keeps its own masking for
+# an agent whose agent-backup stayed older. restore-agent-backup puts the live value back.
+SETTINGS_NAME = "home/.claude/settings.json"
+REDACTED = "[REDACTED]"
+CREDENTIAL_ENV_NAME = re.compile(
+    r"(?:^|_)(?:API_?KEY|KEY|TOKEN|SECRET|PASSWORD|PASSWD|PASSPHRASE|PAT|COOKIES?|CREDENTIALS?)(?:_|$)"
+    r"|(?:TOKEN|SECRET|PASSWORD|APIKEY)$"
+)
+URL_LOGIN = re.compile(rb"[A-Za-z][A-Za-z0-9+.-]*://[^\s/:@]+:[^\s/@]+@")
+
+
+def masked_settings(data: bytes, patterns) -> bytes:
+    """settings.json with each credential-like env value as [REDACTED]; the same bytes when none is."""
+    try:
+        settings = json.loads(data)
+    except ValueError as error:
+        raise ValueError(f"unreadable JSON: {SETTINGS_NAME}") from error
+    env = settings.get("env") if isinstance(settings, dict) else None
+    if not isinstance(env, dict):
+        return data
+    masked = False
+    for name, value in env.items():
+        if value in ("", None, REDACTED):
+            continue
+        text = str(value).encode()
+        if (CREDENTIAL_ENV_NAME.search(name.upper().replace("-", "_"))
+                or URL_LOGIN.search(text) or any(pattern.search(text) for pattern in patterns)):
+            env[name] = REDACTED
+            masked = True
+    return (json.dumps(settings, ensure_ascii=False, indent=2) + "\n").encode() if masked else data
 
 
 def safe_vault_paths(backup: ModuleType) -> set[str]:
