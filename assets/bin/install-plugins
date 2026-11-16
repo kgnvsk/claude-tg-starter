@@ -6,13 +6,6 @@
 # Data-driven: читает settings.json, поэтому корректен для любого кита без правок.
 # Идемпотентно. Запускать ПОСЛЕ входа в Claude (Фаза 2), от пользователя claude.
 set -uo pipefail
-# --stale-only: just remove the managed plugins the policy no longer enables (update.sh's plugin policy migration).
-STALE_ONLY=0
-case "${1:-}" in
-  "") ;;
-  --stale-only) STALE_ONLY=1 ;;
-  *) echo "✗ невідомий параметр: $1" >&2; exit 2 ;;
-esac
 
 # The CLI unpacks the plugin tree with whatever umask it inherits, and Debian
 # gives an agent user 002 through pam_umask, so a plugin installed from here
@@ -195,19 +188,24 @@ raise SystemExit(0 if any(
 # (or past them) and exits before keeping the answer: the refresh token is spent, the next renewal is refused and
 # the login is wiped (kit #186). Near a live login's end, renew first through a run that waits for the answer
 # (a closed one-word model call), or stop before any plugin command; nothing to renew means nothing to spend.
-claude_login_state() {  # near: a live login in its last ten minutes; fresh: a live login beyond them; other
+claude_login_state() {  # fresh: a live login beyond its last ten minutes; wait: in them, before the CLI's own
+  # renewal window; near: inside that window (its last four and a half minutes) or past it; other: no live login
   python3 - "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/.credentials.json" <<'PY' 2>/dev/null || echo other
 import json, sys, time
 try:
     login = json.load(open(sys.argv[1], encoding="utf-8")).get("claudeAiOauth") or {}
     live = bool(login.get("accessToken") and login.get("refreshToken"))
-    near = int(login.get("expiresAt") or 0) <= (time.time() + 600) * 1000
+    left = int(login.get("expiresAt") or 0) / 1000 - time.time()
 except (OSError, ValueError, AttributeError, TypeError):
-    live = near = False
-print("near" if live and near else "fresh" if live else "other")
+    live, left = False, 0
+print("other" if not live else "fresh" if left > 600 else "wait" if left > 270 else "near")
 PY
 }
-if [ "$(claude_login_state)" = near ]; then
+# Claude CLI renews a login only in its last five minutes: a call before them renews nothing, so a login in its last
+# ten waits for that window first (Kristof, 15.11.2026: a call with 5-10 minutes left stopped an update).
+state=$(claude_login_state)
+for _ in $(seq 36); do [ "$state" = wait ] || break; sleep 10; state=$(claude_login_state); done
+if [ "$state" = near ] || [ "$state" = wait ]; then
   ATARAX_SUPPRESS_TELEGRAM=1 timeout 120 "$CLAUDE" -p --safe-mode --tools "" --no-session-persistence \
     --model haiku "Reply with OK" </dev/null >/dev/null 2>&1 || true
   # Only a live login renewed beyond its last ten minutes lets plugin commands run now; a renewal that wiped,
@@ -241,10 +239,6 @@ policy = json.load(open(sys.argv[1], encoding="utf-8"))
 for plugin in sorted(set(policy["managed"]) - set(policy["enabled"])):
     print(plugin)
 ' "$POLICY")
-if [ "$STALE_ONLY" = 1 ]; then
-  [ "$failures" -eq 0 ] || exit 1
-  exit 0
-fi
 
 echo "==> узгодження маркетплейсів (застарілий стан, керований комплектом)"
 while read -r marketplace; do

@@ -1,0 +1,21 @@
+This conversation is the working memory of an assistant that serves its owner and other people in several chats. After this summary the assistant gets back, from files on disk, the latest messages of its chats, its memory map and its list of open work - so do not spend the summary on retelling the latest messages. Spend it on what those files cannot give. Besides your usual sections the summary MUST contain the sections below, each under its own heading; none of them may be dropped or shortened to save space.
+
+## Agreements and decisions
+Every decision the owner made and every agreement reached with any person: the date, the chat or the person, and the exact terms (numbers, dates, names). Standing instructions given in this conversation ("always", "never", "from now on") word for word.
+
+## Open work and promises
+Everything that is not finished: tasks in progress and their state (what is done, what is next); what the assistant promised to anyone (to whom, what, by when); background helpers still running and what each was asked to do; follow-ups that were scheduled. Say for each item whether it is still open at the moment of this summary: the assistant's list of open work on disk is updated a few minutes later than the conversation, so where the two differ, this section is the newer one.
+
+## Questions waiting for an answer
+Questions the assistant asked the owner or another person that have no answer yet, and questions people asked that the assistant has not answered. Quote each question.
+
+## Corrections
+What the owner corrected or rejected in this conversation and what the right way is, so that the mistake is not repeated. Quote his words when they are short.
+
+## Exact identifiers
+Links, document and sheet ids, file paths, account names, phone numbers, e-mails, amounts, dates and times that the work depends on - exactly as written, never paraphrased and never shortened.
+
+## What was found out and where it is
+Results of research and checks that were expensive to obtain, each with its source; and where every produced file, document or note lives.
+
+Rules for all sections. Write in the language the owner uses. Name the chat or the person for every item that is not the owner's own, so that matters of different chats do not mix. A cancelled request is recorded as cancelled and is not carried forward as open. Never restate a guess as a fact: mark what was not verified as UNVERIFIED and give its basis. Do not include secrets, passwords, tokens or keys - say only where they are kept.

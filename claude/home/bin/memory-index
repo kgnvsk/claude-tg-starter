@@ -61,7 +61,7 @@ def exclusive_lock():
         yield
 
 
-def connect() -> sqlite3.Connection:
+def connect(thorough: bool = False) -> sqlite3.Connection:
     MEMORY_DIR.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(INDEX_DB, timeout=10)
     connection.row_factory = sqlite3.Row
@@ -69,7 +69,7 @@ def connect() -> sqlite3.Connection:
         "is_verified_frontmatter", 1, is_verified_frontmatter, deterministic=True
     )
     connection.executescript("PRAGMA journal_mode=WAL;\nPRAGMA synchronous=NORMAL;")
-    ensure_schema(connection)
+    ensure_schema(connection, thorough)
     try:
         os.chmod(INDEX_DB, 0o600)
     except OSError:
@@ -77,7 +77,7 @@ def connect() -> sqlite3.Connection:
     return connection
 
 
-def ensure_schema(connection: sqlite3.Connection) -> None:
+def ensure_schema(connection: sqlite3.Connection, thorough: bool = False) -> None:
     connection.executescript(
         """
         CREATE TABLE IF NOT EXISTS documents (
@@ -130,22 +130,54 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
     # while its whole current text is the one indexed (root's review of f50854f3).
     if "digest" not in {row[1] for row in connection.execute("PRAGMA table_info(documents)")}:
         connection.execute("ALTER TABLE documents ADD COLUMN digest TEXT")
-    if connection.execute("SELECT 1 FROM metadata WHERE key='index_format' AND value='passages'").fetchone():
+    if connection.execute("SELECT 1 FROM metadata WHERE key='index_format' AND value='passages'").fetchone() \
+            and passages_intact(connection, thorough):
         return
     # One FTS row per document becomes one per passage. A legacy vector of a whole short document is exactly its first
-    # passage's and stays; one that saw only a prefix is dropped, and the passages get their own. A note the old index
-    # cut at MAX_NOTE_CHARS is read whole on the next pass.
+    # passage's and stays; one that saw only a prefix is dropped, and the passages get their own. A later passage keeps
+    # its vector while its text is the same (only this index's own passages carry one). A source cut at MAX_NOTE_CHARS,
+    # of any kind, is read whole on its next pass.
+    kept: dict[str, dict[str, bytes]] = {}
+    for doc_id, digest, vector in connection.execute(
+            "SELECT doc_id, digest, vector FROM chunks WHERE ordinal > 0 AND model = ? AND vector IS NOT NULL",
+            (EMBED_MODEL,)):
+        kept.setdefault(doc_id, {})[digest] = vector
     connection.execute("DELETE FROM docs_fts")
     connection.execute("DELETE FROM chunks")
     connection.execute("DELETE FROM partial_sources")
-    for doc_id, source, title, body in connection.execute("SELECT doc_id, source, title, body FROM documents").fetchall():
+    for doc_id, title, body in connection.execute("SELECT doc_id, title, body FROM documents").fetchall():
         if len(title) > TITLE_EMBED_CHARS or len(body) > PASSAGE_CHARS:
             connection.execute("DELETE FROM embeddings WHERE doc_id=?", (doc_id,))
-        store_passages(connection, doc_id, title, body)
-        if source == "vault" and len(body) >= MAX_NOTE_CHARS:
+        store_passages(connection, doc_id, title, body, kept.get(doc_id))
+        if len(body) >= MAX_NOTE_CHARS:
             connection.execute("UPDATE documents SET fingerprint='' WHERE doc_id=?", (doc_id,))
     connection.execute("INSERT OR REPLACE INTO metadata(key, value) VALUES ('index_format', 'passages')")
     connection.commit()
+
+
+def passages_intact(connection: sqlite3.Connection, thorough: bool = False) -> bool:
+    """Every FTS row is one passage's, of the same document, and every passage has its row. The kit's memory-index of
+    29.10–01.11.2026 knew one FTS row per document and kept writing to indexes already in passages: its rows took rowids
+    new passages need (ST, 13.11.2026: «constraint failed» stopped an update) or sat at another document's passage, and
+    recall joined passages to wrong text. Such an index is rebuilt. Every connection reads the FTS5 content table's
+    rowids and doc_ids only (about 9 ms warm for 5 200 passages). An index pass (cron, install) also checks each row's
+    text against its passage's digest: a rewritten newest document takes its freed rowid back (Codex, review of
+    29323a7e), and only its text shows it."""
+    rows, wrong = connection.execute(
+        "SELECT count(*), coalesce(sum(c.chunk_id IS NULL OR f.c0 IS NOT c.doc_id), 0)"
+        " FROM docs_fts_content f LEFT JOIN chunks c ON c.chunk_id = f.id").fetchone()
+    if wrong or rows != connection.execute("SELECT count(*) FROM chunks").fetchone()[0]:
+        return False
+    if not thorough:
+        return True
+    connection.create_function(
+        "passage_digest", 2,
+        lambda title, passage: hashlib.sha256(embed_text(title or "", passage or "").encode()).hexdigest(),
+        deterministic=True)
+    return not connection.execute(
+        "SELECT 1 FROM docs_fts_content f JOIN chunks c ON c.chunk_id = f.id LEFT JOIN documents d ON d.doc_id = c.doc_id"
+        " WHERE d.doc_id IS NULL OR f.c1 IS NOT (CASE WHEN c.ordinal THEN '' ELSE d.title END)"
+        " OR c.digest IS NOT passage_digest(d.title, f.c2) LIMIT 1").fetchone()
 
 
 def opening_frontmatter(body: object) -> tuple[list[str], str | None]:
@@ -376,19 +408,31 @@ def read_vault_note(relative: Path, limit: int | None = MAX_NOTE_CHARS + 1) -> t
     here would let a workspace author turn indexing into a private-file read.
     O_NOFOLLOW on every component also closes a check-then-open rename race.
     """
+    return read_note_at(VAULT, relative, limit)
+
+
+def read_note_at(root: Path, relative: Path, limit: int | None,
+                 directory_identity: tuple[int, int] | None = None) -> tuple[os.stat_result, str]:
+    """The existing no-follow reader; private notes additionally pin their host-selected directory."""
     if relative.is_absolute() or ".." in relative.parts or relative.suffix != ".md":
         raise OSError("unsafe vault note path")
-    directory = os.open(VAULT, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
         for part in relative.parts[:-1]:
             child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
             os.close(directory)
             directory = child
+        if directory_identity is not None:
+            info = os.fstat(directory)
+            if (info.st_dev, info.st_ino) != directory_identity:
+                raise OSError("private memory workspace changed")
         descriptor = os.open(relative.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
-        with os.fdopen(descriptor, "r", encoding="utf-8", errors="replace") as file:
+        with os.fdopen(descriptor, "r", encoding="utf-8", errors="strict" if directory_identity else "replace") as file:
             info = os.fstat(file.fileno())
             if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
                 raise OSError("vault note is not an unlinked regular file")
+            if directory_identity is not None and info.st_size > SOURCE_READ_LIMIT:
+                raise OSError("private memory source exceeds the existing source read limit")
             if limit is None:
                 # A reader of the whole note (memory-open pages) gets all of it, or a refusal that names its size.
                 # The size is checked again on what is read: a note that grows after fstat cannot pass the ceiling (Codex).
@@ -397,7 +441,13 @@ def read_vault_note(relative: Path, limit: int | None = MAX_NOTE_CHARS + 1) -> t
                     raise ValueError(f"this note is over {SOURCE_READ_LIMIT} bytes, more than memory-open reads; open it with a file tool")
                 return info, body
             # One extra character distinguishes a complete note from a cached prefix.
-            return info, file.read(limit)
+            body = file.read(limit)
+            if directory_identity is not None:
+                after = os.fstat(file.fileno())
+                if (info.st_size, info.st_mtime_ns, info.st_ctime_ns, info.st_nlink) != (
+                        after.st_size, after.st_mtime_ns, after.st_ctime_ns, after.st_nlink):
+                    raise OSError("private memory source changed")
+            return info, body
     finally:
         os.close(directory)
 
@@ -593,7 +643,7 @@ def without_vectors(connection: sqlite3.Connection, scope_sql: str = "1", scope_
     ).fetchone()[0]
 
 
-def embed_missing(connection: sqlite3.Connection, budget: int) -> int:
+def embed_missing(connection: sqlite3.Connection, budget: int, doc_ids: list[str] | None = None) -> int:
     """Give a vector to passages that lack one, a request at a time.
 
     Each answered request is stored at once: a failed one leaves its passages, and the rest, to the next run instead
@@ -603,8 +653,11 @@ def embed_missing(connection: sqlite3.Connection, budget: int) -> int:
         return 0
     # A model change invalidates old vectors: comparing across models silently
     # degrades the ranking while everything still looks healthy.
-    connection.execute("DELETE FROM embeddings WHERE model != ?", (EMBED_MODEL,))
-    connection.execute("UPDATE chunks SET model=NULL, vector=NULL WHERE model IS NOT NULL AND model != ?", (EMBED_MODEL,))
+    selected = None if doc_ids is None else json.dumps(doc_ids)
+    connection.execute("DELETE FROM embeddings WHERE model != ? AND (? IS NULL OR doc_id IN (SELECT value FROM json_each(?)))",
+                       (EMBED_MODEL, selected, selected))
+    connection.execute("UPDATE chunks SET model=NULL, vector=NULL WHERE model IS NOT NULL AND model != ? "
+                       "AND (? IS NULL OR doc_id IN (SELECT value FROM json_each(?)))", (EMBED_MODEL, selected, selected))
     rows = connection.execute(
         """
         SELECT c.chunk_id, c.doc_id, c.ordinal, d.title, f.body
@@ -612,11 +665,13 @@ def embed_missing(connection: sqlite3.Connection, budget: int) -> int:
         JOIN documents d ON d.doc_id = c.doc_id
         JOIN docs_fts f ON f.rowid = c.chunk_id
         LEFT JOIN embeddings e ON e.doc_id = c.doc_id AND e.model = ?
-        WHERE CASE WHEN c.ordinal THEN c.vector IS NULL ELSE e.doc_id IS NULL END
+        WHERE (CASE WHEN c.ordinal THEN c.vector IS NULL ELSE e.doc_id IS NULL END)
+          AND (? IS NULL OR c.doc_id IN (SELECT value FROM json_each(?)))
+          AND (d.source != 'private-workspace' OR ? IS NOT NULL)
         ORDER BY c.ordinal > 0, c.chunk_id  -- every document's first passage before any tail
         LIMIT ?
         """,
-        (EMBED_MODEL, budget),
+        (EMBED_MODEL, selected, selected, selected, budget),
     ).fetchall()
     done = 0
     for batch in embed_batches([embed_text(row["title"], row["body"]) for row in rows]):
@@ -646,13 +701,18 @@ def vector_ranking(
     scope_args: list[object],
     top: int = 40,
     passages: dict[str, int | None] | None = None,
+    evidence: dict | None = None,
 ) -> list[str]:
     """doc_ids by meaning, the closest passage of each first. Empty when embeddings are unavailable.
 
     passages, when given, receives each returned document's closest passage (chunk_id).
     """
+    if evidence is not None:
+        evidence["queryEmbedding"] = "disabled"
     if not openai_keys():
         return []
+    if evidence is not None:
+        evidence["queryEmbedding"] = "unavailable"
     try:
         import numpy
     except ImportError:
@@ -660,6 +720,8 @@ def vector_ranking(
     embedded = embed_texts([query])
     if not embedded:
         return []
+    if evidence is not None:
+        evidence.update(queryEmbedding="success", model=EMBED_MODEL, dimensions=len(embedded[0]))
     rows = connection.execute(
         f"""
         SELECT e.doc_id AS doc_id, c.chunk_id AS chunk_id, e.vector AS vector FROM embeddings e
@@ -961,6 +1023,10 @@ def search(
     max_chars: int,
     corporate_key: str | None = None,
     before_message_id: int | None = None,
+    *,
+    selected_doc_ids: list[str] | None = None,
+    evidence: dict | None = None,
+    source_current=None,
 ) -> str:
     exact_expression, widened_expression = fts_queries(query)
     # A missing chat identity cannot prove an owner context. Shared groups and
@@ -971,7 +1037,11 @@ def search(
     current_chat_scope = ""
     current_chat_prefix = ""
     scope_args: list[object] = []
-    if corporate_key is not None:
+    if selected_doc_ids is not None:
+        # Only a trusted host selection uses this branch; no owner/company union.
+        scope_sql = "d.doc_id IN (SELECT value FROM json_each(?))"
+        scope_args = [json.dumps(selected_doc_ids)]
+    elif corporate_key is not None:
         scope_sql = "(d.scope='company-shared' OR d.scope=?)"
         scope_args = [f"conversation:{corporate_key}"]
         # Only canonical user/group identities can own an unthreaded legacy scope.
@@ -1031,7 +1101,7 @@ def search(
     pools = [connection.execute(
         f"""
         SELECT m.doc_id AS doc_id, d.source, d.scope, d.path, d.title, d.body, d.digest,
-               c.start, c.line, p.indexed, p.size, m.excerpt, m.score,
+               c.chunk_id, c.digest AS passage_digest, c.start, c.line, p.indexed, p.size, m.excerpt, m.score,
                CASE
                    WHEN d.source='telegram'
                         AND substr(d.body, 1, 5)='[out ' THEN 0.5
@@ -1075,7 +1145,8 @@ def search(
     for row in rows:
         by_id.setdefault(row["doc_id"], row)
     nearest: dict[str, int | None] = {}
-    closest = vector_ranking(connection, query, scope_sql, scope_args, top=400, passages=nearest)
+    closest = vector_ranking(connection, query, scope_sql, scope_args, top=400, passages=nearest,
+                             **({"evidence": evidence} if evidence is not None else {}))
     sources = {}
     for start in range(0, len(closest), 200):
         part = closest[start:start + 200]
@@ -1090,7 +1161,7 @@ def search(
             continue
         found = connection.execute(
             "SELECT d.doc_id, d.source, d.scope, d.path, d.title, d.body, d.digest, coalesce(c.start, 0) AS start,"
-            " coalesce(c.line, 1) AS line, p.indexed, p.size, substr(coalesce(f.body, d.body), 1, 200) AS excerpt"
+            " coalesce(c.line, 1) AS line, c.chunk_id, c.digest AS passage_digest, p.indexed, p.size, substr(coalesce(f.body, d.body), 1, 200) AS excerpt"
             " FROM documents d LEFT JOIN chunks c ON c.chunk_id = ? LEFT JOIN docs_fts f ON f.rowid = c.chunk_id"
             " LEFT JOIN partial_sources p ON p.doc_id = d.doc_id WHERE d.doc_id=?",
             (nearest.get(doc_id), doc_id),
@@ -1101,6 +1172,9 @@ def search(
     # A stale index or vector must not resurrect an edited/retired/deleted solution.
     solution_dates = {}
     for doc_id, row in list(by_id.items()):
+        if source_current is not None and not source_current(row):
+            del by_id[doc_id]
+            continue
         if row["source"] != "vault":
             continue
         try:
@@ -1127,6 +1201,12 @@ def search(
                       + [[doc_id for doc_id in pool if doc_id in by_id] for pool in semantic_pools], limit,
                       {row["doc_id"]: (row["doc_id"] not in exact_ids, row["score"] * row["trust_weight"]) for row in rows})
     ordered = [by_id[doc_id] for doc_id in chosen if doc_id in by_id]
+    if selected_doc_ids is not None:
+        # The isolated worker cannot open the owner's memory helper. Supply the whole selected passage,
+        # still through the existing whole-result output budget, rather than its first 200 characters.
+        ordered = [{**dict(row), "excerpt": connection.execute(
+            "SELECT body FROM docs_fts WHERE rowid=?", (row["chunk_id"],),
+        ).fetchone()[0]} for row in ordered]
 
     # Root's review of f50854f3: a search that found nothing, or not that source, still says what it could not search,
     # within the same scope: a source past the index's end, and passages still waiting for a vector.
@@ -1183,7 +1263,92 @@ def search(
     rendered = "\n".join([*lines, *kept, *more(len(items) - len(kept)), *notes, closing]) + "\n"
     if units(rendered) > max_chars:  # not even the list of what was found fits: refused, never sent longer
         raise ValueError(f"--max-chars {max_chars} is too small for the result list of this query")
+    if evidence is not None:
+        keyword_ids = {row["doc_id"] for pool in pools for row in pool}
+        evidence["matches"] = [{"docId": row["doc_id"], "sourceDigest": row["digest"],
+                                "chunkId": row["chunk_id"], "passageDigest": row["passage_digest"],
+                                "semanticChunkId": nearest.get(row["doc_id"]), "start": row["start"],
+                                "semantic": row["doc_id"] in closest, "keyword": row["doc_id"] in keyword_ids}
+                               for row in ordered[:len(kept)]]
     return rendered
+
+
+def search_private(connection: sqlite3.Connection, request: object) -> dict:
+    """Host-only direct-chat selection. The host owns admission, epoch and message-cutoff checks."""
+    if (not isinstance(request, dict) or set(request) != {"version", "query", "chatId", "documentIds", "workspace"}
+            or request["version"] != 1 or not isinstance(request["query"], str) or not request["query"].strip()
+            or not isinstance(request["chatId"], str) or not re.fullmatch(r"[1-9][0-9]*", request["chatId"])
+            or not isinstance(request["documentIds"], list) or len(request["documentIds"]) > MAX_TELEGRAM_ROWS):
+        raise ValueError("invalid private memory selection")
+    chat = request["chatId"]
+    if any(not isinstance(value, str) or not re.fullmatch(r"telegram:" + chat + r":[1-9][0-9]*", value)
+           for value in request["documentIds"]):
+        raise ValueError("invalid private memory source")
+    selected = [row[0] for row in connection.execute(
+        "SELECT doc_id FROM documents WHERE source='telegram' AND scope=? "
+        "AND doc_id IN (SELECT value FROM json_each(?))",
+        (f"conversation:user:{chat}", json.dumps(request["documentIds"])),
+    )]
+    evidence = {"queryEmbedding": "disabled", "matches": [], "telegramIndexLatestRows": MAX_TELEGRAM_ROWS,
+                "selectedIndexedMessages": len(selected), "workspaceNote": "absent"}
+    workspace = request["workspace"]
+    note_id = None
+    note_digest = None
+    note_source = None
+    if workspace is not None:
+        if (not isinstance(workspace, dict) or set(workspace) != {"name", "device", "inode"}
+                or not isinstance(workspace["name"], str) or not re.fullmatch(r"[a-f0-9]{64}", workspace["name"])
+                or any(not isinstance(workspace[key], str) or not re.fullmatch(r"[0-9]{1,30}", workspace[key])
+                       for key in ("device", "inode"))):
+            raise ValueError("invalid private memory workspace")
+
+        def read_note():
+            return read_note_at(HOME, Path("corporate-workspaces") / workspace["name"] / "MEMORY.md",
+                                INDEX_CHARS + 1, (int(workspace["device"]), int(workspace["inode"])))
+
+        try:
+            info, body = read_note()
+            note_id = f"private-workspace:{workspace['name']}:MEMORY.md"
+            indexed = body[:INDEX_CHARS]
+            note_digest = hashlib.sha256(body.encode()).hexdigest()
+            upsert_document(connection, doc_id=note_id, source="private-workspace",
+                            scope=f"private-workspace:{workspace['name']}", path="MEMORY.md", title="MEMORY.md",
+                            body=indexed, fingerprint=f"{note_digest}:{info.st_size}",
+                            size=info.st_size if len(body) > INDEX_CHARS else None)
+            connection.commit()
+            selected.append(note_id)
+            evidence["workspaceNote"] = "indexed"
+            try:
+                embed_missing(connection, 400, [note_id])
+            except (ValueError, TypeError, KeyError, OverflowError):
+                evidence["workspaceNote"] = "embedding-unavailable"
+        except (OSError, UnicodeError):
+            evidence["workspaceNote"] = "unavailable"
+
+    def current(row):
+        nonlocal note_source
+        if row["doc_id"] != note_id:
+            return True
+        try:
+            info, body = read_note()
+            if hashlib.sha256(body.encode()).hexdigest() == note_digest:
+                # From the very descriptor read, not a later pathname stat. Never put note text in the receipt.
+                note_source = {"docId": note_id, "device": str(info.st_dev), "inode": str(info.st_ino),
+                               "size": str(info.st_size), "mtimeNs": str(info.st_mtime_ns), "ctimeNs": str(info.st_ctime_ns),
+                               "sha256": row["digest"], "characters": min(len(body), INDEX_CHARS)}
+                return True
+        except (OSError, UnicodeError):
+            pass
+        evidence["workspaceNote"] = "changed"
+        return False
+
+    if not selected:
+        evidence["queryEmbedding"] = "not-needed"
+        return {"text": "[memory-search] no indexed sources in this private selection\n", "evidence": evidence}
+    text = search(connection, request["query"], None, 6, 6000, selected_doc_ids=selected,
+                  evidence=evidence, source_current=current)
+    return {"text": text, "evidence": evidence,
+            "noteSource": note_source if any(item["docId"] == note_id for item in evidence["matches"]) else None}
 
 
 def units(text: str) -> int:
@@ -1443,13 +1608,14 @@ def parser() -> argparse.ArgumentParser:
     get_command.add_argument("--max-chars", type=source_output_limit, default=6000)
     get_command.add_argument("--offset", type=int, default=0)
     sub.add_parser("doctor")
+    sub.add_parser("private-search", help="internal host-selected direct-chat recall (JSON on stdin)")
     return result
 
 
 def main() -> None:
     args = parser().parse_args()
     with exclusive_lock():
-        connection = connect()
+        connection = connect(thorough=args.command == "index")
         try:
             if args.command == "index":
                 print(
@@ -1458,6 +1624,11 @@ def main() -> None:
                         sort_keys=True,
                     )
                 )
+            elif args.command == "private-search":
+                raw = sys.stdin.read(SOURCE_READ_LIMIT + 1)
+                if len(raw) > SOURCE_READ_LIMIT:
+                    raise ValueError("private memory selection is too large")
+                print(json.dumps(search_private(connection, json.loads(raw)), sort_keys=True))
             elif args.command == "search":
                 if not args.no_refresh:
                     index_all(connection)

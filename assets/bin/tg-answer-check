@@ -1,0 +1,795 @@
+#!/usr/bin/env python3
+"""tg-answer-check: PreToolUse hook on the Telegram reply and edit_message tools. A reply whose words claim what this
+turn did not do goes back to the agent once, with what to do; every other reply is sent untouched.
+
+Product owner, 13.11.2026: «не перепроверяет… ой, могу, ой, не могу, ой, да, ты прав, я не сделал. Или ой, не
+запустилось, ой, да, я не проверил. Вот этого всего не должно быть»; «агент не должен сдаваться… должен проверить, если
+не получается — починить, подключить, настроить и вернуться». The kit's version of four checks proven since that night
+on two live agents (their own reply-send-lock):
+
+  done    «зробив / сделал / I've fixed…», and neither this turn nor the 10 minutes before the request took any action;
+  launch  «запустив / запустил / is running…» after a start (a background Agent or command, nohup or &, reminder-task,
+          crontab) that nothing read afterwards: no process, log or task list looked at, no helper's report;
+  giveup  «не можу / не могу / I can't / не вийшло…» with no attempt since the request (nor in the 10 minutes before
+          it), or after one or two tries by one route with no look at the error, no repair and no second route; and
+          «у мене немає X — підключи / надішли» with no attempt and no exact step (a link or a command);
+  lock    a newer message from the same person waits in the receiver's queue: the reply goes back with it, once.
+
+Claims are matched in Ukrainian, Russian and English whatever the agent's language; the reply that goes back is in the
+owner's notice language (agent_notice_locale.py, Ukrainian by default) and says whose request it is: the owner's, or
+another person's in the chat (from the receiver's record). Never held: replies under MIN_CHARS, «🔄» acknowledgements,
+quotes, questions, conditions, negations, «you did», a time named («вчора», «at 14:20»), a refusal that a rule or a
+guard requires, a person-only step named after checking the connection, a turn with a helper's report. The three text
+checks hold one request once between them (the request: its sender's latest message in this chat or topic); the lock
+shows each queued message once and holds one reply at most MAX_HOLDS times in HOLD_WINDOW. A hold is given only after
+it is on record, so the same reply never comes back twice for one reason. Any error lets the reply through.
+
+~/.local/state/tg-answer-check: OFF switches the hook off; NO-DONE-CHECK, NO-LAUNCH-CHECK, NO-GIVEUP-CHECK and
+NO-SEND-LOCK one check each, without a restart. log.jsonl keeps decisions and their reasons, never text.
+
+Not here: an agent whose own reply-send-lock is hooked keeps it, and this hook stays silent (one mechanism, not two
+holds); a subagent's reply passes (its turn is not in the main session record); company sessions have no reply tool,
+the host delivers their answer, so this hook never sees them.
+"""
+import calendar
+import contextlib
+import fcntl
+import hashlib
+import importlib.util
+import json
+import os
+import re
+import sqlite3
+import sys
+import time
+from pathlib import Path
+
+HOME = Path(os.environ.get("AGENT_ROOT") or Path.home())
+CONFIG = Path(os.environ.get("CLAUDE_CONFIG_DIR") or HOME / ".claude")
+TELEGRAM_STATE = Path(os.environ.get("TELEGRAM_STATE_DIR") or CONFIG / "channels" / "telegram")
+DB = TELEGRAM_STATE / "messages.db"
+STATE = HOME / ".local" / "state" / "tg-answer-check"
+OFF, LOG, SAVED = STATE / "OFF", STATE / "log.jsonl", STATE / "state.json"
+SWITCH = {"done": "NO-DONE-CHECK", "launch": "NO-LAUNCH-CHECK", "giveup": "NO-GIVEUP-CHECK", "lock": "NO-SEND-LOCK"}
+TOOLS = "mcp__plugin_telegram_telegram__"
+MIN_CHARS = 80  # a shorter reply is conversation and is never held
+ACK = "\U0001F504"  # «🔄 Прийняв: …», the kit's acknowledgement
+PREV_SECONDS = 600  # what the agent did this long before the request counts for it (the texts say «10 minutes»)
+TAIL = 8_000_000  # how much of the session record's end is read
+KEEP_SECONDS = 2 * 86400
+MAX_HOLDS, HOLD_WINDOW = 3, 600
+BOOK_TOOLS = {"ToolSearch", "TodoWrite", "TaskCreate", "TaskUpdate", "TaskList", "TaskGet"}
+READ_TOOLS = {"Read", "Grep", "Glob", "BashOutput", "TaskOutput", "Monitor"}
+INTERPRETERS = {"python3", "python", "bash", "sh", "node", "timeout", "nice", "env", "exec", "sudo", "cd", "export"}
+
+W = r"[\w'’-]+"
+GAP = rf"(?:{W}\s+){{0,2}}?"
+DONE_CLAIM = re.compile(
+    # Russian: «сделал(а)», «сделано»
+    r"(?<![\w-])(?:(?:сделал|настроил|поставил|добавил|обновил|исправил|починил|записал|сохранил|создал|подключил|включил"
+    r"|выключил|убрал|удалил|перепроверил|проверил|отправил|опубликовал|выложил|разослал|оплатил|запустил|установил)"
+    r"(?:а|о|и)?"
+    r"|(?:сделан|настроен|поставлен|добавлен|обновл[её]н|исправлен|починен|записан|сохран[её]н|создан|подключ[её]н"
+    r"|включ[её]н|выключ[её]н|убран|удал[её]н|перепроверен|проверен|отправлен|опубликован|выложен|разослан|оплачен"
+    r"|запущен|установлен)[аоы]?"
+    # Ukrainian: «зробив / зробила / зробили», «зроблено»
+    r"|(?:зроби|налаштува|постави|дода|онови|виправи|полагоди|записа|створи|підключи|увімкну|ввімкну|вимкну|прибра"
+    r"|видали|перевіри|надісла|відправи|опублікува|розісла|оплати|запусти|встанови)(?:в|ла|ло|ли)|зберіг|зберегл[аои]"
+    r"|(?:зроблен|налаштован|поставлен|додан|оновлен|виправлен|полагоджен|записан|збережен|створен|підключен|увімкнен"
+    r"|ввімкнен|вимкнен|прибран|видален|перевірен|надіслан|відправлен|опублікован|розіслан|оплачен|запущен|встановлен)"
+    r"(?:о|ий|а|е|і))(?![\w-])"
+    # English: «I've fixed», «it is fixed», «Done.»
+    r"|\bI(?:'ve|’ve|\s+have)?\s+(?:just\s+|now\s+|already\s+)?(?:done\s+it|did\s+it|fixed|set\s+up|configured|added"
+    r"|updated|created|saved|connected|enabled|disabled|removed|deleted|checked|verified|double-checked|sent|published"
+    r"|posted|paid|installed|started|launched)\b"
+    r"|\b(?:is|are|was|were|has\s+been|have\s+been)\s+(?:now\s+|already\s+)?(?:done|fixed|set\s+up|configured|added"
+    r"|updated|created|saved|connected|enabled|disabled|removed|deleted|checked|verified|sent|published|posted|paid"
+    r"|installed)\b"
+    r"|^\s*(?:done|fixed|sent)\b(?=\s*[.!:—-])", re.I | re.M)
+RUNNABLE = (r"(?:сторож|задач|завданн|рендер|поиск|пошук|прог[оі]н|процесс?|проверк|перевірк|монтаж|сборк|збірк|выгрузк"
+            r"|вивантаж|скрипт|программ|програм|напоминани|нагадуван|рассылк|розсилк|помощник|помічник|воркер|таймер)\w*")
+RUNS = r"(?:работа[ею]т|ид[её]т|идут|крутится|працю[єю]|працюють|йде|іде|йдуть|ідуть|крутиться)"
+LAUNCH_CLAIM = re.compile(
+    r"(?<![\w-])(?:запустил\w*|запусти(?:в|ла|ли)|запущен\w*"
+    rf"|поставил\w*\s+{GAP}{RUNNABLE}|постави(?:в|ла|ли)\s+{GAP}{RUNNABLE}"
+    rf"|поставлен\w*\s+{GAP}(?:в|на|у)\s+(?:расписани|розклад|cron|крон|очеред|черг)\w*"
+    rf"|{RUNNABLE}\s+{GAP}(?:{RUNS}|запущен\w*|сто[ия]т|сто[їя]ть)(?![\w-])"
+    rf"|{RUNS}\s+(?:{W}\s+)?{RUNNABLE})"
+    r"|\bI(?:'ve|’ve|\s+have)?\s+(?:just\s+|now\s+)?(?:started|launched|kicked\s+off|scheduled|queued|restarted|resumed)\b"
+    r"|\b(?:is|are)\s+(?:now\s+|still\s+)?(?:running|in\s+progress|under\s*way|scheduled|queued)\b"
+    r"|\b(?:running|working)\s+in\s+the\s+background\b", re.I)
+ACTS = (r"(?:открыть|зайти|войти|скачать|выгрузить|отправить|опубликовать|сделать|проверить|достать|получить|загрузить"
+        r"|прочитать|посмотреть|остановить|запустить|поставить|найти|подключить|відкрити|увійти|завантажити|скачати"
+        r"|вивантажити|надіслати|відправити|опублікувати|зробити|перевірити|дістати|отримати|прочитати|подивитися"
+        r"|зупинити|запустити|поставити|знайти|підключити)")
+KNOWING = (r"(?:сказать|судить|гарантир\w*|утвержд\w*|обеща\w*|знать|понять|оценить|подтверд\w*|точно|не|сказати|судити"
+           r"|гарантува\w*|стверджува\w*|обіця\w*|знати|зрозуміти|оцінити|підтверди\w*)")
+NOT_A_FAILURE = (r"(?:смысла|проблем|причин|необходимост|разниц|риск|повод|сенсу|потреби|різниц|ризик|привод"
+                 r"|ничего\s+страшн|ничего\s+плох|нічого\s+страшн|нічого\s+поган)")
+CANT_CLAIM = re.compile(
+    rf"(?<![\w-])(?:не\s+с?могу(?![\w-])(?!\s+(?:[\w-]+\s+)?{KNOWING}(?![\w-]))"
+    rf"|не\s+з?можу(?![\w-])(?!\s+(?:[\w-]+\s+)?{KNOWING}(?![\w-]))"
+    rf"|(?:у\s+меня|мне)\s+{GAP}нет\s+(?:доступа|входа|прав|возможности|логина|пароля)|нет\s+у\s+меня\s+(?:доступа|входа|прав)"
+    rf"|(?:[ув]\s+мене|мені)\s+{GAP}(?:немає|нема)\s+(?:доступу|входу|прав|можливості|логіна|пароля)"
+    r"|(?:немає|нема)\s+[ув]\s+мене\s+(?:доступу|входу|прав)"
+    r"|(?:доступа|входа|прав)\s+(?:[\w-]+\s+){0,3}?у\s+меня\s+нет(?![\w-])"
+    r"|(?:доступу|входу|прав)\s+(?:[\w-]+\s+){0,3}?[ув]\s+мене\s+(?:немає|нема)(?![\w-])"
+    r"|(?:^|(?<=[.!?:;]))\s*(?:нет|немає|нема)\s+(?:доступа|входа|доступу|входу)(?![\w-])"
+    rf"|(?:у\s+меня|мне)\s+не\s+получ(?:ится|ается)|не\s+получ(?:ится|ается)\s+{ACTS}|{ACTS}\s+{GAP}не\s+получ(?:ится|ается)"
+    rf"|(?:[ув]\s+мене|мені)\s+не\s+(?:вийде|виходить)|не\s+(?:вийде|виходить)\s+{ACTS}|{ACTS}\s+{GAP}не\s+(?:вийде|виходить)"
+    r"|в\s+этой\s+сессии\s+(?:нет|не)(?![\w-])|в\s+цій\s+сесії\s+(?:немає|нема|не)(?![\w-])"
+    rf"|отсюда\s+{GAP}не\s+(?:могу|вижу|достать)|звідси\s+{GAP}не\s+(?:можу|бачу|дістати)"
+    r"|напиши(?:те)?\s+(?:мне\s+|мені\s+)?(?:в|у)\s+(?:личк|особист|приват)\w*|временно\s+недоступ\w*|тимчасово\s+недоступ\w*"
+    r"|не\s+получилось|не\s+удал[ао]сь|не\s+смог(?:ла|ли)?(?![\w-])|не\s+сработал[аои]?(?![\w-])"
+    r"|не\s+вийшло|не\s+вдал[ао]ся|не\s+зміг(?![\w-])|не\s+змогл[аи](?![\w-])|не\s+спрацюва(?:в|ла|ло|ли)(?![\w-])"
+    rf"|не\s+(?:видно|вижу|бачу)(?![\w-])(?!\s+(?:[\w-]+\s+)?{NOT_A_FAILURE}))"
+    r"|\bI\s+(?:can(?:no|'|’)t|can\s+not|am\s+unable\s+to|'m\s+unable\s+to|couldn(?:'|’)t|could\s+not"
+    r"|wasn(?:'|’)t\s+able\s+to|was\s+unable\s+to|failed\s+to)\b"
+    r"(?!\s+(?:say|tell|guarantee|promise|confirm|know|judge|be\s+sure)\b)"
+    r"|\bI\s+(?:don(?:'|’)t|do\s+not)\s+(?:have\s+(?:access|a\s+login|permission|the\s+rights|rights|credentials)|see)\b"
+    r"|\b(?:it|this|that)\s+(?:didn(?:'|’)t|did\s+not|doesn(?:'|’)t|does\s+not)\s+work\b|\bno\s+access\s+(?:to|for)\b",
+    re.I | re.M)
+KNOWING_BEFORE = re.compile(r"(?:сказать|назвать|обещать|гарантировать|оценить|судить|утверждать|знать|сказати|назвати"
+                            r"|обіцяти|гарантувати|оцінити|судити|стверджувати|знати)\s+(?:[\w-]+\s+)?$", re.I)
+HEADING_BEFORE = re.compile(r"(?:^|[\s*_«(])(?:что|чего|що|чого|what)\s+$", re.I)
+OWNER_WORDS = r"(?:владел|власник|owner)"
+# OWNER stands for the words for the owner and the stem of OWNER_NAME (a refusal often names the owner: «особисте Олени»).
+RULE_REFUSAL = (
+    rf"личн\w*\s+{GAP}OWNER|особист\w*\s+{GAP}OWNER|(?:это|це)\s+не\s+OWNER|(?:только|лише|тільки)\s+{GAP}OWNER"
+    r"|OWNER\w*\s+(?:решает|вирішує)|(?:решает|вирішує)\s+OWNER|(?:передам|передаю)\s+OWNER"
+    r"|без\s+(?:его|её|твоего|вашего|його|її|твоєї|твого|вашої|вашого|OWNER\w*)\s+(?:[\w-]+\s+)?(?:согласи|разрешени|згод"
+    r"|дозвол|«да»|«так»)"
+    r"|капч|captcha|cloudflare|вы\s+человек|ви\s+людина|за\s+человека|за\s+людину|are\s+you\s+(?:a\s+)?human"
+    r"|verify\s+(?:that\s+)?you(?:'re|\s+are)\s+(?:a\s+)?human|проверк\w*\s+(?:на\s+)?(?:бот|робот|человек)"
+    r"|перевірк\w*\s+(?:на\s+)?(?:бот|робот|людин)|bot\s+check"
+    r"|пароль\w*\s+(?:[\w-]+\s+){0,3}?не\s+(?:присылай|пиши|отправляй|возьму|беру|надсилай|відправляй|візьму)"
+    r"|(?:don(?:'|’)t|do\s+not|never)\s+send\s+(?:me\s+)?(?:your\s+|the\s+|a\s+)?password"
+    r"|only\s+(?:the\s+)?owner|not\s+the\s+owner|the\s+owner(?:'s|’s)\s+(?:private|consent|permission|approval|decision)"
+    r"|without\s+(?:his|her|their|your|the\s+owner(?:'s|’s))\s+(?:consent|permission|approval)"
+    r"|нужны\s+права|потрібні\s+права|need\s+the\s+owner(?:'s|’s)\s+rights")
+GUARD_OUT = re.compile(r"Дію відхилено|Действие отклонено|потрібні права|нужны права|PreToolUse:\S+\s+hook\s+(?:error|blocked)"
+                       r"|blocked\s+by\s+(?:a\s+)?hook|denied\s+by\s+(?:a\s+)?hook|hook\s+(?:denied|blocked)", re.I)
+PERSON_STEP = re.compile(
+    r"(?<![\w-])(?:войд(?:и|ите)|войти\s+(?:в|по|под|через)|залогин\w*|авториз\w*|подтверд\w*\s+вход|оплати(?:те)?"
+    r"|код\w*\s+(?:из|подтвержд|в\s+sms|по\s+sms|з|в\s+смс|з\s+смс)|нужно\s+оплатить|токен\w*|app\s*secret"
+    r"|(?:api|секретн\w*|личн\w*|особист\w*)[\s-]+ключ\w*|ключ\w*\s+(?:api|доступа|приложения|доступу|застосунку)"
+    r"|разреш\w*\s+доступ|откро\w*\s+доступ|выда\w*\s+доступ|пригласи(?:те)?|увійд(?:и|іть)|увійти\s+(?:в|до|через|під)"
+    r"|підтверд\w*\s+вхід|оплат(?:и|іть)|потрібно\s+оплатити|дозвол\w*\s+доступ|відкри\w*\s+доступ|нада\w*\s+доступ"
+    r"|запроси(?:ть)?|sign\s+in|log\s*in|authori[sz]e|verification\s+code|one-time\s+code|pay(?:ment)?|top\s+up|token"
+    r"|api\s+key|grant\s+(?:me\s+)?access|invite)(?![\w-])", re.I)
+PUSHBACK = re.compile(
+    r"(?<![\w-])(?:подключи(?:те)?|настрой(?:те)?|дай(?:те)?\s+(?:мне\s+|мені\s+)?доступ\w*"
+    r"|откро(?:й|йте)\s+(?:мне\s+)?доступ\w*|выдай(?:те)?\s+(?:мне\s+)?доступ\w*|пришли(?:те)?|добавь(?:те)?\s+меня"
+    r"|подели(?:сь|тесь)\s+доступом|підключи(?:ть)?|налаштуй(?:те)?|відкрий(?:те)?\s+(?:мені\s+)?доступ\w*"
+    r"|надай(?:те)?\s+(?:мені\s+)?доступ\w*|надішли(?:ть)?|додай(?:те)?\s+мене|поділи(?:ся|ться)\s+доступом"
+    r"|connect\s+(?:it|your|the|me)|set\s+(?:it\s+)?up\s+for\s+me|give\s+me\s+access|grant\s+me\s+access"
+    r"|share\s+(?:the\s+)?access|send\s+me|add\s+me)(?![\w-])", re.I)
+MISSING = re.compile(
+    rf"(?<![\w-])(?:у\s+меня\s+нет|нет\s+у\s+меня|(?:твоего|твоей|твоих|вашего|вашей|ваших)\s+{GAP}(?:у\s+меня\s+)?нет"
+    r"|нет\s+(?:доступа|входа|подключения|твоего|твоей|твоих|вашего|вашей)|не\s+подключ\w*|не\s+настро\w*|не\s+вижу"
+    r"|не\s+видно|без\s+(?:доступа|подключения|входа|доступу|підключення|входу)|[ув]\s+мене\s+(?:немає|нема)"
+    rf"|(?:немає|нема)\s+[ув]\s+мене|(?:твого|твоєї|твоїх|вашого|вашої|ваших)\s+{GAP}(?:[ув]\s+мене\s+)?(?:немає|нема)"
+    r"|(?:немає|нема)\s+(?:доступу|входу|підключення|твого|твоєї|твоїх|вашого|вашої)|не\s+підключен\w*|не\s+налаштован\w*"
+    r"|не\s+бачу|I\s+(?:don(?:'|’)t|do\s+not)\s+have|no\s+access|not\s+(?:connected|set\s+up)|isn(?:'|’)t\s+(?:connected|set\s+up)"
+    r"|I\s+(?:can(?:'|’)t|cannot|don(?:'|’)t)\s+see|without\s+access)(?![\w-])", re.I)
+EXACT_STEP = re.compile(r"https?://\S+|`[^`\n]{3,}`")
+SHOW_ME = re.compile(
+    r"\s*(?:[\w'’-]+\s+){0,3}?(?:скрин\w*|скрін\w*|снимок|снимк\w*|знімок|знімк\w*|фото\w*|видео|відео|документ\w*"
+    r"|файл\w*|ссылк\w*|посилан\w*|номер\w*|адрес\w*|текст\w*|сообщени\w*|повідомлен\w*|голосов\w*|данные|дані"
+    r"|выписк\w*|виписк\w*|screenshot\w*|photo\w*|picture\w*|video\w*|document\w*|file\w*|link\w*|number\w*"
+    r"|address\w*|text\w*|message\w*|voice|data|statement\w*)", re.I)
+QUOTED = re.compile(r"«[^«»\n]*»|\"[^\"\n]*\"|“[^”\n]*”|„[^“”\n]*[“”]")
+CONDITION = re.compile(r"(?<![\w-])(?:если|якщо|if|unless)(?![\w-])", re.I)
+NEGATED = re.compile(r"(?:^|[\s(,])(?:не|ни|ні|not|never)\s+(?:[\w'’-]+\s+){0,2}$", re.I)
+ADDRESSED = re.compile(r"(?:^|[\s(,])(?:ты|вы|ти|ви|you|[ув]\s+(?:тебя|вас|него|не[её]|них|тебе|нього|неї))\s+"
+                       r"(?:[\w'’-]+\s+){0,2}$", re.I)
+EARLIER = re.compile(
+    r"(?<![\w-])(?:вчера|позавчера|раньше|ранее|прежде|недавно|на\s+днях|утром|дн[её]м|вечером|ночью|с\s+утра|тогда"
+    r"|в\s+прошл\w+\s+раз|на\s+прошл\w+\s+недел\w*|до\s+этого|ещ[её]\s+в|вчора|учора|позавчора|раніше|нещодавно|днями"
+    r"|вранці|зранку|вдень|ввечері|уночі|вночі|тоді|минулого\s+(?:разу|тижня)|до\s+цього|ще\s+в|yesterday|earlier"
+    r"|previously|recently|this\s+morning|last\s+(?:night|time|week)"
+    r"|\d+\s+(?:минут\w*|час\w*|дн\w+|недел\w+|хвилин\w*|годин\w*|тижн\w+|minutes?|hours?|days?|weeks?)"
+    r"\s+(?:назад|тому|ago))(?![\w-])|(?<!\d)\d{1,2}[:.]\d{2}(?!\d)", re.I)
+START_BG = re.compile(r"\bnohup\b|\bsetsid\b|\bdisown\b|\bsystemd-run\b|\bscreen\s+-\w*d|\btmux\s+new\S*\s[^\n]*-d\b"
+                      r"|(?<![&>|<\d])&(?![&>])")
+START_TASK = re.compile(r"\breminder-task\s+(?:one|repeat|sequence)\b|\|\s*crontab\s+-(?![\w-])|\bcrontab\s+(?!-)[^\s|;&]+")
+READ_CMD = re.compile(
+    r"(?<![\w-])(?:ps|pgrep|pidof|jobs|tail|head|cat|less|grep|egrep|rg|ls|stat|wc|du|find|file|ffprobe|test|journalctl)"
+    r"(?![\w-])|\[\s+-[efsd]\s|\bsystemctl\s+(?:status|is-active)\b|\breminder-task\s+(?:status|delivery-status)\b"
+    r"|\bcrontab\s+-l\b")
+STATUS_CMD = re.compile(r"(?<![\w-])(?:status|doctor|whoami|accounts?|check|ping|health|auth\s+(?:list|status)|--help|help|-h)"
+                        r"(?![\w-])|\bsystemctl\s+(?:status|is-active)\b|\bcurl\s+-\w*I\b", re.I)
+FIX_CMD = re.compile(r"(?<![\w-])(?:install|pip3?|npm|npx|apt(?:-get)?|brew|chmod|chown|mkdir|ln|cp|mv|tee|login|logout|auth"
+                     r"|connect|reconnect|relogin|refresh|enable|disable|restart|reset|repair|fix|setup|configure|config"
+                     r"|init|token)(?![\w-])|\bsed\s+-\w*i|\bset-\w+|(?<![<>&=-])\d?>\s*(?!/dev/null)[~/$\w]", re.I)
+CHAT_READ = re.compile(r"\b(?:transcribe-telegram|memory-search|memory-open)\b|messages\.db|channels/telegram/inbox")
+
+# The hold texts, Ukrainian here and Russian, Polish and English in agent_notice_locale.py (one table for the kit).
+HOLD = {
+    "done": ("answer.done",
+             "Перевірка відповіді, один раз на запит: відповідь ще не надіслана. Ти пишеш, що зроблено ({found}), але від "
+             "запиту і за 10 хвилин до нього ти нічого не робив і не перевіряв. Запит від: {who}. Перевір саму річ (файл, "
+             "задачу, сторінку, архів чату) і напиши, що бачиш; якщо це було раніше — напиши коли. Потім надішли відповідь "
+             "ще раз."),
+    "launch": ("answer.launch",
+               "Перевірка відповіді, один раз на запит: відповідь ще не надіслана. Ти пишеш: «{sentence}». У цьому ході ти "
+               "запустив {what}, але після запуску нічим не перевірив, що воно працює. Запит від: {who}. Подивись процес "
+               "(ps, pgrep), перші рядки його журналу чи виводу, задачу в списку (reminder-task status) або файл, який воно "
+               "має дати, і напиши побачений факт. Перевірити нічим — так і напиши: «не перевіряв». Потім надішли відповідь "
+               "ще раз."),
+    "cant": ("answer.cant",
+             "Перевірка відповіді, один раз на запит: відповідь ще не надіслана. Ти пишеш, що не можеш: «{sentence}». Від "
+             "запиту ти нічого не пробував. Запит від: {who}. Спробуй своїми засобами: свої програми (~/bin), браузер, свої "
+             "навички. Потім напиши, що саме не вийшло (що показав сайт чи програма) і що потрібно від людини. Якщо відмови "
+             "вимагає правило або охоронець — надішли відповідь ще раз як є."),
+    "giveup": ("answer.giveup",
+               "Перевірка відповіді, один раз на запит: відповідь ще не надіслана. Ти пишеш: «{sentence}». Одна невдала "
+               "спроба — це ще не «не можу». Подивись, чому не вийшло (що саме повернув інструмент), і спробуй полагодити "
+               "сам: перепідключити, налаштувати, взяти іншу свою програму чи інший шлях (браузер, навичку, помічника). "
+               "Потім зроби те, що просили, і коротко напиши, що було не так і що тепер працює. Якщо без людини справді "
+               "ніяк — назви один крок, потрібний від неї, і що ти вже перевірив сам. Запит від: {who}. Якщо відмови вимагає "
+               "правило або охоронець — надішли відповідь ще раз як є."),
+    "pushback": ("answer.pushback",
+                 "Перевірка відповіді, один раз на запит: відповідь ще не надіслана. Ти повертаєш роботу людині: "
+                 "«{sentence}» — і нічого не перевірив і не дав точного кроку. Запит від: {who}. Відмову, якої вимагає "
+                 "правило, залиш як є. А для того, що потрібно людині: подивись, які шляхи підключення в тебе є (свою "
+                 "навичку чи програму підключення цього сервісу, стан підключення), і або підключи сам, або дай один точний "
+                 "крок — посилання чи команду, яку ти щойно отримав, і що буде після нього. Потім надішли відповідь ще раз."),
+    "lock": ("answer.lock",
+             "Відповідь не надіслана: поки ти її готував, від цієї ж людини в цей чат прийшло нове (нижче повністю, по "
+             "черзі). Прочитай, врахуй і надішли відповідь заново. Ці повідомлення прийдуть тобі ще раз окремим запитом; "
+             "якщо нова відповідь їх уже покриває, закрий той запит одним коротким рядком."),
+}
+WHO = {"owner": ("answer.who.owner", "власник"),
+       "other": ("answer.who.other", "інша людина в цьому чаті, не власник"),
+       "unknown": ("answer.who.unknown", "не визначено")}
+_LOCALE = []
+
+
+def localized(key: str, ukrainian: str) -> str:
+    """The text in the owner's notice language (OWNER_NOTICE_LOCALE), as every kit notice; Ukrainian on any failure."""
+    try:
+        if not _LOCALE:
+            spec = importlib.util.spec_from_file_location("agent_notice_locale",
+                                                          Path(__file__).with_name("agent_notice_locale.py"))
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            _LOCALE.append(module)
+        return _LOCALE[0].notice_text(key, ukrainian, home=HOME)
+    except Exception:
+        return ukrainian
+
+
+def off(check: str) -> bool:
+    return (STATE / SWITCH[check]).exists()
+
+
+def log(record: dict) -> None:
+    try:
+        if LOG.exists() and LOG.stat().st_size > 2_000_000:
+            LOG.write_text("".join(LOG.read_text(encoding="utf-8").splitlines(True)[-4000:]), encoding="utf-8")
+        with LOG.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def own_lock(tool: str) -> bool:
+    """The agent's own reply-send-lock is present and hooked on this tool (two live agents, 13.11.2026): it already
+    checks these replies, and one answer held twice for one reason would be one hold too many. A tool its matcher
+    leaves out (an edit, when it watches replies only) is checked here."""
+    try:
+        settings = json.loads((CONFIG / "settings.json").read_text(encoding="utf-8"))
+        for group in (settings.get("hooks") or {}).get("PreToolUse") or []:
+            matcher = str(group.get("matcher") or "") if isinstance(group, dict) else ""
+            try:
+                if matcher not in ("", "*") and not re.fullmatch(matcher, tool):
+                    continue
+            except re.error:
+                continue
+            for hook in (group.get("hooks") or []) if isinstance(group, dict) else []:
+                for word in str(hook.get("command") or "").split() if isinstance(hook, dict) else []:
+                    path = Path(os.path.expanduser(word.strip("'\"")))
+                    if path.name == "reply-send-lock" and path.is_file():
+                        return True
+    except Exception:
+        return False
+    return False
+
+
+def owner_id() -> str:
+    """The owner's Telegram id: the agent profile first (as tg-format-enforcer), then the channel's .env."""
+    for path in (HOME / ".agent-profile.env", TELEGRAM_STATE / ".env"):
+        try:
+            for line in path.read_text(encoding="utf-8").splitlines():
+                if line.startswith("OWNER_CHAT_ID="):
+                    value = line.split("=", 1)[1].strip().strip("'\"")
+                    if value:
+                        return value
+        except (OSError, UnicodeError):
+            continue
+    return ""
+
+
+def owner_name_stem() -> str:
+    """OWNER_NAME's stem for a refusal that names the owner («це особисте Олени»); empty when there is none."""
+    try:
+        for line in (HOME / ".agent-profile.env").read_text(encoding="utf-8").splitlines():
+            if line.startswith("OWNER_NAME="):
+                words = line.split("=", 1)[1].strip().strip("'\"").split()
+                name = words[0] if words else ""
+                return re.escape(name[:-1] if len(name) > 4 and name[-1].lower() in "аяоaeiouй" else name) if len(name) >= 3 else ""
+    except (OSError, UnicodeError):
+        pass
+    return ""
+
+
+def same(a, b) -> bool:
+    return str(a if a is not None else "") == str(b if b is not None else "")
+
+
+def stamp(event: dict):
+    try:
+        return calendar.timegm(time.strptime(str(event.get("timestamp"))[:19], "%Y-%m-%dT%H:%M:%S"))
+    except (TypeError, ValueError):
+        return None
+
+
+def sentence(text: str, match) -> str:
+    """The whole sentence with the claim, on one line."""
+    starts = [x.end() for x in re.finditer(r"[.!?…](?=\s)|\n", text[:match.start()])]
+    end = re.search(r"[.!?…](?=\s|$)|\n", text[match.end():])
+    return " ".join(text[starts[-1] if starts else 0: match.end() + (end.end() if end else len(text))].split()).removesuffix(".")
+
+
+def claim_matches(rx, text: str, earlier_ok=False, negated_ok=False) -> list:
+    """Matches of rx that state something: not quoted, not in a question, not after «якщо / если / if»; «не …» before
+    the word (unless negated_ok) and «ти / ты / you …» drop it; earlier_ok: a time named in the sentence drops it too."""
+    plain = QUOTED.sub(lambda q: " " * len(q.group(0)), text)
+    found = []
+    for m in rx.finditer(plain):
+        start = max([x.end() for x in re.finditer(r"[.!?…](?=\s)|\n", plain[:m.start()])] or [0])
+        end = re.search(r"[.!?…](?=\s|$)|\n|$", plain[m.end():])
+        before, whole = plain[start:m.start()], plain[start:m.end() + end.end()]
+        if whole.rstrip().endswith("?") or CONDITION.search(before):
+            continue
+        if (not negated_ok and NEGATED.search(before)) or ADDRESSED.search(before):
+            continue
+        if earlier_ok and EARLIER.search(whole):
+            continue
+        found.append(m)
+    return found
+
+
+def by_rule(text: str, m) -> bool:
+    """A refusal a rule requires, in its own sentence or the next one: the owner's private things, owner-only changes,
+    a site's «are you human» check, never sending a password."""
+    end = re.search(r"[.!?…](?=\s|$)|\n", text[m.end():])
+    tail = text[m.end() + end.end():] if end else ""
+    nxt = re.search(r"[.!?…](?=\s|$)|\n|$", tail)
+    stem = owner_name_stem()
+    rule = RULE_REFUSAL.replace("OWNER", f"(?:{OWNER_WORDS[3:-1]}|{stem})" if stem else OWNER_WORDS)
+    return bool(re.search(rule, sentence(text, m) + " " + tail[: nxt.end() if nxt else len(tail)], re.I))
+
+
+def refusal(text: str):
+    """The first «не можу / I can't / не вийшло / не бачу» that no rule requires and that is not «can't say for sure»."""
+    for m in claim_matches(CANT_CLAIM, text, earlier_ok=True, negated_ok=True):
+        if (not by_rule(text, m) and not KNOWING_BEFORE.search(text[max(0, m.start() - 40):m.start()])
+                and not HEADING_BEFORE.search(text[max(0, m.start() - 12):m.start()])):
+            return m  # «*Що не вийшло:*» heads a list, it refuses nothing
+    return None
+
+
+def pushback(text: str):
+    """«У мене немає X / X не підключений» and «підключи / налаштуй / надішли» with no exact step (a link, a command):
+    the work goes back to the person. «Надішли скріншот / файл» asks to see their own thing and is not that."""
+    if not MISSING.search(text) or EXACT_STEP.search(text):
+        return None
+    plain = QUOTED.sub(lambda q: " " * len(q.group(0)), text)
+    for m in PUSHBACK.finditer(plain):
+        end = re.search(r"[.!?…](?=\s|$)|\n|$", plain[m.end():])
+        rest = plain[m.end():m.end() + end.end()]
+        if rest.rstrip().endswith("?") or by_rule(text, m) or SHOW_ME.match(rest):
+            continue
+        return m
+    return None
+
+
+def turn(path: str):
+    """(events since the request, events of the PREV_SECONDS before it), oldest first; None without a request in the
+    record. An event is ("tool", name, input, (error?, result text, the CLI's toolUseResult) | None) or
+    ("note", "", {}, None) for a helper's report (a task-notification, also when queued as an attachment).
+    The request is the latest user prompt that is no tool result, CLI meta line, compaction summary or helper's report
+    (Маркетинг, 10.11.2026: 12 of 66 channel messages that opened a turn were marked meta);
+    Telegram sends and sidechains are no events (reading an attachment is)."""
+    size = os.path.getsize(path)
+    with open(path, "rb") as handle:
+        handle.seek(max(0, size - TAIL))
+        lines = handle.read().split(b"\n")
+    if size > TAIL:
+        lines = lines[1:]
+    events, earlier, results, asked = [], [], {}, None
+    for raw in reversed(lines):
+        if not raw.strip():
+            continue
+        try:
+            event = json.loads(raw)
+        except ValueError:
+            continue
+        if not isinstance(event, dict) or event.get("isSidechain"):
+            continue
+        at = stamp(event)
+        if asked is not None and (at is None or at < asked - PREV_SECONDS):
+            if at is None:
+                continue
+            break
+        content = (event.get("message") or {}).get("content")
+        blocks = [b for b in content if isinstance(b, dict)] if isinstance(content, list) else []
+        attachment = event.get("attachment") if isinstance(event.get("attachment"), dict) else {}
+        if event.get("type") == "attachment":
+            # A helper's report that arrives while the turn runs is queued into it as an attachment (as the stop guard
+            # reads it); any other attachment, a queued channel message included, opens nothing.
+            if attachment.get("type") == "queued_command" and attachment.get("commandMode") == "task-notification":
+                (events if asked is None else earlier).append(("note", "", {}, None))
+        elif event.get("type") == "assistant":
+            for block in reversed(blocks):
+                name = str(block.get("name") or "")
+                if block.get("type") == "tool_use" and (not name.startswith(TOOLS) or name.endswith("__download_attachment")):
+                    item = ("tool", name, block.get("input") if isinstance(block.get("input"), dict) else {},
+                            results.get(block.get("id")))
+                    (events if asked is None else earlier).append(item)
+        elif event.get("type") == "user" and any(b.get("type") == "tool_result" for b in blocks):
+            for block in blocks:  # a result follows its call in the record: read backwards, it is seen first
+                if block.get("type") == "tool_result":
+                    body = block.get("content")
+                    body = body if isinstance(body, str) else " ".join(
+                        str(x.get("text") or "") for x in (body or []) if isinstance(x, dict))
+                    response = event.get("toolUseResult") if isinstance(event.get("toolUseResult"), dict) else {}
+                    results[block.get("tool_use_id")] = (bool(block.get("is_error")), body[:3000], response)
+        elif event.get("type") == "user" and not event.get("isCompactSummary"):
+            text = content if isinstance(content, str) else " ".join(str(b.get("text") or "") for b in blocks)
+            if event.get("isMeta") and not text.lstrip().startswith("<channel"):
+                continue  # a CLI line ([Image …], a reminder); a channel message is a request even when the CLI marks it meta
+            if "<task-notification>" in text:
+                (events if asked is None else earlier).append(("note", "", {}, None))
+            elif asked is None:
+                if at is None:
+                    return events[::-1], []  # a request without a time: nothing before it counts
+                asked = at
+    return None if asked is None else (events[::-1], earlier[::-1])
+
+
+def shell_text(command: str) -> str:
+    """The command without heredoc bodies and quoted strings: «&» in a URL is no start, «cat > file» no reading."""
+    command = re.sub(r"<<-?\s*['\"]?(\w+)['\"]?[^\n]*\n.*?\n\s*\1[ \t]*(?=\n|$)", "\n", command, flags=re.S)
+    return re.sub(r"'[^'\n]*'|\"[^\"\n]*\"", "''", command)
+
+
+def start_of(name: str, inp: dict, result) -> tuple:
+    """(what was started, the command's rest after the start) or (None, ''). A background Agent or command and a
+    resumed helper are read from the CLI's own result, as tg-native-task reads them; a word to a running helper
+    starts nothing, whatever it says."""
+    response = result[2] if result and len(result) > 2 else {}
+    background = inp.get("run_in_background") is True or str(inp.get("run_in_background")).lower() == "true"
+    if name in ("Agent", "Task"):
+        launched = background or response.get("isAsync") is True or bool(result and result[1].startswith("Async agent launched"))
+        return ("Agent (run_in_background)", "") if launched else (None, "")
+    if name == "SendMessage":
+        resumed = response.get("success") is True and bool(response.get("resumedAgentId"))
+        return ("SendMessage (resume)", "") if resumed else (None, "")
+    if name != "Bash":
+        return None, ""
+    command = shell_text(str(inp.get("command") or ""))
+    if background or response.get("backgroundTaskId"):
+        return "Bash (run_in_background)", ""
+    for rx, what in ((START_BG, "nohup / &"), (START_TASK, "reminder-task / crontab")):
+        m = rx.search(command)
+        if m:
+            return what, command[m.end():]
+    return None, ""
+
+
+def is_read(name: str, inp: dict) -> bool:
+    if name in READ_TOOLS:
+        return True
+    return name == "Bash" and bool(READ_CMD.search(re.sub(r"\bcat\s*>>?", " ", shell_text(str(inp.get("command") or "")))))
+
+
+def unchecked_start(events: list):
+    """The last start of the turn when nothing after it was read and no helper reported; else None."""
+    last = None
+    for index, (kind, name, inp, result) in enumerate(events):
+        if kind == "tool":
+            what, rest = start_of(name, inp, result)
+            if what:
+                last = (index, what, rest)
+    if not last or READ_CMD.search(re.sub(r"\bcat\s*>>?", " ", last[2])):
+        return None
+    if any(kind == "note" or is_read(name, inp) for kind, name, inp, _ in events[last[0] + 1:]):
+        return None
+    return last[1]
+
+
+def segments(command: str) -> list:
+    return [part for part in re.split(r"[;\n|]+|&&", shell_text(command)) if part.strip()]
+
+
+def side_call(name: str, inp: dict) -> bool:
+    """No attempt: bookkeeping, reading the chat, writing notes."""
+    if name in BOOK_TOOLS:
+        return True
+    if name == "Read":
+        return bool(CHAT_READ.search(str(inp.get("file_path") or "")))
+    if name == "Bash":
+        parts = segments(str(inp.get("command") or ""))
+        return bool(parts) and all(CHAT_READ.search(p) or re.search(r">>\s*\S*(?:obsidian-vault|\.md)\b", p)
+                                   or re.match(r"\s*(?:echo|printf|date|true|sleep|cd)\b", p) for p in parts)
+    return False
+
+
+def route(name: str, inp: dict) -> str:
+    """The way an attempt went: a program (its first word), a site (its host), a tool."""
+    if name == "Bash":
+        for part in segments(str(inp.get("command") or "")):
+            words = [w for w in part.split() if not re.match(r"^\w+=", w)]
+            while words and (os.path.basename(words[0]) in INTERPRETERS or words[0].isdigit()
+                             or words[0].startswith("-") or words[0] == "''"):
+                words = words[1:]
+            if words:
+                program = os.path.basename(words[0])
+                if program in ("curl", "wget"):
+                    host = re.search(r"https?://([^/\s'\"]+)", str(inp.get("command") or ""))
+                    return f"{program}:{host.group(1) if host else ''}"
+                return program
+        return "bash"
+    host = re.search(r"https?://([^/\s]+)", str(inp.get("url") or ""))
+    return f"{name}:{host.group(1)}" if host else name
+
+
+def diagnosis(name: str, inp: dict) -> bool:
+    """A look at why it failed: a read (a file, a log, settings), a status check, --help."""
+    if name in READ_TOOLS or (name.startswith("mcp__") and re.search(r"snapshot|status|list|get|read|whoami|doctor",
+                                                                      f"{name} {inp.get('action') or ''}")):
+        return True
+    command = str(inp.get("command") or "")
+    return name == "Bash" and bool(READ_CMD.search(re.sub(r"\bcat\s*>>?", " ", shell_text(command))) or STATUS_CMD.search(command))
+
+
+def status_check(name: str, inp: dict) -> bool:
+    """A check of a connection or a sign-in: status, doctor, whoami, auth list, --help, systemctl status, curl -I."""
+    if name.startswith("mcp__"):
+        return bool(re.search(r"status|list|whoami|doctor", f"{name} {inp.get('action') or ''}", re.I))
+    return name == "Bash" and bool(STATUS_CMD.search(shell_text(str(inp.get("command") or ""))))
+
+
+def repair(name: str, inp: dict) -> bool:
+    """A try to fix it or to hand it on: a file or settings written, a sign-in, a connection, an install, a helper."""
+    if name in ("Write", "Edit", "MultiEdit", "NotebookEdit", "Agent", "Task", "SendMessage"):
+        return True
+    if name.startswith("mcp__") and re.search(r"connect|auth|login|set|create|update", f"{name} {inp.get('action') or ''}", re.I):
+        return True
+    return name == "Bash" and bool(FIX_CMD.search(shell_text(str(inp.get("command") or ""))))
+
+
+def gave_up(events: list, earlier: list, text: str):
+    """«cant»: no attempt since the request, nor in the minutes before it; «giveup»: one or two tries by one route and
+    after the first no look at why, no repair, no second route; None: a second route or a repair, a helper's report, a
+    guard's refusal, or one person-only step named after the agent checked the connection itself."""
+    def attempts(items):
+        return [e for e in items if e[0] == "tool" and not side_call(e[1], e[2])]
+    if any(e[0] == "note" for e in events):
+        return None
+    tries = attempts(events) or attempts(earlier)
+    if not tries:
+        return None if any(e[0] == "note" for e in earlier) else "cant"
+    if any(e[3] and GUARD_OUT.search(e[3][1]) for e in tries):
+        return None
+    if PERSON_STEP.search(text) and any(status_check(e[1], e[2]) for e in tries):
+        return None
+    first = route(tries[0][1], tries[0][2])
+    if sum(1 for e in tries if route(e[1], e[2]) == first) > 2:
+        return None  # kept at it by one route: that is no giving up after the first try
+    if any(route(e[1], e[2]) != first or diagnosis(e[1], e[2]) or repair(e[1], e[2]) for e in tries[1:]):
+        return None
+    return "giveup"
+
+
+def request_of(db, chat: str, thread, delivery: str, edited) -> tuple:
+    """(key, requester) of the request a reply answers. The key: the message the reply's delivery_id names, else the
+    latest message in this chat and topic (an edit's topic is the edited message's); (None, '') when the receiver's
+    archive holds no such message. The requester only when certain: the sender of the named message, or the owner
+    in his own chat; else '' — a reply to a third person's chat or a group without a delivery_id names nobody."""
+    if edited:
+        row = db.execute("SELECT thread_id FROM messages WHERE chat_id=? AND direction='out' AND message_id=?",
+                         (chat, str(edited))).fetchone()
+        thread = row[0] if row else thread
+    rows = [r for r in db.execute("SELECT direction, user_id, message_id, thread_id FROM messages WHERE chat_id=? "
+                                  "ORDER BY ts DESC, id DESC LIMIT 500", (chat,)) if same(r[3], thread)]
+    topic = "" if thread is None else thread
+    message = delivery.rsplit(":", 1)[-1] if delivery.startswith(chat + ":") else ""
+    named = next((r for r in rows if r[0] == "in" and message and str(r[2]) == message), None)
+    if named:  # a newer message already in the archive is its own request, with its own check
+        return f"{chat}|{topic}|{named[2]}", str(named[1] or "")
+    sender = "" if chat.startswith("-") else chat
+    latest = next((r for r in rows if r[0] == "in" and (not sender or str(r[1]) == sender)), None)
+    if not latest:
+        return None, ""
+    return f"{chat}|{topic}|{latest[2]}", chat if chat == owner_id() else ""
+
+
+def requester(sender: str) -> str:
+    owner = owner_id()
+    which = "unknown" if not owner or not sender else "owner" if sender == owner else "other"
+    return localized(*WHO[which])
+
+
+def payload_of(payload: str) -> tuple:
+    try:
+        params = json.loads(payload).get("params") or {}
+        return params.get("meta") or {}, str(params.get("content") or "")
+    except (ValueError, AttributeError):
+        return {}, ""
+
+
+def render(meta: dict, content: str) -> str:
+    sent = str(meta.get("ts") or "")[11:19]
+    kind = str(meta.get("transcribed_from") or meta.get("attachment_kind") or "")
+    head = ", ".join(x for x in (sent and sent + " UTC", kind,
+                                 meta.get("attachment_name") and f"«{meta['attachment_name']}»") if x)
+    extra = [f"image_path: {meta.get('image_paths') or meta.get('image_path')}"] if meta.get("image_paths") or meta.get("image_path") else []
+    if meta.get("attachment_file_id") and not meta.get("transcribed_from"):
+        extra.append(f"attachment_file_id={meta['attachment_file_id']} (download_attachment)")
+    return "\n".join(["— " + head + ":", content.strip() or "—", *extra])
+
+
+def send_lock(db, inp: dict, chat: str, now: float, shown: dict, held: dict, base: dict):
+    """The hold text when the receiver's queue keeps a message of the same person in this chat and topic that the agent
+    has not been shown; else None. Another person's message in a group holds nothing."""
+    rows = db.execute("SELECT delivery_id, payload, state FROM pending_inbound_deliveries ORDER BY created_at, rowid").fetchall()
+    delivery = str(inp.get("delivery_id") or "")
+    current = next((payload_of(p)[0] for d, p, _ in rows if d == delivery), {})
+    user = str(current.get("user_id") or "")
+    thread = inp.get("thread_id", current.get("thread_id"))
+    fresh = []
+    for delivery_id, payload, state in rows:
+        if state != "queued" or delivery_id in shown or delivery_id == delivery:
+            continue
+        meta, content = payload_of(payload)
+        if not same(meta.get("chat_id"), chat) or not same(meta.get("thread_id"), thread):
+            continue
+        sender = str(meta.get("user_id") or "")
+        if (user and sender and sender != user) or (not user and chat.startswith("-")):
+            continue
+        fresh.append((delivery_id, meta, content))
+    if not fresh:
+        return None
+    key = delivery or chat
+    if len(held.get(key, [])) >= MAX_HOLDS:
+        base["lock"] = "cap"
+        return None
+    for delivery_id, _, _ in fresh:
+        shown[delivery_id] = now
+    held[key] = held.get(key, []) + [now]
+    return localized(*HOLD["lock"]) + "\n\n" + "\n\n".join(render(meta, content) for _, meta, content in fresh)
+
+
+def text_checks(data: dict, inp: dict, edit: bool, chat: str, text: str, once: dict, now: float, base: dict):
+    """(hold text or None, log fields) of the three text checks, one hold per request between them."""
+    body = text.strip()
+    if len(body) < MIN_CHARS or body.startswith(ACK):
+        return None, {}
+    done = None if off("done") else next(iter(claim_matches(DONE_CLAIM, text, earlier_ok=True)), None)
+    launch = None if off("launch") else next(iter(claim_matches(LAUNCH_CLAIM, text)), None)
+    refuse = None if off("giveup") else refusal(text)
+    pushed = None if off("giveup") else pushback(text)
+    if not (done or launch or refuse or pushed):
+        return None, {}
+    with contextlib.closing(sqlite3.connect(f"file:{DB}?mode=ro", uri=True, timeout=1.0)) as db:
+        key, sender = request_of(db, chat, inp.get("thread_id"), str(inp.get("delivery_id") or ""),
+                                 inp.get("message_id") if edit else None)
+    if not key:
+        return None, {"request": "unknown"}
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+    if key in once:  # this request has had its hold: everything passes, and the first send after it is on record
+        record = once[key]
+        if record.get("done"):
+            return None, {}
+        record["done"] = True
+        return None, {"after_" + record["why"].replace("-", "_"): True, "changed": record["h"] != digest}
+    found = turn(str(data.get("transcript_path") or ""))
+    if found is None:
+        return None, {"turn": "not found"}
+    events, earlier = found
+    why, fields, extra = None, {}, {}
+    what = unchecked_start(events) if launch else None
+    if what:
+        why, fields, extra = "launch", {"sentence": sentence(text, launch), "what": what}, {"started": what}
+    if not why and (refuse or pushed):
+        verdict = gave_up(events, earlier, text) if refuse else None
+        if verdict:
+            why, fields = verdict, {"sentence": sentence(text, refuse)}
+            extra = {"attempts": sum(1 for e in events + earlier if e[0] == "tool" and not side_call(e[1], e[2]))}
+        elif pushed and not any(e[0] == "note" or not side_call(e[1], e[2]) for e in events + earlier):
+            why, fields, extra = "pushback", {"sentence": sentence(text, pushed)}, {"kind": "pushback"}
+    if not why and done and not refuse and not MISSING.search(text) and not any(
+            e[0] == "note" or e[1] not in BOOK_TOOLS for e in events + earlier):
+        why, fields = "done", {"found": f"«{' '.join(done.group(0).split())}»"}
+    if not why:
+        return None, {}
+    once[key] = {"t": now, "why": why + "-check", "h": digest}
+    reason = localized(*HOLD[why]).format(who=requester(sender), **fields)
+    return reason, {"why": ("giveup" if why == "pushback" else why) + "-check", **extra}
+
+
+@contextlib.contextmanager
+def state_lock():
+    """One reply hook at a time reads and writes the state: two replies at once never both find «no hold yet»."""
+    with open(STATE / "lock", "a+") as handle:
+        deadline = time.time() + 3
+        while True:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.time() > deadline:
+                    raise
+                time.sleep(0.05)
+        yield
+
+
+def main() -> None:
+    data = json.loads(sys.stdin.read() or "{}")
+    name = str(data.get("tool_name") or "")
+    edit = name == TOOLS + "edit_message"
+    if (name != TOOLS + "reply" and not edit) or data.get("agent_id"):
+        return
+    inp = data.get("tool_input") if isinstance(data.get("tool_input"), dict) else {}
+    chat = str(inp.get("chat_id") or "")
+    if not chat or not DB.exists() or OFF.exists() or own_lock(name):
+        return
+    STATE.mkdir(parents=True, exist_ok=True)
+    os.chmod(STATE, 0o700)
+    now = time.time()
+    text = str(inp.get("text") or "")
+    base = {"t": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)), "delivery": str(inp.get("delivery_id") or ""),
+            "phase": inp.get("phase"), **({"edit": True} if edit else {})}
+    with state_lock():
+        try:  # a record that cannot be read starts afresh: at worst a request gets its one hold again
+            saved = json.loads(SAVED.read_text(encoding="utf-8"))
+            once = {k: v for k, v in saved["once"].items() if now - v["t"] < KEEP_SECONDS}
+            shown = {k: v for k, v in saved["shown"].items() if now - v < KEEP_SECONDS}
+            held = {k: [t for t in v if now - t < HOLD_WINDOW] for k, v in saved["held"].items()}
+        except Exception:
+            once, shown, held = {}, {}, {}
+        reason, why, more = None, None, {}
+        if not edit and not off("lock"):
+            try:  # first: a newer message of the same person matters more than any wording; its error holds nothing
+                with contextlib.closing(sqlite3.connect(f"file:{DB}?mode=ro", uri=True, timeout=1.0)) as db:
+                    reason = send_lock(db, inp, chat, now, shown, held, base)
+                why = "send-lock" if reason else None
+            except Exception as error:
+                more = {"lock_error": type(error).__name__}
+        if not reason:
+            try:
+                reason, extra = text_checks(data, inp, edit, chat, text, once, now, base)
+                why = extra.pop("why", None)
+                more.update(extra)
+            except Exception as error:
+                reason, more = None, {**more, "error": type(error).__name__}
+        tmp = SAVED.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"once": once, "shown": shown, "held": {k: v for k, v in held.items() if v}}),
+                       encoding="utf-8")
+        os.replace(tmp, SAVED)  # a hold is given only once it is on record
+    if reason:
+        log({**base, "decision": "deny", "why": why, "chars": len(text), **more})
+        print(json.dumps({"decision": "block", "reason": reason}))  # as tg-format-enforcer; ASCII on any locale
+        return
+    log({**base, "decision": "allow", **more})
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as error:  # the hook never stops a reply by failing
+        log({"t": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "decision": "allow", "error": type(error).__name__})

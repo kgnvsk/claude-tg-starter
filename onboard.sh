@@ -155,16 +155,6 @@ write_env_value() {
   printf '\n' >> "$ENV_OUT"
 }
 
-# Novsky sets these: corporate mode, the sold modules and their contact, roles. A rerun keeps each exactly as
-# saved and never invents one: an empty NOVSKY_MODULES means «nothing sold», an absent one «an older agent with
-# everything» (docs audit 20.10.2026: a rerun dropped them and install-core switched corporate routing off).
-write_novsky_fields() {
-  local name
-  for name in TG_CORPORATE_SESSIONS MODULE_TELEGRAM_CORPORATE NOVSKY_MODULES NOVSKY_MODULES_CONTACT ACTIVE_ROLES; do
-    [ -z "${!name+x}" ] || write_env_value "$name"
-  done
-}
-
 # A re-run is allowed to change the guided core fields, but it must not silently
 # reset integrations or module choices that were configured earlier.
 ALERT_COPY_CHAT_IDS="${ALERT_COPY_CHAT_IDS:-}"
@@ -175,7 +165,6 @@ PRESERVE_NAMES=(
   MODULE_DESIGN_PACK MODULE_CHANNEL_PUBLISH MODULE_SOCIAL_BROWSER
   MODULE_TRANSPORT_DAEMON MODULE_VAULT_WEB MODULE_INSTAGRAM_DM
   MODULE_YOUTUBE_COMMENTS CHANNEL_ID SITE_PASSWORD ACTIVE_ROLES
-  TG_CORPORATE_SESSIONS MODULE_TELEGRAM_CORPORATE NOVSKY_MODULES NOVSKY_MODULES_CONTACT
 )
 if [ -r "$ENV_OUT" ]; then
   _requested_license_key="${NOVSKY_LICENSE_KEY:-}"
@@ -263,8 +252,9 @@ else
   VOICE_SETUP_STATUS=deferred
 fi
 # Semantic (vector) memory is on by default whenever a voice key exists — the
-# OpenAI key serves voice and memory alike (owner decision 2026-09-03). An
-# explicit "disabled" in the live environment still wins.
+# OpenAI key serves voice and memory alike (owner decision 2026-09-03). A
+# "disabled" in the live environment wins only with the owner's own refusal
+# on record (the voice block below).
 if [ -z "${MEMORY_EMBEDDINGS_OPENAI:-}" ]; then
   if [ -n "$OPENAI_API_KEY" ]; then
     MEMORY_EMBEDDINGS_OPENAI=enabled
@@ -355,7 +345,7 @@ if product_feature_declared channel-publishing; then
 fi
 
 if product_check_declared voice_transcription; then
-  printf '\nГолосові повідомлення — необов’язкова функція. OpenAI використовується лише для розпізнавання через gpt-4o-mini-transcribe.\n'
+  printf '\nГолосові повідомлення — необов’язкова функція. OpenAI використовується для розпізнавання через gpt-4o-mini-transcribe і для семантичної пам’яті.\n'
   printf 'Ключ створюється на https://platform.openai.com/. Для легкого старту можна внести $5; витрати залежать від аудіо.\n'
   read -rp "Підключити розпізнавання голосових повідомлень зараз? [т/Н]: " voice_now
   case "${voice_now:-}" in y|Y|yes|YES|да|Да|так|Так|т|Т)
@@ -365,17 +355,15 @@ if product_check_declared voice_transcription; then
   esac
 
   # onboarding state key: memory_semantic_search
-  if [ -n "$OPENAI_API_KEY" ] && [ "$MEMORY_EMBEDDINGS_OPENAI" != enabled ]; then
-    printf '\nСемантичний пошук у пам’яті — окрема функція й окрема згода власника.\n'
-    printf 'Після ввімкнення OpenAI отримує фрагменти сховища й Telegram (до 8 000 символів кожен, до 400 нових документів за запуск індексації) та кожен пошуковий запит; використання може оплачуватися окремо.\n'
-    printf 'Без цього пам’ять залишається повністю локальною: пошук за ключовими словами продовжує працювати. Вимкнення: ~/bin/memory-embeddings-config disable.\n'
-    read -rp "Дозволити семантичну пам’ять OpenAI зараз? [т/Н]: " memory_embeddings_now
-    case "${memory_embeddings_now:-}" in y|Y|yes|YES|да|Да|так|Так|т|Т)
-      MEMORY_EMBEDDINGS_OPENAI=enabled ;;
-      *) MEMORY_EMBEDDINGS_OPENAI=disabled ;;
-    esac
-  elif [ "$MEMORY_EMBEDDINGS_OPENAI" = enabled ]; then
-    printf '\nСемантичну пам’ять OpenAI уже ввімкнено за явною згодою власника. Вимкнення: ~/bin/memory-embeddings-config disable.\n'
+  # Owner, 14.11.2026: with a key, semantic memory is on without a separate question; it stays off only where the
+  # owner switched it off himself (memory-embeddings-config disable leaves a record beside the channel profile).
+  if [ -n "$OPENAI_API_KEY" ] && [ "$MEMORY_EMBEDDINGS_OPENAI" != enabled ] \
+      && [ ! -e "${TELEGRAM_CHANNEL_ENV%/*}/memory-embeddings-refused" ]; then
+    MEMORY_EMBEDDINGS_OPENAI=enabled
+  fi
+  if [ -n "$OPENAI_API_KEY" ] && [ "$MEMORY_EMBEDDINGS_OPENAI" = enabled ]; then
+    printf '\nСемантичну пам’ять увімкнено разом із ключем OpenAI. Щоб будувати пошуковий індекс, OpenAI Embeddings отримують фрагменти нотаток зі сховища й історії Telegram (до 8 000 символів кожен, до 400 нових документів за запуск індексації) та кожен пошуковий запит; використання може оплачуватися окремо.\n'
+    printf 'Вимкнути на прохання власника: ~/bin/memory-embeddings-config disable — пошук за ключовими словами продовжить працювати, а оновлення її знову не ввімкне.\n'
   fi
 fi
 
@@ -527,7 +515,6 @@ for name in AGENT_NAME OWNER_NAME OWNER_TG_USERNAME OWNER_CHAT_ID ADDITIONAL_ADM
             MODULE_YOUTUBE_COMMENTS CHANNEL_ID SITE_PASSWORD; do
   write_env_value "$name"
 done
-write_novsky_fields
 chmod 600 "$ENV_OUT"
 umask "$env_umask"
 
@@ -537,9 +524,6 @@ export RECALL_API_KEY RECALL_REGION CALENDAR_EMAIL VAULT_LOCALE OWNER_NOTICE_LOC
 export MODULE_DESIGN_PACK MODULE_CHANNEL_PUBLISH MODULE_SOCIAL_BROWSER
 export MODULE_TRANSPORT_DAEMON MODULE_VAULT_WEB MODULE_INSTAGRAM_DM MODULE_YOUTUBE_COMMENTS
 export CHANNEL_ID SITE_PASSWORD
-for name in TG_CORPORATE_SESSIONS MODULE_TELEGRAM_CORPORATE NOVSKY_MODULES NOVSKY_MODULES_CONTACT ACTIVE_ROLES; do
-  [ -z "${!name+x}" ] || export "$name"
-done
 
 echo "==> Готую систему (пакети, Node)"
 bash "$KIT/scripts/install-base.sh"

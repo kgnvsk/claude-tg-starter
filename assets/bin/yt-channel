@@ -35,10 +35,15 @@ EMAIL = re.compile(r"^[^@\s/]{1,64}@[A-Za-z0-9.-]{1,190}\.[A-Za-z]{2,24}$")
 MAX_ROWS = 50
 MAX_VIDEO_BYTES = 2 * 1024 ** 3  # ponytail: 2 GB per upload; raise it when a channel needs longer videos
 CHUNK = 8 * 1024 * 1024
+# YouTube takes a custom thumbnail as a .jpg or .png of at most 2 MB; tags of at most 500 characters together.
+THUMBNAIL_TYPES = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png"}
+MAX_THUMBNAIL_BYTES = 2 * 1024 * 1024
+MAX_TAGS_CHARS = 500
 
 
 class CliError(Exception):
-    """Expected failure without credential disclosure."""
+    """Expected failure without credential disclosure; status is YouTube's HTTP answer when there was one."""
+    status: int | None = None
 
 
 def client_credentials(client: str) -> tuple[str, str]:
@@ -99,9 +104,23 @@ def api(token: str, method: str, path: str, *, query: dict | None = None, body: 
         with request.urlopen(request.Request(url, data=data, headers=sent, method=method), timeout=timeout) as response:
             return response.headers, response.read()
     except error.HTTPError as exc:
-        raise CliError(f"YouTube API returned HTTP {exc.code}") from exc
+        failure = CliError(f"YouTube API returned HTTP {exc.code}" + youtube_reason(exc))
+        failure.status = exc.code
+        raise failure from exc
     except (error.URLError, TimeoutError) as exc:
         raise CliError("YouTube API is unavailable or timed out") from exc
+
+
+def youtube_reason(exc: error.HTTPError) -> str:
+    """YouTube's own words (an unverified channel cannot set a thumbnail, a quota is spent), so the agent can say what
+    is missing; never more than one short line."""
+    try:
+        found = json.loads(exc.read() or b"{}").get("error") or {}
+    except (OSError, ValueError, AttributeError):
+        return ""
+    reason = next((item.get("reason") for item in found.get("errors") or [] if isinstance(item, dict) and item.get("reason")), "")
+    text = " ".join(str(found.get("message") or "").split())[:300]
+    return f": {text}" + (f" ({reason})" if reason else "") if text else (f": {reason}" if reason else "")
 
 
 def api_json(token: str, method: str, path: str, **kwargs) -> dict:
@@ -127,6 +146,33 @@ def video_on_channel(token: str, video_id: str, channel: str) -> None:
     items = api_json(token, "GET", "videos", query={"part": "snippet", "id": video_id}).get("items") or []
     if len(items) != 1 or items[0].get("snippet", {}).get("channelId") != channel:
         raise CliError("this video is not on the pinned channel")
+
+
+def thumbnail_file(value: str) -> Path:
+    """A custom thumbnail (owner, 05.11.2026: the cover is part of the video, not an extra): .jpg or .png up to 2 MB."""
+    path = Path(value)
+    if path.is_symlink() or not path.is_file() or path.suffix.lower() not in THUMBNAIL_TYPES \
+            or not 0 < path.stat().st_size <= MAX_THUMBNAIL_BYTES:
+        raise argparse.ArgumentTypeError("a thumbnail is a regular .jpg or .png file of at most 2 MB")
+    return path
+
+
+def checked_tags(tags: list[str]) -> list[str] | None:
+    """The tags as YouTube counts them: a tag with a space costs its quotes, every tag after the first a comma."""
+    if not tags:
+        return None
+    clean = [tag.strip() for tag in tags]
+    if any(not tag or "<" in tag or ">" in tag for tag in clean):
+        raise CliError("a tag is empty or contains < or >")
+    if sum(len(tag) + (2 if " " in tag else 0) for tag in clean) + len(clean) - 1 > MAX_TAGS_CHARS:
+        raise CliError(f"the tags exceed {MAX_TAGS_CHARS} characters together")
+    return clean
+
+
+def set_thumbnail(token: str, video_id: str, path: Path) -> None:
+    writing("thumbnail")
+    api_json(token, "POST", "thumbnails/set", base=UPLOAD, query={"videoId": video_id, "uploadType": "media"},
+             headers={"Content-Type": THUMBNAIL_TYPES[path.suffix.lower()]}, data=path.read_bytes(), timeout=120)
 
 
 def writing(kind: str) -> None:
@@ -175,10 +221,13 @@ def build_parser() -> argparse.ArgumentParser:
     comments = commands.add_parser("comments", help="comment threads of one video")
     comments.add_argument("video_id", type=pattern(VIDEO, "video ID"))
     comments.add_argument("--limit", type=bounded_limit, default=50)
-    update = commands.add_parser("update", help="change a video's title or description")
+    update = commands.add_parser("update", help="change a video's title, description, tags or thumbnail")
     update.add_argument("video_id", type=pattern(VIDEO, "video ID"))
     update.add_argument("--title-file", type=Path)
     update.add_argument("--description-file", type=Path)
+    update.add_argument("--tag", action="append", default=[], help="replaces all tags; give it as --tag=VALUE")
+    update.add_argument("--clear-tags", action="store_true", help="removes every tag of the video")
+    update.add_argument("--thumbnail", type=thumbnail_file)
     update.add_argument("--confirm", action="store_true")
     reply = commands.add_parser("reply", help="reply to one comment")
     reply.add_argument("comment_id", type=pattern(COMMENT, "comment ID"))
@@ -189,6 +238,8 @@ def build_parser() -> argparse.ArgumentParser:
     upload.add_argument("--title-file", type=Path, required=True)
     upload.add_argument("--description-file", type=Path)
     upload.add_argument("--privacy", choices=("private", "unlisted", "public"), default="private")
+    upload.add_argument("--tag", action="append", default=[], help="give it as --tag=VALUE")
+    upload.add_argument("--thumbnail", type=thumbnail_file)
     upload.add_argument("--confirm", action="store_true")
     return parser
 
@@ -206,11 +257,19 @@ def main() -> int:
             print(json.dumps({"ok": True, "channel": args.channel}))
             return 0
         if args.command == "videos":
-            found = api_json(token, "GET", "search", query={"part": "snippet", "forMine": "true", "channelId": args.channel,
-                                                            "type": "video", "order": "date", "maxResults": args.limit})
-            found["items"] = [item for item in found.get("items") or []
-                              if item.get("snippet", {}).get("channelId") == args.channel]
-            print(json.dumps(found, ensure_ascii=False, indent=1))
+            # The pinned channel's own uploads list: exactly its videos, newest first, one quota unit. A forMine search is
+            # account-wide and refuses channelId (HTTP 400; Маркетинг found it on 04.11.2026), so with several channels its
+            # page could hold none of the pinned one's (Codex, 05.11.2026).
+            channels = api_json(token, "GET", "channels", query={"part": "contentDetails", "id": args.channel}).get("items") or []
+            uploads = ((channels[0].get("contentDetails") or {}).get("relatedPlaylists") or {}).get("uploads") if len(channels) == 1 else None
+            if not isinstance(uploads, str) or not uploads:
+                raise CliError("the pinned channel's list of uploads is not available")
+            listed = api_json(token, "GET", "playlistItems", query={"part": "snippet,contentDetails", "playlistId": uploads,
+                                                                   "maxResults": args.limit})
+            items = [{"id": {"kind": "youtube#video", "videoId": (item.get("contentDetails") or {}).get("videoId")},
+                      "snippet": item.get("snippet") or {}}
+                     for item in listed.get("items") or [] if (item.get("snippet") or {}).get("channelId") == args.channel]
+            print(json.dumps({"items": items}, ensure_ascii=False, indent=1))
             return 0
         if args.command == "comments":
             video_on_channel(token, args.video_id, args.channel)
@@ -220,22 +279,29 @@ def main() -> int:
             return 0
         if args.command == "update":
             title, description = read_text(args.title_file, 100), read_text(args.description_file, 5000)
-            if not title and description is None:
-                raise CliError("nothing to change: give a title or a description")
+            tags = [] if args.clear_tags else checked_tags(args.tag)
+            if args.clear_tags and args.tag:
+                raise CliError("give tags or --clear-tags, not both")
+            if not title and description is None and tags is None and args.thumbnail is None:
+                raise CliError("nothing to change: give a title, a description, tags or a thumbnail")
             current = api_json(token, "GET", "videos", query={"part": "snippet", "id": args.video_id}).get("items") or []
             if len(current) != 1 or current[0].get("snippet", {}).get("channelId") != args.channel:
                 raise CliError("this video is not on the pinned channel")
-            snippet = current[0]["snippet"]
-            changed = {key: snippet[key] for key in ("title", "description", "categoryId", "tags", "defaultLanguage")
-                       if key in snippet}
-            if title:
-                changed["title"] = title
-            if description is not None:
-                changed["description"] = description
-            writing("video details")
-            saved = api_json(token, "PUT", "videos", query={"part": "snippet"},
-                             body={"id": args.video_id, "snippet": changed})
-            print(json.dumps({"ok": True, "id": saved.get("id"), "url": f"https://youtu.be/{args.video_id}"}))
+            if title or description is not None or tags is not None:
+                snippet = current[0]["snippet"]
+                changed = {key: snippet[key] for key in ("title", "description", "categoryId", "tags", "defaultLanguage")
+                           if key in snippet}
+                if title:
+                    changed["title"] = title
+                if description is not None:
+                    changed["description"] = description
+                if tags is not None:
+                    changed["tags"] = tags
+                writing("video details")
+                api_json(token, "PUT", "videos", query={"part": "snippet"}, body={"id": args.video_id, "snippet": changed})
+            if args.thumbnail is not None:
+                set_thumbnail(token, args.video_id, args.thumbnail)
+            print(json.dumps({"ok": True, "id": args.video_id, "url": f"https://youtu.be/{args.video_id}"}))
             return 0
         if args.command == "reply":
             text = read_text(args.message_file, 10000)
@@ -251,6 +317,7 @@ def main() -> int:
             print(json.dumps({"ok": True, "id": saved.get("id")}))
             return 0
         title, description = read_text(args.title_file, 100), read_text(args.description_file, 5000) or ""
+        tags = checked_tags(args.tag)
         if not title:
             raise CliError("an upload needs a title")
         size = args.file.stat().st_size if args.file.is_file() else 0
@@ -259,7 +326,7 @@ def main() -> int:
         writing("upload")
         headers, _ = api(token, "POST", "videos", base=UPLOAD,
                          query={"uploadType": "resumable", "part": "snippet,status"},
-                         body={"snippet": {"title": title, "description": description},
+                         body={"snippet": {"title": title, "description": description, **({"tags": tags} if tags else {})},
                                "status": {"privacyStatus": args.privacy, "selfDeclaredMadeForKids": False}},
                          headers={"X-Upload-Content-Length": str(size), "X-Upload-Content-Type": "video/*"})
         session = headers.get("Location") or ""
@@ -281,7 +348,7 @@ def main() -> int:
                         raw, done = response.read(), True
                 except error.HTTPError as exc:
                     if exc.code != 308:
-                        raise CliError(f"YouTube upload returned HTTP {exc.code}") from exc
+                        raise CliError(f"YouTube upload returned HTTP {exc.code}" + youtube_reason(exc)) from exc
                     # Resume from what YouTube acknowledged; no Range means it kept nothing of this request.
                     acknowledged = re.fullmatch(r"bytes=0-(\d+)", exc.headers.get("Range") or "")
                     sent = int(acknowledged.group(1)) + 1 if acknowledged else 0
@@ -293,7 +360,19 @@ def main() -> int:
             video_id = None
         if not isinstance(video_id, str) or not VIDEO.fullmatch(video_id):
             raise CliError("YouTube did not confirm the uploaded video ID")
-        print(json.dumps({"ok": True, "id": video_id, "url": f"https://youtu.be/{video_id}", "privacy": args.privacy}))
+        result = {"ok": True, "id": video_id, "url": f"https://youtu.be/{video_id}", "privacy": args.privacy}
+        if args.thumbnail is not None:
+            # The video is on the channel already: a refused thumbnail is reported, never turned into a failure that
+            # would make the agent upload the video a second time.
+            try:
+                set_thumbnail(token, video_id, args.thumbnail)
+                result["thumbnail"] = "set"
+            except (CliError, OSError) as exc:
+                # A refusal (4xx) left nothing; a timeout or a server error may have set it after all.
+                refused = isinstance(exc, CliError) and exc.status is not None and 400 <= exc.status < 500
+                result["thumbnail"] = (f"not set: {exc}; set it later with update --thumbnail" if refused
+                                       else f"unknown: {exc}; look at the video before setting the cover again")
+        print(json.dumps(result, ensure_ascii=False))
         return 0
     except (CliError, OSError, subprocess.SubprocessError, ValueError) as exc:
         print(f"yt-channel: {exc}", file=sys.stderr)

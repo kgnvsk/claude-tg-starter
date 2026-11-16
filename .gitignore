@@ -5,4 +5,3 @@
 __pycache__/
 *.pyc
 assets/video-edit/node_modules/
-tools/business-mcp-sdk/node_modules/

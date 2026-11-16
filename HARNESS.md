@@ -56,6 +56,13 @@ Detailed vault notes and up to 5,000 recent Telegram rows are indexed locally.
 Telegram results are returned only when the caller supplies the matching
 `--chat-id`.
 
+Since memory v2 (14.11.2026) the agent keeps `USER.md` and `MEMORY.md` itself,
+with Edit or Write: `MEMORY.md` is its memory map (what it has and where it
+lives). `memory-budget-guard` lets a write pass while the file stays within
+its limit and most of it stays in place, and refuses a shell write. A
+scheduled review (`memory-review`) keeps the map, the owner profile and the
+open-work section of `wiki/hot.md` up to date and sends nothing to anyone.
+
 ## Self-learning contract
 
 Self-learning is a reviewed persistence pipeline, not permission for an online
@@ -66,7 +73,9 @@ chat to rewrite the agent. The target design uses three distinct classes:
 - procedural memory: narrow, testable Claude skills.
 
 Only a configured administrator's private conversation may propose a global
-memory or skill change. Other allowlisted Telegram turns remain attributed
+skill change, or a reviewed replacement of a memory core (the agent's own
+day-to-day edits of the cores are the memory contract above). Other
+allowlisted Telegram turns remain attributed
 evidence and cannot approve changes to owner memory, persona, permissions,
 shared skills, prompts, or configuration. Automated candidates are staged with sender/chat/job provenance,
 an evidence excerpt, promptware/secret scanning, expiry, and a bounded queue.

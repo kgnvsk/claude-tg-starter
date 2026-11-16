@@ -24,6 +24,18 @@ def emit(value):
     print(json.dumps(value, ensure_ascii=False), flush=True)
 
 
+def locked(backup, seconds=60):
+    """The backup lock, which every setup step (cancel, a newer setup) also holds; a running copy may keep it a while."""
+    deadline = time.monotonic() + seconds
+    while True:
+        try:
+            return backup.lock()
+        except backend.BackupError as exc:
+            if str(exc) != 'busy' or time.monotonic() >= deadline:
+                raise
+            time.sleep(0.5)
+
+
 def login(backup, owner, nonce):
     def current():
         state = backup.load(backup.directory / 'chat.json')
@@ -74,7 +86,8 @@ def login(backup, owner, nonce):
                 output = (output + chunk)[-8192:]
                 match = re.search(r'one-time code:\s*([A-Z0-9]{4}-[A-Z0-9]{4})', output)
                 if match and not sent:
-                    emit({'progress': True, 'text': 'Відкрий https://github.com/login/device і введи код ' + match[1] + '. Увійди у свій GitHub та підтвердь доступ GitHub CLI. Пароль або токен сюди надсилати не потрібно. Після входу я сам створю приватний репозиторій.'})
+                    current()  # Codex 13.11: a cancel during the wait must not send its code.
+                    emit({'progress': True, 'text': backend.notice('backup.chat_device_code', 'Відкрий https://github.com/login/device і введи код {code}. Увійди у свій GitHub та підтвердь доступ GitHub CLI. Пароль або токен сюди надсилати не потрібно. Після входу я сам створю приватний репозиторій.', backup.home, code=match[1])})
                     sent = True
         if process.returncode:
             raise backend.BackupError('github-login-failed')
@@ -116,14 +129,20 @@ def login(backup, owner, nonce):
             raise
         current()
         command(['api', '--method', 'POST', 'user/repos', '-f', 'name=' + repository.split('/')[1], '-F', 'private=true', '-F', 'auto_init=true', '-f', 'description=Private encrypted agent recovery backups'])
-    current()
-    backup.connect(repository, token)
-    state.update(phase='ready' if prepared.get('keySaved') else 'key', keyDelivered=False)
-    state.pop('nonce', None)
-    backup.save(backup.directory / 'chat.json', state)
+    # Codex 13.11: the last check and the commit hold the backup lock, so a cancel or a newer setup either comes
+    # first (and this sign-in stops here) or after it; it never lands in between.
+    descriptor = locked(backup)
+    try:
+        state = current()
+        backup.connect(repository, token)
+        state.update(phase='ready' if prepared.get('keySaved') else 'key', keyDelivered=False)
+        state.pop('nonce', None)
+        backup.save(backup.directory / 'chat.json', state)
+    finally:
+        os.close(descriptor)
     if prepared.get('keySaved'):
-        return chat.reply('GitHub підключено. Приватний репозиторій: https://github.com/' + repository + '. Запускаю автоматичний бекап.', enable=True)
-    return chat.reply('GitHub підключено. Приватний репозиторій: https://github.com/' + repository + '. Збережи файл ключа відновлення окремо від сервера й напиши «ключ збережено».', recoveryKey=True)
+        return chat.reply(backend.notice('backup.chat_github_ready', 'GitHub підключено. Приватний репозиторій: https://github.com/{repo}. Запускаю автоматичний бекап.', backup.home, repo=repository), enable=True)
+    return chat.reply(backend.notice('backup.chat_github_key', 'GitHub підключено. Приватний репозиторій: https://github.com/{repo}. Збережи файл ключа відновлення окремо від сервера й напиши мені, коли збережеш.', backup.home, repo=repository), recoveryKey=True)
 
 
 def main():

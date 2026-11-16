@@ -166,6 +166,18 @@ def age_tools(state_dir: Path):
     return str(destination / "age"), str(destination / "age-keygen")
 
 
+def notice(key: str, ukrainian: str, home: Path, **values) -> str:
+    """The owner's notice language (OWNER_NOTICE_LOCALE in home's profile) from the kit's catalog; Ukrainian on any failure."""
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "agent_notice_locale", Path(__file__).resolve().with_name("agent_notice_locale.py"))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module.notice_text(key, ukrainian, home=home).format(**values)
+    except Exception:
+        return ukrainian.format(**values)
+
+
 class Backup:
     def __init__(self, home: Path):
         self.home = home.absolute()
@@ -500,12 +512,17 @@ class Backup:
                 token = match[1] if match else ''
             if not re.fullmatch(r'[0-9]+:[A-Za-z0-9_-]+', token):
                 return
-            prior = "Попередню успішну копію збережено. " if state.get("lastSuccessAt") else "Першу успішну копію ще не створено. "
-            message = ("Автоматичний повний бекап GitHub не вдалося завершити. " + prior +
-                       "Напиши мені «перевір бекап»: перевіримо доступ до приватного репозиторію, строк дії токена та вільне місце.")
+            prior = (notice("backup.prior_kept", "Попередню успішну копію збережено. ", self.home)
+                     if state.get("lastSuccessAt") else
+                     notice("backup.no_prior", "Першу успішну копію ще не створено. ", self.home))
+            message = notice("backup.auto_failed",
+                             "Автоматичний повний бекап GitHub не вдалося завершити. {prior}"
+                             "Напиши мені «перевір бекап»: перевіримо доступ до приватного репозиторію, строк дії токена та вільне місце.",
+                             self.home, prior=prior)
             payload = json.dumps({"chat_id": chat_id, "text": message}).encode()
-            endpoint_state = path.parent if not native else self.home / '.claude/channels/telegram'
-            req = request.Request(telegram_api_base(endpoint_state) + '/bot' + token + "/sendMessage", data=payload,
+            # A native Codex bot keeps the cloud endpoint of 11.10: only the Claude channel has a local server.
+            base = 'https://api.telegram.org' if native else telegram_api_base(path.parent)
+            req = request.Request(base + '/bot' + token + "/sendMessage", data=payload,
                                   headers={"Content-Type": "application/json"}, method="POST")
             with request.urlopen(req, timeout=20) as response:
                 result = json.loads(response.read(16384))

@@ -161,6 +161,10 @@ def main() -> int:
     value = "enabled" if configured else "disabled"
     state_text = normalized_state_text(state, configured)
     env_text = "\n".join(replace_setting(lines, value)) + "\n"
+    # Owner, 14.11.2026: the installer switches semantic memory on wherever the agent has a key, on install and on
+    # update. Only this record of the owner's own refusal keeps a `disabled` through an update (without it the value
+    # is the old default), so it is written before the setting: a refusal cut short must not be undone by an update.
+    refusal = ENV.with_name("memory-embeddings-refused")
     try:
         if configured:
             # Enabling writes derived status first and authoritative consent
@@ -168,10 +172,12 @@ def main() -> int:
             if state_text is not None:
                 atomic_text(STATE, state_text)
             atomic_text(ENV, env_text)
+            refusal.unlink(missing_ok=True)
         else:
             # Disabling revokes authoritative consent first. A later derived
             # status failure cannot leave embeddings enabled behind a disabled
             # onboarding-state marker.
+            refusal.touch(mode=0o600)
             atomic_text(ENV, env_text)
             if state_text is not None:
                 atomic_text(STATE, state_text)

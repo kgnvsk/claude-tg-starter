@@ -85,6 +85,22 @@ PINNED_LEGACY_SHARED_CONTEXT = {
 }
 
 
+class Refused(ValueError):
+    """The tool cannot run as asked: not root, or an agent unit or account it cannot use. Nothing was read or
+    changed, so it is not a migration (partner report 01.11.2026: --check-current as claude said «migration»)."""
+
+
+def require_caller(unit, user):
+    if os.geteuid() != 0:
+        raise Refused("root is required")
+    if not re.fullmatch(r"[a-zA-Z0-9@_.-]+\.service", unit):
+        raise Refused("an exact agent unit is required")
+    try:
+        return pwd.getpwnam(user)
+    except KeyError:
+        raise Refused("unknown agent account") from None
+
+
 def _metadata(info, owners, *, directory=False):
     kind = stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode)
     if not kind or info.st_uid not in owners or info.st_mode & 0o022 or not directory and info.st_nlink != 1:
@@ -351,6 +367,19 @@ def required_files(home, unit, engine):
     return sorted(set(files))
 
 
+def window_holds(home, user, unit, engine):
+    """The temporary drop-ins a kit or Novsky maintenance window writes for this agent's unit."""
+    names = ["zz-maintenance-hold.conf"]
+    if engine == "claude" and unit in ("claude-telegram.service", f"claude-telegram@{user}.service"):
+        names.append("zy-novsky-transaction.conf")
+    return [Path("/etc/systemd/system") / (unit + ".d") / name for name in names]
+
+
+def exact_window_hold(hold, home):
+    expected = f"[Unit]\nConditionPathExists=!{home}/logs/restart-hold.until\n".encode()
+    return _read(hold, {0}) == expected and stat.S_IMODE(hold.stat(follow_symlinks=False).st_mode) == 0o644
+
+
 def agent_python(value, uid):
     """Validate a selected user runtime without ever executing it as root."""
     if (not isinstance(value, str) or len(value) > 4096
@@ -422,9 +451,7 @@ def retire_legacy_user_backup_cron(home, user, backup):
 def _check_current(home, user, unit, engine, *, source_dir=None, python_binary=None,
                    allow_maintenance_hold=False, allow_pinned_legacy_shared_context=False):
     """Read-only proof that maintenance need not touch root backup context."""
-    if os.geteuid() != 0 or not re.fullmatch(r"[a-zA-Z0-9@_.-]+\.service", unit):
-        raise ValueError("root and an exact agent unit are required")
-    account = pwd.getpwnam(user)
+    account = require_caller(unit, user)
     home = Path(home).absolute()
     if ".." in home.parts:
         raise ValueError("unsafe agent home")
@@ -437,15 +464,9 @@ def _check_current(home, user, unit, engine, *, source_dir=None, python_binary=N
     profile = hashlib.sha256(str(home).encode()).hexdigest()[:24]
     agent_cron = CRON_DIRECTORY / ("novsky-agent-full-backup-" + profile)
     if allow_maintenance_hold:
-        names = ["zz-maintenance-hold.conf"]
-        if engine == "claude" and unit in ("claude-telegram.service", f"claude-telegram@{user}.service"):
-            names.append("zy-novsky-transaction.conf")
-        expected = f"[Unit]\nConditionPathExists=!{home}/logs/restart-hold.until\n".encode()
-        for name in names:
-            hold = Path("/etc/systemd/system") / (unit + ".d") / name
+        for hold in window_holds(home, user, unit, engine):
             if str(hold) in files:
-                if (_read(hold, {0}) != expected
-                        or stat.S_IMODE(hold.stat(follow_symlinks=False).st_mode) != 0o644):
+                if not exact_window_hold(hold, home):
                     raise ValueError("unexpected maintenance hold")
                 files.remove(str(hold))
     files.append(str(agent_cron))
@@ -582,13 +603,37 @@ def _check_current(home, user, unit, engine, *, source_dir=None, python_binary=N
     return {"profileId": profile, "policy": str(active), "contextRequired": True}
 
 
+class UnsafeKitSource(ValueError):
+    """The staged kit's own files fail the root-only read, so nothing can be said about the installed context."""
+
+
+def staged_kit_readable(source_dir=None):
+    """A kit staged under a shared directory such as /tmp (1777) cannot be read safely. Say so, instead of letting
+    the check call it a migration and send the operator into a move that rewrites /etc/cron.d (partner report 31.10)."""
+    source = Path(source_dir) if source_dir else Path(__file__).resolve().parent
+    bootstrap = source.parent / "bin/agent-full-backup"
+    if not bootstrap.is_file():
+        bootstrap = source / "agent-full-backup"
+    for path in (source / "agent-backup-context.py", bootstrap, bootstrap.with_name("agent-backup-sanitize")):
+        if not path.is_file():
+            continue  # a missing runtime keeps its own error from the check or the install
+        try:
+            no_links(path)
+            _read(path, {0})
+        except (OSError, ValueError) as error:
+            raise UnsafeKitSource(f"{path}: {error}") from None
+
+
 def check_current(home, user, unit, engine, *, source_dir=None, python_binary=None,
                   allow_maintenance_hold=False, allow_pinned_legacy_shared_context=False):
+    staged_kit_readable(source_dir)
     try:
         return _check_current(home, user, unit, engine, source_dir=source_dir,
                               python_binary=python_binary,
                               allow_maintenance_hold=allow_maintenance_hold,
                               allow_pinned_legacy_shared_context=allow_pinned_legacy_shared_context)
+    except Refused:
+        raise
     except Exception as error:
         raise ValueError("backup context requires reviewed migration before maintenance") from error
 
@@ -694,9 +739,7 @@ def backup_exclusions(existing):
 
 
 def install(home, user, unit, engine, *, source_dir=None, python_binary=None):
-    if os.geteuid() != 0 or not re.fullmatch(r"[a-zA-Z0-9@_.-]+\.service", unit):
-        raise ValueError("root and an exact agent unit are required")
-    account = pwd.getpwnam(user)
+    account = require_caller(unit, user)
     home = Path(home).absolute()
     if ".." in home.parts:
         raise ValueError("unsafe agent home")
@@ -708,6 +751,10 @@ def install(home, user, unit, engine, *, source_dir=None, python_binary=None):
     if python_binary is not None:
         python_binary = agent_python(python_binary, account.pw_uid)
     files = required_files(home, unit, engine)
+    # A move made inside a window must not record the window's own exact hold (Cash, 29.10.2026): the maintenance
+    # check leaves it out, and the collector would miss the file once the window removes it.
+    files = [name for name in files if not any(name == str(hold) and exact_window_hold(hold, home)
+                                               for hold in window_holds(home, user, unit, engine))]
     profile = hashlib.sha256(str(home).encode()).hexdigest()[:24]
     agent_cron = CRON_DIRECTORY / ("novsky-agent-full-backup-" + profile)
     files.append(str(agent_cron))
@@ -804,8 +851,12 @@ def main():
                         help="Move only absent files and the exact files of a kit release; stop on anything else")
     args = parser.parse_args()
     try:
+        # Root first: the staged kit's own files are root-only, so a non-root read would look like an unsafe kit.
+        if os.geteuid() != 0:
+            raise Refused("root is required")
         if args.allow_pinned_legacy_shared_context and not args.check_current:
             raise ValueError("legacy shared context is maintenance-only")
+        staged_kit_readable()
         if args.kit_origin_only:
             if args.check_current:
                 raise ValueError("a move is not a check")
@@ -822,9 +873,17 @@ def main():
     except ConfiguredBackup as error:
         print(json.dumps({"ok": False, "error": "backup-context-configured-backup", "detail": str(error)}))
         return 1
-    except Exception:
+    except UnsafeKitSource as error:
+        print(json.dumps({"ok": False, "error": "backup-context-unsafe-kit-location", "detail": str(error)}))
+        return 1
+    except Refused as error:
+        print(json.dumps({"ok": False, "error": "backup-context-refused", "detail": str(error)}))
+        return 1
+    except Exception as error:
+        # The check still fails closed, but it names what stopped it instead of masking every cause (partner, 01.11).
+        cause = error.__cause__ or error
         error_code = "backup-context-migration-required" if args.check_current else "backup-context-install-failed"
-        print(json.dumps({"ok": False, "error": error_code}))
+        print(json.dumps({"ok": False, "error": error_code, "detail": f"{type(cause).__name__}: {cause}"[:300]}))
         return 1
     return 0
 

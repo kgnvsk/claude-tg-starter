@@ -22,6 +22,34 @@ import urllib.request
 from pathlib import Path
 
 HOME = Path(os.environ.get("HOME", "/home/claude"))
+
+
+def notice(key: str, ukrainian: str, **values) -> str:
+    """The owner's notice language (OWNER_NOTICE_LOCALE) from the kit's catalog; Ukrainian when unset or on any failure."""
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "agent_notice_locale", Path(__file__).resolve().with_name("agent_notice_locale.py"))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module.notice_text(key, ukrainian, home=HOME).format(**values)
+    except Exception:
+        return ukrainian.format(**values)
+
+
+def api_key_access() -> bool | None:
+    """Nooman, 13.11.2026: True when Claude Code runs on a key from apiKeyHelper (no Claude login, so /relogin gets an
+    answer, not a link), None when that cannot be told (no link either), False on a Claude login. The same home as the
+    notices, so the answer is in the owner's language."""
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "agent_notice_locale", Path(__file__).resolve().with_name("agent_notice_locale.py"))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module.api_key_access(HOME)
+    except Exception:
+        return None
 AGENT_ROOT = Path(os.environ.get("AGENT_ROOT", str(HOME)))
 STATE_DIR = Path(os.environ.get("TELEGRAM_STATE_DIR")
                  or (AGENT_ROOT / ".claude/channels/telegram"))
@@ -138,13 +166,28 @@ def main() -> int:
 
     authorized = control_chats(owner())
     requests = {chat: ts for chat, ts in requests.items() if chat in authorized}
+    access = api_key_access() if requests else False
+    if access is not False:
+        # No login flow: the answer carries no state, and the owner may simply ask again.
+        text = (notice("relogin.api_key", "Вхід у Claude тут не потрібен: я працюю з моделлю за ключем доступу. "
+                                          "Якщо я мовчу, напиши /fix; якщо не допоможе — напиши нам.") if access else
+                notice("relogin.settings_unreadable", "Не вдалося прочитати налаштування Claude на сервері, тому "
+                                                      "посилання для входу не надсилаю. Напиши нам — ми подивимось."))
+        for chat in requests:
+            send(chat, text)
+        return 0
     if requests:
         chat = max(requests, key=requests.get)
-        # The waiting rescue observes this private command, stops only its own
-        # login child and releases its lock. The replacement waits for that
-        # handoff; killing CLI children here left their rescue parent locked.
+        # exactly ONE live login flow: kill any stale one first (no verifier clobber)
+        subprocess.run(["pkill", "-f", "claude auth login"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        for stale in (AGENT_ROOT / "logs/auth-rescue.state",):
+            try:
+                stale.unlink()
+            except OSError:
+                pass
         subprocess.Popen(
-            ["/usr/bin/timeout", "960", str(RESCUE), "--force", "--chat", chat],
+            ["/usr/bin/timeout", "900", str(RESCUE), "--force", "--chat", chat],
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL, start_new_session=True)
         # Network notices can each block for 15 seconds. The rescue must be
@@ -152,9 +195,11 @@ def main() -> int:
         # checkpointed requests without starting the login flow.
         for superseded in requests:
             if superseded != chat:
-                send(superseded, "⚠️ Одночасно надійшов запит на вхід з іншого дозволеного чату. "
-                                 "Запускаю одне нове посилання там; повтори /relogin пізніше, якщо потрібне окреме посилання.")
-        send(chat, "🔄 Запускаю повторний вхід — за кілька секунд надішлю свіже посилання.")
+                send(superseded, notice("relogin.superseded",
+                                        "⚠️ Одночасно надійшов запит на вхід з іншого дозволеного чату. "
+                                        "Запускаю одне нове посилання там; повтори /relogin пізніше, "
+                                        "якщо потрібне окреме посилання."))
+        send(chat, notice("relogin.starting", "🔄 Запускаю повторний вхід — за кілька секунд надішлю свіже посилання."))
     return 0
 
 

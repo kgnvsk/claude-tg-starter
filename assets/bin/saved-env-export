@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
 """Parse persisted shell-style settings as data and emit NUL pairs."""
 
-import codecs
 import os
-import re
 import shlex
 import sys
-import warnings
 from pathlib import Path
 
 
@@ -20,7 +17,7 @@ EXPORTABLE = {
     "MODULE_DESIGN_PACK", "MODULE_INSTAGRAM_DM",
     "MODULE_SOCIAL_BROWSER", "MODULE_TELEGRAM_CORPORATE", "MODULE_TRANSPORT_DAEMON",
     "MEMORY_EMBEDDINGS_OPENAI", "MODULE_VAULT_WEB", "MODULE_YOUTUBE_COMMENTS",
-    "OPENAI_API_KEY", "NOVSKY_LICENSE_KEY", "NOVSKY_MODULES", "NOVSKY_MODULES_CONTACT",
+    "OPENAI_API_KEY", "NOVSKY_LICENSE_KEY",
     "OWNER_CHAT_ID", "OWNER_EMAIL", "OWNER_NAME", "OWNER_NOTICE_LOCALE",
     "OWNER_TG_USERNAME", "RECALL_API_KEY", "RECALL_REGION",
     "RETRY_INITIAL_MS", "RETRY_MAX_MS",
@@ -44,19 +41,49 @@ RETIRED = {
     "INSTAGRAM_TOP_REPORT_EXECUTABLE", "INSTAGRAM_WEB_REPORT_EXECUTABLE",
 }
 ALLOWED = EXPORTABLE | RETIRED
-ANSI_C_VALUE = re.compile(r"^\$'(?:[^'\\]|\\.)*'$", re.DOTALL)
+ANSI_C_ESCAPES = {"a": 7, "b": 8, "e": 27, "E": 27, "f": 12, "n": 10, "r": 13, "t": 9, "v": 11,
+                  "\\": 92, "'": 39, '"': 34, "?": 63}
+OCTAL, HEX = "01234567", "0123456789abcdefABCDEF"
 
 
-def ansi_c_value(raw: str) -> str:
-    # Legacy install-core used printf %q. Decode only one literal, never source/eval it.
-    if ANSI_C_VALUE.fullmatch(raw) is None:
-        raise ValueError
-    with warnings.catch_warnings():
-        warnings.simplefilter("error", DeprecationWarning)
-        decoded = codecs.escape_decode(raw[2:-1].encode("utf-8"))[0]
-    if b"\0" in decoded:
-        raise ValueError
-    return decoded.decode("utf-8")
+def ansi_c_value(raw: str, name: str, number: int) -> str:
+    """Bash's %q wrote $'…' for non-ASCII under `env -i` in older updates (Cash, 29.10.2026): read the escapes it
+    uses, as data; anything else in that form is still refused."""
+    invalid = ValueError(f"invalid saved value for {name} on line {number}")
+    if len(raw) < 3 or not raw.endswith("'"):
+        raise invalid
+    body, out, index = raw[2:-1], bytearray(), 0
+    while index < len(body):
+        char = body[index]
+        if char == "'":
+            raise invalid
+        if char != "\\":
+            out += char.encode("utf-8")
+            index += 1
+            continue
+        index += 1
+        char = body[index] if index < len(body) else ""
+        if char in ANSI_C_ESCAPES:
+            out.append(ANSI_C_ESCAPES[char])
+            index += 1
+        elif char and char in OCTAL:
+            end = index
+            while end < len(body) and end - index < 3 and body[end] in OCTAL:
+                end += 1
+            out.append(int(body[index:end], 8) & 0xFF)
+            index = end
+        elif char == "x" and index + 1 < len(body) and body[index + 1] in HEX:
+            end = index + 1
+            while end < len(body) and end - index - 1 < 2 and body[end] in HEX:
+                end += 1
+            out.append(int(body[index + 1:end], 16))
+            index = end
+        else:
+            raise invalid
+    try:
+        return out.decode("utf-8")
+    except UnicodeDecodeError:
+        raise invalid from None
 
 
 def parse(path: Path) -> dict[str, str]:
@@ -69,10 +96,7 @@ def parse(path: Path) -> dict[str, str]:
         if not separator or name not in ALLOWED or name in values:
             raise ValueError(f"invalid saved setting on line {number}")
         if raw.startswith("$'"):
-            try:
-                value = ansi_c_value(raw)
-            except (UnicodeError, ValueError, DeprecationWarning) as error:
-                raise ValueError(f"invalid saved value for {name} on line {number}") from error
+            value = ansi_c_value(raw, name, number)
         elif raw == "":
             value = ""
         else:
@@ -83,6 +107,7 @@ def parse(path: Path) -> dict[str, str]:
             if len(tokens) != 1:
                 raise ValueError(f"invalid saved value for {name} on line {number}")
             value = tokens[0]
+        # Readers split on NUL (saved-env-export prints NUL pairs): none in any form.
         if "\0" in value:
             raise ValueError(f"invalid saved value for {name} on line {number}")
         values[name] = value

@@ -62,7 +62,7 @@ def unmasked_settings(data: bytes, target: Path) -> tuple[bytes, list[str]]:
     live = live if isinstance(live, dict) else {}
     missing = []
     for name in [name for name, value in env.items() if value == REDACTED]:
-        if live.get(name) in (None, "", REDACTED):
+        if live.get(name) in (None, REDACTED):
             del env[name]
             missing.append(name)
         else:

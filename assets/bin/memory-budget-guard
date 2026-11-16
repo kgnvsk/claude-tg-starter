@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-"""Require owner-reviewed replacements for the always-injected memory cores."""
+"""Keep the always-injected memory cores whole and within their limits: the agent edits them itself, with Edit or
+Write; a shell may not touch them."""
 
 from pathlib import Path
+import hashlib
 import json
 import os
 import re
@@ -45,24 +47,6 @@ def normalize_path(value: object) -> Path | None:
         return None
 
 
-def block(detail: str = "") -> None:
-    suffix = f" {detail}" if detail else ""
-    print(
-        json.dumps(
-            {
-                "decision": "block",
-                "reason": (
-                    f"Direct changes to active core memory are blocked.{suffix} "
-                    "Store detailed facts in Novsky Vault. A global USER.md or MEMORY.md "
-                    "change must go through learning-review: propose a complete "
-                    "replacement, show the diff, obtain explicit owner approval, "
-                    "then apply the reviewed bytes with rollback available."
-                ),
-            }
-        )
-    )
-
-
 def first_fill_allowed(tool_input: dict) -> bool:
     """The owner's profile may be written once, during the first conversation:
     the core is still the stock template, so there is nothing to review yet."""
@@ -76,6 +60,50 @@ def first_fill_allowed(tool_input: dict) -> bool:
         return False
     content = tool_input.get("content")
     return isinstance(content, str) and len(content) <= USER_CHAR_LIMIT
+
+
+CORE_LIMITS = {USER_PATH: USER_CHAR_LIMIT, (HOME / ".claude/memory/MEMORY.md").resolve(): 2200}
+# The installer's own templates, whitespace aside (the fingerprints wiki-hot-inject has; tests keep both sets equal to
+# the kit's templates). A core that still is one holds nothing of the agent's, so its first map may be far shorter
+# than the template (478 characters).
+STOCK_TEMPLATES = {"e136f640cfd1070f", "8986e8c0fda8270c", "2c862e867b35b68c"}
+
+
+def direct_write_refusal(tool_name: str, tool_input: dict, path: Path) -> str:
+    """Why this direct write may not pass; empty when it may. Memory v2 (owner, 14.11.2026): the agent keeps its own
+    cores, as Hermes and OpenClaw agents do - a core nobody was allowed to write stayed an empty template for weeks
+    (Arti). A write passes while the result stays within the core's limit and most of the core's lines stay."""
+    try:
+        current = path.read_text(encoding="utf-8")
+    except OSError:
+        current = ""
+    if tool_name == "Write":
+        result = tool_input.get("content")
+    else:
+        edits = tool_input.get("edits") if tool_name == "MultiEdit" else [tool_input]
+        result = current
+        for edit in edits if isinstance(edits, list) else []:
+            old, new = (edit or {}).get("old_string"), (edit or {}).get("new_string")
+            if not isinstance(old, str) or not isinstance(new, str) or old not in result:
+                return ""  # the tool itself refuses an edit that does not apply
+            result = result.replace(old, new) if (edit or {}).get("replace_all") else result.replace(old, new, 1)
+    if not isinstance(result, str):
+        return ""
+    limit = CORE_LIMITS[path]
+    if len(result) > limit:
+        return (f"The result would be {len(result)} characters and this core holds {limit}. In the same edit shorten, "
+                "merge or remove stale lines so that the whole file fits.")
+    stock = hashlib.sha256(" ".join(current.split()).encode("utf-8")).hexdigest()[:16] in STOCK_TEMPLATES
+    # By the lines that stay, not by the length: a rewrite of the same size loses every fact just as well.
+    lines = [row.strip() for row in current.splitlines() if row.strip()]
+    if not stock and len(current.strip()) > 400 and sum(1 for row in lines if row in result) < 0.4 * len(lines):
+        return ("This edit would throw away most of the core. Remove stale lines a few at a time; a full rewrite needs "
+                "the owner's explicit word.")
+    return ""
+
+
+def refuse(reason: str) -> None:
+    print(json.dumps({"decision": "block", "reason": "Core memory edit not applied. " + reason}))
 
 
 def main() -> None:
@@ -110,7 +138,8 @@ def main() -> None:
         if (references_memory_dir or references_core) and SHELL_MUTATION_RE.search(
             normalized
         ):
-            block("Shell mutation of the memory directory is disabled.")
+            refuse("A shell may not change the memory directory: edit USER.md or MEMORY.md with Edit or Write, "
+                   "within the file's limit.")
         return
 
     if tool_name not in {"Edit", "Write", "MultiEdit"}:
@@ -119,7 +148,9 @@ def main() -> None:
     if path == USER_PATH and tool_name == "Write" and first_fill_allowed(tool_input):
         return
     if path in CORE_PATHS:
-        block()
+        refusal = direct_write_refusal(tool_name, tool_input, path)
+        if refusal:
+            refuse(refusal)
 
 
 if __name__ == "__main__":
