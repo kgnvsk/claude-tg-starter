@@ -7,7 +7,7 @@
     "local-foundation-v1"
   ],
   "source": "codex/starter/product.json",
-  "sourceRevision": "ef20320bb1016f04b849b79d6bfd8d535a054115",
+  "sourceRevision": "feae1a88e894f1790f9b26c2a601640e85a208e9",
   "sourceDirty": false,
   "features": [
     "browser"
@@ -87,7 +87,7 @@
     "assets/bin/memory-open": "c9ed9335cc4aa96d00260bf643d71e6405caef44eae1e2a4dee0c540ba601d86",
     "assets/bin/memory-search": "6536ec596067f4b6a6b1b6cd30fbc9d90b43f6e1dcd9bae72099be0d8c978da9",
     "assets/bin/provider-quota": "5bb343be5deedb6ef23fcb2fdb01c3a2602363f0eb9fc6ea5659f2ab7019d6f7",
-    "assets/bin/reminder-task": "fbca4e92ad638e1858e02cff1532e55a622fc0c8682cc9f2ac04bcfcca06320b",
+    "assets/bin/reminder-task": "7069af508cf3e50a57f0ec7e9a1ecb6f5f158a1f94a5dfa0a7578c73cd1221d7",
     "assets/bin/set-openai-key": "3ca070b27074633c38b9d5ae4b56d82c3f97fec272b63d811b936d7b65614e88",
     "assets/bin/skill-doctor": "23f9dd86a9302eaec6ee43a470d8dc0bc2d60758dde54bc1f43a99679e64510d",
     "assets/bin/speak": "1d88fa4981403f1fc129e4721138103085d09ad47275fb3398e82d8c77acfae3",
@@ -213,7 +213,7 @@
     "home/bin/memory-search": "6536ec596067f4b6a6b1b6cd30fbc9d90b43f6e1dcd9bae72099be0d8c978da9",
     "home/bin/native-lifecycle": "4cd1e78a91a85ff5fb687edb82d097a2d9ee22a0e152c66b5c7624ffe7af8a99",
     "home/bin/provider-quota": "5bb343be5deedb6ef23fcb2fdb01c3a2602363f0eb9fc6ea5659f2ab7019d6f7",
-    "home/bin/reminder-task": "fbca4e92ad638e1858e02cff1532e55a622fc0c8682cc9f2ac04bcfcca06320b",
+    "home/bin/reminder-task": "7069af508cf3e50a57f0ec7e9a1ecb6f5f158a1f94a5dfa0a7578c73cd1221d7",
     "home/bin/set-openai-key": "3ca070b27074633c38b9d5ae4b56d82c3f97fec272b63d811b936d7b65614e88",
     "home/bin/skill-doctor": "23f9dd86a9302eaec6ee43a470d8dc0bc2d60758dde54bc1f43a99679e64510d",
     "home/bin/speak": "1d88fa4981403f1fc129e4721138103085d09ad47275fb3398e82d8c77acfae3",

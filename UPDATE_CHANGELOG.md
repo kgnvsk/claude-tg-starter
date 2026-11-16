@@ -1,8 +1,8 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-11-16.ef20320bb101`
+- Реліз: `2026-11-16.feae1a88e894`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `ef20320bb1016f04b849b79d6bfd8d535a054115`
+- Ревізія вихідного комплекту: `feae1a88e894f1790f9b26c2a601640e85a208e9`
 - Дата релізу: `2026-11-16`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
@@ -19,8 +19,7 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    Company chats: an admin's or the developer's private chat has the whole power; no "the owner sees" notice (#504)
-    Tests: the fake live CLI leaves no orphan when its host is gone (#503)
+    reminder-task status inside a scheduled run reads without waiting for its own tick (#505)
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не
