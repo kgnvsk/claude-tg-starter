@@ -182,6 +182,15 @@ SCOPE_WORK = (
     "(SELECT l.created_at FROM delivery_task_launches l WHERE l.launch_ref=o.launch_ref "
     "AND l.session_id=o.session_id AND l.stamp=o.stamp), 9223372036854775807) >= coalesce(entered.at, 0))))){released}"
 )
+# The open requests an unregistered worker of :turn may belong to, by the same B0-c reading (Volchenko, 16.11.2026;
+# the hook's LAUNCH_TURN_REQUESTS in tg-context-inject is the same query).
+LAUNCH_TURN_REQUESTS = (
+    "SELECT r.delivery_id FROM delivery_results r WHERE r.session_id=:session AND r.stamp=:stamp "
+    "AND r.state IN ('pending','deferred') AND (r.turn_id=:turn OR (r.response_turn_id=:turn AND coalesce("
+    "(SELECT l.created_at FROM delivery_task_launches l WHERE l.launch_ref=:launch AND l.session_id=:session "
+    "AND l.stamp=:stamp), 9223372036854775807) >= coalesce((SELECT min(t.observed_at) FROM delivery_task_returns t "
+    "WHERE t.session_id=:session AND t.stamp=:stamp AND t.delivery_id=r.delivery_id AND t.turn_id=:turn), 0)))"
+)
 # The list before B0-c: everything both turns launched.
 SCOPE_WORK_TURNS = (
     "SELECT 'launch ' || launch_ref FROM delivery_task_launches WHERE session_id=:session "
@@ -333,7 +342,7 @@ def end_unread_worker(connection, delivery, session, stamp, work, generation, no
         return False
     task = work[0][len("task "):]
     owner = connection.execute(
-        "SELECT o.state, o.delivery_id, o.occurrence, o.launched_turn FROM delivery_task_owners o "
+        "SELECT o.state, o.delivery_id, o.occurrence, o.launched_turn, o.launch_ref FROM delivery_task_owners o "
         "JOIN delivery_task_unread_ends u ON u.session_id=o.session_id AND u.stamp=o.stamp AND u.task_id=o.task_id "
         "AND u.occurrence=o.occurrence AND u.launch_ref=o.launch_ref AND u.released_at IS NULL "
         "WHERE o.session_id=? AND o.stamp=? AND o.task_id=? AND o.silent_notified_at IS NULL",
@@ -341,11 +350,10 @@ def end_unread_worker(connection, delivery, session, stamp, work, generation, no
     if owner is None:
         return False
     if owner[0] == "unowned":
-        # An unregistered worker belongs to the one open request of the turn that launched it (B0-a).
-        sole = connection.execute(
-            "SELECT delivery_id FROM delivery_results WHERE session_id=? AND stamp=? "
-            "AND state IN ('pending','deferred') AND (turn_id=? OR response_turn_id=?)",
-            (session, stamp, owner[3], owner[3])).fetchall()
+        # An unregistered worker belongs to the one open request of the turn that launched it (B0-a), a request
+        # reopened into that turn only for what the turn launched after it entered (B0-c; tg-context-inject).
+        sole = connection.execute(LAUNCH_TURN_REQUESTS, {"session": session, "stamp": stamp, "turn": owner[3],
+                                                         "launch": owner[4]}).fetchall()
         if [row[0] for row in sole] != [delivery]:
             return False
     elif owner[0] != "owned" or owner[1] != delivery:

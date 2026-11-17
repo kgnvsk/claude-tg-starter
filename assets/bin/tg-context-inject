@@ -730,7 +730,7 @@ def return_callback(conn: sqlite3.Connection, session_id: str, stamp: str, turn_
         # owed its final now, in this turn, as every mode bound this notice before U4.
         # Otherwise the worker still running answers it.
         delivery = (owner[0] if owner[1] in ("owned", "ended_unread")
-                    else launch_turn_request(conn, session_id, stamp, owner[4]))
+                    else launch_turn_request(conn, session_id, stamp, owner[4], owner[2]))
         request = conn.execute(
             "SELECT chat_id, thread_id, state, turn_id, response_turn_id FROM delivery_results "
             "WHERE delivery_id=? AND session_id=? AND stamp=?", (delivery, session_id, stamp),
@@ -762,7 +762,7 @@ def return_callback(conn: sqlite3.Connection, session_id: str, stamp: str, turn_
     ).fetchone()
     delivery = owner[0] if exact else None
     if exact and owner[1] == "unowned" and owner[4] is not None:
-        delivery = launch_turn_request(conn, session_id, stamp, owner[4])
+        delivery = launch_turn_request(conn, session_id, stamp, owner[4], owner[2])
         exact = delivery is not None
     if exact:
         conn.execute("UPDATE delivery_task_owners SET state='returned', delivery_id=? WHERE session_id=? "
@@ -882,15 +882,26 @@ def fallback_answered(conn: sqlite3.Connection, session_id: str, stamp: str, tas
         (session_id, stamp, task_id, occurrence)).fetchone() is not None
 
 
-def launch_turn_request(conn: sqlite3.Connection, session_id: str, stamp: str, launched_turn: int | None) -> str | None:
+# The open requests an unregistered worker of :turn may belong to (B0-a), read as SCOPE_WORK reads a request's
+# scope (B0-c): a request that only entered :turn by its own return owns what the turn launched after that return,
+# never what it launched before (Volchenko, 16.11.2026: two ends in one prompt left the second one bound to nobody).
+LAUNCH_TURN_REQUESTS = (
+    "SELECT r.delivery_id FROM delivery_results r WHERE r.session_id=:session AND r.stamp=:stamp "
+    "AND r.state IN ('pending','deferred') AND (r.turn_id=:turn OR (r.response_turn_id=:turn AND coalesce("
+    "(SELECT l.created_at FROM delivery_task_launches l WHERE l.launch_ref=:launch AND l.session_id=:session "
+    "AND l.stamp=:stamp), 9223372036854775807) >= coalesce((SELECT min(t.observed_at) FROM delivery_task_returns t "
+    "WHERE t.session_id=:session AND t.stamp=:stamp AND t.delivery_id=r.delivery_id AND t.turn_id=:turn), 0)))"
+)
+
+
+def launch_turn_request(conn: sqlite3.Connection, session_id: str, stamp: str, launched_turn: int | None,
+                        launch_ref: str | None) -> str | None:
     """No progress registered the worker: under the receiver it belongs to the one open
     request of the turn it was launched in, like a deferral (B0-a)."""
     if AUTHORITY != "receiver" or launched_turn is None:
         return None
     open_requests = conn.execute(
-        "SELECT delivery_id FROM delivery_results WHERE session_id=? AND stamp=? "
-        "AND state IN ('pending','deferred') AND (turn_id=? OR response_turn_id=?)",
-        (session_id, stamp, launched_turn, launched_turn),
+        LAUNCH_TURN_REQUESTS, {"session": session_id, "stamp": stamp, "turn": launched_turn, "launch": launch_ref},
     ).fetchall()
     return open_requests[0][0] if len(open_requests) == 1 else None
 

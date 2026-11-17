@@ -28,10 +28,12 @@ UPSTREAM_SERVER_SHA256 = (
 )
 UPSTREAM_PACKAGE_START = "bun install --no-summary 1>&2 && bun server.ts"
 GOLDEN_SERVER_SHA256 = (
-    "58605786f047bfe8da7c96f705c6d9d9fc1f39b532edd57fd85214e41978a9d6"
+    "9c3ffab10aa3d3c6922925d1327c4211f9b078c79e0b4f721f4d9a2eabf3ce9e"
 )
 PREVIOUS_GOLDEN_SERVER_SHA256S = frozenset(
     {
+        # 3cf45015309a Owner host: compact an idle conversation after an hour of silence, as the
+        "58605786f047bfe8da7c96f705c6d9d9fc1f39b532edd57fd85214e41978a9d6",
         # d7dde12812e7 Owner host: only the result right after its own /compact replay ends t
         "f2e557cd0fa56f41a926ed64911ca48145e980f2a312cafbceb0a6d6dcd2cb54",
         # 0a3cc0b4b2c8 Owner host: idle compaction ends on its own command's result; a refusa

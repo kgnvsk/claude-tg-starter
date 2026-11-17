@@ -1,9 +1,9 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-11-16.feae1a88e894`
+- Реліз: `2026-11-17.95124dca5d97`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `feae1a88e894f1790f9b26c2a601640e85a208e9`
-- Дата релізу: `2026-11-16`
+- Ревізія вихідного комплекту: `95124dca5d97fbe35c3971be6533fd18e115e616`
+- Дата релізу: `2026-11-17`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
 
@@ -19,7 +19,8 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    reminder-task status inside a scheduled run reads without waiting for its own tick (#505)
+    Background work: an unregistered worker's end binds to its own launch turn's request (B0-c) (#506)
+    Instagram: read Meta's webhook back for half a minute before calling it failed; subscribed_apps rows name the app app_id (#507)
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не

@@ -2818,18 +2818,25 @@ function countFinalRefusal(refusal: OpenWorkRefusal): void {
 function endUnreadWorker(request: ScopedRequest, open: string[], generation: number, now: number): boolean {
   if (open.length !== 1 || !open[0]!.startsWith('task ')) return false
   const task = open[0]!.slice('task '.length)
-  const owner = MSG_DB.query(`SELECT o.state, o.delivery_id, o.occurrence, o.launched_turn FROM delivery_task_owners o
+  const owner = MSG_DB.query(`SELECT o.state, o.delivery_id, o.occurrence, o.launched_turn, o.launch_ref
+      FROM delivery_task_owners o
       JOIN delivery_task_unread_ends u ON u.session_id=o.session_id AND u.stamp=o.stamp AND u.task_id=o.task_id
         AND u.occurrence=o.occurrence AND u.launch_ref=o.launch_ref AND u.released_at IS NULL
     WHERE o.session_id=? AND o.stamp=? AND o.task_id=? AND o.silent_notified_at IS NULL`)
     .get(request.session_id, request.stamp, task) as
-    { state: string; delivery_id: string | null; occurrence: number; launched_turn: number | null } | null
+    { state: string; delivery_id: string | null; occurrence: number; launched_turn: number | null;
+      launch_ref: string | null } | null
   if (!owner) return false
   if (owner.state === 'unowned') {
-    // An unregistered worker belongs to the one open request of the turn that launched it (B0-a).
-    const sole = MSG_DB.query(`SELECT delivery_id FROM delivery_results WHERE session_id=? AND stamp=?
-        AND state IN ('pending','deferred') AND (turn_id=? OR response_turn_id=?)`)
-      .all(request.session_id, request.stamp, owner.launched_turn, owner.launched_turn) as Array<{ delivery_id: string }>
+    // An unregistered worker belongs to the one open request of the turn that launched it (B0-a); a request reopened
+    // into that turn owns only what the turn launched after it entered (B0-c, as scopeWork reads it; Volchenko,
+    // 16.11.2026: two ends in one prompt left the second one bound to nobody).
+    const sole = MSG_DB.query(`SELECT r.delivery_id FROM delivery_results r WHERE r.session_id=?1 AND r.stamp=?2
+        AND r.state IN ('pending','deferred') AND (r.turn_id=?3 OR (r.response_turn_id=?3 AND coalesce(
+          (SELECT l.created_at FROM delivery_task_launches l WHERE l.launch_ref=?4 AND l.session_id=?1 AND l.stamp=?2),
+          9223372036854775807) >= coalesce((SELECT min(t.observed_at) FROM delivery_task_returns t
+          WHERE t.session_id=?1 AND t.stamp=?2 AND t.delivery_id=r.delivery_id AND t.turn_id=?3), 0)))`)
+      .all(request.session_id, request.stamp, owner.launched_turn, owner.launch_ref) as Array<{ delivery_id: string }>
     if (sole.length !== 1 || sole[0]!.delivery_id !== request.delivery_id) return false
   } else if (owner.state !== 'owned' || owner.delivery_id !== request.delivery_id) {
     return false
