@@ -143,12 +143,19 @@ ZONE_SEGMENT = r"[A-Za-z][A-Za-z0-9._+-]*"
 # CLI's own table (2.1.280: five_hour "session limit", seven_day "weekly
 # limit", seven_day_opus "Opus limit", seven_day_sonnet "Sonnet limit",
 # seven_day_overage_included "Fable limit", overage "usage credit limit"),
-# plus "usage limit" from earlier versions.
-LIMIT_KINDS = r"session|weekly|Opus|Sonnet|Fable|usage credit|usage"
+# plus "usage limit" from earlier versions. 2.1.319 prints the five_hour window
+# as "5-hour limit" (an owner's agent, 18.11.2026: the reset went unread, so
+# the owner was told of the limit without its time and the request was retried
+# blind, an hour and more apart). It is the session limit under a new name and
+# keeps that kind (limit_kind).
+LIMIT_KINDS = r"session|5-hour|weekly|Opus|Sonnet|Fable|usage credit|usage"
 # Limits whose reset is not read (2.1.280): the bare "limit" and the Team and
-# Enterprise spend caps. They hold like a limit with no reset time.
+# Enterprise spend caps (2.1.319 names them "monthly spend limit", "monthly
+# limit", "channel's monthly spend limit"). They hold like a limit with no
+# reset time.
 UNTIMED_LIMITS = (r"limit|individual usage limit|org's monthly usage limit"
-                  r"|channel's monthly usage limit|team's shared budget")
+                  r"|channel's monthly usage limit|team's shared budget"
+                  r"|monthly spend limit|monthly limit|channel's monthly spend limit")
 # Two provider phrasings: the classic "hit your … limit" and the credits pool
 # of Team/Enterprise seats ("out of usage credits", resets monthly).
 LIMIT_ERROR_PATTERN = re.compile(
@@ -334,6 +341,11 @@ def _valid_local_instants(
     return [candidates[key] for key in sorted(candidates)]
 
 
+def limit_kind(name: str | None) -> str:
+    """The kind a limit is keyed by: the CLI's name for it, the session limit under either of its names."""
+    return "session" if name == "5-hour" else name or "credits"
+
+
 def parse_reset(error: str, event_epoch_ms: int) -> ResetAt | None:
     """Resolve the next real local reset instant at or after the event.
 
@@ -404,7 +416,7 @@ def parse_reset(error: str, event_epoch_ms: int) -> ResetAt | None:
         if dated and reset_epoch_ms - event_epoch_ms > MAX_DATED_RESET_MS:
             return None  # a day already behind the event, not one a year ahead
         return ResetAt(
-            kind=match.group("kind") or "credits",
+            kind=limit_kind(match.group("kind")),
             key=chosen.isoformat(timespec="seconds"),
             epoch_ms=reset_epoch_ms,
         )

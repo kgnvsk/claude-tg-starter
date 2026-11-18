@@ -7,7 +7,7 @@
     "local-foundation-v1"
   ],
   "source": "codex/starter/product.json",
-  "sourceRevision": "f30f40f918ef036ad4ab27d81d4ab81070e4932c",
+  "sourceRevision": "28805c77788491ece747c70b1216603875c6f43e",
   "sourceDirty": false,
   "features": [
     "browser"
@@ -176,7 +176,7 @@
     "modules/telegram-corporate/tests/native-cli-canary.ts": "2a4186fd218fbd87d47a6bddbbf59bb53cfa2c8c33059b3ec92c23aee98e6ccb",
     "modules/telegram-corporate/types.ts": "344797ffd36194183d905e517a94cf4cd9319071067f9e3d8e1e412f67866588",
     "modules/telegram-corporate/worker-activity.ts": "dd5ffec7bd7d6665bcc1d7ed8456d543d3de43c29acee8238ef08ced2fc81aa2",
-    "modules/telegram-corporate/worker.ts": "ccc0e0cfc4b43043240dd5f939cb9601137b2f67acbb7d11603480f3690c7624"
+    "modules/telegram-corporate/worker.ts": "4325f1679bec19dfe80bf8d9f95585de7ceebf3ebae66c0146c994766541e968"
   },
   "files": {
     "home/.claude/agents/researcher.md": "d3781912006696258dc84032c2bd56ef8bbadb91848c04f793da35e55b4d2390",

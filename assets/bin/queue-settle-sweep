@@ -274,7 +274,7 @@ def still_started(delivery_id: str) -> bool:
 # 2026-09-15: a weekly limit, every turn dying at once). A 5xx is not listed:
 # an overloaded provider is exactly what a later replay fixes.
 TURN_NEVER_RAN = re.compile(
-    r"You've hit your (?:session|weekly|usage) limit"
+    r"You've hit your (?:session|5-hour|weekly|usage) limit"
     r"|You're out of usage credits"
     r"|Invalid API key|OAuth token has expired|Please run /login"
     r"|Failed to authenticate"
