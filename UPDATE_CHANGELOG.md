@@ -1,8 +1,8 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-11-18.28805c777884`
+- Реліз: `2026-11-18.aeaed591077a`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `28805c77788491ece747c70b1216603875c6f43e`
+- Ревізія вихідного комплекту: `aeaed591077aa6e4641cff4a9c9c41db372941fd`
 - Дата релізу: `2026-11-18`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
@@ -19,7 +19,7 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    Claude's 5-hour limit under its new name is read again: the reset time, the notice, the resume (#509)
+    Company mode: an update no longer stops at its last step when the company memory default arrives under its pause (#511)
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не

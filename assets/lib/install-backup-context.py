@@ -638,6 +638,22 @@ def check_current(home, user, unit, engine, *, source_dir=None, python_binary=No
         raise ValueError("backup context requires reviewed migration before maintenance") from error
 
 
+def backup_runs(state, uid):
+    """Whether the agent's own backup schedule does any work.
+
+    Every kit's helper (agent-full-backup, since its first release) backs up on schedule
+    only with a repository, a saved key and a token, and answers «setup-required»
+    otherwise. A config that cannot be read counts as a running backup.
+    """
+    try:
+        config = json.loads(_read(state / "config.json", {uid}, limit=128 * 1024))
+    except Exception:
+        return True
+    if not isinstance(config, dict):
+        return True
+    return bool(config.get("repositoryId") and config.get("keySavedAt") and (state / "github-token").exists())
+
+
 def require_kit_origin(home, user, unit, engine, *, source_dir=None):
     """Refuse a move over anything a kit release did not write.
 
@@ -670,9 +686,12 @@ def require_kit_origin(home, user, unit, engine, *, source_dir=None):
     state = home / ".local/state/agent-full-backup"
     # A backup an owner set up on an old kit runs from that kit's line; the scheduler
     # that replaces it arrives only with this update. Moved now, the backup would have
-    # no working trigger if the update stops (Codex, review of 2fbec439).
+    # no working trigger if the update stops (Codex, review of 2fbec439). One that was only
+    # prepared does no work on that line and loses nothing; refused as well, its agent
+    # could not be updated at all (a partner's client, 18.11.2026).
     no_links(state / "config.json")
-    if (state / "config.json").exists() and not (home / "bin/agent-nightly-github-backup").is_file():
+    if ((state / "config.json").exists() and not (home / "bin/agent-nightly-github-backup").is_file()
+            and backup_runs(state, account.pw_uid)):
         raise ConfiguredBackup("a configured backup still runs on its old schedule")
     settings = current(state / "context.json", {account.pw_uid})
     settings = json.loads(settings) if settings is not None else {}
