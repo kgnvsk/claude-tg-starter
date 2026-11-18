@@ -1,9 +1,9 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-11-17.95124dca5d97`
+- Реліз: `2026-11-18.f30f40f918ef`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `95124dca5d97fbe35c3971be6533fd18e115e616`
-- Дата релізу: `2026-11-17`
+- Ревізія вихідного комплекту: `f30f40f918ef036ad4ab27d81d4ab81070e4932c`
+- Дата релізу: `2026-11-18`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
 
@@ -19,8 +19,7 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    Background work: an unregistered worker's end binds to its own launch turn's request (B0-c) (#506)
-    Instagram: read Meta's webhook back for half a minute before calling it failed; subscribed_apps rows name the app app_id (#507)
+    WhatsApp pairing: the bridge says how a pairing ended and leaves; wa-link --status tells it (#508)
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не
