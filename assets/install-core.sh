@@ -1066,6 +1066,13 @@ set_managed_persona_mode "$MANAGED_PRODUCT"
 [ ! -e "$H/CLAUDE.md" ] || runuser -u "$AGENT_USER" -- python3 "$KIT/assets/lib/owner-rules-restore.py" "$H" >/dev/null
 runuser -u "$AGENT_USER" -- python3 "$KIT/assets/lib/sync-managed-claude.py" \
   "$H/CLAUDE.md" "$MANAGED_IMPORT" "$PRODUCT_IMPORT"
+# The company rules of an agent moved to rules by scope are part of its instructions (owner, 18.11.2026): ~/CLAUDE.md
+# imports them, the CLI reads them once per session, and the hook's limit no longer bounds them. An agent that keeps
+# its rules in ~/CLAUDE.md is untouched. A refusal here leaves the rules arriving with each message, as before.
+if [ -f "$H/.local/share/agent-rules/MIGRATED" ] && [ ! -L "$H/.local/share/agent-rules/MIGRATED" ]; then
+  runuser -u "$AGENT_USER" -- env HOME="$H" python3 "$KIT/assets/bin/agent-rules" instructions >/dev/null \
+    || echo "WARN: правила компанії не підключено до інструкцій агента; вони й далі приходять із кожним повідомленням" >&2
+fi
 ACCESS_FILE="$H/.claude/channels/telegram/access.json"
 if [ ! -e "$ACCESS_FILE" ]; then
   # The transport moves an unreadable access.json aside as access.json.corrupt-<ts>.

@@ -1,8 +1,8 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-11-18.aeaed591077a`
+- Реліз: `2026-11-18.52ed29062107`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `aeaed591077aa6e4641cff4a9c9c41db372941fd`
+- Ревізія вихідного комплекту: `52ed29062107cf7745fc1f20ecc4e92f548ac616`
 - Дата релізу: `2026-11-18`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
@@ -19,7 +19,7 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    Company mode: an update no longer stops at its last step when the company memory default arrives under its pause (#511)
+    Agent rules: the company rules are part of the instructions, read once per session; the hook's limit no longer bounds them (#512)
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не

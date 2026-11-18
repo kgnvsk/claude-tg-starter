@@ -25,6 +25,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -34,7 +35,15 @@ import tempfile
 # characters reaches the model whole; above that the model sees a ~2 300-character preview.
 CLI_HOOK_CONTEXT_LIMIT = 10_000
 # The whole applicable set of one conversation; the rest of the limit stays for the hook's parts that are never cut.
+# Where the company rules are part of the instructions (below), this is the room of the rules that still travel with
+# each message: a person's own, a group's, a topic's.
 RULES_BUDGET = 6_000
+# Owner, 18.11.2026 (his decision of 22.10: rules live in the instructions, read once per session): rules that do not
+# ride each message need no hook limit. Company rules hold for every conversation and are the set that grows, so the
+# main session reads them as instructions: ~/CLAUDE.md imports company.md, the CLI loads it once per session, and the
+# hook's limit does not bound it. The CLI reads such a file whole up to 4 MiB; the ceiling is ours, about a twentieth
+# of a 200K-token context, so the rules stay a small part of what every request carries.
+COMPANY_BUDGET = 30_000
 # The installer's notes about the owner travel next to the rules of the owner's private chat, in room of their own:
 # a full rule set, full notes and the hook's fixed parts still fit the limit (tests/test_agent_rules_budget.py).
 BRIEF_BUDGET = 2_000
@@ -67,6 +76,25 @@ BRIEF_OVERFLOW = ("The developer's briefing about the owner was edited by hand a
                   "whole ({size} characters). The complete text is in {path}; read it before answering the owner.")
 SECTION = {"company": "Company rules:", "person": "This person's own rules (their private chat):",
            "chat": "This group's rules:", "topic": "This topic's rules:"}
+# What a message carries where the company rules are part of the instructions.
+HEAD_BEYOND = ("AGENT RULES of this conversation beyond the company rules (complete; follow them in this answer). The "
+               "company rules in your instructions come first; a narrower rule never relaxes them.")
+# The line names how many there are and where to read them, so a session whose instructions came without the import
+# (the one thing the hook cannot see) notices and reads the file instead of answering without them.
+COMPANY_LOADED = ("COMPANY RULES ({count}) are in your instructions under the heading «Правила компанії цього агента» "
+                  "(~/CLAUDE.md imports them whole); they hold in this answer and come first. If your instructions show "
+                  "no such section, read {path} before answering.")
+COMPANY_CHANGED = ("COMPANY RULES were changed after your instructions were loaded. Each change below replaces what "
+                   "the instructions say; the rest of them holds as it stands there.")
+COMPANY_REREAD = ("COMPANY RULES were changed after your instructions were loaded, by more than this message carries. "
+                  "Read the current ones whole in {path} before answering; they replace what the instructions say.")
+# A session whose start nobody noted, on a set too long to repeat: no owner is told to split anything.
+COMPANY_UNNOTED = ("COMPANY RULES are too long to repeat with each message and this session's start was not noted. "
+                   "Read them whole in {path} before answering.")
+IMPORT_HEAD = ("# Правила компанії цього агента (повні; діють у кожній розмові й мають перевагу над вужчими правилами; "
+               "змінюються лише через ~/bin/agent-rules)")
+SESSION = re.compile(r"[0-9A-Za-z][0-9A-Za-z_-]{7,79}")
+LOADED_KEPT = 30
 
 
 class Refused(Exception):
@@ -497,19 +525,35 @@ def sources(chat: str, thread: str | None) -> list[tuple[str, Path]]:
     return found
 
 
-def compose(blocks: list[tuple[str, list[str]]]) -> str:
+def compose(blocks: list[tuple[str, list[str]]], head: str = HEAD) -> str:
     sections = [SECTION[kind] + "\n" + "\n\n".join(texts) for kind, texts in blocks if texts]
-    return HEAD + "\n\n" + "\n\n".join(sections) if sections else ""
+    return head + "\n\n" + "\n\n".join(sections) if sections else ""
 
 
-def render(chat: str, thread: str | None, overrides: dict[Path, str] | None = None) -> str:
+def instructions_import() -> str:
+    return f"@{data_dir() / 'company.md'}"
+
+
+def linked() -> bool:
+    """The company rules reach the main session as instructions: ~/CLAUDE.md imports the company file."""
+    try:
+        return instructions_import() in (home() / "CLAUDE.md").read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError):
+        return False
+
+
+def render(chat: str, thread: str | None, overrides: dict[Path, str] | None = None, beyond: bool = False) -> str:
+    """The rules of one conversation. With `beyond`, without the company rules: what a message carries where they
+    are part of the instructions."""
     owner = owner_id()
     admin_ids = admins()
     blocks = []
     for kind, relative in sources(chat, thread):
+        if beyond and kind == "company":
+            continue
         text = overrides[relative] if overrides and relative in overrides else read_bytes(data_dir() / relative).decode("utf-8")
         blocks.append((kind, [rule["text"] for rule in parse(text) if active(rule, kind, owner, admin_ids)]))
-    return compose(blocks)
+    return compose(blocks, HEAD_BEYOND if beyond else HEAD)
 
 
 def brief_text(rules: list[dict]) -> str:
@@ -544,14 +588,28 @@ def check_budget(relative: Path, new_text: str) -> dict:
         if size > BRIEF_BUDGET:
             raise Refused("over_budget", context="brief", size=size, budget=BRIEF_BUDGET, over_by=size - BRIEF_BUDGET)
         return {"brief": size}
+    instructions = linked()
+    if instructions and relative == Path("company.md"):
+        # Part of the instructions: measured against their own ceiling, and no message grows by them.
+        size = units(compose([("company", [rule["text"] for rule in parse(new_text)])]))
+        if size > COMPANY_BUDGET:
+            raise Refused("over_budget", context="company", size=size, budget=COMPANY_BUDGET,
+                          over_by=size - COMPANY_BUDGET)
+        return {"company": size}
     sizes = {}
     for chat, thread in affected_contexts(relative):
-        size = units(render(chat, thread, {relative: new_text}))
+        size = units(render(chat, thread, {relative: new_text}, beyond=instructions))
         sizes[f"{chat}:{thread}" if thread else chat] = size
         if size > RULES_BUDGET:
             raise Refused("over_budget", context=chat if thread is None else f"{chat}:{thread}", size=size,
                           budget=RULES_BUDGET, over_by=size - RULES_BUDGET)
     return sizes
+
+
+def budget_of(relative: Path) -> int:
+    if relative.parts[0] == "brief":
+        return BRIEF_BUDGET
+    return COMPANY_BUDGET if relative == Path("company.md") and linked() else RULES_BUDGET
 
 
 # ---------- commands ----------
@@ -581,8 +639,7 @@ def change(relative: Path, mutate, authorize=None) -> dict:
         for rule, event in events:
             append_history(relative, rule, event)
         write_atomic(path, text)
-    receipt.update({"file": str(relative), "sizes": sizes,
-                    "budget": BRIEF_BUDGET if relative.parts[0] == "brief" else RULES_BUDGET})
+    receipt.update({"file": str(relative), "sizes": sizes, "budget": budget_of(relative)})
     return receipt
 
 
@@ -739,11 +796,124 @@ def overflow(chat: str, thread: str | None, text: str) -> str:
             f"The complete text is in {snapshot}. The owner has been told the set needs splitting.")
 
 
+def loaded_path(session: str | None) -> Path | None:
+    return data_dir() / "loaded" / f"{session}.md" if session and SESSION.fullmatch(session) else None
+
+
+def company_note(before: str) -> tuple[str, bool]:
+    """What a message says about the company rules to a session that holds them as instructions, and whether they
+    changed since it read them: where they are while they stand as loaded; after a change, every changed rule whole,
+    next to the rule it replaces."""
+    path = data_dir() / "company.md"
+    then, now = parse(before), parse(read_bytes(path).decode("utf-8"))
+
+    def named(rule: dict) -> str:
+        text = rule["text"]
+        return ((f"{rule['id']} " if rule.get("id") else "") + "that began «"
+                + (text if len(text) <= 160 else text[:160].rstrip() + "…") + "»")
+
+    old_texts = {rule["text"] for rule in then}
+    by_id = {rule["id"]: rule for rule in then if rule.get("id")}
+    changes, replaced = [], set()
+    for rule in now:
+        if rule["text"] in old_texts:
+            continue
+        # A replacement stands in the old rule's place under a new id and names it (command_replace); a hand edit
+        # keeps the id.
+        previous = by_id.get(rule["fields"].get("replaces")) or by_id.get(rule.get("id"))
+        if previous is None:
+            changes.append("New rule:\n" + rule["text"])
+        else:
+            replaced.add(previous["text"])
+            changes.append(f"In place of the rule {named(previous)}:\n" + rule["text"])
+    current_texts = {rule["text"] for rule in now}
+    for rule in {rule["text"]: rule for rule in then}.values():
+        if rule["text"] not in current_texts and rule["text"] not in replaced:
+            changes.append(f"No longer in force: the rule {named(rule)}")
+    if changes:
+        return COMPANY_CHANGED + "\n\n" + "\n\n".join(changes), True
+    return COMPANY_LOADED.format(count=len(now), path=path), False
+
+
 def command_render(args) -> str:
-    text = render(args.chat, args.thread)
-    if args.max_chars and units(text) > args.max_chars:
-        return overflow(args.chat, args.thread, text)
-    return text
+    session, room, path = getattr(args, "session", None), args.max_chars, data_dir() / "company.md"
+    fresh, before = session == "fresh", None
+    if not fresh:
+        snapshot = loaded_path(session)
+        try:  # a note pruned this instant is a session nobody noted
+            if snapshot is not None and not snapshot.is_symlink():
+                before = snapshot.read_text(encoding="utf-8")
+                os.utime(snapshot)  # a session in use keeps its note among the newest (command_loaded)
+        except OSError:
+            before = None
+    join = lambda *parts: "\n\n".join(part for part in parts if part)
+    if not linked() or (before is None and not fresh):
+        text = render(args.chat, args.thread)
+        if not room or units(text) <= room:
+            return text
+        if not linked():
+            return overflow(args.chat, args.thread, text)
+        status = short = COMPANY_UNNOTED.format(path=path)
+    elif fresh:  # a run that has just read its instructions
+        status = short = COMPANY_LOADED.format(count=len(parse(read_bytes(path).decode("utf-8"))), path=path)
+    else:
+        status, changed = company_note(before)
+        short = COMPANY_REREAD.format(path=path) if changed else status
+    # The company rules do not travel with this message: it carries the rest, and a line about them that is never
+    # dropped, so a narrow set too long for the message cannot hide a change of the company rules.
+    beyond = render(args.chat, args.thread, beyond=True)
+    if room and beyond and units(join(short, beyond)) > room:
+        return join(short, overflow(args.chat, args.thread, beyond))
+    text = join(status, beyond)
+    return text if not room or units(text) <= room else join(short, beyond)
+
+
+def command_loaded(args) -> str:
+    """The hook's note at a session's start: the company rules as that session's instructions hold them. Kept for
+    the sessions used last. Nobody else writes the company rules between a process reading its instructions and this
+    note: only the main session does, and it is the process that is starting."""
+    snapshot = loaded_path(args.session)
+    if snapshot is None:
+        raise Refused("bad_session")
+    with Lock():
+        if not linked():
+            snapshot.unlink(missing_ok=True)  # whatever this session read earlier no longer counts
+            return ""
+        write_atomic(snapshot, read_bytes(data_dir() / "company.md").decode("utf-8"))
+        kept = sorted(snapshot.parent.glob("*.md"), key=lambda path: path.stat().st_mtime, reverse=True)
+        for path in kept[LOADED_KEPT:]:
+            path.unlink(missing_ok=True)
+    return ""
+
+
+def link_locked() -> bool:
+    """Make the company rules part of the main session's instructions: ~/CLAUDE.md imports the company file under a
+    heading of its own, after the kit's other imports. Everything else in the file stays as it is; a second run
+    changes nothing. The caller holds the lock."""
+    root, claude_md, line = data_dir(), home() / "CLAUDE.md", instructions_import()
+    if not (root / "company.md").exists():
+        write_atomic(root / "company.md", serialize([], "company.md"))
+    text = read_bytes(claude_md).decode("utf-8")
+    lines = [POINTER if item == POINTER_BEFORE else item for item in (text or "# Правила власника\n").splitlines()
+             if item.strip() not in (IMPORT_HEAD, line)]
+    top = next((index for index, item in enumerate(lines) if not item.startswith("@")), len(lines))
+    rest = lines[top:]
+    while rest and not rest[0].strip():
+        rest.pop(0)
+    new = "\n".join(lines[:top] + ([""] if top else []) + [IMPORT_HEAD, line, ""] + rest).rstrip("\n") + "\n"
+    if new == text:
+        return False
+    mode = claude_md.stat().st_mode & 0o777 if claude_md.exists() else 0o644
+    write_atomic(claude_md, new)
+    os.chmod(claude_md, mode)
+    return True
+
+
+def command_instructions(args) -> dict:
+    require_migrated()
+    with Lock():
+        changed = link_locked()
+    return {"status": "linked" if changed else "unchanged", "import": instructions_import(), "restart_required": changed}
 
 
 def command_brief(args) -> str:
@@ -780,8 +950,12 @@ def command_installer(args) -> dict:
 
 # ---------- migration of one agent (plan, apply, rollback) ----------
 
+POINTER_BEFORE = ("Правила цього агента зберігаються через ~/bin/agent-rules: спільні для компанії, особисті для кожної людини, "
+                  "для груп і тем. Щоходу вони приходять у контекст цілком. Нове правило, зміну чи зняття роби командою "
+                  "`~/bin/agent-rules save|replace|retire --scope company|person|chat|topic --delivery <delivery_id запиту>`.")
 POINTER = ("Правила цього агента зберігаються через ~/bin/agent-rules: спільні для компанії, особисті для кожної людини, "
-           "для груп і тем. Щоходу вони приходять у контекст цілком. Нове правило, зміну чи зняття роби командою "
+           "для груп і тем. Правила компанії підключено вище в цих інструкціях, вужчі приходять у контекст із кожним "
+           "повідомленням. Нове правило, зміну чи зняття роби командою "
            "`~/bin/agent-rules save|replace|retire --scope company|person|chat|topic --delivery <delivery_id запиту>`.")
 RULE_HEADING = re.compile(r"(?i)^#{1,6}\s.*(правил|rules)")
 
@@ -908,10 +1082,17 @@ def compute_plan(company: set[int], take: set[int], groups: set[str]) -> dict:
                 rule["id"] = next_id(rules, "")
                 rule["fields"] = {"id": rule["id"], "rev": "1", "source": "migration"}
         overrides[Path(relative)] = serialize(rules, relative)
+    # The move makes the company rules part of the instructions (link_locked): they are measured against their own
+    # ceiling, and every narrower set on its own.
     over = []
     for relative in overrides:
+        if relative == Path("company.md"):
+            size = units(compose([("company", [rule["text"] for rule in parse(overrides[relative])])]))
+            if size > COMPANY_BUDGET:
+                over.append({"context": "company", "size": size})
+            continue
         for chat, thread in affected_contexts(relative):
-            size = len(render(chat, thread, overrides))
+            size = units(render(chat, thread, overrides, beyond=True))
             if size > RULES_BUDGET:
                 over.append({"context": chat if thread is None else f"{chat}:{thread}", "size": size})
     body = json.dumps({"moves": {str(k): v for k, v in overrides.items()}, "sources": sources,
@@ -987,6 +1168,8 @@ def migrate_apply(sha: str) -> dict:
         original_mode = claude_md.stat().st_mode & 0o777
         write_atomic(claude_md, "\n".join(new).rstrip("\n") + "\n")
         os.chmod(claude_md, original_mode)
+        link_locked()
+        shutil.rmtree(root / "loaded", ignore_errors=True)  # no process has read these instructions yet
         (backup / "written.json").write_text(json.dumps(written))
         write_atomic(root / "MIGRATED", json.dumps({"plan": sha, "at": now_iso(), "backup": backup.name}) + "\n")
     return {"status": "migrated", "plan": sha, "files": written, "backup": str(backup.relative_to(root)),
@@ -1017,6 +1200,7 @@ def migrate_rollback() -> dict:
             if saved.exists():
                 write_atomic(target, saved.read_text(encoding="utf-8"))
         os.replace(root / "MIGRATED", aside / "MIGRATED")
+        shutil.rmtree(root / "loaded", ignore_errors=True)  # the instructions no longer import the company rules
     return {"status": "rolled_back", "restored": "CLAUDE.md", "aside": str(aside.relative_to(root)),
             "restart_required": True}
 
@@ -1025,7 +1209,7 @@ def migrate_rollback() -> dict:
 # (-100…:7), a group chat id or a rule written as «- item» stopped with «expected one argument». Every option here takes
 # exactly one value, so each value is bound to its option before parsing.
 VALUE_OPTIONS = frozenset({"--chat", "--company", "--delivery", "--fencing", "--groups", "--id", "--job", "--max-chars",
-                           "--plan", "--scope", "--take", "--text", "--text-file", "--thread"})
+                           "--plan", "--scope", "--session", "--take", "--text", "--text-file", "--thread"})
 
 
 def bound_values(argv: list[str]) -> list[str]:
@@ -1085,13 +1269,17 @@ def main(argv: list[str]) -> int:
         p.add_argument("--thread")
         if name == "render":
             p.add_argument("--max-chars", type=int)
+            p.add_argument("--session", help="the id of a session whose instructions hold the company rules "
+                                             "(`loaded` noted them), or «fresh» for a run that has just read them")
         if name == "list":
             p.add_argument("--scope", choices=("brief",), help="the installer's notes about the owner, with a proof")
             proof(p)
+    sub.add_parser("loaded").add_argument("--session", required=True)
+    sub.add_parser("instructions")
     args = parser.parse_args(bound_values(argv))
     try:
-        if args.command in ("render", "brief"):
-            sys.stdout.write(command_render(args) if args.command == "render" else command_brief(args))
+        if args.command in ("render", "brief", "loaded"):
+            sys.stdout.write({"render": command_render, "brief": command_brief, "loaded": command_loaded}[args.command](args))
             return 0
         if args.command == "migrate":
             numbers = lambda value: {int(item) for item in value.split(",") if item.strip().isdigit()}
@@ -1100,8 +1288,8 @@ def main(argv: list[str]) -> int:
                       else migrate_apply(args.plan) if args.step == "apply" else migrate_rollback())
             print(json.dumps(result, ensure_ascii=False, indent=2))
             return 0
-        handler = {"save": command_save, "replace": command_replace, "retire": command_retire,
-                   "adopt": command_adopt, "list": command_list, "installer": command_installer}[args.command]
+        handler = {"save": command_save, "replace": command_replace, "retire": command_retire, "adopt": command_adopt,
+                   "list": command_list, "installer": command_installer, "instructions": command_instructions}[args.command]
         print(json.dumps(handler(args), ensure_ascii=False))
         return 0
     except Refused as refusal:

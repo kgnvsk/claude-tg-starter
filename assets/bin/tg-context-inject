@@ -75,7 +75,7 @@ RULES_DIR = Path(os.environ.get("AGENT_RULES_DIR") or Path.home() / ".local/shar
 # CLI_HOOK_CONTEXT_LIMIT (tests/test_agent_rules_budget.py keeps the two equal).
 RULES_HOOK_ROOM = 10000
 RULES_SAVE_NOTE = ("Saving a lasting rule: use `~/bin/agent-rules save|replace|retire --scope company|person|chat|topic "
-                   "--delivery <this request's delivery_id>`; ~/CLAUDE.md no longer holds the rules.")
+                   "--delivery <this request's delivery_id>`; never by editing ~/CLAUDE.md or a file it imports.")
 
 
 def units(text: str) -> int:
@@ -88,22 +88,48 @@ def rules_migrated() -> bool:
     return marker.is_file() and not marker.is_symlink()
 
 
-def scoped_rules(chat_id: str | None, thread_id: str | None, room: int) -> str:
+def scoped_rules(chat_id: str | None, thread_id: str | None, room: int, session: str | None = None,
+                 fresh: bool = False) -> str:
     """This conversation's rules, whole, from agent-rules; with no chat, the owner's private chat. A set that cannot
-    fit in `room` comes back as agent-rules' flagged pointer, never cut."""
+    fit in `room` comes back as agent-rules' flagged pointer, never cut. Where the company rules are part of the
+    instructions (owner, 18.11.2026), a session agent-rules knows gets the rest and what changed since it read them;
+    `fresh` is a run that has just read them."""
     chat = chat_id or _owner_chat_id()
     if not chat:
         return ""
     command = [str(Path(__file__).resolve().with_name("agent-rules")), "render", "--chat", str(chat),
                "--max-chars", str(max(room, 1))] + (["--thread", str(thread_id)] if thread_id else [])
-    try:
-        result = subprocess.run(command, capture_output=True, text=True, timeout=20)
-    except (OSError, subprocess.SubprocessError):
-        result = None
+    named = ["--session", "fresh" if fresh else session] if fresh or session else []
+    result = None
+    # An agent-rules older than this hook (a helper its owner edited is not replaced by an update) knows no
+    # sessions and refuses the option: it is asked again the old way and gives the whole set.
+    for extra in ([named, []] if named else [[]]):
+        try:
+            result = subprocess.run(command + extra, capture_output=True, text=True, timeout=20)
+        except (OSError, subprocess.SubprocessError):
+            result = None
+        if result is not None and result.returncode == 0:
+            break
     if result is None or result.returncode != 0:
         return ("AGENT RULES could not be read this turn (agent-rules failed); act on the rules you already know "
                 "and tell the owner the rules did not load.")
     return result.stdout.strip()
+
+
+# The moments a session reads its instructions, ~/CLAUDE.md with the company rules in it: a new process. What it
+# read is noted then, so a later message can say what changed since.
+INSTRUCTIONS_READ = ("startup", "resume")
+# A process started with its CLAUDE.md reading switched off (a company worker is) holds no instructions at all: it
+# is never noted and never called fresh, and gets the whole set with each message.
+INSTRUCTIONS_OFF = os.environ.get("CLAUDE_CODE_DISABLE_CLAUDE_MDS") == "1"
+
+
+def instructions_loaded(session: str) -> None:
+    try:
+        subprocess.run([str(Path(__file__).resolve().with_name("agent-rules")), "loaded", "--session", session],
+                       capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        pass
 
 
 def brief_recorded() -> bool:
@@ -240,9 +266,12 @@ if os.environ.get("ATARAX_SUPPRESS_TELEGRAM") == "1":
     if os.environ.get("ATARAX_TASK_DELIVERY") == "1":
         try:
             if json.loads(sys.stdin.read() or "{}").get("hook_event_name") == "UserPromptSubmit":
-                # A migrated agent's task renders the context it was created in (the tick passes it).
+                # A migrated agent's task renders the context it was created in (the tick passes it). A run inside
+                # the agent's home has just read ~/CLAUDE.md, the company rules with it.
                 rules = (scoped_rules(os.environ.get("ATARAX_RULES_CHAT"), os.environ.get("ATARAX_RULES_THREAD") or None,
-                                      RULES_HOOK_ROOM) if rules_migrated() else owner_rules())
+                                      RULES_HOOK_ROOM, fresh=not INSTRUCTIONS_OFF
+                                      and Path.cwd().resolve().is_relative_to(Path.home().resolve()))
+                         if rules_migrated() else owner_rules())
         except Exception:
             rules = ""
     print(json.dumps({"continue": True, "hookSpecificOutput": {
@@ -1555,6 +1584,9 @@ def main() -> None:
 
     parts = [current_moment()]
     migrated = rules_migrated()
+    session = data.get("session_id") if isinstance(data.get("session_id"), str) and not INSTRUCTIONS_OFF else None
+    if migrated and session and hook_event == "SessionStart" and data.get("source") in INSTRUCTIONS_READ:
+        instructions_loaded(session)
     rules = "" if migrated else owner_rules()
     if rules:
         parts.append(rules)
@@ -1628,7 +1660,7 @@ def main() -> None:
         room = (CLI_HOOK_CONTEXT_LIMIT - sum(units(part) + 2 for part in fixed) - units(RULES_SAVE_NOTE) - 3
                 - (units(turn_pointer(RULES_DIR / "overflow" / ("turn-" + "0" * 16 + ".md"))) + 2 if movable else 0)
                 - (units(brief) + 2 if brief else 0))
-        scoped = scoped_rules(rules_chat, rules_thread, room)
+        scoped = scoped_rules(rules_chat, rules_thread, room, session)
         # The notes stay with the rules block, which never moves to a file.
         parts.insert(1, "\n\n".join(part for part in (scoped + "\n" + RULES_SAVE_NOTE if scoped else RULES_SAVE_NOTE, brief)
                                     if part))
