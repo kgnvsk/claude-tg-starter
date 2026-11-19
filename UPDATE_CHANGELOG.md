@@ -1,8 +1,8 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-11-19.da3e2fdae5e1`
+- Реліз: `2026-11-19.9641419800b6`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `da3e2fdae5e1752bb26a4321a97b2c65d287f1a7`
+- Ревізія вихідного комплекту: `9641419800b6833844712a830e433e2ae91ab82a`
 - Дата релізу: `2026-11-19`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
@@ -19,8 +19,7 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    Browser: every session of the agent gets the one browser; a scheduled task is no longer refused while the bot's own session holds it (#516)
-    Agent rules: no limit on the company rules, and the agent is told so; scheduled tasks: the tick lends the queue while its check or the model runs (#515)
+    After the first live update: a session's start is noted, and an update gives an earlier install the shared browser (#517)
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не

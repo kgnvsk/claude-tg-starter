@@ -117,11 +117,23 @@ def scoped_rules(chat_id: str | None, thread_id: str | None, room: int, session:
 
 
 # The moments a session reads its instructions, ~/CLAUDE.md with the company rules in it: a new process. What it
-# read is noted then, so a later message can say what changed since.
+# read is noted then, so a later message can say what changed since. settings.json registers this hook for exactly
+# these starts with --instructions-read (Volchenko, 19.11.2026: it stood on a compaction alone, no session was ever
+# noted, and every message sent the bot to read the rules file again).
 INSTRUCTIONS_READ = ("startup", "resume")
-# A process started with its CLAUDE.md reading switched off (a company worker is) holds no instructions at all: it
-# is never noted and never called fresh, and gets the whole set with each message.
-INSTRUCTIONS_OFF = os.environ.get("CLAUDE_CODE_DISABLE_CLAUDE_MDS") == "1"
+# A process started with its CLAUDE.md reading switched off (a company worker is), or outside the agent's home, where
+# the CLI never reads ~/CLAUDE.md, holds no such instructions: it is never noted and never called fresh, and gets the
+# whole set with each message.
+def _instructions_off() -> bool:
+    if os.environ.get("CLAUDE_CODE_DISABLE_CLAUDE_MDS") == "1":
+        return True
+    try:
+        return not Path.cwd().resolve().is_relative_to(Path.home().resolve())
+    except (OSError, RuntimeError):
+        return True
+
+
+INSTRUCTIONS_OFF = _instructions_off()
 
 
 def instructions_loaded(session: str) -> None:
@@ -269,8 +281,7 @@ if os.environ.get("ATARAX_SUPPRESS_TELEGRAM") == "1":
                 # A migrated agent's task renders the context it was created in (the tick passes it). A run inside
                 # the agent's home has just read ~/CLAUDE.md, the company rules with it.
                 rules = (scoped_rules(os.environ.get("ATARAX_RULES_CHAT"), os.environ.get("ATARAX_RULES_THREAD") or None,
-                                      RULES_HOOK_ROOM, fresh=not INSTRUCTIONS_OFF
-                                      and Path.cwd().resolve().is_relative_to(Path.home().resolve()))
+                                      RULES_HOOK_ROOM, fresh=not INSTRUCTIONS_OFF)
                          if rules_migrated() else owner_rules())
         except Exception:
             rules = ""
@@ -1565,6 +1576,12 @@ def main() -> None:
     except Exception:
         data = {}
     hook_event = data.get("hook_event_name")
+    if sys.argv[1:] == ["--instructions-read"]:
+        # The registration for the starts of INSTRUCTIONS_READ: the note alone, nothing is said to the session.
+        if (hook_event == "SessionStart" and data.get("source") in INSTRUCTIONS_READ
+                and isinstance(data.get("session_id"), str) and not INSTRUCTIONS_OFF and rules_migrated()):
+            instructions_loaded(data["session_id"])
+        return
     prompt = data.get("prompt") or ""
     completed_tasks = []
     if hook_event == "UserPromptSubmit" and os.environ.get("TG_TRANSPORT") != "daemon":
@@ -1585,8 +1602,6 @@ def main() -> None:
     parts = [current_moment()]
     migrated = rules_migrated()
     session = data.get("session_id") if isinstance(data.get("session_id"), str) and not INSTRUCTIONS_OFF else None
-    if migrated and session and hook_event == "SessionStart" and data.get("source") in INSTRUCTIONS_READ:
-        instructions_loaded(session)
     rules = "" if migrated else owner_rules()
     if rules:
         parts.append(rules)

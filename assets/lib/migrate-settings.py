@@ -31,6 +31,8 @@ MANAGED_HOOKS = (
     # Owner, 15.11.2026: a helper gets the owner's profile with his corrections too.
     ("SubagentStart", None, "{H}/bin/wiki-hot-inject --subagent", 10),
     ("SessionStart", "compact", "{H}/bin/tg-context-inject", 5),
+    # Missing until 19.11.2026: the hook noted what a session's instructions hold at its start, and nothing ran it then.
+    ("SessionStart", "startup|resume", "{H}/bin/tg-context-inject --instructions-read", 5),
     ("UserPromptSubmit", None, "{H}/bin/tg-context-inject", 5),
     # In the template since 18.08.2026 and missing here until 10.11.2026: an agent installed earlier had the file and
     # no registration, so its subagent results were never checked.

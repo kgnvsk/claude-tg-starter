@@ -872,6 +872,38 @@ else
 fi
 # END selected agent systemd unit
 systemctl daemon-reload 2>/dev/null || true
+# BEGIN shared browser context
+# The browser's own installer runs at the first install: an update leaves the browser service as an earlier kit set it
+# up. Here a unit exactly as the earlier kits installed it becomes this kit's unit, which starts the server with
+# --shared-browser-context; without the flag only one session of the agent can use the browser at a time, and its
+# scheduled tasks are refused with «Browser is already in use» (Volchenko, 18.11.2026). The server has been the one
+# pinned version since the kit has a browser, so it knows the flag. A unit somebody changed and a drop-in that
+# replaces the start command stay as they are and are said aloud. Only the primary writes the shared service, the
+# service is never created or started here, and nothing here stops the update.
+browser_unit=/etc/systemd/system/claude-browser.service
+if product_has_feature browser && [ "$AGENT_USER" = claude ] && [ -f "$browser_unit" ] && [ ! -L "$browser_unit" ]; then
+  if sed 's/ --shared-browser-context//' "$KIT/assets/systemd/claude-browser.service" 2>/dev/null | cmp -s - "$browser_unit"; then
+    if install -m 644 "$KIT/assets/systemd/claude-browser.service" "$browser_unit.new" \
+        && mv -f "$browser_unit.new" "$browser_unit" && systemctl daemon-reload; then
+      echo "  браузер: служба має команду запуску цього кита"
+    else
+      echo "WARN: службу браузера не вдалося оновити до команди запуску цього кита" >&2
+    fi
+  fi
+  # What systemd has loaded decides: a server still running without the flag takes it at a restart. One that does
+  # not come back is the health check's to repair and report.
+  case "$(systemctl show claude-browser.service -p ExecStart --value 2>/dev/null || true)" in
+    '') ;;
+    *' --shared-browser-context '*)
+      if ps -ww -u claude-browser -o args= 2>/dev/null \
+          | awk '/(^| )[^ ]*\/playwright-mcp( |$)/ && !/ --shared-browser-context( |$)/ { old = 1 } END { exit !old }'; then
+        systemctl try-restart claude-browser.service 2>/dev/null \
+          || echo "WARN: службу браузера не вдалося перезапустити з --shared-browser-context" >&2
+      fi ;;
+    *) echo "WARN: служба браузера запускається без --shared-browser-context: сесії агента користуються браузером по черзі" >&2 ;;
+  esac
+fi
+# END shared browser context
 sed "s|/home/claude|$H|g" "$KIT/assets/systemd/logrotate-cash" > "/etc/logrotate.d/cash-$AGENT_USER"
 chmod 644 "/etc/logrotate.d/cash-$AGENT_USER"
 # BEGIN managed skill installation
