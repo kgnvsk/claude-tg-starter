@@ -9,7 +9,7 @@ User=claude-browser
 Group=claude-browser
 Environment=HOME=/var/lib/claude-browser
 Environment=PLAYWRIGHT_BROWSERS_PATH=/var/lib/claude-browser/ms-playwright
-ExecStart=/opt/claude-browser/node_modules/.bin/playwright-mcp --headless --browser=chromium --host=127.0.0.1 --port=8931 --user-data-dir=/var/lib/claude-browser/profile --output-dir=/srv/claude-browser-share --output-max-size=52428800
+ExecStart=/opt/claude-browser/node_modules/.bin/playwright-mcp --headless --browser=chromium --host=127.0.0.1 --port=8931 --user-data-dir=/var/lib/claude-browser/profile --shared-browser-context --output-dir=/srv/claude-browser-share --output-max-size=52428800
 Restart=always
 RestartSec=5
 TimeoutStopSec=30

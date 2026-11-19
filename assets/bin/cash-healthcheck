@@ -734,6 +734,35 @@ if [ -f "${HEALTHCHECK_BROWSER_UNIT:-/etc/systemd/system/claude-browser.service}
 else
     rm -f "$STAMP/browser-down-since.epoch"
 fi
+
+# One browser serves every session of the agent since 19.11.2026, tabs included (--shared-browser-context): a session
+# that leaves its tabs open makes it grow, and nothing else closes them. When the service holds more than a third of
+# the machine's memory (a gigabyte at least) AND the machine has less than an eighth of its memory left, the service
+# restarts through the same bounded helper: the tabs go, the logins stay in the profile. A large page on a machine
+# with room is left alone. Silent, like every repair here; the helper's cooldown spaces the restarts.
+# BEGIN browser memory
+browser_memory_high() {
+    local used total_kb available_kb limit meminfo="${HEALTHCHECK_MEMINFO:-/proc/meminfo}"
+    used=$(systemctl show claude-browser.service -p MemoryCurrent --value 2>/dev/null)
+    # Kilobytes as the file gives them: an awk that clamps integers at 2^31 (mawk) made sixteen gigabytes two.
+    total_kb=$(awk '/^MemTotal:/ { print $2 }' "$meminfo" 2>/dev/null)
+    available_kb=$(awk '/^MemAvailable:/ { print $2 }' "$meminfo" 2>/dev/null)
+    # No number, or systemd's «no limit» (2^64-1, past what the shell compares): nothing is restarted on a guess.
+    case "$used" in ''|*[!0-9]*|???????????????????*) return 1 ;; esac
+    case "$total_kb" in ''|*[!0-9]*|0|????????????????*) return 1 ;; esac
+    case "$available_kb" in ''|*[!0-9]*|????????????????*) return 1 ;; esac
+    limit=$((total_kb * 1024 / 3))
+    [ "$limit" -ge 1073741824 ] || limit=1073741824
+    [ "$used" -gt "$limit" ] && [ "$available_kb" -lt $((total_kb / 8)) ]
+}
+# END browser memory
+if [ -f "${HEALTHCHECK_BROWSER_UNIT:-/etc/systemd/system/claude-browser.service}" ] && browser_memory_high \
+        && service_mutation_allowed && [ -x /usr/local/sbin/claude-browser-recover ]; then
+    # 76 is the helper's cooldown: nothing was restarted, and nothing is logged for it.
+    if sudo /usr/local/sbin/claude-browser-recover >/dev/null 2>&1; then
+        echo "[$(date -u +%FT%TZ)] browser service restarted: it held more than a third of the memory and the machine was short of it" >> "$LOG"
+    fi
+fi
 # END browser service recovery
 
 # A model can occasionally emit textual <invoke> markup instead of a real tool call.

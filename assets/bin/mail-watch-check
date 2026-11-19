@@ -7,7 +7,12 @@ no model run, and the scheduler wakes the agent only when it prints something. I
 marks per set of mailboxes, so a daily sorting task still sees everything. Only that one task runs it: a look by hand
 would take the letters the task is about to show.
 
-  mail-watch-check [--gmail EMAIL]... [--icloud] [--skip-from TEXT]...
+  mail-watch-check [--gmail EMAIL]... [--icloud]
+
+Every new letter is shown. What the owner hears about is decided by the task's own rules, never by hiding senders
+here (owner, 19.11.2026: «он все должен читать»): a watch that skipped «auto1» and «noreply» kept a site's own
+requests, a pick-up notice, banks and a lender's answer from the agent for weeks. Tasks made before that day still
+name --skip-from TEXT; it is accepted and hides nothing.
 
 Gmail goes through ~/bin/gog (the wrapper that loads the keyring), iCloud through ~/bin/icloud-mail. The first look
 only remembers where each mailbox stands. Every later look takes all that came since the last good one, page after
@@ -90,7 +95,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--gmail", action="append", default=[])
     parser.add_argument("--icloud", action="store_true")
-    parser.add_argument("--skip-from", action="append", default=[])
+    parser.add_argument("--skip-from", action="append", default=[], help=argparse.SUPPRESS)
     args = parser.parse_args()
     if not args.gmail and not args.icloud or any(not EMAIL.fullmatch(account) for account in args.gmail):
         parser.error("name at least one mailbox: --gmail EMAIL or --icloud")
@@ -105,7 +110,6 @@ def main():
             state = json.load(handle)
     except (OSError, ValueError):
         state = {}
-    skip = [text.lower() for text in args.skip_from if text.strip()]
     deadline = time.monotonic() + DEADLINE
     lines, after = [], dict(state)
     # A mailbox that keeps failing goes last, and each one gets its share of the time left, so one that hangs never
@@ -132,7 +136,7 @@ def main():
             sender = str(row.get("from", ""))
             if "notice" in row:
                 lines.append(f"{name} | {row['notice']}")
-            elif not any(text in sender.lower() for text in skip):
+            else:
                 lines.append(f"{name} | {row.get('date', '')} | {sender} | {row.get('subject', '')}")
     # Lines first, marks after (Codex #235 R1): a look stopped between the two shows the same letters again next time.
     if lines:

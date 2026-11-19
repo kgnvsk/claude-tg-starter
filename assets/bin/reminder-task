@@ -9,7 +9,6 @@ import json
 import os
 import re
 import shutil
-import subprocess
 import sys
 import tempfile
 import time
@@ -924,53 +923,6 @@ def normalize(args):
     return args
 
 
-def process_start(pid):
-    """Start time of a process the way cash-reminder-tick records its lock holder: ps lstart in UTC, C locale.
-    Empty when it cannot be read, which never matches (Codex review, 16.11.2026)."""
-    env = {**os.environ, "LC_ALL": "C", "TZ": "UTC"}
-    try:
-        done = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True, env=env, timeout=5)
-    except (OSError, subprocess.SubprocessError):
-        return ""
-    return done.stdout.strip() if done.returncode == 0 else ""
-
-
-def parent_pid(pid):
-    try:
-        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8", errors="replace")
-        return int(stat.rsplit(")", 1)[1].split()[1])
-    except (OSError, ValueError, IndexError):
-        return 0
-
-
-def held_for_this_run(lock_file):
-    """True inside a scheduled run: the tick that runs it holds the queue lock and waits until the run ends.
-
-    cash-reminder-tick hands its children REMINDER_TICK_LOCK_HELD=1 and records itself in <lock>.holder. A task's own
-    `reminder-task status` waited for that lock forever, the run died at its time limit and its answer was lost
-    (Volchenko, 16.11.2026). Only a live ancestor with the recorded start time counts: an orphan of a killed run that
-    inherited the variable, or a reused PID, still waits as before."""
-    if os.environ.get("REMINDER_TICK_LOCK_HELD") != "1":
-        return False
-    try:
-        lines = Path(f"{lock_file}.holder").read_text(encoding="utf-8").splitlines()
-    except OSError:
-        return False
-    holder = dict(line.split("=", 1) for line in lines if "=" in line)
-    pid = holder.get("PID", "")
-    if not pid.isdigit():
-        return False
-    current = os.getppid()
-    for _ in range(64):
-        if current <= 1:
-            return False
-        if current == int(pid):
-            recorded = holder.get("START", "")
-            return bool(recorded) and process_start(current) == recorded
-        current = parent_pid(current)
-    return False
-
-
 def main():
     try:
         args = normalize(parser().parse_args())
@@ -986,13 +938,8 @@ def main():
         lock_file = Path(
             os.environ.get("LOCK_FILE", f"{rem_dir_value}.worker.lock")
         )
-        if args.command == "status" and held_for_this_run(lock_file):
-            # The queue cannot change while its tick waits for this run, so a read needs no lock. A change still waits
-            # for it: meet-bot gives such a call two seconds and defers it to a detached copy when the queue is busy.
-            resolve_legacy_task(rem_dir, args)
-            result = verified_status(rem_dir, args.task, args.actor, args.chat, args.legacy_prefix)
-            print(result)
-            return 2 if result.startswith("PENDING ") else 0
+        # The tick lends this lock while its check or the model runs (cash-reminder-tick, queue_lend), so a task's
+        # own commands and the bot's get it at once; it is busy only while somebody really works on the queue.
         with queue_lock(rem_dir, lock_file):
             resolve_legacy_task(rem_dir, args)
             if args.command == "one":

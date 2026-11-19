@@ -60,6 +60,10 @@ for _ in $(seq 1 30); do
   sleep 1
 done
 systemctl is-active --quiet claude-browser.service || { journalctl -u claude-browser.service -n 80 --no-pager; exit 1; }
+# A drop-in that replaces ExecStart starts the service its own way, and this script leaves drop-ins alone. What
+# counts is the command that really runs, not the text of a unit.
+ps -ww -u claude-browser -o args= | awk '/playwright-mcp/ && / --shared-browser-context( |$)/ { found = 1 } END { exit !found }' || \
+  echo "WARN: claude-browser.service is started without --shared-browser-context (a drop-in replaces ExecStart?): the bot's own session and its scheduled tasks cannot use the browser at the same time" >&2
 
 echo "==> running real DOM + screenshot smoke as isolated browser user"
 runuser -u claude-browser -- "$KIT/assets/lib/install-env" "$STATE" PLAYWRIGHT_BROWSERS_PATH="$STATE/ms-playwright" \

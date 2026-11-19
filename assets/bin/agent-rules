@@ -41,9 +41,8 @@ RULES_BUDGET = 6_000
 # Owner, 18.11.2026 (his decision of 22.10: rules live in the instructions, read once per session): rules that do not
 # ride each message need no hook limit. Company rules hold for every conversation and are the set that grows, so the
 # main session reads them as instructions: ~/CLAUDE.md imports company.md, the CLI loads it once per session, and the
-# hook's limit does not bound it. The CLI reads such a file whole up to 4 MiB; the ceiling is ours, about a twentieth
-# of a 200K-token context, so the rules stay a small part of what every request carries.
-COMPANY_BUDGET = 30_000
+# hook's limit does not bound it. Owner, 19.11.2026: the kit puts no limit of its own on them either (Knopa, whose
+# rules are instructions, has none); the CLI reads such a file whole up to 4 MiB.
 # The installer's notes about the owner travel next to the rules of the owner's private chat, in room of their own:
 # a full rule set, full notes and the hook's fixed parts still fit the limit (tests/test_agent_rules_budget.py).
 BRIEF_BUDGET = 2_000
@@ -81,16 +80,29 @@ HEAD_BEYOND = ("AGENT RULES of this conversation beyond the company rules (compl
                "company rules in your instructions come first; a narrower rule never relaxes them.")
 # The line names how many there are and where to read them, so a session whose instructions came without the import
 # (the one thing the hook cannot see) notices and reads the file instead of answering without them.
-COMPANY_LOADED = ("COMPANY RULES ({count}) are in your instructions under the heading «Правила компанії цього агента» "
-                  "(~/CLAUDE.md imports them whole); they hold in this answer and come first. If your instructions show "
-                  "no such section, read {path} before answering.")
+COMPANY_LOADED = ("COMPANY RULES ({count}) are in your instructions under the heading «Правила компанії цього агента»; "
+                  "they hold in this answer and come first. If your instructions show no such section, read {path} "
+                  "before answering.")
 COMPANY_CHANGED = ("COMPANY RULES were changed after your instructions were loaded. Each change below replaces what "
                    "the instructions say; the rest of them holds as it stands there.")
+# Owner, 19.11.2026: the agent itself must know what room its rules have. Igor's agent went on shortening rules for a
+# limit it had learnt from refusals; told with every message, an old belief does not outlive the update. Whatever a
+# message says of a linked agent's rules carries this sentence. It is short on purpose (next to full notes about the
+# owner a full narrower set still has to fit, tests/test_agent_rules_brief.py) and it is the first thing left out
+# when a message has no room for it: a set the save accepted never becomes a pointer for its sake. What room the
+# narrower rules have is said in the instructions (POINTER) and by a refusal itself.
+COMPANY_ROOM = ("The company rules have no size limit ({used} characters now): never shorten, merge or drop one of "
+                "them to save room.")
 COMPANY_REREAD = ("COMPANY RULES were changed after your instructions were loaded, by more than this message carries. "
                   "Read the current ones whole in {path} before answering; they replace what the instructions say.")
 # A session whose start nobody noted, on a set too long to repeat: no owner is told to split anything.
 COMPANY_UNNOTED = ("COMPANY RULES are too long to repeat with each message and this session's start was not noted. "
                    "Read them whole in {path} before answering.")
+# The CLI reads a launch file whole up to this size (its documentation, read 18.11.2026). A company file past it is
+# not called loaded: the session gets the set whole when a message has room for it, and is sent to the file otherwise.
+INSTRUCTIONS_FILE_LIMIT = 4 * 1024 * 1024
+COMPANY_OVERSIZE = ("COMPANY RULES are larger than your instructions carry whole. Read them whole in {path} before "
+                    "answering.")
 IMPORT_HEAD = ("# Правила компанії цього агента (повні; діють у кожній розмові й мають перевагу над вужчими правилами; "
                "змінюються лише через ~/bin/agent-rules)")
 SESSION = re.compile(r"[0-9A-Za-z][0-9A-Za-z_-]{7,79}")
@@ -590,12 +602,8 @@ def check_budget(relative: Path, new_text: str) -> dict:
         return {"brief": size}
     instructions = linked()
     if instructions and relative == Path("company.md"):
-        # Part of the instructions: measured against their own ceiling, and no message grows by them.
-        size = units(compose([("company", [rule["text"] for rule in parse(new_text)])]))
-        if size > COMPANY_BUDGET:
-            raise Refused("over_budget", context="company", size=size, budget=COMPANY_BUDGET,
-                          over_by=size - COMPANY_BUDGET)
-        return {"company": size}
+        # Part of the instructions: no message grows by them, and nothing bounds them here.
+        return {"company": units(compose([("company", [rule["text"] for rule in parse(new_text)])]))}
     sizes = {}
     for chat, thread in affected_contexts(relative):
         size = units(render(chat, thread, {relative: new_text}, beyond=instructions))
@@ -606,10 +614,11 @@ def check_budget(relative: Path, new_text: str) -> dict:
     return sizes
 
 
-def budget_of(relative: Path) -> int:
+def budget_of(relative: Path) -> int | None:
+    """The room a saved set is told it has; none for company rules that are part of the instructions."""
     if relative.parts[0] == "brief":
         return BRIEF_BUDGET
-    return COMPANY_BUDGET if relative == Path("company.md") and linked() else RULES_BUDGET
+    return None if relative == Path("company.md") and linked() else RULES_BUDGET
 
 
 # ---------- commands ----------
@@ -800,12 +809,14 @@ def loaded_path(session: str | None) -> Path | None:
     return data_dir() / "loaded" / f"{session}.md" if session and SESSION.fullmatch(session) else None
 
 
-def company_note(before: str) -> tuple[str, bool]:
-    """What a message says about the company rules to a session that holds them as instructions, and whether they
-    changed since it read them: where they are while they stand as loaded; after a change, every changed rule whole,
-    next to the rule it replaces."""
-    path = data_dir() / "company.md"
-    then, now = parse(before), parse(read_bytes(path).decode("utf-8"))
+def company_room(rules: list[dict]) -> str:
+    return COMPANY_ROOM.format(used=units(compose([("company", [rule["text"] for rule in rules])])))
+
+
+def company_changes(before: str, now: list[dict]) -> str:
+    """What changed in the company rules since a session read them as its instructions: every changed rule whole,
+    next to the rule it replaces. Empty while they stand as loaded."""
+    then = parse(before)
 
     def named(rule: dict) -> str:
         text = rule["text"]
@@ -830,9 +841,7 @@ def company_note(before: str) -> tuple[str, bool]:
     for rule in {rule["text"]: rule for rule in then}.values():
         if rule["text"] not in current_texts and rule["text"] not in replaced:
             changes.append(f"No longer in force: the rule {named(rule)}")
-    if changes:
-        return COMPANY_CHANGED + "\n\n" + "\n\n".join(changes), True
-    return COMPANY_LOADED.format(count=len(now), path=path), False
+    return "\n\n".join(changes)
 
 
 def command_render(args) -> str:
@@ -847,25 +856,39 @@ def command_render(args) -> str:
         except OSError:
             before = None
     join = lambda *parts: "\n\n".join(part for part in parts if part)
-    if not linked() or (before is None and not fresh):
+    fits = lambda text: not room or units(text) <= room
+    noted, in_instructions = fresh or before is not None, linked()
+    current = read_bytes(path) if in_instructions else b""
+    oversize = len(current) > INSTRUCTIONS_FILE_LIMIT
+    noted = noted and not oversize
+    rules = parse(current.decode("utf-8"))
+    told = company_room(rules) if in_instructions else ""
+    if not in_instructions or not noted:
         text = render(args.chat, args.thread)
-        if not room or units(text) <= room:
-            return text
-        if not linked():
+        for whole in (join(told, text), text) if text else ("",):
+            if fits(whole):
+                return whole
+        if not in_instructions:
             return overflow(args.chat, args.thread, text)
-        status = short = COMPANY_UNNOTED.format(path=path)
-    elif fresh:  # a run that has just read its instructions
-        status = short = COMPANY_LOADED.format(count=len(parse(read_bytes(path).decode("utf-8"))), path=path)
+    changes = company_changes(before, rules) if before is not None else ""  # a fresh run has just read them
+    if not noted:
+        status = short = (COMPANY_OVERSIZE if oversize else COMPANY_UNNOTED).format(path=path)
+    elif changes:
+        status, short = COMPANY_CHANGED, COMPANY_REREAD.format(path=path)
     else:
-        status, changed = company_note(before)
-        short = COMPANY_REREAD.format(path=path) if changed else status
+        status = short = COMPANY_LOADED.format(count=len(rules), path=path)
     # The company rules do not travel with this message: it carries the rest, and a line about them that is never
-    # dropped, so a narrow set too long for the message cannot hide a change of the company rules.
+    # dropped, so a narrow set too long for the message cannot hide a change of the company rules. What gives way
+    # first is the sentence about the room, then the changes in full (the line then names the file to read).
     beyond = render(args.chat, args.thread, beyond=True)
-    if room and beyond and units(join(short, beyond)) > room:
-        return join(short, overflow(args.chat, args.thread, beyond))
-    text = join(status, beyond)
-    return text if not room or units(text) <= room else join(short, beyond)
+    for line in (join(status + " " + told, changes), join(status, changes), short + " " + told, short):
+        if fits(join(line, beyond)):
+            return join(line, beyond)
+    if not beyond:
+        return short
+    pointer = overflow(args.chat, args.thread, beyond)
+    with_room = join(short + " " + told, pointer)
+    return with_room if fits(with_room) else join(short, pointer)
 
 
 def command_loaded(args) -> str:
@@ -894,7 +917,7 @@ def link_locked() -> bool:
     if not (root / "company.md").exists():
         write_atomic(root / "company.md", serialize([], "company.md"))
     text = read_bytes(claude_md).decode("utf-8")
-    lines = [POINTER if item == POINTER_BEFORE else item for item in (text or "# Правила власника\n").splitlines()
+    lines = [POINTER if item in POINTERS_BEFORE else item for item in (text or "# Правила власника\n").splitlines()
              if item.strip() not in (IMPORT_HEAD, line)]
     top = next((index for index, item in enumerate(lines) if not item.startswith("@")), len(lines))
     rest = lines[top:]
@@ -950,13 +973,24 @@ def command_installer(args) -> dict:
 
 # ---------- migration of one agent (plan, apply, rollback) ----------
 
-POINTER_BEFORE = ("Правила цього агента зберігаються через ~/bin/agent-rules: спільні для компанії, особисті для кожної людини, "
-                  "для груп і тем. Щоходу вони приходять у контекст цілком. Нове правило, зміну чи зняття роби командою "
-                  "`~/bin/agent-rules save|replace|retire --scope company|person|chat|topic --delivery <delivery_id запиту>`.")
+# What the owner's section said before: every turn (until 18.11.2026), and for one release without the room.
+POINTERS_BEFORE = (
+    "Правила цього агента зберігаються через ~/bin/agent-rules: спільні для компанії, особисті для кожної людини, "
+    "для груп і тем. Щоходу вони приходять у контекст цілком. Нове правило, зміну чи зняття роби командою "
+    "`~/bin/agent-rules save|replace|retire --scope company|person|chat|topic --delivery <delivery_id запиту>`.",
+    "Правила цього агента зберігаються через ~/bin/agent-rules: спільні для компанії, особисті для кожної людини, "
+    "для груп і тем. Правила компанії підключено вище в цих інструкціях, вужчі приходять у контекст із кожним "
+    "повідомленням. Нове правило, зміну чи зняття роби командою "
+    "`~/bin/agent-rules save|replace|retire --scope company|person|chat|topic --delivery <delivery_id запиту>`.",
+)
 POINTER = ("Правила цього агента зберігаються через ~/bin/agent-rules: спільні для компанії, особисті для кожної людини, "
-           "для груп і тем. Правила компанії підключено вище в цих інструкціях, вужчі приходять у контекст із кожним "
-           "повідомленням. Нове правило, зміну чи зняття роби командою "
-           "`~/bin/agent-rules save|replace|retire --scope company|person|chat|topic --delivery <delivery_id запиту>`.")
+           "для груп і тем. Правила компанії підключено вище в цих інструкціях; обмеження на їхній обсяг немає, тож не "
+           "скорочуй, не зливай і не прибирай правила заради місця. Вужчі правила (особисті правила людини, правила "
+           "групи та її теми) приходять у контекст із кожним повідомленням, тому на всі вужчі правила однієї розмови "
+           "разом є NARROW знаків. Попередні редакції правил лежать у "
+           "~/.local/share/agent-rules/history. Нове правило, зміну чи зняття роби командою "
+           "`~/bin/agent-rules save|replace|retire --scope company|person|chat|topic --delivery <delivery_id запиту>`."
+           ).replace("NARROW", f"{RULES_BUDGET:,}".replace(",", " "))
 RULE_HEADING = re.compile(r"(?i)^#{1,6}\s.*(правил|rules)")
 
 
@@ -1082,14 +1116,11 @@ def compute_plan(company: set[int], take: set[int], groups: set[str]) -> dict:
                 rule["id"] = next_id(rules, "")
                 rule["fields"] = {"id": rule["id"], "rev": "1", "source": "migration"}
         overrides[Path(relative)] = serialize(rules, relative)
-    # The move makes the company rules part of the instructions (link_locked): they are measured against their own
-    # ceiling, and every narrower set on its own.
+    # The move makes the company rules part of the instructions (link_locked), where nothing bounds them; every
+    # narrower set is measured on its own.
     over = []
     for relative in overrides:
         if relative == Path("company.md"):
-            size = units(compose([("company", [rule["text"] for rule in parse(overrides[relative])])]))
-            if size > COMPANY_BUDGET:
-                over.append({"context": "company", "size": size})
             continue
         for chat, thread in affected_contexts(relative):
             size = units(render(chat, thread, overrides, beyond=True))

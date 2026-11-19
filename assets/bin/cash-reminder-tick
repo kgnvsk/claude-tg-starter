@@ -73,7 +73,11 @@ mkdir -p "$REM_DIR" "$(dirname "$LOG")"
 # every task. Once the lock has been busy longer than any tick may live while its
 # recorded holder is gone, a fresh lock file replaces it. Nothing is killed: the
 # child keeps a lock nobody waits on, and the owner is told once.
-if [ "${REMINDER_TICK_LOCK_HELD:-0}" != "1" ]; then
+# The worker below is the very process that took the lock (the wrapper execs into it). A tick started by a check or
+# by a run inherits the wrapper's variables and, until 19.11.2026, walked in past the lock on REMINDER_TICK_LOCK_HELD
+# alone; with the queue lent to that check or run it would work beside whoever changes the queue. It now takes the
+# lock like any other tick and leaves, because the tick that started its parent is recorded and alive.
+if [ "${REMINDER_TICK_LOCK_PID:-}" != "$$" ]; then
   exec python3 - "$LOCK_FILE" "$0" "$@" <<'PY'
 import fcntl
 import os
@@ -151,6 +155,10 @@ def take():
 os.makedirs(os.path.dirname(lock_path) or ".", exist_ok=True)
 lock = take()
 broken = ""
+if lock is not None and holds(fields(holder_path)):
+    # The recorded tick is alive and its lock is free: it has lent the queue to the check or the model run it is
+    # waiting for (queue_lend in the worker). The queue is still its work, so this tick leaves it alone.
+    raise SystemExit(0)
 if lock is None:
     holder = fields(holder_path)
     pid = holder.get("PID", "")
@@ -182,7 +190,9 @@ except FileNotFoundError:
 record(holder_path, f"PID={os.getpid()}\nSTART={started(os.getpid())}\nTZ=UTC\nAT={now}\n")
 os.set_inheritable(lock.fileno(), True)
 env = os.environ.copy()
-env["REMINDER_TICK_LOCK_HELD"] = "1"
+env["REMINDER_TICK_LOCK_HELD"] = "1"  # what a child reads to know the scheduler started it (meet-bot)
+env["REMINDER_TICK_LOCK_PID"] = str(os.getpid())
+env["REMINDER_TICK_LOCK_FD"] = str(lock.fileno())
 env["REMINDER_TICK_LOCK_BROKEN"] = broken
 os.execvpe("bash", ["bash", worker, *worker_args], env)
 PY
@@ -607,6 +617,34 @@ keep_observation() {
   atomic_text "$1/offers" 0 && atomic_text "$1/observed.id" "$(date +%s)-$$-$RANDOM$RANDOM" && mv -f "$2" "$1/observed.txt"
 }
 
+# The queue lock is this tick's for the work it does on the queue itself. While a check or the model runs the tick
+# only waits, so it lends the queue: a task that sets its own follow-up no longer waits for the run it is part of
+# (Volchenko, 18.11.2026: «Команда постановки повтора зависла дольше 2 минут и ушла в фон»), and the bot's own
+# reminder-task calls no longer wait out a whole run. The occurrence is settled before the run and only its journal is
+# written after it. Whoever changes the queue meanwhile holds the same lock, so the tick takes it back only when that
+# change is done; another tick that finds the lock free sees this one recorded and alive, and leaves (the wrapper
+# above). The lock belongs to the open file this tick inherited, so a child python can drop and take it for the tick.
+queue_flock() {
+  [ -n "${REMINDER_TICK_LOCK_FD:-}" ] || return 0  # started by something that holds the lock for it
+  python3 -c 'import fcntl, sys; fcntl.flock(int(sys.argv[1]), getattr(fcntl, sys.argv[2]))' "$REMINDER_TICK_LOCK_FD" "$1"
+}
+queue_lend() { queue_flock LOCK_UN || :; }  # a lock that could not be dropped stays held: safe, as before
+# What a check or the model starts never gets the lock's descriptor: a process it left behind kept the queue locked
+# after the tick had ended (a fresh lock replaced it only seventeen minutes later), and through the descriptor it
+# could drop the tick's own lock. Called first thing in the subshell that runs the child; the tick keeps its own.
+queue_fd_closed() {
+  case ${REMINDER_TICK_LOCK_FD:-} in ''|*[!0-9]*) return 0 ;; esac
+  eval "exec ${REMINDER_TICK_LOCK_FD}>&-"
+  unset REMINDER_TICK_LOCK_FD REMINDER_TICK_LOCK_PID
+}
+queue_retake() {
+  queue_flock LOCK_EX && return 0
+  # Without the lock nothing more may be done to the queue. The occurrence in hand is taken up by the next tick.
+  log_message "the queue lock could not be taken back after a run; this tick stops"
+  kill -TERM $$
+  exit 1
+}
+
 run_agent_task() {
   local file="$1" prompt="$2" out rc destination="чат ${chat}"
   local workdir="${AGENT_TASK_DIR:-$HOME/.atarax/agent-task}"
@@ -685,7 +723,7 @@ run_agent_task() {
     part="$pending/look.$$"
     if ! atomic_text "$pending/incomplete" 1; then
       held=1
-    elif (cd "$workdir" && PATH="$agent_path" ATARAX_SUPPRESS_TELEGRAM=1 ${limit:+${bound}timeout 60} bash -c "$check_cmd" 2>/dev/null) > "$part"; then
+    elif { queue_lend; (queue_fd_closed; cd "$workdir" && PATH="$agent_path" ATARAX_SUPPRESS_TELEGRAM=1 ${limit:+${bound}timeout 60} bash -c "$check_cmd" 2>/dev/null) > "$part"; rc=$?; queue_retake; [ "$rc" -eq 0 ]; }; then
       atomic_text "$pending/incomplete" 0 || held=1
       # A look whose output cannot be read is kept as its file, never taken for silence (R7-P1-1).
       bare=$(tr -d '[:space:]*`."' < "$part") || held=1
@@ -766,7 +804,8 @@ ${prompt}"
   [ -n "$rules_chat" ] || { rules_chat="$chat"; rules_thread="${thread_id:-}"; }
   # A task started from the live session must not settle that session's pending
   # request with its own sends: it runs without the service's delivery binding.
-  out=$(cd "$workdir" &&
+  queue_lend
+  out=$(queue_fd_closed; cd "$workdir" &&
     export PATH="$agent_path" TG_DELIVERY_STAMP= TG_DELIVERY_ID= TG_DELIVERY_TASK_ID= TG_DELIVERY_PHASE=final \
       ATARAX_RULES_CHAT="$rules_chat" ATARAX_RULES_THREAD="$rules_thread" \
       ATARAX_TASK_QUIET="$quiet" ATARAX_TASK_ID="${task_id:-$(basename "$file" .rem)}" \
@@ -774,6 +813,7 @@ ${prompt}"
       ATARAX_TASK_DELIVERY_DIR="$REM_DIR/.quiet-delivery" &&
     ATARAX_SUPPRESS_TELEGRAM=1 ATARAX_TASK_DELIVERY=1 $limit "$HOME/.local/bin/claude" -p --output-format text <<<"$prompt" 2>&1)
   rc=$?
+  queue_retake
   if [ $rc -ne 0 ]; then
     log_message "run $(basename "$file"): помилка виконання rc=$rc: $(printf '%s' "$out" | tail -c 200 | tr '\n' ' ')"
     # A limit that names its reset is kept with the occurrence: a retry-safe run goes again after it (run_occurrence).
@@ -1817,6 +1857,8 @@ joined=$'\n'
 for f in "$REM_DIR"/*.rem; do
   # Already sent, or tried, inside another reminder's message this tick.
   case "$joined" in *$'\n'"$f"$'\n'*) continue ;; esac
+  # Cancelled while the queue was lent to an earlier task's run.
+  [ -f "$f" ] || continue
   now="$tick_now"
   epoch=$(header_value "$f" EPOCH)
   chat=$(header_value "$f" CHAT)
