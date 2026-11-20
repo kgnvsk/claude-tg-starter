@@ -1,8 +1,8 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-11-20.a6592f726702`
+- Реліз: `2026-11-20.2c2df8636688`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `a6592f726702f6e24af81f2a7e48820ba548160f`
+- Ревізія вихідного комплекту: `2c2df86366887ddacdfc9e699395bc7cf718c4de`
 - Дата релізу: `2026-11-20`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
@@ -19,16 +19,9 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    Tests: the licence gate's trimmed kit carries agent-home.py, which install-core now reads the channel file with
-    Tests: the graphify cleanup test runs the section removal as the agent, as the installer now does
-    Installers: the review's fourth round
-    Tests: the shadow departure marker is awaited after its record, not read between the tick's two writes
-    Tests: the memory default is decided after the channel file is put in place by the helper
-    Installers: root reads the agent's channel file through descriptors; the agent's other files are rewritten as the agent
-    Persona names the installed browser again; tests that cut install-core blocks know the helper
-    Installers: root reads no agent file through a link; the review's second round
-    Installers: files root hands to the agent are adopted by descriptor; the review's other points
-    Installers: root's directories and copies in the agent's home follow no link the agent planted
+    Фото: правка за навичкою codex-imagegen, запасний rembg лише для вирізання
+    Розшифровка й фото: уточнення за ревʼю Codex
+    Розшифровка й правка фото — спершу через OpenAI, локальні моделі лише запасні
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не
