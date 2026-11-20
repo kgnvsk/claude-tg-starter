@@ -1,8 +1,8 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-11-20.f8971b946b3d`
+- Реліз: `2026-11-20.a6592f726702`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `f8971b946b3d649851d0695e57e5c07e82b548b3`
+- Ревізія вихідного комплекту: `a6592f726702f6e24af81f2a7e48820ba548160f`
 - Дата релізу: `2026-11-20`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
@@ -19,13 +19,16 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    Правило браузера: «завдання», а не «задачу»
-    Retire guard tells a missing table from an nft that cannot answer; bounded read of the agent's settings; clearer instructions (Codex round 3)
-    Browser repair stays with root-run updates: claude-browser-recover keeps restart-only; install-browser.sh reads the agent's file as the agent
-    The agent repairs its own browser: claude-browser-recover sets up a missing browser and retires the old guard; no sending people to an administrator
-    Retire guard test: another agent's drop-in lives in its own unit
-    Retire guard: after the account exists and every preflight; no account, nothing to retire
-    Retire the private-browser guard of the kits of 24-26.10 on update
+    Tests: the licence gate's trimmed kit carries agent-home.py, which install-core now reads the channel file with
+    Tests: the graphify cleanup test runs the section removal as the agent, as the installer now does
+    Installers: the review's fourth round
+    Tests: the shadow departure marker is awaited after its record, not read between the tick's two writes
+    Tests: the memory default is decided after the channel file is put in place by the helper
+    Installers: root reads the agent's channel file through descriptors; the agent's other files are rewritten as the agent
+    Persona names the installed browser again; tests that cut install-core blocks know the helper
+    Installers: root reads no agent file through a link; the review's second round
+    Installers: files root hands to the agent are adopted by descriptor; the review's other points
+    Installers: root's directories and copies in the agent's home follow no link the agent planted
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не

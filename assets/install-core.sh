@@ -349,9 +349,20 @@ if [ "$CLAUDE_UPDATE_MAINTENANCE" = 1 ]; then
     }
 fi
 
+# BEGIN agent file reader
+# Root reads the agent's channel file for its keys and merges the new one over it. A link the agent put on its path
+# would hand root's read of another file to the agent (another agent's keys on a shared server), and the agent's cron
+# may run during an update, so no check-then-read holds (Codex, 20.11.2026): each read opens the file from the home's
+# descriptor, following no link, and prints it. A missing file reads as empty; anything else refused stops the install.
+agent_file() {
+  local status=0
+  python3 "$KIT/assets/lib/agent-home.py" "$H" "${AGENT_USER:-}" read "$1" || status=$?
+  [ "$status" = 0 ] || [ "$status" = 4 ]
+}
+# END agent file reader
 # Check the installed runtime identity before writing templates, credentials or
 # cron entries. A wizard may already have replaced the root input agent.env.
-_installed_token="$(python3 "$KIT/assets/lib/merge-env.py" --value "$H/.claude/channels/telegram/.env" TELEGRAM_BOT_TOKEN)"
+_installed_token="$(agent_file "$H/.claude/channels/telegram/.env" | python3 "$KIT/assets/lib/merge-env.py" --value /dev/stdin TELEGRAM_BOT_TOKEN)"
 if [ -n "$_installed_token" ] && [ "${_installed_token%%:*}" != "${TELEGRAM_BOT_TOKEN%%:*}" ]; then
   echo "FATAL: каталог $H належить іншому Telegram-боту; для нового агента задай окремий AGENT_USER" >&2
   exit 1
@@ -535,12 +546,15 @@ validate_starter_foundation
 # further down must be refused here, before the first write (Арти, 03.11.2026: a refusal after the writes left the
 # update in recovery-hold with the bot stopped). Same reading as below, nothing written: the channel file must parse,
 # and the memory and delivery values this run would take from it must be ones this installer accepts.
-_preflight_channel="$H/.claude/channels/telegram/.env"
-if [ -e "$_preflight_channel" ]; then
+# The channel file read once through agent_file (no link followed); a missing one reads as empty.
+_preflight_channel="$(mktemp)"
+agent_file "$H/.claude/channels/telegram/.env" >"$_preflight_channel" || { rm -f "$_preflight_channel"; exit 1; }
+if [ -s "$_preflight_channel" ]; then
   _preflight_empty="$(mktemp)"
   _preflight_out="$(mktemp)"
   if ! python3 "$KIT/assets/lib/merge-env.py" "$_preflight_channel" "$_preflight_empty" "$_preflight_out" >/dev/null 2>&1; then
     rm -f "$_preflight_empty" "$_preflight_out"
+    rm -f "$_preflight_channel"
     echo "FATAL: наявний файл середовища каналу містить небезпечні присвоєння" >&2
     exit 1
   fi
@@ -554,6 +568,7 @@ fi
 case "$_preflight_memory" in
   enabled|disabled) ;;
   *)
+    rm -f "$_preflight_channel"
     echo "FATAL: MEMORY_EMBEDDINGS_OPENAI містить недопустиме значення" >&2
     exit 2
     ;;
@@ -568,10 +583,12 @@ fi
 case "$_preflight_authority" in
   guard|shadow|receiver) ;;
   *)
+    rm -f "$_preflight_channel"
     echo "FATAL: TG_DELIVERY_AUTHORITY містить недопустиме значення «${_preflight_authority}» (очікується guard, shadow або receiver)" >&2
     exit 2
     ;;
 esac
+rm -f "$_preflight_channel"
 unset _preflight_channel _preflight_memory _preflight_authority _preflight_value _preflight_empty _preflight_out
 # END saved input preflight
 
@@ -678,8 +695,13 @@ write_shell_value() {
 
 read_channel_value() {
   local file="$1" name="$2"
-  [ -r "$file" ] || return 0
-  python3 "$KIT/assets/lib/merge-env.py" --value "$file" "$name"
+  # agent_file reads a missing file as empty and refuses a link, a dangling one too.
+  agent_file "$file" | python3 "$KIT/assets/lib/merge-env.py" --value /dev/stdin "$name"
+}
+# A file of the agent's an older kit left root's own is handed back before the agent rewrites it; a link is the agent's
+# own business and is left to the agent's rights.
+agent_owns() {
+  [ -L "$1" ] || [ ! -e "$1" ] || "${AGENT_HOME_WRITE[@]}" own - "$1"
 }
 
 copy_tree_no_clobber() {
@@ -735,10 +757,12 @@ id "$AGENT_USER" >/dev/null 2>&1 || useradd -m -s /bin/bash "$AGENT_USER"
 # gone, so without this the agent never reaches the shared browser again (Clone, 20.11.2026).
 python3 "$KIT/assets/lib/retire-private-browser-guard.py" "$AGENT_USER" "$AGENT_SERVICE"
 # END retired private browser guard
-install -d -o "$AGENT_USER" -g "$AGENT_USER" "$H/bin" "$H/obsidian-vault" \
+# Root's directories and copies in the agent's home follow no link the agent planted (Codex, 20.11.2026).
+AGENT_HOME_WRITE=(python3 "$KIT/assets/lib/agent-home.py" "$H" "$AGENT_USER")
+"${AGENT_HOME_WRITE[@]}" dir 755 "$H/bin" "$H/obsidian-vault" \
   "$H/.claude" "$H/.claude/skills" "$H/.claude/agents" \
   "$H/.claude/channels/telegram" "$H/.claude/product"
-install -d -o "$AGENT_USER" -g "$AGENT_USER" -m 700 \
+"${AGENT_HOME_WRITE[@]}" dir 700 \
   "$H/logs" "$H/.claude/memory" "$H/.claude/goals" "$H/.claude/projects" "$H/backups" \
   "$H/telegram-outbox" \
   "$H/.cache" "$H/.cache/codex-image" "$H/.cache/codex-image/prompts" \
@@ -858,12 +882,13 @@ if [ "$CLAUDE_UPDATE_MAINTENANCE" != 1 ]; then
     "$H/obsidian-vault/graphify-out"
   # The extension itself is shared by the server; only the primary removes it.
   [ "$AGENT_USER" != claude ] || rm -rf /opt/claude-graphify
-  python3 "$KIT/assets/lib/remove-markdown-section.py" \
+  agent_owns "$H/.claude/CLAUDE.md"
+  runuser -u "$AGENT_USER" -- python3 "$KIT/assets/lib/remove-markdown-section.py" \
     "$H/.claude/CLAUDE.md" "## graphify"
 fi
 
-install -m 644 -o "$AGENT_USER" -g "$AGENT_USER" "$KIT/assets/telegram-server-fixed.ts" "$H/telegram-server-fixed.ts"
-install -m 600 -o "$AGENT_USER" -g "$AGENT_USER" \
+"${AGENT_HOME_WRITE[@]}" copy 644 "$KIT/assets/telegram-server-fixed.ts" "$H/telegram-server-fixed.ts"
+"${AGENT_HOME_WRITE[@]}" copy 600 \
   "$KIT/assets/product/telegram-plugin-compat.json" \
   "$H/.claude/product/telegram-plugin-compat.json"
 # BEGIN selected agent systemd unit
@@ -926,12 +951,12 @@ env AGENT_NAME="$AGENT_NAME" OWNER_NAME="$OWNER_NAME" \
   --external-source "$KIT/assets/external-skills" \
   --baseline "$H/.claude/product/managed-skills-baseline.json"
 # END managed skill installation
-install -m 600 -o "$AGENT_USER" -g "$AGENT_USER" \
+"${AGENT_HOME_WRITE[@]}" copy 600 \
   "$KIT/assets/product/runtime.json" "$H/.claude/product/runtime.json"
-install -m 600 -o "$AGENT_USER" -g "$AGENT_USER" \
+"${AGENT_HOME_WRITE[@]}" copy 600 \
   "$KIT/assets/product/managed-plugins.json" \
   "$H/.claude/product/managed-plugins.json"
-install -m 600 -o "$AGENT_USER" -g "$AGENT_USER" \
+"${AGENT_HOME_WRITE[@]}" copy 600 \
   "$KIT/assets/product/plugin-contract.json" \
   "$H/.claude/product/plugin-contract.json"
 # The same checksum applicator protects base and role subagents. It installs
@@ -1010,13 +1035,15 @@ SETTINGS_FILE="$H/.claude/settings.json"
 if [ ! -e "$SETTINGS_FILE" ]; then
   render_template "$KIT/assets/templates/settings.json" "$SETTINGS_FILE"
 fi
-python3 "$KIT/assets/lib/migrate-settings.py" \
+# The agent's own file, rewritten as the agent: a link there leads only where the agent may write (Codex, 20.11.2026).
+agent_owns "$SETTINGS_FILE"
+runuser -u "$AGENT_USER" -- python3 "$KIT/assets/lib/migrate-settings.py" \
   "$SETTINGS_FILE" "$KIT/assets/templates/settings.json" \
   "$KIT/assets/product/managed-plugins.json"
 
 for memory_file in MEMORY.md USER.md; do
   if [ ! -e "$H/.claude/memory/$memory_file" ]; then
-    install -m 600 -o "$AGENT_USER" -g "$AGENT_USER" \
+    "${AGENT_HOME_WRITE[@]}" copy 600 \
       "$KIT/assets/templates/$memory_file" "$H/.claude/memory/$memory_file"
   fi
 done
@@ -1028,13 +1055,13 @@ MEMORY_CORE="$H/.claude/memory/MEMORY.md"
 if [ -f "$MEMORY_CORE" ] && [ ! -L "$MEMORY_CORE" ] && [ "$(python3 -c 'import hashlib, sys
 print(hashlib.sha256(" ".join(open(sys.argv[1], encoding="utf-8", errors="replace").read().split()).encode("utf-8")).hexdigest()[:16])' \
     "$MEMORY_CORE")" = e136f640cfd1070f ]; then
-  install -m 600 -o "$AGENT_USER" -g "$AGENT_USER" "$KIT/assets/templates/MEMORY.md" "$MEMORY_CORE"
+  "${AGENT_HOME_WRITE[@]}" copy 600 "$KIT/assets/templates/MEMORY.md" "$MEMORY_CORE"
 fi
 # END memory map template
 
 copy_tree_no_clobber "$KIT/assets/vault-skeleton" "$H/obsidian-vault"
 if [ ! -e "$H/.claude/onboarding-state.json" ]; then
-  install -m 600 -o "$AGENT_USER" -g "$AGENT_USER" "$KIT/assets/templates/onboarding-state.json" "$H/.claude/onboarding-state.json"
+  "${AGENT_HOME_WRITE[@]}" copy 600 "$KIT/assets/templates/onboarding-state.json" "$H/.claude/onboarding-state.json"
   # The reminder helper spaces its first nudge from this stamp.
   runuser -u "$AGENT_USER" -- python3 - "$H/.claude/onboarding-state.json" <<'PY'
 import json, sys, time
@@ -1049,10 +1076,11 @@ PY
 fi
 LEGACY_THREAD="$H/obsidian-vault/wiki/active-thread.md"
 if [ -f "$LEGACY_THREAD" ]; then
-  install -d -o "$AGENT_USER" -g "$AGENT_USER" -m 700 "$H/.claude/memory/quarantine"
-  mv "$LEGACY_THREAD" \
-    "$H/.claude/memory/quarantine/active-thread.$(date +%s).md"
-  chmod 600 "$H/.claude/memory/quarantine/"active-thread.*.md
+  "${AGENT_HOME_WRITE[@]}" dir 700 "$H/.claude/memory/quarantine"
+  quarantined="$H/.claude/memory/quarantine/active-thread.$(date +%s).md"
+  runuser -u "$AGENT_USER" -- mv -T -- "$LEGACY_THREAD" "$quarantined"
+  # A one-time cleanup: a note the helper will not adopt stays where the agent moved it, the update goes on.
+  [ -L "$quarantined" ] || "${AGENT_HOME_WRITE[@]}" own 600 "$quarantined" || echo "WARN: $quarantined лишився як є" >&2
 fi
 
 cat > "$SUDOERS_FILE" <<SUDOERS
@@ -1236,15 +1264,18 @@ if [ "$NEW_AGENT" = 1 ] && [ "$TG_DELIVERY_AUTHORITY" = receiver ] && [ "${LIVE_
   install -d -m 755 "$CONFIG_DIR"
   [ -e "$CONFIG_DIR/live-engines-allowed" ] || install -o root -g root -m 0644 /dev/null "$CONFIG_DIR/live-engines-allowed"
 fi
-if ! python3 "$KIT/assets/lib/merge-env.py" \
-    "$CHANNEL_ENV" "$MANAGED_CHANNEL_ENV" "$CHANNEL_ENV"; then
-  rm -f "$MANAGED_CHANNEL_ENV"
+# Merged in root's own files from the agent's file read through agent_file, then put in place by the home helper.
+CHANNEL_PREVIOUS="$(mktemp)"
+CHANNEL_MERGED="$(mktemp)"
+if ! agent_file "$CHANNEL_ENV" >"$CHANNEL_PREVIOUS" || ! python3 "$KIT/assets/lib/merge-env.py" \
+    "$CHANNEL_PREVIOUS" "$MANAGED_CHANNEL_ENV" "$CHANNEL_MERGED"; then
+  rm -f "$MANAGED_CHANNEL_ENV" "$CHANNEL_PREVIOUS" "$CHANNEL_MERGED"
   echo "FATAL: наявний файл середовища каналу містить небезпечні присвоєння" >&2
   exit 1
 fi
-rm -f "$MANAGED_CHANNEL_ENV"
-chown "$AGENT_USER:$AGENT_USER" "$CHANNEL_ENV"
-chmod 600 "$CHANNEL_ENV"
+rm -f "$MANAGED_CHANNEL_ENV" "$CHANNEL_PREVIOUS"
+"${AGENT_HOME_WRITE[@]}" copy 600 "$CHANNEL_MERGED" "$CHANNEL_ENV" || { rm -f "$CHANNEL_MERGED"; exit 1; }
+rm -f "$CHANNEL_MERGED"
 
 # BEGIN semantic memory default
 # Owner, 14.11.2026: with an OpenAI key the agent has, semantic (vector) memory is on, on install and on update, and
@@ -1312,8 +1343,7 @@ for name in AGENT_NAME AGENT_GENDER OWNER_NAME OWNER_TG_USERNAME OWNER_CHAT_ID A
   READ_CONTEXT_BEFORE_ANSWER; do
   write_shell_value "$profile_new" "$name"
 done
-chown "$AGENT_USER:$AGENT_USER" "$profile_new"
-chmod 600 "$profile_new"
+"${AGENT_HOME_WRITE[@]}" own 600 "$profile_new"
 mv -fT -- "$profile_new" "$PROFILE_FILE"
 umask "${secrets_umask:-022}"
 if [ "$AGENT_USER" = claude ]; then
@@ -1325,7 +1355,8 @@ if [ -n "$RECALL_API_KEY" ]; then
 else
   MEETING_SETUP_STATUS=deferred
 fi
-python3 - "$H/.claude/onboarding-state.json" "$VOICE_SETUP_STATUS" \
+agent_owns "$H/.claude/onboarding-state.json"
+runuser -u "$AGENT_USER" -- python3 - "$H/.claude/onboarding-state.json" "$VOICE_SETUP_STATUS" \
   "$MEETING_SETUP_STATUS" \
   "$MEMORY_EMBEDDINGS_OPENAI" "$MEMORY_EMBEDDINGS_KEY_PRESENT" <<'PY'
 import json
@@ -1616,11 +1647,16 @@ SKILLS_DEFAULT_OFF="$KIT/assets/product/skills-default-off.json"
 if [ "$(python3 "$PRODUCT_CONFIG" get productId)" != "premium" ]; then
   SKILLS_DEFAULT_OFF=/dev/null
 fi
-python3 "$KIT/assets/lib/apply-disabled-skills.py" "$H" "$SKILLS_DEFAULT_OFF"
+# Its moves and its state file stay in the agent's own folders: run as the agent, once a state file an older kit wrote
+# as root is the agent's (Codex, 20.11.2026: root wrote and chmodded it through whatever link stood there).
+SKILLS_OFF_STATE="$H/.claude/product/skills-default-off-applied.json"
+if [ -e "$SKILLS_OFF_STATE" ] && [ ! -L "$SKILLS_OFF_STATE" ]; then
+  "${AGENT_HOME_WRITE[@]}" own 600 "$SKILLS_OFF_STATE"
+fi
+runuser -u "$AGENT_USER" -- python3 "$KIT/assets/lib/apply-disabled-skills.py" "$H" "$SKILLS_DEFAULT_OFF"
 if [ -d "$H/.claude/skills.disabled" ]; then
   chown -R "$AGENT_USER:$AGENT_USER" "$H/.claude/skills.disabled"
 fi
-chown "$AGENT_USER:$AGENT_USER" "$H/.claude/product/skills-default-off-applied.json"
 
 if product_has_feature media-downloads || \
    product_has_feature vercel || \
@@ -1741,7 +1777,7 @@ for owned_path in logs bin obsidian-vault .claude backups .venvs; do
   [ ! -e "$H/$owned_path" ] || chown -R "$AGENT_USER:$AGENT_USER" "$H/$owned_path"
 done
 for owned_file in CLAUDE.md telegram-server-fixed.ts .agent-profile.env; do
-  [ ! -e "$H/$owned_file" ] || chown "$AGENT_USER:$AGENT_USER" "$H/$owned_file"
+  [ ! -e "$H/$owned_file" ] || chown -h "$AGENT_USER:$AGENT_USER" "$H/$owned_file"
 done
 if [ ! -d "$H/obsidian-vault/.git" ]; then
   runuser -u "$AGENT_USER" -- git -C "$H/obsidian-vault" init -q

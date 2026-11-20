@@ -28,7 +28,9 @@ install -d -o root -g root -m 755 "$RUNTIME"
 install -d -o claude-browser -g claude-browser -m 755 "$STATE" "$STATE/ms-playwright" "$STATE/output"
 install -d -o claude-browser -g claude-browser -m 700 "$STATE/profile"
 install -d -o claude -g claude-browser -m 2770 "$SHARE"
-install -d -o claude -g claude -m 755 "$CLAUDE_HOME/bin"
+# Root's directories and copies in the agent's home follow no link the agent planted (Codex, 20.11.2026).
+AGENT_HOME_WRITE=(python3 "$KIT/assets/lib/agent-home.py" "$CLAUDE_HOME" claude)
+"${AGENT_HOME_WRITE[@]}" dir 755 "$CLAUDE_HOME/bin"
 
 echo "==> installing pinned @playwright/mcp@$PLAYWRIGHT_MCP_VERSION"
 "$KIT/assets/lib/install-env" /root PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm install --prefix "$RUNTIME" --omit=dev --no-audit --no-fund \
@@ -46,9 +48,9 @@ chmod -R a+rX "$STATE/ms-playwright"
 install -m 644 "$KIT/assets/browser/browser-smoke.mjs" "$RUNTIME/browser-smoke.mjs"
 install -m 644 "$KIT/assets/browser/browser-mcp-smoke.mjs" "$RUNTIME/browser-mcp-smoke.mjs"
 install -m 644 "$KIT/assets/systemd/claude-browser.service" /etc/systemd/system/claude-browser.service
-install -m 755 -o claude -g claude "$KIT/assets/bin/browser-doctor" "$CLAUDE_HOME/bin/browser-doctor"
-install -m 755 -o claude -g claude "$KIT/assets/bin/browser-pdf.mjs" "$CLAUDE_HOME/bin/browser-pdf.mjs"
-install -m 755 -o claude -g claude "$KIT/assets/bin/html-to-pdf" "$CLAUDE_HOME/bin/html-to-pdf"
+"${AGENT_HOME_WRITE[@]}" copy 755 "$KIT/assets/bin/browser-doctor" "$CLAUDE_HOME/bin/browser-doctor"
+"${AGENT_HOME_WRITE[@]}" copy 755 "$KIT/assets/bin/browser-pdf.mjs" "$CLAUDE_HOME/bin/browser-pdf.mjs"
+"${AGENT_HOME_WRITE[@]}" copy 755 "$KIT/assets/bin/html-to-pdf" "$CLAUDE_HOME/bin/html-to-pdf"
 chown -R root:root "$RUNTIME"
 chmod -R go-w "$RUNTIME"
 
@@ -99,6 +101,22 @@ except Exception:
 print("yes" if isinstance(s, dict) and s.get("type") == "http" and s.get("url") == "http://localhost:8931/mcp" else "no")' "$CLAUDE_HOME/.claude.json" 2>/dev/null || echo no)"
 if [ "$registered" = yes ]; then
   echo "==> Claude already has the localhost-only HTTP MCP"
+  # BEGIN bot browser group
+  # A bot started before claude joined claude-browser above cannot read the browser's group-only screenshots: a running
+  # bot read for sure to lack the group restarts to take it; anything not read for sure leaves it alone (Codex, 20.11.2026).
+  browser_gid="$(getent group claude-browser | cut -d: -f3)" || browser_gid=
+  bot_pid="$(systemctl show -p MainPID --value claude-telegram.service 2>/dev/null)" || bot_pid=
+  has_group=
+  if [ -n "$browser_gid" ] && [ -n "$bot_pid" ] && [ "$bot_pid" != 0 ]; then
+    has_group="$(awk -v gid="$browser_gid" '/^Groups:/ { seen = 1; for (i = 2; i <= NF; i++) if ($i == gid) found = 1 }
+      END { if (seen) print (found ? "yes" : "no") }' "/proc/$bot_pid/status" 2>/dev/null)" || has_group=
+  fi
+  bot_pid_now="$(systemctl show -p MainPID --value claude-telegram.service 2>/dev/null)" || bot_pid_now=
+  if [ "$has_group" = no ] && [ "$bot_pid_now" = "$bot_pid" ]; then
+    echo "==> restarting the bot: it was started before claude joined claude-browser"
+    systemctl try-restart claude-telegram.service
+  fi
+  # END bot browser group
 else
   was_active=0
   if systemctl is-active --quiet claude-telegram.service; then
