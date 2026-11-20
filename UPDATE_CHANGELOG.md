@@ -1,9 +1,9 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-11-19.9641419800b6`
+- Реліз: `2026-11-20.f8971b946b3d`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `9641419800b6833844712a830e433e2ae91ab82a`
-- Дата релізу: `2026-11-19`
+- Ревізія вихідного комплекту: `f8971b946b3d649851d0695e57e5c07e82b548b3`
+- Дата релізу: `2026-11-20`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
 
@@ -19,7 +19,13 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    After the first live update: a session's start is noted, and an update gives an earlier install the shared browser (#517)
+    Правило браузера: «завдання», а не «задачу»
+    Retire guard tells a missing table from an nft that cannot answer; bounded read of the agent's settings; clearer instructions (Codex round 3)
+    Browser repair stays with root-run updates: claude-browser-recover keeps restart-only; install-browser.sh reads the agent's file as the agent
+    The agent repairs its own browser: claude-browser-recover sets up a missing browser and retires the old guard; no sending people to an administrator
+    Retire guard test: another agent's drop-in lives in its own unit
+    Retire guard: after the account exists and every preflight; no account, nothing to retire
+    Retire the private-browser guard of the kits of 24-26.10 on update
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не

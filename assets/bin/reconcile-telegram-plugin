@@ -28,10 +28,16 @@ UPSTREAM_SERVER_SHA256 = (
 )
 UPSTREAM_PACKAGE_START = "bun install --no-summary 1>&2 && bun server.ts"
 GOLDEN_SERVER_SHA256 = (
-    "9c3ffab10aa3d3c6922925d1327c4211f9b078c79e0b4f721f4d9a2eabf3ce9e"
+    "a68e2afc81236655f7985d55167e64e8214d964b8cb9251e280787fd399e9fd6"
 )
 PREVIOUS_GOLDEN_SERVER_SHA256S = frozenset(
     {
+        # The golden before the inactivity check retained observed work across transcript rotation.
+        "03e8cd09d4c1c180a98fa9eb97d988a37f6541f33e1fe622bacd2e8f9a0901bf",
+        # The golden before recognizing an existing owner's confirmed private conversation on Start.
+        "ede284b982ecf191e6be8b06f8dfb44580c53a4b735edc0ece04c000af54524e",
+        # The golden before personal first contact.
+        "9c3ffab10aa3d3c6922925d1327c4211f9b078c79e0b4f721f4d9a2eabf3ce9e",
         # 3cf45015309a Owner host: compact an idle conversation after an hour of silence, as the
         "58605786f047bfe8da7c96f705c6d9d9fc1f39b532edd57fd85214e41978a9d6",
         # d7dde12812e7 Owner host: only the result right after its own /compact replay ends t

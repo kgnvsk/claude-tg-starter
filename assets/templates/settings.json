@@ -28,7 +28,12 @@
       "Read(/etc/claude-tg-starter/**)",
       "Edit({{AGENT_HOME}}/.claude/channels/telegram/.env)",
       "Edit({{AGENT_HOME}}/.claude/.credentials.json)",
-      "Edit(/etc/claude-tg-starter/**)"
+      "Edit(/etc/claude-tg-starter/**)",
+      "CronCreate",
+      "CronDelete",
+      "CronList",
+      "ScheduleWakeup",
+      "RemoteTrigger"
     ]
   },
   "model": "claude-opus-5-5[1m]",

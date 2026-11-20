@@ -56,8 +56,10 @@ def percent(value):
     return type(value) in (int, float) and math.isfinite(value) and 0 <= value <= 100
 
 def claude_available(body):
-    if type(body) is not dict or not all(type(body.get(k)) is dict for k in ('five_hour', 'seven_day')):
+    if type(body) is not dict or 'five_hour' not in body or type(body.get('seven_day')) is not dict:
         return None
+    # Some accounts return an explicit null five_hour alongside a real weekly
+    # window. Only the reported windows and limits can justify a model probe.
     # The live endpoint also returns dashboard metadata, not quota windows.
     # Explicit limits are quota evidence too; malformed/new windows stay unknown.
     metadata = {'extra_usage', 'limits', 'spend', 'member_dashboard_available', 'seven_day_breakdown', 'weekly_scoped_shares'}

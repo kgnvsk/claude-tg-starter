@@ -730,6 +730,11 @@ initialize_limit_recovery_state() {
 
 echo "[1/7] користувач і каталоги"
 id "$AGENT_USER" >/dev/null 2>&1 || useradd -m -s /bin/bash "$AGENT_USER"
+# BEGIN retired private browser guard
+# Kits of 24-26.10 left an nft guard that rejects this agent on the shared browser port; the private browser it served is
+# gone, so without this the agent never reaches the shared browser again (Clone, 20.11.2026).
+python3 "$KIT/assets/lib/retire-private-browser-guard.py" "$AGENT_USER" "$AGENT_SERVICE"
+# END retired private browser guard
 install -d -o "$AGENT_USER" -g "$AGENT_USER" "$H/bin" "$H/obsidian-vault" \
   "$H/.claude" "$H/.claude/skills" "$H/.claude/agents" \
   "$H/.claude/channels/telegram" "$H/.claude/product"
@@ -1218,7 +1223,7 @@ umask 077
 MANAGED_CHANNEL_ENV="$(mktemp)"
 : > "$MANAGED_CHANNEL_ENV"
 for name in TELEGRAM_BOT_TOKEN OPENAI_API_KEY MEMORY_EMBEDDINGS_OPENAI RECALL_API_KEY RECALL_REGION TG_DROP_PENDING_ON_BOOT \
-  TG_DELIVERY_AUTHORITY OWNER_CHAT_ID TG_CORPORATE_SESSIONS GOG_KEYRING_BACKEND GOG_KEYRING_PASSWORD; do
+  TG_DELIVERY_AUTHORITY OWNER_CHAT_ID OWNER_NAME TG_CORPORATE_SESSIONS GOG_KEYRING_BACKEND GOG_KEYRING_PASSWORD; do
   write_shell_value "$MANAGED_CHANNEL_ENV" "$name"
 done
 # The whole agent on receipts for a new agent only: an update never writes these lines, so it cannot switch a
@@ -1283,14 +1288,33 @@ python3 "$KIT/assets/lib/agent-license.py" --scrub-backups "$AGENT_USER" >/dev/n
   || echo "WARN: старі архіви агента ще містять ключ покупки; наступне оновлення спробує знову" >&2
 
 PROFILE_FILE="$H/.agent-profile.env"
-: > "$PROFILE_FILE"
+# OWNER_TECHNICAL_ALERTS=off: the health alerts and the scheduler's notices go to ALERT_COPY_CHAT_IDS only, never to
+# the owner (owner, 13.11.2026: «технические оповещения — разработчику, а не владельцу агента»). Read here, after the
+# managed files: where the one known hand edit of cash-healthcheck did this, step 2 saved the setting as the kit's
+# file took the edit's place. Only on or off change what is saved: an empty or wrong value must not send the alerts
+# back to the owner, and neither must a profile that cannot be read (step 2 read the same file; no `|| true` here).
+saved_technical_alerts="$(python3 "$KIT/assets/bin/update-safety-check" profile-value --home "$H" OWNER_TECHNICAL_ALERTS)"
+case "${OWNER_TECHNICAL_ALERTS:-}" in
+  on|off) ;;
+  *) [ -z "${OWNER_TECHNICAL_ALERTS:-}" ] || echo "WARN: OWNER_TECHNICAL_ALERTS може бути лише on або off; лишається збережене значення" >&2
+     OWNER_TECHNICAL_ALERTS="$saved_technical_alerts" ;;
+esac
+case "$OWNER_TECHNICAL_ALERTS" in on|off) ;; *) OWNER_TECHNICAL_ALERTS= ;; esac
+if [ "$OWNER_TECHNICAL_ALERTS" = off ] && [ -z "${ALERT_COPY_CHAT_IDS:-}" ]; then
+  echo "WARN: OWNER_TECHNICAL_ALERTS=off без ALERT_COPY_CHAT_IDS — технічні сповіщення лишатимуться тільки в журналі" >&2
+fi
+# Written whole beside the profile and put in its place at once: a helper that runs meanwhile reads the old profile
+# or the new one, never an empty one (an empty one names no copies and no setting, and the owner would get the alert).
+profile_new="$(mktemp "$PROFILE_FILE.XXXXXX")"
 for name in AGENT_NAME AGENT_GENDER OWNER_NAME OWNER_TG_USERNAME OWNER_CHAT_ID ADDITIONAL_ADMIN_CHAT_IDS ALERT_COPY_CHAT_IDS \
   OWNER_EMAIL BOT_USERNAME TIMEZONE CALENDAR_EMAIL VAULT_LOCALE OWNER_NOTICE_LOCALE \
-  TG_DROP_PENDING_ON_BOOT TG_CORPORATE_SESSIONS OWNER_PROGRESS_NOTICES SECURITY_NOTICE_CHAT READ_CONTEXT_BEFORE_ANSWER; do
-  write_shell_value "$PROFILE_FILE" "$name"
+  TG_DROP_PENDING_ON_BOOT TG_CORPORATE_SESSIONS OWNER_PROGRESS_NOTICES OWNER_TECHNICAL_ALERTS SECURITY_NOTICE_CHAT \
+  READ_CONTEXT_BEFORE_ANSWER; do
+  write_shell_value "$profile_new" "$name"
 done
-chown "$AGENT_USER:$AGENT_USER" "$PROFILE_FILE"
-chmod 600 "$PROFILE_FILE"
+chown "$AGENT_USER:$AGENT_USER" "$profile_new"
+chmod 600 "$profile_new"
+mv -fT -- "$profile_new" "$PROFILE_FILE"
 umask "${secrets_umask:-022}"
 if [ "$AGENT_USER" = claude ]; then
   rm -f /home/claude/.cash-agent.env
@@ -1519,15 +1543,24 @@ fi
 # later, when this installation is over. Nothing here stops the installation: without a usable owner chat, or with
 # the queue held by a running task, the next run puts it in.
 ensure_memory_review_task() {
-  local queued
+  local queued prompt
   [[ "${OWNER_CHAT_ID:-}" =~ ^[1-9][0-9]{0,19}$ ]] || return 0
+  prompt="$(cat "$KIT/assets/templates/memory-review-prompt.txt")"
   for queued in "$H"/.atarax/reminders/*-memory-review.rem; do
-    if [[ "${queued##*/}" =~ ^[0-9]+-memory-review\.rem$ ]]; then return 0; fi
+    if [[ "${queued##*/}" =~ ^[0-9]+-memory-review\.rem$ ]]; then
+      # The queued task carries the review's text of the kit that put it in. A kit with another text gives the task
+      # its own in place (20.11.2026: the review learned to keep the helpers); the schedule and the count stay. The
+      # scheduler compares and writes as the agent, under its queue lock: root opens no file of that folder.
+      runuser -u "$AGENT_USER" -- env HOME="$H" timeout 60 "$H/bin/reminder-task" retext --task memory-review \
+        --text "$prompt" >/dev/null \
+        || echo "      WARN: текст огляду пам’яті не оновлено; наступне встановлення чи оновлення спробує ще раз"
+      return 0
+    fi
   done
   runuser -u "$AGENT_USER" -- env HOME="$H" timeout 60 "$H/bin/reminder-task" repeat --task memory-review \
     --chat "$OWNER_CHAT_ID" --at "$(( $(date +%s) + 900 ))" --every 120 --timezone "$TIMEZONE" \
     --run --self-deliver --retry-safe --check '$HOME/bin/owner-chat-recent review-check' \
-    --text "$(cat "$KIT/assets/templates/memory-review-prompt.txt")" >/dev/null \
+    --text "$prompt" >/dev/null \
     || echo "      WARN: завдання огляду пам’яті не поставлено; наступне встановлення чи оновлення спробує ще раз"
 }
 # END memory review task

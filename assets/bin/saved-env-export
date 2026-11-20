@@ -39,6 +39,10 @@ RETIRED = {
     "CODEX_EXECUTABLE", "OPENAI_API_KEY_FILE",
     "INSTAGRAM_DM_REPORT_EXECUTABLE", "INSTAGRAM_COMMENT_REPORT_EXECUTABLE",
     "INSTAGRAM_TOP_REPORT_EXECUTABLE", "INSTAGRAM_WEB_REPORT_EXECUTABLE",
+    # Novsky writes these two into agent.env when the seller picks paid modules (src/server/deploy/agent-env.ts,
+    # moduleLines); the kit does not read them. Refused, they stopped every later update of such an agent at
+    # «invalid saved setting» (Clone, 20.11.2026: the core failed and the bot was left down in recovery-hold).
+    "NOVSKY_MODULES", "NOVSKY_MODULES_CONTACT",
 }
 ALLOWED = EXPORTABLE | RETIRED
 ANSI_C_ESCAPES = {"a": 7, "b": 8, "e": 27, "E": 27, "f": 12, "n": 10, "r": 13, "t": 9, "v": 11,

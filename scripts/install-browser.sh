@@ -83,21 +83,39 @@ if [ ! -x "$CLAUDE_BIN" ]; then
   exit 1
 fi
 
-was_active=0
-if systemctl is-active --quiet claude-telegram.service; then
-  was_active=1
-  systemctl stop claude-telegram.service
-fi
-restart_agent() {
-  [ "$was_active" -eq 0 ] || systemctl start claude-telegram.service
-}
-trap restart_agent EXIT
+# A reinstall (an update of an agent that lost its browser) finds the MCP already registered: Claude CLI is not started
+# then, so neither the bot nor the login is touched (a Claude CLI call in the login's renewal window can wipe it). The
+# agent's own file is read as the agent, and anything but the exact entry counts as not registered.
+registered="$(runuser -u claude -- timeout 10 python3 -I -c 'import json,os,stat,sys
+try:
+    st = os.lstat(sys.argv[1])
+    if not stat.S_ISREG(st.st_mode) or st.st_size > 8 * 1024 * 1024:
+        raise ValueError("not a plain settings file")
+    d = json.load(open(sys.argv[1], encoding="utf-8"))
+    s = d.get("mcpServers") if isinstance(d, dict) else None
+    s = s.get("playwright") if isinstance(s, dict) else None
+except Exception:
+    s = None
+print("yes" if isinstance(s, dict) and s.get("type") == "http" and s.get("url") == "http://localhost:8931/mcp" else "no")' "$CLAUDE_HOME/.claude.json" 2>/dev/null || echo no)"
+if [ "$registered" = yes ]; then
+  echo "==> Claude already has the localhost-only HTTP MCP"
+else
+  was_active=0
+  if systemctl is-active --quiet claude-telegram.service; then
+    was_active=1
+    systemctl stop claude-telegram.service
+  fi
+  restart_agent() {
+    [ "$was_active" -eq 0 ] || systemctl start claude-telegram.service
+  }
+  trap restart_agent EXIT
 
-echo "==> registering localhost-only HTTP MCP for Claude"
-runuser -u claude -- env HOME="$CLAUDE_HOME" "$CLAUDE_BIN" mcp remove --scope user playwright >/dev/null 2>&1 || true
-runuser -u claude -- env HOME="$CLAUDE_HOME" "$CLAUDE_BIN" mcp add --scope user --transport http \
-  playwright http://localhost:8931/mcp
-runuser -u claude -- env HOME="$CLAUDE_HOME" "$CLAUDE_BIN" mcp get playwright >/dev/null
+  echo "==> registering localhost-only HTTP MCP for Claude"
+  runuser -u claude -- env HOME="$CLAUDE_HOME" "$CLAUDE_BIN" mcp remove --scope user playwright >/dev/null 2>&1 || true
+  runuser -u claude -- env HOME="$CLAUDE_HOME" "$CLAUDE_BIN" mcp add --scope user --transport http \
+    playwright http://localhost:8931/mcp
+  runuser -u claude -- env HOME="$CLAUDE_HOME" "$CLAUDE_BIN" mcp get playwright >/dev/null
+fi
 
 runuser -u claude -- env HOME="$CLAUDE_HOME" PATH="$CLAUDE_HOME/.local/bin:/usr/local/bin:/usr/bin:/bin" \
   "$CLAUDE_HOME/bin/browser-doctor"

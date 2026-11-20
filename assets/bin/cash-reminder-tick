@@ -1136,8 +1136,55 @@ else:
 '
 }
 
+# Who hears the scheduler's own notices (a failed task, the day's failures, a held or undelivered one): the owner.
+# With OWNER_TECHNICAL_ALERTS=off in the profile (owner, 13.11.2026: «технические оповещения — разработчику, а не
+# владельцу агента») it is the first chat of ALERT_COPY_CHAT_IDS that is not the owner's own; with no such chat, or
+# with no valid owner to tell the copies from, they stay in the log. The owner is known here by the profile's
+# OWNER_CHAT_ID alone. One read of the profile answers all of it, with cash-healthcheck's reading of a value.
 owner_chat_id() {
-  grep '^OWNER_CHAT_ID=' "$PROFILE_FILE" 2>/dev/null | head -n1 | cut -d= -f2- | tr -d "\"'"
+  python3 - "$PROFILE_FILE" <<'PY' 2>/dev/null || true
+import re
+import shlex
+import sys
+
+valid_id = re.compile(r"^[1-9][0-9]*$").fullmatch
+try:
+    with open(sys.argv[1], encoding="utf-8", newline="") as profile:
+        text = profile.read(65_537)
+except (OSError, UnicodeError):
+    text = ""
+# Lines end at a newline alone, as for grep. An oversized profile names nobody, as for cash-healthcheck.
+lines = text.split("\n") if len(text) <= 65_536 else []
+
+
+def written(name):
+    return next((line[len(name) + 1:] for line in lines if line.startswith(name + "=")), None)
+
+
+def profile_value(name):
+    value = (written(name) or "").strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+        value = value[1:-1]
+    return value
+
+
+try:  # read as the shell reads it, as in cash-healthcheck: quotes or a note after the value change nothing
+    copies_only = shlex.split(profile_value("OWNER_TECHNICAL_ALERTS"), comments=True) == ["off"]
+except ValueError:
+    copies_only = False
+if not copies_only:
+    # As before the setting: the owner's line as written, without its quotes.
+    owner = written("OWNER_CHAT_ID")
+    if owner is not None:
+        print(owner.replace('"', "").replace("'", ""))
+else:
+    owner = profile_value("OWNER_CHAT_ID")
+    if valid_id(owner):
+        for copy in profile_value("ALERT_COPY_CHAT_IDS").split(","):
+            if valid_id(copy.strip()) and copy.strip() != owner:
+                print(copy.strip())
+                break
+PY
 }
 
 # owner_notice KEY UKRAINIAN [NAME=VALUE...]: the notice in OWNER_NOTICE_LOCALE,
@@ -2162,7 +2209,7 @@ for f in "$REM_DIR"/*.rem; do
       # A new agent's Claude may not be signed in yet when the kit's own task first comes due: held, nobody is told.
       if kit_task "$task_id" "${check_cmd:-}"; then continue; fi
       if [ "$(cat "$f.unapproved" 2>/dev/null)" != "$epoch" ]; then
-        owner=$(grep '^OWNER_CHAT_ID=' "$PROFILE_FILE" 2>/dev/null | head -n1 | cut -d= -f2- | tr -d "\"'")
+        owner=$(owner_chat_id)
         if [ -n "$owner" ] && send_text "$owner" "$(owner_notice schedule.unapproved '⚠️ Автоматичне завдання «{task}» ще не виконано: потрібно оновити доступ Claude для планувальника. Повторю, щойно доступ оновиться.' task="$task_id")" text >/dev/null; then
           printf '%s\n' "$epoch" > "$f.unapproved"
         fi

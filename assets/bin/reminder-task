@@ -750,6 +750,26 @@ def cancel_task(rem_dir, task, actor=None, chat=None, legacy_prefix=None):
     return f"VERIFIED task={task} mode=cancelled files=0"
 
 
+def retext_task(rem_dir, task, text, actor=None, chat=None):
+    """Replace the text of a queued task and keep the rest of it - its time, its count, every header. A kit task
+    carries the kit's own prompt: a later kit changes that prompt without a moment when the task is not queued."""
+    records = task_records(rem_dir, task)
+    if not records:
+        raise TaskError(f"task is not queued: {task}")
+    require_scope(records, actor, chat)
+    body = body_text(text)
+    changed = 0
+    for record in records:
+        if record.body.strip() == body:
+            continue  # the task has this text already: its file is left as it is
+        headers = [line for line in record.path.read_text(encoding="utf-8").splitlines() if HEADER_RE.fullmatch(line)]
+        if len(headers) != len(record.headers):
+            raise TaskError(f"cannot tell the headers from the text in {record.path}")
+        replace_text(record.path, "\n".join([*headers, "", body]))
+        changed += 1
+    return f"VERIFIED task={task} mode=retext files={len(records)} changed={changed}"
+
+
 @contextmanager
 def queue_lock(rem_dir, lock_file):
     rem_dir.mkdir(parents=True, exist_ok=True)
@@ -867,6 +887,10 @@ def parser():
     cancel.add_argument("--chat")
     cancel.add_argument("--legacy-prefix", help="host-bound old unthreaded task namespace; never bypasses CHAT or an existing ACTOR")
     cancel.add_argument("--legacy-task", help="host-bound old corp task, considered only when the new scoped task is absent")
+    retext = commands.add_parser("retext", help="replace the text of a queued task; its schedule stays")
+    identity(retext)
+    retext.add_argument("--chat")
+    retext.add_argument("--text", required=True)
     return root
 
 
@@ -950,6 +974,8 @@ def main():
                 result = create_sequence(rem_dir, args)
             elif args.command == "status":
                 result = verified_status(rem_dir, args.task, args.actor, args.chat, args.legacy_prefix)
+            elif args.command == "retext":
+                result = retext_task(rem_dir, args.task, args.text, args.actor, args.chat)
             else:
                 result = cancel_task(rem_dir, args.task, args.actor, args.chat, args.legacy_prefix)
         print(result)

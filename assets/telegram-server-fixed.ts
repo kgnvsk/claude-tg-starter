@@ -45,7 +45,11 @@ try {
   chmodSync(ENV_FILE, 0o600)
   for (const line of readFileSync(ENV_FILE, 'utf8').split('\n')) {
     const m = line.match(/^(\w+)=(.*)$/)
-    if (m && process.env[m[1]] === undefined) process.env[m[1]] = m[2]
+    if (!m || process.env[m[1]] !== undefined) continue
+    // The service has already sourced the managed file. A standalone receiver reads its shell-quoted name here.
+    const value = m[2]!
+    process.env[m[1]!] = m[1] === 'OWNER_NAME' && value.startsWith("'") && value.endsWith("'")
+      ? value.slice(1, -1).replaceAll(`'"'"'`, "'") : value
   }
 } catch {}
 
@@ -6132,7 +6136,9 @@ const turnRecordVerdicts = new Map<string, { size: number; mtimeMs: number; at: 
 function newestTurnRecord(path: string, size: number, mtimeMs: number): number {
   const known = turnRecordVerdicts.get(path)
   if (known?.size === size && known.mtimeMs === mtimeMs) return known.at
-  const at = scanTurnRecords(path, size, mtimeMs)
+  // A future-dated record counts once when first observed. Rechecking the same file
+  // must not renew a quiet turn every tick until the wall clock catches up.
+  const at = Math.min(Date.now(), scanTurnRecords(path, size, mtimeMs))
   if (turnRecordVerdicts.size >= 1000) turnRecordVerdicts.clear() // a bound, not an eviction policy
   turnRecordVerdicts.set(path, { size, mtimeMs, at })
   return at
@@ -6169,8 +6175,11 @@ function scanTurnRecords(path: string, size: number, mtimeMs: number): number {
   }
 }
 
+// Compaction or rotation can leave the file empty between two ticks. Recent work already
+// observed for an open turn still counts until its normal warning and interruption deadlines.
+const observedTurnActivity = new Map<number, number>()
 function lastTranscriptActivity(turn: LadderTurn): number {
-  let last = turn.opened_at
+  let last = Math.max(turn.opened_at, observedTurnActivity.get(turn.turn_id) ?? 0)
   if (!turn.transcript_path) return last
   const paths = [turn.transcript_path]
   if (turn.transcript_path.endsWith('.jsonl')) {
@@ -6186,6 +6195,7 @@ function lastTranscriptActivity(turn: LadderTurn): number {
     try { file = statSync(path) } catch { continue }
     if (file.mtimeMs > last) last = Math.max(last, newestTurnRecord(path, file.size, file.mtimeMs))
   }
+  observedTurnActivity.set(turn.turn_id, last)
   return last
 }
 
@@ -6296,6 +6306,7 @@ async function inactivityLadderTick(): Promise<void> {
     if (providerHoldsDrain(now)) return
     const open = openTurnsOfBoundSessions()
     const openIds = new Set(open.map(t => t.turn_id))
+    for (const id of observedTurnActivity.keys()) if (!openIds.has(id)) observedTurnActivity.delete(id)
     for (const id of ladderWarned) if (!openIds.has(id)) ladderWarned.delete(id)
     for (const id of ladderShadowed.keys()) if (!openIds.has(id)) ladderShadowed.delete(id)
     for (const [id, escaped] of escapedTurns) {
@@ -8465,7 +8476,7 @@ const BOT_COMMAND_COPY: Record<string, { menu: readonly string[]; connected: str
       'Разблокировать запрос; в режиме компании — только эту сессию',
       'Перезапустить бота (нужен работающий бот)',
     ],
-    connected: 'Привет! Ты уже подключён — просто напиши мне, что нужно.',
+    connected: 'Ты уже подключён — просто напиши мне, что нужно.',
     help: 'Сообщения, которые ты присылаешь сюда, передаются в подключённую сессию Claude Code. '
       + 'Текст и фото пересылаются; ответы и реакции возвращаются сюда.\n\n'
       + '/start — инструкция по подключению\n/status — проверить состояние подключения',
@@ -8479,7 +8490,7 @@ const BOT_COMMAND_COPY: Record<string, { menu: readonly string[]; connected: str
       'Odblokuj prośbę; w trybie firmowym — tylko tę sesję',
       'Uruchom bota ponownie (bot musi działać)',
     ],
-    connected: 'Cześć! Jesteś już połączony — po prostu napisz, czego potrzebujesz.',
+    connected: 'Jesteś już połączony — po prostu napisz, czego potrzebujesz.',
     help: 'Wiadomości, które tu wysyłasz, trafiają do połączonej sesji Claude Code. '
       + 'Tekst i zdjęcia są przekazywane; odpowiedzi i reakcje wracają tutaj.\n\n'
       + '/start — instrukcja połączenia\n/status — sprawdź stan połączenia',
@@ -8493,7 +8504,7 @@ const BOT_COMMAND_COPY: Record<string, { menu: readonly string[]; connected: str
       'Unblock a request; in company mode — this session only',
       'Restart the bot (the bot must be running)',
     ],
-    connected: "Hi! You're already connected — just write to me what you need.",
+    connected: "You're already connected — just write to me what you need.",
     help: 'Messages you send here go to the connected Claude Code session. '
       + 'Text and photos are passed on; replies and reactions come back here.\n\n'
       + '/start — how to connect\n/status — check the connection',
@@ -8524,13 +8535,51 @@ function apiKeyAccess(): boolean {
   }
 }
 
+function ownerAlreadyIntroduced(home: string): boolean {
+  if (existsSync(join(home, '.claude/memory/first-contact.done'))) return true
+  // Novsky records the introduction immediately. Its first-day profile marker follows a day later.
+  try {
+    const path = join(home, '.novsky/onboarding.json'), file = lstatSync(path)
+    if (file.isFile() && file.size <= 1024 * 1024) {
+      const at = JSON.parse(readFileSync(path, 'utf8'))?.introducedAt
+      if (Number.isSafeInteger(at) && at > 0) return true
+    }
+  } catch { /* An existing installation may predate either onboarding marker. */ }
+  // Only a final answer confirmed in this owner's DM counts. An install notice,
+  // a previous /start or a conversation in a group cannot finish their introduction.
+  try {
+    return MSG_DB.query(`SELECT 1 FROM delivery_terminal_receipts
+      WHERE chat_id=? AND thread_id IS NULL AND message_id>0 LIMIT 1`).get(OWNER_CHAT_ID) != null
+  } catch {
+    return true // The neutral connected greeting is valid when history is unavailable.
+  }
+}
+
+// /start stays a transport command. Only the owner's first natural message may start their onboarding.
+function startReply(senderId: string, telegramName?: string): string {
+  const owner = senderId === OWNER_CHAT_ID
+  const name = ((owner ? process.env.OWNER_NAME?.trim() : '') || telegramName || '').trim().replace(/\s+/gu, ' ').slice(0, 200)
+  const hello = ({ ru: 'Привет', en: 'Hi', pl: 'Cześć' } as Record<string, string>)[ownerNoticeLocale()] ?? 'Привіт'
+  const greeting = name ? `${hello}, ${name}!` : `${hello}!`
+  if (owner && !ownerAlreadyIntroduced(process.env.AGENT_ROOT || homedir())) {
+    const first: Record<string, string> = {
+      ru: 'Я твой новый AI-агент. Пришли первую задачу или напиши «С чего начать?» — подберём задачу под твою работу.',
+      pl: 'Jestem Twoim nowym agentem AI. Napisz, co mam zrobić, albo zapytaj „Od czego zacząć?”, a zaproponuję zadanie przydatne w Twojej pracy.',
+      en: 'I’m your new AI agent. Send me your first task, or ask “Where should I start?” and I’ll suggest something that fits your work.',
+    }
+    return greeting + ' ' + (first[ownerNoticeLocale()] ?? 'Я твій новий AI-агент. Надішли перше завдання або напиши «З чого почати?» — підберемо завдання для твоєї роботи.')
+  }
+  const connected = botCommandCopy()?.connected ?? 'Ти вже на зв’язку. Напиши мені, з чим допомогти.'
+  return greeting + ' ' + connected
+}
+
 bot.command('start', async ctx => {
   const gate = dmCommandGate(ctx)
   if (!gate) return
   // The owner and everyone on the allowlist are already connected: pairing
   // instructions would only send them looking for a code that never comes.
   if (gate.senderId === OWNER_CHAT_ID || gate.access.allowFrom.includes(gate.senderId)) {
-    await ctx.reply(botCommandCopy()?.connected ?? `Привіт! Ти вже підключений — просто напиши мені, що потрібно.`)
+    await ctx.reply(startReply(gate.senderId, ctx.from?.first_name))
     return
   }
   await ctx.reply(

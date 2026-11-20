@@ -146,6 +146,17 @@ def memory_block(label: str, content: str) -> str:
 # profile over its limit (memory-budget-guard keeps it within) gives a helper nothing.
 SUBAGENT = sys.argv[1:] == ["--subagent"]
 
+# Owner, 20.11.2026: «одно из самых важных правил… не сдаваться при первой сложности… Агенты должны делать задачи, а не
+# просто отчитываться, почему они что-то не смогли… в разумных пределах». Every helper gets this at its start, whoever
+# wrote its file: the kit's worker, a role, the owner's own helper for a kind of work, the built-in one. It is the
+# kit's text and changes with the kit, so a helper's own file holds only what is its own.
+HELPER_RULES = """<helper-rules source="kit">
+Правила комплекту для кожного помічника; діють разом із правилами власника й твоїми власними.
+**Доведи доручення до результату: ти шукач, а не доповідач.** Перша невдача — не відповідь. Дочитай помилку, знайди причину й зайди інакше: доступ чи файл може лежати в іншому місці (`.env` інтеграцій, пам’ять, vault, сусідні папки), є інше джерело, браузер замість API, інший формат. Чого бракує, але можна знайти, — знайди сам.
+**Зупинись, коли шляхи скінчилися або наступний крок вирішує лише власник:** гроші, чужі живі акаунти, розсилки й публікації, видалення, його вибір. Той самий хід удруге не повторюй і навмання не перебирай: у кожної нової спроби є причина.
+**«Не вдалося» — це звіт шукача:** що саме пробував, що дослівно повернула кожна спроба, що лишилося неперевіреним і що потрібно, щоб закінчити. Значень ключів, паролів, токенів, кодів входу, cookie та посилань, що самі дають доступ, у звіт не пиши — лише де вони лежать.
+</helper-rules>"""
+
 cores = []
 for path, label, limit in SOURCES:
     if SUBAGENT and label != "user-profile":
@@ -184,6 +195,9 @@ while units("\n\n".join(blocks)) > HOOK_BUDGET and any(core[4] for core in cores
     path, label, limit, content, _ = cores[index]
     cores[index][4] = False
     blocks[index] = memory_block(label, too_long(path, len(content), limit))
+
+if SUBAGENT:
+    blocks.append(HELPER_RULES)  # after the cores: the loop above indexes them by position
 
 if blocks:
     print(

@@ -357,4 +357,10 @@ if ! doctor_report="$("$PLUGIN_DOCTOR" --json 2>/dev/null)"; then
   fi
 fi
 
+# install-core builds the company worker before the logged-in CLI installs or updates plugins.
+corporate="$HOME/.local/share/claude-telegram-corporate"
+if [ -f "$corporate/worker-plugin/.claude-plugin/plugin.json" ]; then
+  bash "$corporate/worker-plugin-sync.sh" --refresh-skills || exit 1
+fi
+
 echo "✅ install-plugins: плагіни та експортовані навички перевірено"

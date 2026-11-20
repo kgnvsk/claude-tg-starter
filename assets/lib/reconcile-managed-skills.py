@@ -83,6 +83,19 @@ def claude_managed_skill(name: str, relative: str, payload: bytes) -> bytes:
     Leave the shared upstream tree and the frozen Codex builder untouched. This
     same projection is used before server baseline hashing and native payload hashing.
     """
+    if name == "team-access" and relative == "SKILL.md":
+        text = re.sub(r"(?m)^  Якщо роль змінює суперадміністратор,[^\n]*(?:\n  [^\n]+)*",
+            "  У корпоративній особистій розмові окремо призначений адміністратор налаштувань працює через "
+            "`mcp__corporate__business_settings`, коли шлюз надав цей інструмент. Для складу й кількості людей "
+            "прочитай `team_list`. Для зміни ролі виклич `team_preview` й дочекайся приватного підтвердження. "
+            "Роль суперадміністратора сама по собі дає доступ до робочих ресурсів. Якщо інструмента немає, "
+            "поясни, що власник може перевірити склад у своєму чаті. Шлях власника через оболонку призначений "
+            "тільки для його підтвердженого доручення.", payload.decode("utf-8"), count=1)
+        return text.replace("Для суперадміністратора лишається його приватний `settings-preview` → `settings-confirm`.",
+            "Призначений адміністратор налаштувань використовує `settings_overview` та `settings_preview` "
+            "у наданому шлюзом інструменті у своєму приватному чаті.").encode()
+    if name == "video-craft" and relative == "SKILL.md":
+        return payload.replace(" Use ПЕРШИМ на будь-яке прохання зробити відео чи reel.".encode(), b"", 1)
     if name not in HYPERFRAMES_SKILLS:
         return payload
     if name == "media-use" and relative in {
@@ -241,7 +254,7 @@ def load_baseline(path: Path, *, agent_files: bool = False) -> dict[str, str]:
     return data["entries"]
 
 
-def snapshot(path: Path, *, render: bool = False, claude_external: bool = False) -> Snapshot | None:
+def snapshot(path: Path, *, render: bool = False, claude_skill: bool = False) -> Snapshot | None:
     check_path(path)
     if not path.exists():
         return None
@@ -258,7 +271,7 @@ def snapshot(path: Path, *, render: bool = False, claude_external: bool = False)
             flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
             with os.fdopen(os.open(item, flags), "rb") as handle:
                 payload = handle.read()
-            if claude_external:
+            if claude_skill:
                 payload = claude_managed_skill(path.name, relative, payload)
             if render and re.search(rb"\{\{[A-Z_]+\}\}", payload):
                 for name in PLACEHOLDERS:
@@ -356,7 +369,7 @@ def reconcile(
         if not source_root.is_dir():
             raise PolicyError("каталог вихідних навичок відсутній")
         for name in sorted(selected | {"manifest.json"}):
-            value = snapshot(source_root / name, render=True)
+            value = snapshot(source_root / name, render=True, claude_skill=True)
             if value is not None:
                 targets[name] = value
     if external_root is not None:
@@ -368,7 +381,7 @@ def reconcile(
         for name in sorted(selected):
             # External skills contain their own example/template markers. Only
             # first-party sources use this installer's profile substitutions.
-            value = snapshot(external_root / name, claude_external=True)
+            value = snapshot(external_root / name, claude_skill=True)
             if value is not None:
                 if name in targets:
                     raise PolicyError(f"навичка оголошена у двох джерелах: {name}")
@@ -589,9 +602,9 @@ def seed_baseline(
         raise PolicyError("рішення лише для керованих навичок і одне на навичку: " + ", ".join(unknown or sorted(keep_live & take_kit)))
 
     def candidate(name: str, first_party: Path, third_party: Path | None, *, current: bool = False) -> Snapshot | None:
-        value = snapshot(first_party / name, render=True)
+        value = snapshot(first_party / name, render=True, claude_skill=current)
         if value is None and third_party is not None and name != "manifest.json":
-            value = snapshot(third_party / name, claude_external=current)
+            value = snapshot(third_party / name, claude_skill=current)
         return value
 
     entries: dict[str, str] = {}

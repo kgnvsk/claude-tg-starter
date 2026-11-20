@@ -570,5 +570,8 @@ if product_check_declared vercel_auth; then
   echo "5. Авторизація Vercel для розгортання сайтів."
 fi
 echo "6. Запуск служби, захист сервера та повна перевірка за інструкцією VERIFY.md."
+if [ "$(python3 "$PRODUCT_CONFIG" get productId)" = premium ] && product_feature_declared telegram-corporate-sessions; then
+  echo "Для нової установки Premium заверши запуск із корпоративною ізоляцією за етапом 4 DEPLOY.md: probe, resume і перевірка фактичного стану."
+fi
 echo
 echo "Поточний безпечний список перевірок: runuser -u claude -- /home/claude/bin/onboarding-status"

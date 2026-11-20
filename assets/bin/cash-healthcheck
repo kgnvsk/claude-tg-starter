@@ -382,10 +382,11 @@ PROFILE_FILE=$H/.agent-profile.env
 ACCESS_FILE=$H/.claude/channels/telegram/access.json
 
 alert_recipients() {
-    python3 - "$PROFILE_FILE" "$ACCESS_FILE" "$RENDERED_OWNER_ID" <<'PY'
+    python3 - "$PROFILE_FILE" "$ACCESS_FILE" "$RENDERED_OWNER_ID" "${1:-}" <<'PY'
 import json
 from pathlib import Path
 import re
+import shlex
 import sys
 
 profile_path = Path(sys.argv[1])
@@ -435,12 +436,23 @@ if not valid_id(owner):
 if not valid_id(owner):
     owner = rendered_owner if valid_id(rendered_owner) else ""
 
+# `alert_recipients alert` is the list an alert is sent to. OWNER_TECHNICAL_ALERTS=off in the profile (owner,
+# 13.11.2026: «технические оповещения — разработчику, а не владельцу агента») leaves the copies only; with no copy
+# configured the alert stays in the log. The value is read as the shell reads it: quotes around it or a note written
+# after it by hand change nothing.
+try:
+    copies_only = sys.argv[4] == "alert" and shlex.split(profile_value("OWNER_TECHNICAL_ALERTS"), comments=True) == ["off"]
+except ValueError:
+    copies_only = False
+
 seen: set[str] = set()
 for candidate in [owner, *profile_value("ALERT_COPY_CHAT_IDS").split(",")]:
     chat_id = candidate.strip()
     if not valid_id(chat_id) or chat_id in seen:
         continue
     seen.add(chat_id)
+    if copies_only and chat_id in (owner, rendered_owner):
+        continue
     print(chat_id)
 PY
 }
@@ -572,7 +584,7 @@ alert() {
         return 0
     fi
     local recipients
-    if ! recipients="$(alert_recipients)"; then
+    if ! recipients="$(alert_recipients alert)"; then
         echo "[$(date -u +%FT%TZ)] ALERT [${key}]: recipient resolution failed" >> "$LOG"
         return 0
     fi
@@ -597,8 +609,8 @@ alert() {
     done <<ALERT_RECIPIENTS_EOF
 $recipients
 ALERT_RECIPIENTS_EOF
-    # The cooldown starts once the owner (the first recipient) was told; a copy
-    # alone does not count, and a send the owner did not get retries next tick.
+    # The cooldown starts once the first recipient was told (the owner, or the first copy when
+    # OWNER_TECHNICAL_ALERTS=off); a later copy alone does not count, and a send the first did not get retries next tick.
     if [ "$delivered" = 1 ]; then
         echo "$now" > "$last_file"
     fi

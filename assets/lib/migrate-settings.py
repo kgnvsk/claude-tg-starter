@@ -64,6 +64,14 @@ PROTECTED_DENY_RULES = (
     "Edit({H}/.claude/channels/telegram/.env)",
     "Edit({H}/.claude/.credentials.json)",
     "Edit(/etc/claude-tg-starter/**)",
+    # Owner, 20.11.2026: «агент всегда должен ставить кроны не в сессии, а те, которые переживают перезагрузку
+    # сервера». These timers live in one CLI process (or run in Anthropic's cloud, away from this server): a reminder
+    # set with them dies with the session. The agent's one scheduler is ~/bin/reminder-task.
+    "CronCreate",
+    "CronDelete",
+    "CronList",
+    "ScheduleWakeup",
+    "RemoteTrigger",
 )
 DEPRECATED_DENY_RULES = (
     "Write({H}/.claude/channels/telegram/.env)",

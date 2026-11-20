@@ -53,9 +53,12 @@ PROFILE_KEYS = (
     "VAULT_LOCALE",
     "TG_DROP_PENDING_ON_BOOT",
     "OWNER_PROGRESS_NOTICES",
+    "OWNER_TECHNICAL_ALERTS",
     "SECURITY_NOTICE_CHAT",
     "READ_CONTEXT_BEFORE_ANSWER",
 )
+# Exact seven-line installed filter, including its private comment and final newline.
+HEALTH_ALERT_BLOCK_SHA256 = "4fd697a0fd8cea39db4dcd96991bb30147477eeea0e12e3078623c7b68034a8f"
 MAX_LEGACY_TEMPLATE_BYTES = 1024 * 1024
 ANSI_C_VALUE = re.compile(r"^\$'(?:[^'\\]|\\.)*'$", re.DOTALL)
 
@@ -80,6 +83,8 @@ class Decision:
     path: str
     action: str
     reason: str
+    # The exact live file a recognized routing edit was planned against: the kit's file and its setting replace it.
+    routed_install: FileState | None = None
 
 
 @dataclass(frozen=True)
@@ -539,6 +544,67 @@ def metadata_state(value: dict[str, object]) -> FileState:
     )
 
 
+def replace_health_alert_routing(
+    original: Decision, live: FileState, baseline: FileState, installed: bytes, stock: bytes,
+) -> Decision:
+    """The kit's own file replaces the one known hand-made alert filter (13.11.2026): OWNER_TECHNICAL_ALERTS=off,
+    which install-core keeps for such an installation, routes the same alerts from this release on."""
+    define_at = b'ACCESS_FILE=$H/.claude/channels/telegram/access.json\n'
+    resolver = b'\nalert_recipients() {\n'
+    send_at = b'    if [ -z "$recipients" ]; then\n'
+    call = b'    recipients="$(drop_owner_recipients "$recipients")"\n'
+    sender = b'\nalert() {\n'
+    sent = b'    echo "[$(date -u +%FT%TZ)] ALERT [${key}]: ${msg}" >> "$LOG"\n}\n'
+    # The kit's file must route by the setting itself: its resolver reads it and alert() asks that resolver.
+    if (live.mode != 0o755 or baseline.mode != live.mode
+            or b'shlex.split(profile_value("OWNER_TECHNICAL_ALERTS"), comments=True) == ["off"]' not in stock
+            or b'    if ! recipients="$(alert_recipients alert)"; then\n' not in stock):
+        return original
+    # One recipients guard in the file, inside alert(), with the filter's call right before it.
+    if any(installed.count(anchor) != 1 for anchor in (define_at, resolver, sender, send_at, call + send_at, sent)):
+        return original
+    if not installed.index(sender) < installed.index(call + send_at) < installed.index(sent):
+        return original
+    block = installed.partition(define_at)[2].partition(resolver)[0]
+    # Everything else in the live file must be the kit's file of the last install, byte for byte.
+    clean = installed.replace(define_at + block + resolver, define_at + resolver).replace(call + send_at, send_at)
+    if (hashlib.sha256(block).hexdigest() != HEALTH_ALERT_BLOCK_SHA256
+            or hashlib.sha256(clean).hexdigest() != baseline.digest):
+        return original
+    return Decision(original.path, "install", "alert-routing-setting", live)
+
+
+def keep_technical_alerts_from_owner(home: Path, uid: int | None, gid: int | None) -> None:
+    """OWNER_TECHNICAL_ALERTS=off in the agent's profile: what the hand-made alert filter did, as the kit's setting."""
+    profile = home / ".agent-profile.env"
+    lines: list[str] = []
+    try:
+        # Opened once and never through a link: this runs as root and what it reads goes into the agent's own file.
+        descriptor = os.open(profile, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except FileNotFoundError:
+        descriptor = None
+    except OSError as error:
+        raise UpdateError("agent profile is unsafe") from error
+    if descriptor is not None:
+        with os.fdopen(descriptor, "rb") as handle:
+            metadata = os.fstat(handle.fileno())
+            if (not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1
+                    or (uid is not None and metadata.st_uid not in (uid, 0))):
+                raise UpdateError("agent profile is unsafe")
+            payload = handle.read(64 * 1024 + 1)
+        if len(payload) > 64 * 1024:
+            raise UpdateError("agent profile is too large")
+        try:
+            lines = payload.decode("utf-8").splitlines()
+        except UnicodeDecodeError as error:
+            raise UpdateError("cannot read agent profile") from error
+    lines = [line for line in lines if not line.startswith("OWNER_TECHNICAL_ALERTS=")]
+    data = ("\n".join([*lines, "OWNER_TECHNICAL_ALERTS=off"]) + "\n").encode("utf-8")
+    if len(data) > 64 * 1024:  # the helpers read no more: the setting must not land beyond what they see
+        raise UpdateError("agent profile is too large")
+    atomic_install_bytes(data, profile, 0o600, uid, gid)
+
+
 def build_plan(
     home: Path,
     kit: Path,
@@ -607,9 +673,18 @@ def build_plan(
                     "file",
                     baseline_state.mode,
                 )
-        decisions.append(
-            decide(relative, baseline_state, live, target)
-        )
+        decision = decide(relative, baseline_state, live, target)
+        if (decision.action == "conflict" and product_id == "premium"
+                and relative == "bin/cash-healthcheck" and baseline_state is not None
+                and live.kind == "file" and live_path(home, relative).stat().st_size <= MAX_LEGACY_TEMPLATE_BYTES):
+            with live_path(home, relative).open("rb") as source:
+                installed = source.read(MAX_LEGACY_TEMPLATE_BYTES + 1)
+            stock = rendered_target_bytes(home, kit, relative, values)
+            if (hashlib.sha256(installed).hexdigest() != live.digest
+                    or hashlib.sha256(stock).hexdigest() != target.digest):
+                raise UpdateError("healthcheck changed during planning")
+            decision = replace_health_alert_routing(decision, live, baseline_state, installed, stock)
+        decisions.append(decision)
     files = {
         relative: {
             "sha256": target.digest,
@@ -717,6 +792,8 @@ def apply_plan(
         baseline_backup = transaction / "baseline.preimage"
         if baseline_existed:
             shutil.copy2(baseline_path, baseline_backup, follow_symlinks=False)
+        written = []
+        accepting_baseline = False
         try:
             for decision in plan.decisions:
                 target = live_path(home, decision.path)
@@ -727,20 +804,29 @@ def apply_plan(
                     expected = plan.baseline["files"][decision.path]["sha256"]
                     if hashlib.sha256(payload).hexdigest() != expected:
                         raise UpdateError("managed render context changed during apply")
+                    if decision.routed_install is not None:
+                        if inspect_live(home, decision.path) != decision.routed_install:
+                            raise UpdateError("healthcheck changed during apply")
+                        # In the profile before the filter goes: no moment when neither keeps the owner out.
+                        keep_technical_alerts_from_owner(home, uid, gid)
                     atomic_install_bytes(payload, target, uid=uid, gid=gid)
+                    written.append(decision.path)
                 elif decision.action == "remove":
                     target.unlink(missing_ok=True)
+                    written.append(decision.path)
             if not defer_baseline:
+                accepting_baseline = True
                 write_baseline(baseline_path, plan.baseline, uid, gid)
         except Exception:
             try:
-                for relative, (backup, mode) in reversed(tuple(preimages.items())):
+                for relative in reversed(written):
+                    backup, mode = preimages[relative]
                     target = live_path(home, relative)
                     if backup is None:
                         target.unlink(missing_ok=True)
                     else:
                         atomic_install(backup, target, mode or 0o755, uid, gid)
-                if not defer_baseline:
+                if accepting_baseline:
                     if baseline_existed:
                         atomic_install(baseline_backup, baseline_path, 0o600, uid, gid)
                     else:
