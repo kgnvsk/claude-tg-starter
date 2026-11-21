@@ -56,6 +56,12 @@ QUIET_RUN_DIR="$REM_DIR/.quiet-runs"
 # What a task's CHECK printed, kept per task until a run with it finishes (CHECK= below).
 CHECK_PENDING_DIR="$REM_DIR/.check-pending"
 CHECK_INLINE_BYTES=100000
+# The line before what a new look added to a batch that is offered again, and the one that stands for a look that
+# printed the very same text again (add_look).
+CHECK_ADDED_LINE='--- Нове з повторної перевірки ---'
+CHECK_SAME_LINE='Перевірка показала дослівно те саме, що частина №%s вище (№1 — перша перевірка, далі кожен рядок «%s» починає наступну). Якщо вона позначає прочитане, це може бути нова така сама подія — звір із джерелом.'
+# The line a run ends its answer with when it did not get through the check's batch: the batch is offered again.
+CHECK_UNFINISHED='<<<UNFINISHED>>>'
 # The kit's own scheduled task (memory v2, 14.11.2026): the memory review the installer puts in, known by its name and
 # its check together - a task of the owner's that merely has the name is his own. It is not the owner's: a failed run
 # stays in this log and the next run takes the same batch again, so neither an alert nor the daily list names it (the
@@ -209,6 +215,16 @@ atomic_text() {
     rm -f "$temp"
     return 1
   fi
+}
+
+# first_line FILE NAME: the file's first line into the variable NAME, read by the shell itself. The walk over every run
+# journal each minute started several programs per journal (Арти, 19.11.2026: about 800 new journals a day). Fails,
+# leaving NAME as it was, when the file is missing or its first line is empty.
+first_line() {
+  local first_line_text=""
+  IFS= read -r first_line_text 2>/dev/null < "$1"
+  [ -n "$first_line_text" ] || return 1
+  printf -v "$2" '%s' "$first_line_text"
 }
 
 header_value() {
@@ -617,6 +633,30 @@ keep_observation() {
   atomic_text "$1/offers" 0 && atomic_text "$1/observed.id" "$(date +%s)-$$-$RANDOM$RANDOM" && mv -f "$2" "$1/observed.txt"
 }
 
+# add_look PENDING LOOK: a new look of a kept observation that is offered again (run_agent_task) goes after the batch,
+# whole, as a part of its own; a look that does not move a mark prints the batch again, and the run hears that the
+# part may repeat it. Silence adds nothing. A look that prints the very text of the batch or of a part already kept
+# leaves one line saying so instead of a second copy: from a look that moves a mark it may be a new event of the
+# same kind (Codex). The part is kept with one rename: a tick killed at any point adds nothing twice and loses nothing.
+add_look() {
+  local pending="$1" look="$2" bare part next=1 number=0
+  bare=$(tr -d '[:space:]*`."' < "$look") || return 1
+  if [ -z "$bare" ] || printf '%s\n' "$bare" | grep -qxE "NO_NEW|$SILENCE_WORDS"; then
+    rm -f "$look"
+    return
+  fi
+  for part in "$pending/observed.txt" "$pending"/more.*; do
+    [ -f "$part" ] || continue
+    number=$((number + 1))
+    cmp -s "$part" "$look" || continue
+    { printf "$CHECK_SAME_LINE\n" "$number" "$CHECK_ADDED_LINE" > "$pending/note.$$" &&
+        mv -f "$pending/note.$$" "$look"; } || return 1
+    break
+  done
+  while [ -e "$pending/more.$(printf '%06d' "$next")" ]; do next=$((next + 1)); done
+  mv -f "$look" "$pending/more.$(printf '%06d' "$next")"
+}
+
 # The queue lock is this tick's for the work it does on the queue itself. While a check or the model runs the tick
 # only waits, so it lends the queue: a task that sets its own follow-up no longer waits for the run it is part of
 # (Volchenko, 18.11.2026: «Команда постановки повтора зависла дольше 2 минут и ушла в фон»), and the bot's own
@@ -679,16 +719,21 @@ run_agent_task() {
   # check_cmd and check_key are read with the other headers, while the task file is still in the queue.
   # A look often moves its own «seen» mark, so what it printed goes straight into a file kept for the task until a
   # run with it finishes (release_check). A killed or limited run, its retry and the next slot get the same text
-  # again, whole, instead of a new look that would show nothing new (Codex #227 R3, 09.10.2026).
-  local pending="" observed="" bare part size offers id held=""
+  # again, whole (Codex #227 R3, 09.10.2026), with what a new look adds after it (add_look).
+  local pending="" observed="" bare part size offers=0 id held="" view
   case ${check_key:-} in ''|.*|*/*) ;; *)
     [ -n "${check_cmd:-}" ] && mkdir -p -m 700 "$CHECK_PENDING_DIR/$check_key" &&
       pending="$CHECK_PENDING_DIR/$check_key" observed="$CHECK_PENDING_DIR/$check_key/observed.txt" ;;
   esac
-  if [ -n "$pending" ] && [ -s "$observed" ] && [ ! -s "$pending/observed.id" ]; then
+  if [ -n "$pending" ] && [ ! -s "$pending/observed.id" ]; then
     # An id is always written before its text appears, so text without its id is what an interrupted release left
     # behind: that observation was handed on, and it is dropped instead of being offered again (Codex #227 R5-P2-1).
-    rm -rf -- "$pending" && mkdir -p -m 700 "$pending" || pending=""
+    # So are the parts new looks added to it (add_look).
+    for part in "$observed" "$pending"/more.*; do
+      [ -s "$part" ] || continue
+      rm -rf -- "$pending" && mkdir -p -m 700 "$pending" || pending=""
+      break
+    done
   fi
   if [ -n "$pending" ] && [ ! -s "$observed" ]; then
     # A tick killed after its look printed, or a look that could not be kept, left the look's file behind. Each such file
@@ -749,12 +794,50 @@ run_agent_task() {
       fi
     fi
   fi
+  if [ -n "$pending" ] && [ -z "$held" ] && [ -s "$observed" ]; then
+    # A count that cannot be read counts as given (Codex): one more look, and the run hears part may be done.
+    offers=$(cat "$pending/offers" 2>/dev/null) && is_uint "$offers" && offers=$(decimal_value "$offers") || offers=1
+  fi
+  if [ "$offers" -gt 0 ]; then
+    # A batch already handed to a run that did not finish (cut off at its cap, a limit, a death) was offered again with
+    # no new look, so a daily task too big for its cap got the same batch, and nothing newer, every day (Арти,
+    # 19.11.2026). A new look comes first now and goes after the batch (add_look). A look a killed tick left behind
+    # goes first, as possibly incomplete. The batch takes a new id before any look (Codex): a journal it was given to
+    # before never releases what a look adds, even from a tick killed between the look and keeping what it printed.
+    atomic_text "$pending/observed.id" "$(date +%s)-$$-$RANDOM$RANDOM" || held=1
+    for part in "$pending"/look.*; do
+      [ -z "$held" ] || break
+      [ -f "$part" ] || continue
+      atomic_text "$pending/incomplete" 1 && add_look "$pending" "$part" || { held=1; break; }
+    done
+    if [ -z "$held" ]; then
+      part="$pending/look.$$"
+      queue_lend
+      (queue_fd_closed; cd "$workdir" && PATH="$agent_path" ATARAX_SUPPRESS_TELEGRAM=1 ${limit:+${bound}timeout 60} bash -c "$check_cmd" 2>/dev/null) > "$part"
+      rc=$?
+      queue_retake
+      { [ "$rc" -eq 0 ] || atomic_text "$pending/incomplete" 1; } && add_look "$pending" "$part" || held=1
+    fi
+  fi
   if [ -n "$held" ]; then
     log_message "check $(basename "$file"): what the look found could not be kept; no run now, kept for the next try"
     printf '⚠️ Автоматичне завдання «%s» не виконано: %s.' "$task_id" "не вдалося зберегти, що знайшла перевірка; повторю наступного разу"
     return 4
   fi
   if [ -n "$pending" ]; then
+    # What new looks added is offered after the batch, each part under its line; the copy is rebuilt for every offer.
+    view="$observed"
+    for part in "$pending"/more.*; do
+      [ -f "$part" ] && view="$pending/offer.txt" && break
+    done
+    if [ "$view" != "$observed" ] && ! { (cat "$observed" && for part in "$pending"/more.*; do
+           [ ! -f "$part" ] || { printf '\n\n%s\n' "$CHECK_ADDED_LINE" && cat "$part"; } || exit 1; done) > "$view.tmp" &&
+           mv -f "$view.tmp" "$view"; }; then
+      rm -f "$view.tmp"
+      log_message "check $(basename "$file"): what the looks found could not be put together; kept, no run now"
+      printf '⚠️ Автоматичне завдання «%s» не виконано: %s.' "$task_id" "не вдалося зібрати, що знайшли перевірки; повторю наступного разу"
+      return 4
+    fi
     # The occurrence records which observation it was given before the model starts, so a result committed under it
     # releases exactly that one, even when the tick dies before releasing it (Codex #227 R4-P2-1). Without that record
     # (an id not read, or not written) the model does not start: the observation stays and the owner hears why (R5-P2-2).
@@ -765,10 +848,13 @@ run_agent_task() {
       printf '⚠️ Автоматичне завдання «%s» не виконано: %s.' "$task_id" "не вдалося зберегти, яку знахідку перевірки отримав запуск; повторю наступного разу"
       return 4
     fi
-    offers=$(cat "$pending/offers" 2>/dev/null)
-    is_uint "$offers" && offers=$(decimal_value "$offers") || offers=0
-    atomic_text "$pending/offers" $((offers + 1)) || log_message "check $(basename "$file"): offer count not saved"
-    size=$(wc -c < "$observed")
+    # The count decides whether the next offer looks again first (above), so the model does not start without it.
+    if ! atomic_text "$pending/offers" $((offers + 1)); then
+      log_message "check $(basename "$file"): offer count not saved; kept, no run now"
+      printf '⚠️ Автоматичне завдання «%s» не виконано: %s.' "$task_id" "не вдалося зберегти, що знахідку перевірки вже видано; повторю наступного разу"
+      return 4
+    fi
+    size=$(wc -c < "$view")
     size=$((size))
     prompt="${prompt}
 
@@ -777,20 +863,41 @@ run_agent_task() {
 Перевірка перервалася або завершилася помилкою; збережений вивід може бути неповним. Оброби вже прочитане, а повноту перевір окремим читанням дозволеного джерела без руху курсора. Не оголошуй відсутність інших подій без такої перевірки."
     [ "$offers" -eq 0 ] || prompt="${prompt}
 Цей самий вивід уже передавався запуску, який не завершився, тож частину могло бути зроблено. Спершу перевір, що вже зроблено (відповіді, надіслані файли), і не повторюй зроблене."
+    [ "$view" = "$observed" ] || prompt="${prompt}
+Перед повторним запуском перевірку виконано знову: її вивід дописано після рядка «${CHECK_ADDED_LINE}». Він може повторювати вже наведене вище — одне й те саме не обробляй двічі."
     prompt="${prompt}
+Якщо всього, що вона показала, не встигнеш обробити, останнім окремим рядком відповіді напиши ${CHECK_UNFINISHED}: необроблене дадуть наступному запуску разом із новим.
 Ось що вона показала:
-$(head -c "$CHECK_INLINE_BYTES" "$observed")"
+$(head -c "$CHECK_INLINE_BYTES" "$view")"
     [ "$size" -le "$CHECK_INLINE_BYTES" ] || prompt="${prompt}
 
-[Тут лише початок. Увесь вивід перевірки (${size} байт) збережено у файлі ${observed} — прочитай його повністю: решта теж нова.]"
+[Тут лише початок. Увесь вивід перевірки (${size} байт) збережено у файлі ${view} — прочитай його повністю: решта теж нова.]"
+  fi
+  # The run hears when its cap stops it (Арти, 19.11.2026): a daily task too big for its 15 minutes was cut off with its
+  # whole answer, day after day. Told the time, it hands over what is done.
+  # A cap of 0 is none for timeout(1); one written another way (15m) stays unnamed.
+  local cap="${AGENT_TASK_TIMEOUT:-900}" deadline="" span=""
+  if [ -n "$limit" ] && is_uint "$cap" && [ "$(decimal_value "$cap")" -gt 0 ]; then
+    cap=$(decimal_value "$cap")
+    [ "$cap" -lt 60 ] || span="$((cap / 60)) хв"
+    [ $((cap % 60)) -eq 0 ] || span="${span:+$span }$((cap % 60)) с"
+    deadline=$(( $(date +%s) + cap ))
+    if date -d '@0' '+%s' >/dev/null 2>&1; then
+      deadline=$(date -d "@$deadline" '+%H:%M:%S')
+    else
+      deadline=$(date -r "$deadline" '+%H:%M:%S')
+    fi && deadline="Час на цей запуск обмежено: о ${deadline} за годинником сервера (через ${span}) його зупинять." ||
+      deadline=""
   fi
   if [ "$quiet" -eq 1 ]; then
-    prompt="Це автоматичне завдання планувальника. Результат доставляй сам через tg-send і tg-send-file туди, куди сказано в завданні, мовою завдання. Текст, який ти повернеш, у чат не піде.
+    prompt="Це автоматичне завдання планувальника. Результат доставляй сам через tg-send і tg-send-file туди, куди сказано в завданні, мовою завдання. Текст, який ти повернеш, у чат не піде.${deadline:+
+${deadline} Що не надіслано до того, пропаде: якщо всього не встигаєш, завчасно надішли готове й скажи в ньому, що лишилося.}
 
 ${prompt}"
   else
     [ -z "${thread_id:-}" ] || destination="чат ${chat}, тему ${thread_id}"
-    prompt="Це автоматичне завдання планувальника. Напиши лише текст результату мовою завдання: планувальник сам доставить його в ${destination}. Якщо завдання просить кілька окремих повідомлень, розділи їх рядком <<<SPLIT>>> — кожна частина піде окремим повідомленням. Файли надсилай через tg-send-file${thread_id:+ з --thread-id ${thread_id}}.
+    prompt="Це автоматичне завдання планувальника. Напиши лише текст результату мовою завдання: планувальник сам доставить його в ${destination}. Якщо завдання просить кілька окремих повідомлень, розділи їх рядком <<<SPLIT>>> — кожна частина піде окремим повідомленням. Файли надсилай через tg-send-file${thread_id:+ з --thread-id ${thread_id}}.${deadline:+
+${deadline} Відповідь, не повернута до того, пропаде: якщо всього не встигаєш, завчасно поверни готове й допиши, що лишилося.}
 
 ${prompt}"
   fi
@@ -830,6 +937,19 @@ ${prompt}"
     return 4
   fi
   out=$(printf '%s' "$out" | sed -e 's/[[:space:]]*$//')
+  # A run that did not get through its check's batch says so (Codex): told the time, it may stop early, and a result
+  # committed under the batch would release all of it. The occurrence lets go of the batch first, so the batch is
+  # offered again; the marker leaves the result, and a result that was only the marker is silence.
+  if [ -n "$pending" ] && printf '%s\n' "$out" | grep -qxF "$CHECK_UNFINISHED"; then
+    if ! rm -f "$check_journal/check-id" || [ -e "$check_journal/check-id" ]; then
+      log_message "run $(basename "$file"): did not get through its check batch, and the batch could not be kept"
+      printf '⚠️ Автоматичне завдання «%s» не виконано: %s.' "$task_id" "не вдалося залишити необроблене на наступний запуск"
+      return 4
+    fi
+    log_message "run $(basename "$file"): did not get through its check batch; it is offered again"
+    out=$(printf '%s\n' "$out" | grep -vxF "$CHECK_UNFINISHED" | sed -e 's/[[:space:]]*$//')
+    [ -n "$out" ] || out=NOTHING
+  fi
   if [ "$quiet" -eq 1 ]; then
     log_message "quiet $(basename "$file"): output withheld from chat: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-200)"
     return 3
@@ -1428,16 +1548,16 @@ except Exception:
 # refused by Telegram stayed in this log, and the client was the one who asked
 # why the news had stopped (Яша Директ, 29-30.08).
 alert_owner_issue() {
-  local journal="$1" source="$1/source.rem" owner notice alert_state resp response_class issue
+  local journal="$1" source="$1/source.rem" owner notice alert_state="" resp response_class issue=""
   local f="$source" epoch thread_id task_id chat where="" run_mode="" pause last started
-  issue=$(cat "$journal/state" 2>/dev/null) || return 0
+  first_line "$journal/state" issue || return 0
   case "$issue" in
     blocked|uncertain) ;;
     agent_failed) [ -f "$journal/failure.txt" ] || return 0 ;;
     *) return 0 ;;
   esac
   [ -f "$source" ] || return 0
-  alert_state=$(cat "$journal/owner-alert.state" 2>/dev/null) || alert_state=""
+  first_line "$journal/owner-alert.state" alert_state
   # A previous version recorded only the send attempt. Its outcome is unknown.
   if [ -e "$journal/owner-alert.attempted" ] && [ -z "$alert_state" ]; then
     atomic_text "$journal/owner-alert.state" uncertain
@@ -1576,8 +1696,8 @@ reconcile_prepared_topic() {
 }
 
 deliver_saved_run() {
-  local journal="$1" state source result cursor prefix chunk index resp response_class saved_parse pin_id
-  state=$(cat "$journal/state" 2>/dev/null) || return 1
+  local journal="$1" state="" source result cursor prefix chunk index resp response_class saved_parse pin_id
+  first_line "$journal/state" state || [ -f "$journal/state" ] || return 1
   source="$journal/source.rem"
   result="$journal/result.txt"
   if [ "$state" = running ] && [ -f "$result" ]; then
@@ -1597,6 +1717,8 @@ deliver_saved_run() {
     return 0
   fi
   if [ "$state" = blocked ] || [ "$state" = uncertain ]; then
+    # A result that was committed handed its check batch on; a release that failed back then is retried here.
+    [ ! -f "$journal/result.txt" ] || release_check "$journal"
     alert_owner_issue "$journal"
     # A retry promised before a crash, or held back by quiet hours, runs now.
     [ -e "$journal/retry-pending" ] && retry_dead_run "$journal"
@@ -1617,7 +1739,9 @@ deliver_saved_run() {
     # have been, or another one today already covered the task: without an
     # OWNER_CHAT_ID the failure used to survive only in the log.
     alert_owner_issue "$journal"
-    case "$(cat "$journal/owner-alert.state" 2>/dev/null)" in
+    local told=""
+    first_line "$journal/owner-alert.state" told
+    case "$told" in
       sent|uncertain|paused) rm -rf -- "$journal" ;;
     esac
     return 0
@@ -1783,12 +1907,75 @@ run_occurrence() {
 # was given is released and the next look starts fresh. A newer observation of the same task is never touched. Called
 # wherever a committed result is found, so a tick that died between the commit and this still releases it.
 release_check() {
-  local name id
-  name=$(cat "$1/name" 2>/dev/null) || return 0
-  case $name in ''|.*|*/*) return 0 ;; esac
-  id=$(cat "$1/check-id" 2>/dev/null) || return 0
-  [ -n "$id" ] && [ "$(cat "$CHECK_PENDING_DIR/$name/observed.id" 2>/dev/null)" = "$id" ] || return 0
+  local name="" id="" held=""
+  first_line "$1/name" name || return 0
+  case $name in .*|*/*) return 0 ;; esac
+  # first_line fails on an empty first line, so two blank ids never match.
+  first_line "$1/check-id" id && first_line "$CHECK_PENDING_DIR/$name/observed.id" held && [ "$held" = "$id" ] || return 0
   rm -rf -- "${CHECK_PENDING_DIR:?}/$name"
+}
+
+# A settled journal goes two days after its last change (Арти, 19.11.2026: every quiet run left one, about 800 a day,
+# kept for good and walked every minute). Settled: a quiet run that finished, or a failed, refused or unconfirmed
+# occurrence whose owner alert is settled and that owes no retry. The daily list reads one day back, and delivery-status
+# shows what is open, so neither loses anything it uses. A journal whose check batch is still kept stays: it is what
+# releases that batch (release_check). A journal first moves aside under a dot name, one rename, and what a killed
+# cleanup left there goes on the next tick. Called after the walk, which releases a finished run's check.
+prune_settled_journals() {
+  python3 - "$QUIET_RUN_DIR" "$RUN_DELIVERY_DIR" "$CHECK_PENDING_DIR" "$tick_now" <<'PY' 2>/dev/null || log_message "settled journal cleanup failed"
+import os
+import shutil
+import sys
+from pathlib import Path
+
+quiet_root, delivery_root, pending, now = Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3]), int(sys.argv[4])
+
+
+def first(path):
+    try:
+        with open(path, encoding="utf-8") as source:
+            return source.readline().strip()
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeError):
+        return "?"  # unreadable: it may still be the one that matters
+
+
+for root in (quiet_root, delivery_root):
+    if root.is_symlink() or not root.is_dir():
+        continue
+    for gone in root.glob(".gone.*"):
+        if gone.is_dir() and not gone.is_symlink():
+            shutil.rmtree(gone, ignore_errors=True)
+    for journal in root.iterdir():
+        if journal.name.startswith(".") or journal.is_symlink() or not journal.is_dir():
+            continue
+        try:
+            changed = (journal / "state").stat().st_mtime
+        except OSError:
+            continue
+        if now - changed < 2 * 86400:
+            continue
+        state, name, check = first(journal / "state"), first(journal / "name"), first(journal / "check-id")
+        # Only a committed result releases a batch; a failed run tied to one goes like any other. Whatever cannot be
+        # read may be the one that matters, so a committed journal it belongs to stays.
+        if (state == "finished" or (journal / "result.txt").exists()) and check:
+            if "?" in (name, check):
+                continue
+            held = first(pending / name / "observed.id") if name and "/" not in name and not name.startswith(".") else None
+            if held in (check, "?"):
+                continue
+        if (state == "finished" and root == quiet_root) or (
+                state in ("agent_failed", "blocked", "uncertain")
+                and first(journal / "owner-alert.state") in ("sent", "uncertain", "paused", "stale")
+                and not (journal / "retry-pending").exists()):
+            gone = root / f".gone.{journal.name}"
+            try:
+                os.replace(journal, gone)
+            except OSError:
+                continue
+            shutil.rmtree(gone, ignore_errors=True)
+PY
 }
 
 # A run that died runs once more when its task is retry-safe. The recipient's
@@ -1883,22 +2070,27 @@ shopt -s nullglob
 if [ -d "$QUIET_RUN_DIR" ] && [ ! -L "$QUIET_RUN_DIR" ]; then
   for journal in "$QUIET_RUN_DIR"/*; do
     [ -d "$journal" ] && [ ! -L "$journal" ] || continue
-    if [ "$(cat "$journal/state" 2>/dev/null)" = running ]; then
+    journal_state=""
+    first_line "$journal/state" journal_state
+    if [ "$journal_state" = running ]; then
       run_is_alive "$journal" && continue
       atomic_text "$journal/state" uncertain || continue
       log_message "UNCERTAIN quiet scheduled run $(basename "$journal"): agent stopped before completing; never rerun automatically"
     fi
-    [ "$(cat "$journal/state" 2>/dev/null)" = finished ] && release_check "$journal"
+    [ "$journal_state" = finished ] && release_check "$journal"
     alert_owner_issue "$journal"
   done
 fi
 for journal in "$RUN_DELIVERY_DIR"/*; do
   [ -d "$journal" ] || continue
-  if [ "$(cat "$journal/state" 2>/dev/null)" = prepared ]; then
+  journal_state=""
+  first_line "$journal/state" journal_state
+  if [ "$journal_state" = prepared ]; then
     reconcile_prepared_topic "$journal"
   fi
   deliver_saved_run "$journal"
 done
+prune_settled_journals
 
 joined=$'\n'
 for f in "$REM_DIR"/*.rem; do
