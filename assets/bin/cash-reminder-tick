@@ -56,6 +56,8 @@ QUIET_RUN_DIR="$REM_DIR/.quiet-runs"
 # What a task's CHECK printed, kept per task until a run with it finishes (CHECK= below).
 CHECK_PENDING_DIR="$REM_DIR/.check-pending"
 CHECK_INLINE_BYTES=100000
+# Cron stops a whole tick, any run it started included, at this many seconds (install-core.sh: timeout 960).
+TICK_TIMEOUT="${TICK_TIMEOUT:-960}"
 # The line before what a new look added to a batch that is offered again, and the one that stands for a look that
 # printed the very same text again (add_look).
 CHECK_ADDED_LINE='--- Нове з повторної перевірки ---'
@@ -685,8 +687,24 @@ queue_retake() {
   exit 1
 }
 
+# Cron stops the tick at TICK_TIMEOUT, and a run the tick started with it (Арти, 21.11.2026: a daily run started 947 s
+# into a tick that a 14-minute run had kept busy died 13 s later; 18.11 and 19.11 the same). A run that would get less
+# than half its usual time (never more than a tick holds) waits for the next tick, which has all of it; run_agent_task
+# gives the others what is left, a minute kept for delivering their answer, and a CHECK may take a minute before it.
+# A cap written another way (15m) is left as it was.
+run_waits() {
+  local cap="${AGENT_TASK_TIMEOUT:-900}" reserve=60
+  is_uint "$cap" || return 1
+  cap=$(decimal_value "$cap")
+  [ "$cap" -le $((TICK_TIMEOUT - 60)) ] || cap=$((TICK_TIMEOUT - 60))
+  [ -z "${check_cmd:-}" ] || reserve=120
+  [ $((TICK_TIMEOUT - SECONDS - reserve)) -lt $((cap / 2)) ]
+}
+
 run_agent_task() {
   local file="$1" prompt="$2" out rc destination="чат ${chat}"
+  # Set when the end of the tick, not the run's own cap, stopped it (run_occurrence).
+  tick_cut=0
   local workdir="${AGENT_TASK_DIR:-$HOME/.atarax/agent-task}"
   # A scheduled run sees the live service's PATH, the agent's own wrappers first (Арти, 09.10.2026: under cron's PATH
   # mail-clean ran the bare gog without the ~/bin wrapper that loads the keyring password, and Gmail went unread).
@@ -876,9 +894,20 @@ $(head -c "$CHECK_INLINE_BYTES" "$view")"
   # The run hears when its cap stops it (Арти, 19.11.2026): a daily task too big for its 15 minutes was cut off with its
   # whole answer, day after day. Told the time, it hands over what is done.
   # A cap of 0 is none for timeout(1); one written another way (15m) stays unnamed.
-  local cap="${AGENT_TASK_TIMEOUT:-900}" deadline="" span=""
+  local cap="${AGENT_TASK_TIMEOUT:-900}" deadline="" span="" left full shortened=0
   if [ -n "$limit" ] && is_uint "$cap" && [ "$(decimal_value "$cap")" -gt 0 ]; then
     cap=$(decimal_value "$cap")
+    # Only what is left of the tick, less a minute for delivery, when that is shorter (run_waits).
+    left=$((TICK_TIMEOUT - SECONDS - 60))
+    if [ "$left" -gt 0 ] && [ "$left" -lt "$cap" ]; then
+      # The tick took a real share of the run's time only when under nine tenths of what a fresh tick gives is left:
+      # at the defaults the cap (900) is all a tick holds, so every run loses its first seconds to the walk.
+      full=$cap
+      [ "$full" -le $((TICK_TIMEOUT - 60)) ] || full=$((TICK_TIMEOUT - 60))
+      [ "$left" -ge $((full * 9 / 10)) ] || shortened=1
+      cap=$left
+      limit="${bound}timeout $cap"
+    fi
     [ "$cap" -lt 60 ] || span="$((cap / 60)) хв"
     [ $((cap % 60)) -eq 0 ] || span="${span:+$span }$((cap % 60)) с"
     deadline=$(( $(date +%s) + cap ))
@@ -921,6 +950,7 @@ ${prompt}"
     ATARAX_SUPPRESS_TELEGRAM=1 ATARAX_TASK_DELIVERY=1 $limit "$HOME/.local/bin/claude" -p --output-format text <<<"$prompt" 2>&1)
   rc=$?
   queue_retake
+  [ "$rc" = 124 ] && [ "$shortened" = 1 ] && tick_cut=1
   if [ $rc -ne 0 ]; then
     log_message "run $(basename "$file"): помилка виконання rc=$rc: $(printf '%s' "$out" | tail -c 200 | tr '\n' ' ')"
     # A limit that names its reset is kept with the occurrence: a retry-safe run goes again after it (run_occurrence).
@@ -1859,6 +1889,15 @@ run_occurrence() {
   rc=$?
   local limit_retry=0 reset
   [ "$rc" = 4 ] && [ -s "$journal/limit-reset" ] && retry_allowed "$journal" && limit_retry=1
+  # Stopped by the end of its tick, not by its own cap: a retry-safe run goes again with a whole tick and the owner hears
+  # it, as when cron killed it (retry_dead_run). Its runner record stays for that retry.
+  if [ "$rc" = 4 ] && [ "${tick_cut:-0}" = 1 ] && retry_allowed "$journal"; then
+    rm -f "$result_temp"
+    : > "$journal/retry-pending"
+    atomic_text "$journal/state" uncertain
+    log_message "UNCERTAIN scheduled run $(basename "$journal"): stopped at the end of its tick; retry-safe, runs again"
+    return
+  fi
   # The run has ended and its outcome follows, so nobody may take it for dead.
   rm -f "$journal/runner"
   case $rc in
@@ -1998,6 +2037,11 @@ retry_dead_run() {
   task_id=$(header_value "$source" TASK)
   [ -n "$task_id" ] || task_id=$(cat "$journal/name" 2>/dev/null)
   late=$(owner_notice schedule.late "Нагадування запізнилося — ось воно:")
+  if run_waits; then
+    : > "$journal/retry-pending"
+    log_message "retry of scheduled run $(basename "$journal") waits for the next tick: this one has run ${SECONDS}s"
+    return 0
+  fi
   # The promise stays durable until the retry is really under way (run_occurrence marks it
   # used): a failed write here leaves it owed (Codex, 28.09).
   atomic_text "$journal/state" running || return 0
@@ -2026,6 +2070,10 @@ retry_limited_run() {
   [ -n "$task_id" ] || task_id=$(cat "$journal/name" 2>/dev/null)
   is_uint "$epoch" && due=$(clock_time "$(decimal_value "$epoch")") || due=""
   late=$(owner_notice schedule.late_limit "Запуск о {time} чекав, поки скинеться ліміт Claude, — ось результат:" time="$due")
+  if run_waits; then
+    log_message "retry of limited run $(basename "$journal") waits for the next tick: this one has run ${SECONDS}s"
+    return 0
+  fi
   atomic_text "$journal/state" running || return 0
   log_message "retrying scheduled run $(basename "$journal") once: its Claude limit has reset"
   run_occurrence "$journal" "$source" "$(message_body "$source")" 2 "$late"
@@ -2388,6 +2436,12 @@ for f in "$REM_DIR"/*.rem; do
       continue
     fi
     deliver_saved_run "$journal"
+    continue
+  fi
+  # A run left too little of this tick starts with the next one, still due (run_waits). One bound by UNTIL_EPOCH keeps
+  # its old path, as the quiet-start runway does: a deferral could carry it past its end.
+  if [ "${run_mode:-}" = "1" ] && [ -z "${until:-}" ] && run_waits; then
+    log_message "deferred $(basename "$f") to the next tick: this one has run ${SECONDS}s of its ${TICK_TIMEOUT}s"
     continue
   fi
   # The task folder is approved before the occurrence is spent: a refusal leaves

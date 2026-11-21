@@ -238,14 +238,14 @@ Path(destination).write_text("".join(kept), encoding="utf-8")
 PY
 {
   printf '%s\n' '# BEGIN DURABLE FOLLOWUPS'
-  printf '%s\n' "* * * * * /usr/bin/timeout 50s /usr/bin/env HOME='$AGENT_HOME' PATH='/usr/local/bin:/usr/bin:/bin' REM_DIR='$REM_DIR' LOCK_FILE='$LOCK_FILE' TOKEN_FILE='$TOKEN_FILE' PROFILE_FILE='$PROFILE_FILE' LOG='$LOG' '$WORKER'"
+  printf '%s\n' "* * * * * /usr/bin/timeout 960 /usr/bin/env HOME='$AGENT_HOME' PATH='/usr/local/bin:/usr/bin:/bin' REM_DIR='$REM_DIR' LOCK_FILE='$LOCK_FILE' TOKEN_FILE='$TOKEN_FILE' PROFILE_FILE='$PROFILE_FILE' LOG='$LOG' '$WORKER'"
   printf '%s\n' '# END DURABLE FOLLOWUPS'
 } >> "$CRON_NEW"
 crontab -u "$AGENT_USER" "$CRON_NEW"
 rm -f "$CRON_OLD" "$CRON_NEW"
 ```
 
-This runs every minute under a 50-second timeout and passes every runtime path explicitly. The filter unwraps only `timeout`, `/usr/bin/timeout`, `env`, `/usr/bin/env`, and environment assignments; parse errors, unsupported wrapper syntax, path arguments, and comments are preserved fail-closed. The worker and helper use the same `${REM_DIR}.worker.lock`, so creation, status, cancellation, and delivery serialize. If a target path contains whitespace or shell metacharacters, generate and inspect a safely quoted cron line rather than copying this one literally.
+This runs every minute under the 960-second timeout `install-core.sh` installs (a scheduled `RUN=1` task works inside the tick, and the worker sizes its runs to that cap) and passes every runtime path explicitly. The filter unwraps only `timeout`, `/usr/bin/timeout`, `env`, `/usr/bin/env`, and environment assignments; parse errors, unsupported wrapper syntax, path arguments, and comments are preserved fail-closed. The worker and helper use the same `${REM_DIR}.worker.lock`, so creation, status, cancellation, and delivery serialize. If a target path contains whitespace or shell metacharacters, generate and inspect a safely quoted cron line rather than copying this one literally.
 
 ## 5. Verify in isolation first
 
