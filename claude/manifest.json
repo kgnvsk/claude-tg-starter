@@ -7,7 +7,7 @@
     "local-foundation-v1"
   ],
   "source": "codex/starter/product.json",
-  "sourceRevision": "dd74bd0631873e7c9b649231a8c5e60bda5d5e66",
+  "sourceRevision": "09cd9aebac06a23bf5cb149a223a30f0596ced4e",
   "sourceDirty": false,
   "features": [
     "browser"
@@ -84,7 +84,7 @@
     "assets/bin/learning-review": "7c61f7214dac384f1b284d33d9e4e31cf1d946f8a5dd7ba0853058136e920507",
     "assets/bin/memory-doctor": "3a9101415cb72ece601a8117d79682999ff7f55417948695213ae7caf4d9845e",
     "assets/bin/memory-embeddings-config": "4ad43f951dac88b0bf13c2aa83f499d115f6126e9a676a162852e258b7034878",
-    "assets/bin/memory-index": "f4968c781fe8752385508a51b66844d6d8105023a15e39f150245492d4e98f60",
+    "assets/bin/memory-index": "aba34e92c4903e5bef7b5d0e6faa6dff9b75e02ceb2fea70e21eef31be452cd2",
     "assets/bin/memory-open": "c9ed9335cc4aa96d00260bf643d71e6405caef44eae1e2a4dee0c540ba601d86",
     "assets/bin/memory-search": "6536ec596067f4b6a6b1b6cd30fbc9d90b43f6e1dcd9bae72099be0d8c978da9",
     "assets/bin/provider-quota": "96fa80f3f94f8408596b67390238cbaf4e10968eb7c29e58b9953a6e64d94fb0",
@@ -210,7 +210,7 @@
     "home/bin/learning-review": "7c61f7214dac384f1b284d33d9e4e31cf1d946f8a5dd7ba0853058136e920507",
     "home/bin/memory-doctor": "3a9101415cb72ece601a8117d79682999ff7f55417948695213ae7caf4d9845e",
     "home/bin/memory-embeddings-config": "4ad43f951dac88b0bf13c2aa83f499d115f6126e9a676a162852e258b7034878",
-    "home/bin/memory-index": "f4968c781fe8752385508a51b66844d6d8105023a15e39f150245492d4e98f60",
+    "home/bin/memory-index": "aba34e92c4903e5bef7b5d0e6faa6dff9b75e02ceb2fea70e21eef31be452cd2",
     "home/bin/memory-open": "c9ed9335cc4aa96d00260bf643d71e6405caef44eae1e2a4dee0c540ba601d86",
     "home/bin/memory-search": "6536ec596067f4b6a6b1b6cd30fbc9d90b43f6e1dcd9bae72099be0d8c978da9",
     "home/bin/native-lifecycle": "4cd1e78a91a85ff5fb687edb82d097a2d9ee22a0e152c66b5c7624ffe7af8a99",

@@ -36,7 +36,7 @@ INDEX_CHARS = 4_000_000
 PASSAGE_CHARS = 4_000  # one passage: one FTS row and one vector
 PASSAGE_OVERLAP = 400
 SOURCE_READ_LIMIT = 64 * 1024 * 1024
-MAX_TELEGRAM_ROWS = 5_000
+MAX_PRIVATE_SELECTION = 5_000  # messages one private-search request may name
 EXCLUDED_PARTS = {
     ".git",
     ".obsidian",
@@ -722,7 +722,7 @@ def vector_ranking(
         return []
     if evidence is not None:
         evidence.update(queryEmbedding="success", model=EMBED_MODEL, dimensions=len(embedded[0]))
-    rows = connection.execute(
+    cursor = connection.execute(
         f"""
         SELECT e.doc_id AS doc_id, c.chunk_id AS chunk_id, e.vector AS vector FROM embeddings e
         JOIN documents d ON d.doc_id = e.doc_id
@@ -734,27 +734,33 @@ def vector_ranking(
         WHERE c.ordinal > 0 AND c.model=? AND c.vector IS NOT NULL AND {scope_sql}
         """,
         [EMBED_MODEL, *scope_args, EMBED_MODEL, *scope_args],
-    ).fetchall()
-    if not rows:
-        return []
-    matrix = numpy.frombuffer(
-        b"".join(row["vector"] for row in rows), dtype=numpy.float32
-    ).reshape(len(rows), -1)
+    )
     wanted = numpy.asarray(embedded[0], dtype=numpy.float32)
-    if matrix.shape[1] != wanted.shape[0]:
-        return []
     # Both sides are already unit length from the API, so a dot product is the
-    # cosine. 40k passages take about 3ms — no approximate index needed.
+    # cosine. 40k passages take about 3ms — no approximate index needed. The vectors are read a batch at a time:
+    # all at once, a whole history's held ~250 MB per search at 60 000 messages (review of kit PR 528).
+    ids: list[tuple[str, int | None]] = []
+    scores = []
+    while batch := cursor.fetchmany(4096):
+        matrix = numpy.frombuffer(
+            b"".join(row["vector"] for row in batch), dtype=numpy.float32
+        ).reshape(len(batch), -1)
+        if matrix.shape[1] != wanted.shape[0]:
+            return []
+        scores.append(matrix @ wanted)
+        ids.extend((row["doc_id"], row["chunk_id"]) for row in batch)
+    if not ids:
+        return []
     ranked: list[str] = []
     seen: set[str] = set()
-    for i in numpy.argsort(matrix @ wanted)[::-1]:
-        doc_id = rows[i]["doc_id"]
+    for i in numpy.argsort(numpy.concatenate(scores))[::-1]:
+        doc_id, chunk_id = ids[i]
         if doc_id in seen:
             continue
         seen.add(doc_id)
         ranked.append(doc_id)
         if passages is not None:
-            passages[doc_id] = rows[i]["chunk_id"]
+            passages[doc_id] = chunk_id
         if len(ranked) == top:
             break
     return ranked
@@ -799,22 +805,24 @@ def index_telegram(connection: sqlite3.Connection) -> dict[str, int]:
         conversation_column = (
             "conversation_key" if "conversation_key" in columns else "NULL"
         )
+        # The whole history (owner, 22.11.2026): only the latest 5 000 left Arti's first week out of memory-search.
+        # shortcut: one read and one transaction, seconds and ~12 MB for the thousands of messages an agent holds
+        # (Arti 7 439; 300 000 took 18.6 s); a history whose first pass outlasts cron's 60 s would lose that work each
+        # run, and its read would hold hundreds of MB: read and commit in batches then.
         rows = source.execute(
             f"""
             SELECT rowid AS source_rowid, chat_id, direction, username, text,
                    ts, message_id, {conversation_column} AS conversation_key
             FROM messages
             WHERE text IS NOT NULL AND text != ''
-            ORDER BY ts DESC
-            LIMIT ?
-            """,
-            (MAX_TELEGRAM_ROWS,),
+            ORDER BY ts
+            """
         ).fetchall()
         source.close()
     except (OSError, sqlite3.Error):
         return {"seen": 0, "changed": 0, "removed": 0}
 
-    for row in reversed(rows):
+    for row in rows:
         chat_id = str(row["chat_id"])
         row_id = str(row["source_rowid"])
         doc_id = f"telegram:{chat_id}:{row_id}"
@@ -1098,10 +1106,13 @@ def search(
     # FTS5 BM25 scores are negative: weights above 1 boost, below 1 demote. A row is a passage: each document
     # takes its best one, and the passage's own place in the source comes with it. The weight is the document's,
     # equal for all its passages, so it ranks documents and not passages.
+    searched = [(expression, limit_rows, source_sql)
+                for expression, limit_rows in ((exact_expression, 25), (widened_expression, 75)) if expression
+                for source_sql in ("d.source='vault'", "d.source!='vault'")]
     pools = [connection.execute(
         f"""
         SELECT m.doc_id AS doc_id, d.source, d.scope, d.path, d.title, d.body, d.digest,
-               c.chunk_id, c.digest AS passage_digest, c.start, c.line, p.indexed, p.size, m.excerpt, m.score,
+               c.chunk_id, c.digest AS passage_digest, c.start, c.line, p.indexed, p.size, m.score,
                CASE
                    WHEN d.source='telegram'
                         AND substr(d.body, 1, 5)='[out ' THEN 0.5
@@ -1114,11 +1125,10 @@ def search(
                    ELSE 1.0
                END AS trust_weight
         FROM (
-            SELECT doc_id, chunk_id, excerpt, score,
+            SELECT doc_id, chunk_id, score,
                    row_number() OVER (PARTITION BY doc_id ORDER BY score, chunk_id) AS nth
             FROM (
                 SELECT docs_fts.doc_id AS doc_id, docs_fts.rowid AS chunk_id,
-                       snippet(docs_fts, 2, '', '', '...', 18) AS excerpt,
                        bm25(docs_fts) AS score
                 FROM docs_fts
                 JOIN documents d ON d.doc_id = docs_fts.doc_id
@@ -1133,13 +1143,13 @@ def search(
         LIMIT ?
         """,
         [*parameters, expression, *scope_args, limit_rows],
-    ).fetchall() for expression, limit_rows in ((exact_expression, 25), (widened_expression, 75)) if expression
-        for source_sql in ("d.source='vault'", "d.source!='vault'")]
+    ).fetchall() for expression, limit_rows, source_sql in searched]
     # The widened pools hold only what the exact words did not find: a document votes once from the
     # keyword side, and the stems only add what the words as written miss.
     exact_ids = {row["doc_id"] for pool in pools[:2] for row in pool}
     pools[2:] = [[row for row in pool if row["doc_id"] not in exact_ids][:25] for pool in pools[2:]]
     rows = [row for pool in pools for row in pool]
+    matched_by = {row["doc_id"]: expression for (expression, _rows, _source), pool in zip(searched, pools) for row in pool}
 
     by_id = {}
     for row in rows:
@@ -1201,6 +1211,12 @@ def search(
                       + [[doc_id for doc_id in pool if doc_id in by_id] for pool in semantic_pools], limit,
                       {row["doc_id"]: (row["doc_id"] not in exact_ids, row["score"] * row["trust_weight"]) for row in rows})
     ordered = [by_id[doc_id] for doc_id in chosen if doc_id in by_id]
+    # The excerpt is cut only for what is shown: snippet() over every matching passage made recall of a whole
+    # history slow (review of kit PR 528: a 12-word recall over 60 000 messages took 2.5 s, 0.9 s without it).
+    ordered = [{**dict(row), "excerpt": (connection.execute(
+        "SELECT snippet(docs_fts, 2, '', '', '...', 18) FROM docs_fts WHERE docs_fts MATCH ? AND rowid = ?",
+        (matched_by[row["doc_id"]], row["chunk_id"]),
+    ).fetchone() or ("",))[0]} if row["doc_id"] in matched_by else row for row in ordered]
     if selected_doc_ids is not None:
         # The isolated worker cannot open the owner's memory helper. Supply the whole selected passage,
         # still through the existing whole-result output budget, rather than its first 200 characters.
@@ -1278,7 +1294,7 @@ def search_private(connection: sqlite3.Connection, request: object) -> dict:
     if (not isinstance(request, dict) or set(request) != {"version", "query", "chatId", "documentIds", "workspace"}
             or request["version"] != 1 or not isinstance(request["query"], str) or not request["query"].strip()
             or not isinstance(request["chatId"], str) or not re.fullmatch(r"[1-9][0-9]*", request["chatId"])
-            or not isinstance(request["documentIds"], list) or len(request["documentIds"]) > MAX_TELEGRAM_ROWS):
+            or not isinstance(request["documentIds"], list) or len(request["documentIds"]) > MAX_PRIVATE_SELECTION):
         raise ValueError("invalid private memory selection")
     chat = request["chatId"]
     if any(not isinstance(value, str) or not re.fullmatch(r"telegram:" + chat + r":[1-9][0-9]*", value)
@@ -1289,7 +1305,7 @@ def search_private(connection: sqlite3.Connection, request: object) -> dict:
         "AND doc_id IN (SELECT value FROM json_each(?))",
         (f"conversation:user:{chat}", json.dumps(request["documentIds"])),
     )]
-    evidence = {"queryEmbedding": "disabled", "matches": [], "telegramIndexLatestRows": MAX_TELEGRAM_ROWS,
+    evidence = {"queryEmbedding": "disabled", "matches": [],
                 "selectedIndexedMessages": len(selected), "workspaceNote": "absent"}
     workspace = request["workspace"]
     note_id = None
