@@ -4,6 +4,7 @@
 from pathlib import Path
 import json
 import os
+import re
 import sys
 import tempfile
 
@@ -363,6 +364,20 @@ def migrate(
         # Owner, 23.10.2026: nothing the model is shown may be cut. Command output over 30 000 characters reached
         # Арти cut (a full context check printed ~35 000); CLI 2.1.288 reads this when bashOutputMaxChars is unset.
         env.setdefault("BASH_MAX_OUTPUT_LENGTH", "128000")
+
+    # Owner, 23.11.2026: «мы же чинили, чтобы воркеры и субагенты видели правила». The CLI keeps its own memory per
+    # working folder. The main session runs in ~/obsidian-vault and writes the owner's corrections there; scheduled
+    # tasks run in ~/.atarax/agent-task, so neither they nor the helpers they start ever loaded them (Арти 16-23.11:
+    # 0 of 300 such helper runs, against 156 of 156 helpers of the main session). Every session of the agent now uses
+    # the main session's folder: the CLI names it by the real path of the session's git root, each character outside
+    # [A-Za-z0-9] a "-" (so a vault that is a link names the folder it leads to). Sessions of other chats switch this
+    # memory off (native-profile.ts). An owner's own folder stays; one this kit wrote for an earlier home follows the home.
+    # shortcut: the CLI cuts a name over 200 characters and adds a hash; an agent's home path never comes near that.
+    vault = os.path.realpath(os.path.join(home, "obsidian-vault"))
+    memory_folder = "~/.claude/projects/" + re.sub(r"[^A-Za-z0-9]", "-", vault) + "/memory"
+    current = data.get("autoMemoryDirectory")
+    if current is None or re.fullmatch(r"~/\.claude/projects/[A-Za-z0-9-]+-obsidian-vault/memory", str(current)):
+        data["autoMemoryDirectory"] = memory_folder
 
     rendered = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
     fd, temporary = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)
