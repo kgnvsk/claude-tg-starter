@@ -58,7 +58,8 @@ def save(path: Path, row: dict) -> None:
 
 
 class Receipt:
-    def __init__(self, home: Path, via: str, peer, text: str, source: str, name: str = '', caller: str = ''):
+    def __init__(self, home: Path, via: str, peer, text: str, source: str, name: str = '', caller: str = '',
+                 consent: dict | None = None):
         outbox = home / '.claude/personal-inbox/outbox'
         outbox.mkdir(parents=True, mode=0o700, exist_ok=True)
         self.journal = outbox / 'sent.jsonl'
@@ -74,6 +75,8 @@ class Receipt:
         # caller: which agent path sent (owner-send's caller(), '' unknown), so another path can tell its send apart.
         self.row = dict(ts=time.time(), via=via, peer=peer, name=name, chars=len(text), actor='agent',
                         source=source, caller=caller, message_id='', state='uncertain', uncertain=True)
+        if consent:
+            self.row['consent'] = consent  # where the owner's yes came from: his request, his «так», a draft that kept it
         save(self.path, self.row)  # process death after handoff remains an uncertain attempt
 
     def finish(self, state: str, message_id: str = '') -> None:
@@ -90,7 +93,8 @@ class Receipt:
 
 @contextmanager
 def attempt(home: Path, via: str, pending: dict, source: str, unknown):
-    receipt = Receipt(home, via, pending['peer'], pending['text'], source, pending.get('name', ''), pending.get('caller', ''))
+    receipt = Receipt(home, via, pending['peer'], pending['text'], source, pending.get('name', ''), pending.get('caller', ''),
+                      pending.get('consent'))
     result = {'message_id': ''}
     try:
         yield result
