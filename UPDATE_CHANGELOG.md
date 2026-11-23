@@ -1,8 +1,8 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-11-23.c9945e883468`
+- Реліз: `2026-11-23.88a30359f59c`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `c9945e8834686b8fec95cb72b05061362eae2a9e`
+- Ревізія вихідного комплекту: `88a30359f59c69f81455d4062367eb13d608aa13`
 - Дата релізу: `2026-11-23`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
@@ -19,9 +19,8 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    owner-send: a stale kept draft is removed; the agent's own first send is not «someone wrote»; review round 3
-    owner-send: a kept draft goes only into an untouched chat; review of PR 535
-    owner-send: the owner's yes to a WhatsApp draft outlives the new-number pace that held it
+    Company plan reads its pinned snapshot in place, never a memory copy
+    Company plan reads a messages.db too large for SQLite to serialize
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не

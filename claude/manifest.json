@@ -7,7 +7,7 @@
     "local-foundation-v1"
   ],
   "source": "codex/starter/product.json",
-  "sourceRevision": "c9945e8834686b8fec95cb72b05061362eae2a9e",
+  "sourceRevision": "88a30359f59c69f81455d4062367eb13d608aa13",
   "sourceDirty": false,
   "features": [
     "browser"
@@ -142,7 +142,7 @@
     "modules/telegram-corporate/live-engines.ts": "8b107f7d7ed6a5bebfe1cb7a34d14c0e5016d101995dbc7a3d10aa6de6fecddd",
     "modules/telegram-corporate/live-session.ts": "5f4e5f2cc6687e657bec8a8e8e5d560e13318c5357ae51e50d332ee651d7c10e",
     "modules/telegram-corporate/media.ts": "abc3a527a604024c3cb8997ddf8f8d2c35953ac9dde96584696182de2d002d35",
-    "modules/telegram-corporate/migration-plan.ts": "0a1a3685290cf7c50cc815291dd5cfcef8d02aed975f93477f20e7e6db1434a9",
+    "modules/telegram-corporate/migration-plan.ts": "db6b0a765192c4bae0d98249c7093687baf2db7ec007fcfe3ab4ba987b77585e",
     "modules/telegram-corporate/native-browser-runtime.ts": "5807aed4dd2290e6bb16503277845d9f2e28f83c2d3241c71c226df0581a3880",
     "modules/telegram-corporate/native-browser.ts": "42e1039ac3d7fa8ad3da500921586e900a03261a44f67fe1c0745054db7b5863",
     "modules/telegram-corporate/native-capability-bundle.ts": "65493e70c142c88001c82a017c6e38fd54b59629b844102e2ffaeac6381f0422",
