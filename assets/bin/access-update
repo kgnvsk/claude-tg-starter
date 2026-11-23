@@ -177,6 +177,39 @@ def set_superadmins(data: dict, owner: str, csv: str) -> str:
     return f"Суперадміністраторів: {len(wanted)}"
 
 
+def transfer_owner(data: dict, previous: str, owner: str, keep: str, company: bool = True) -> str:
+    """The agent changes hands (owner, 23.11.2026: Novsky's «Передати іншому власнику», root's owner-transfer). The new
+    owner is admitted and an administrator, never a superadministrator of his own agent. The previous one stays a
+    superadministrator (a company: the business owner owns the agent, the head of the line keeps running it) or loses
+    every admission. Whom the previous owner let read his memory and notes was his choice; the new owner names his own.
+    A superadministrator needs company mode: without it (the Individual kit never has it) he can only leave."""
+    if not APPROVER.fullmatch(previous) or not APPROVER.fullmatch(owner) or previous == owner or keep not in ("superadmin", "remove"):
+        raise SystemExit("Недопустима передача власника")
+    if keep == "superadmin" and not company:
+        raise SystemExit("Роль суперадміністратора працює лише в корпоративному режимі агента: попередній власник може лише втратити доступ")
+    admins, admitted = unique(data.get("admins", [])), unique(data.get("allowFrom", []))
+    if previous not in admins or previous not in admitted:
+        raise SystemExit("Чинний власник відсутній у файлі доступу")
+    superadmins = [value for value in unique(data.get("superadmins", [])) if value != owner]
+    admitted += [] if owner in admitted else [owner]
+    # The owner first, as reconcile_admins and Novsky's installer put him: admins[0] is the owner for the kit's helpers.
+    admins = [owner, *(value for value in admins if value != owner)]
+    if keep == "superadmin":
+        superadmins += [] if previous in superadmins else [previous]
+    else:
+        superadmins = [value for value in superadmins if value != previous]
+        admins = [value for value in admins if value != previous]
+        admitted = [value for value in admitted if value != previous]
+        groups = data.get("groups")
+        for policy in groups.values() if isinstance(groups, dict) else ():
+            if isinstance(policy, dict) and isinstance(policy.get("allowFrom"), list):
+                policy["allowFrom"] = [value for value in unique(policy["allowFrom"]) if value != previous]
+    data["allowFrom"], data["admins"], data["superadmins"] = admitted, admins, superadmins
+    if "ownerDataSuperadmins" in data:
+        data["ownerDataSuperadmins"] = []
+    return f"Власник {owner}; попередній власник {previous}: {'суперадміністратор' if keep == 'superadmin' else 'без доступу'}"
+
+
 def prune_owner_data(data: dict) -> None:
     """A person who stops being a superadministrator leaves the owner's named readers: appointed again by someone else,
     they see his memory and notes only when he names them again."""
@@ -1066,6 +1099,7 @@ def main(argv: list[str]) -> int:
             f"Використання: {command_name} reconcile-admins <path> <chat_id_власника> [additional_csv]\n"
             f"       {command_name} preserve-admins <path> <chat_id_власника> [additional_csv]\n"
             f"       {command_name} set-superadmins <path> <chat_id_власника> <csv>\n"
+            f"       {command_name} transfer-owner <path> <попередній_власник> <новий_власник> <superadmin|remove>\n"
             f"       {command_name} pairing <path> prune <now_ms> | bump <code> <sender> | add <code> <sender> <chat> <created_ms> <expires_ms>\n"
             f"       {command_name} team-list <path> <owner> <actor>\n"
             f"       {command_name} team-preview <path> <owner> <actor> <message_id> <target> <role>\n"
@@ -1097,6 +1131,10 @@ def main(argv: list[str]) -> int:
         )
     elif command == "set-superadmins" and len(argv) == 5:
         message = locked_update(path, lambda data: set_superadmins(data, argv[3], argv[4]))
+    elif command == "transfer-owner" and len(argv) == 6:
+        company = os.path.lexists(path.with_name("corporate-isolation-activated"))
+        message = locked_update(path, lambda data: transfer_owner(data, argv[3], argv[4], argv[5], company))
+        record_access_event({"action": "owner-transfer", "previous": argv[3], "owner": argv[4], "keep": argv[5]})
     elif command == "pairing" and len(argv) >= 4:
         message = locked_update(path, lambda data: pairing_change(data, argv[3], argv[4:]))
     elif command == "team-list" and len(argv) == 5:

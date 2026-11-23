@@ -7,7 +7,7 @@
     "local-foundation-v1"
   ],
   "source": "codex/starter/product.json",
-  "sourceRevision": "88a30359f59c69f81455d4062367eb13d608aa13",
+  "sourceRevision": "a2bb9a0a1593a02383f9b8c1d5b9b9f775ba620b",
   "sourceDirty": false,
   "features": [
     "browser"
@@ -63,7 +63,7 @@
     "assets/agents/worker.md": "e82aac56e8efd4c9a0dcf6b746770f4e81b4389a5073977d31c8dbb470b9f74d",
     "assets/agents/researcher.md": "d3781912006696258dc84032c2bd56ef8bbadb91848c04f793da35e55b4d2390",
     "codex/native-lifecycle": "368ab321c90e4677e9a31f894022cb72bb126100390c36781f43be44eb6c78bd",
-    "assets/bin/access-update": "124d11f2f76f51ef8e30cae491410bc0191f5b77bfd9880f35455ddb40da2280",
+    "assets/bin/access-update": "81cd5b5f83db99b328fc4fb65be3462262339ae0dd9c6ab06db714a5bf8ed27e",
     "assets/bin/agent-backup": "1f028f8a5b46ebbbed93f20db21188e2704e6b63bb7fd685eb12fdf3d238fd96",
     "assets/bin/agent-backup-chat": "fa2c063be03292da17b75b1c92327e8f8903f2c93187ea5439707b227c85c22a",
     "assets/bin/agent-backup-github-login": "b4341c43bf4293042c63ade506abfb8de5a1f272d5df8731477dfabee1853aee",
@@ -189,7 +189,7 @@
     "home/.claude/skills/backup-recovery/github-copy.md": "369093bbf2106f3e9ae6fabcca7c59146d55b5e308bfcd5192abffbda75e4366",
     "home/.claude/skills/backup-recovery/guide-uk.md": "495d8393d7e39b224ed72cbe37f835960ace92b80bf372248622630f099f9abc",
     "home/.claude/skills/research/SKILL.md": "9f6607fcb2029d90d5b40d98918c2d3aa2da2058edec5907b647e784b02d569e",
-    "home/bin/access-update": "124d11f2f76f51ef8e30cae491410bc0191f5b77bfd9880f35455ddb40da2280",
+    "home/bin/access-update": "81cd5b5f83db99b328fc4fb65be3462262339ae0dd9c6ab06db714a5bf8ed27e",
     "home/bin/agent-backup": "1f028f8a5b46ebbbed93f20db21188e2704e6b63bb7fd685eb12fdf3d238fd96",
     "home/bin/agent-backup-chat": "fa2c063be03292da17b75b1c92327e8f8903f2c93187ea5439707b227c85c22a",
     "home/bin/agent-backup-github-login": "b4341c43bf4293042c63ade506abfb8de5a1f272d5df8731477dfabee1853aee",

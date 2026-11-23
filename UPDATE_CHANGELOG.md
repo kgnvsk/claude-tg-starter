@@ -1,8 +1,8 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-11-23.88a30359f59c`
+- Реліз: `2026-11-23.a2bb9a0a1593`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `88a30359f59c69f81455d4062367eb13d608aa13`
+- Ревізія вихідного комплекту: `a2bb9a0a1593a02383f9b8c1d5b9b9f775ba620b`
 - Дата релізу: `2026-11-23`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
@@ -19,8 +19,17 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    Company plan reads its pinned snapshot in place, never a memory copy
-    Company plan reads a messages.db too large for SQLite to serialize
+    Owner transfer: the person the agent is made for («Для кого агент») is never made its owner; root tests' cron never fires
+    Owner transfer, review 4: one sign-out attempt, told once; status never touches the agent; alignment guarded
+    Owner transfer, review 3: signing out of Claude with the agent stopped, both logins, pending until revoked
+    Owner transfer: the root CI job sits before the video job, clear of the Individual kit's patches
+    Owner transfer: the accounts test clears what it signed in to before the next tie
+    Owner transfer, review 2: the lock first, the previous owner's accounts, a status, signing out of Claude
+    Owner transfer: two runs within one second each get their own copies
+    Owner transfer: the review — real root runs, the previous owner cut off, no race with a starting job
+    Owner transfer: a systemctl that hangs or a failed step of the way back still ends with an answer
+    Owner transfer: asked for the owner it already has, the command changes nothing and reports him
+    Owner transfer: one root command hands an agent to another owner
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не
