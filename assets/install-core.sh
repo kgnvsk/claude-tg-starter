@@ -1129,6 +1129,9 @@ fi
 set_managed_persona_mode "$MANAGED_PRODUCT"
 # An agent from main's line keeps its owner rules in a library its CLAUDE.md only names; V2 reads them in CLAUDE.md.
 [ ! -e "$H/CLAUDE.md" ] || runuser -u "$AGENT_USER" -- python3 "$KIT/assets/lib/owner-rules-restore.py" "$H" >/dev/null
+# Novsky's first installer block sent owners to the administrator (owner, 19.11.2026); its current wording replaces it.
+runuser -u "$AGENT_USER" -- python3 "$KIT/assets/lib/installer-contacts-wording.py" "$H" >/dev/null \
+  || echo "WARN: старий текст блоку установника в ~/CLAUDE.md не замінено" >&2
 runuser -u "$AGENT_USER" -- python3 "$KIT/assets/lib/sync-managed-claude.py" \
   "$H/CLAUDE.md" "$MANAGED_IMPORT" "$PRODUCT_IMPORT"
 # The company rules of an agent moved to rules by scope are part of its instructions (owner, 18.11.2026): ~/CLAUDE.md

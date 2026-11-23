@@ -109,6 +109,8 @@ def locked_update(path: Path, update: Callable[[dict], str]) -> str:
             raise SystemExit(f"Файл доступу має містити JSON-об’єкт: {path}")
         before = json.loads(json.dumps(data))
         message = update(data)
+        # Every writer, the reconciliation of an install included (review of PR 529): a role lost leaves the owner's list.
+        prune_owner_data(data)
         count_narrowings(data, admission_narrowings(before, data))
         fd, temporary = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)
         try:
@@ -173,6 +175,14 @@ def set_superadmins(data: dict, owner: str, csv: str) -> str:
             raise SystemExit(f"Суперадміністратор має бути адміністратором цього бота: {chat_id}")
     data["superadmins"] = wanted
     return f"Суперадміністраторів: {len(wanted)}"
+
+
+def prune_owner_data(data: dict) -> None:
+    """A person who stops being a superadministrator leaves the owner's named readers: appointed again by someone else,
+    they see his memory and notes only when he names them again."""
+    if "ownerDataSuperadmins" in data:
+        superadmins = unique(data.get("superadmins", []))
+        data["ownerDataSuperadmins"] = [value for value in unique(data.get("ownerDataSuperadmins") or []) if value in superadmins]
 
 
 def pairing_change(data: dict, operation: str, values: list[str]) -> str:
@@ -474,6 +484,7 @@ def settings_list(data: dict, owner: str, actor: str) -> str:
         "textChunkLimit": data.get("textChunkLimit", 4096),
         "chunkMode": data.get("chunkMode", "length"),
         "ackReaction": data.get("ackReaction", "👀"),
+        "ownerDataSuperadmins": unique(data.get("ownerDataSuperadmins") or []),
     }, "groups": shown}, ensure_ascii=False)
 
 
@@ -482,6 +493,20 @@ def apply_settings(data: dict, owner: str, actor: str, change: dict) -> str:
     if not isinstance(change, dict):
         raise SystemExit("Invalid setting request")
     scope, setting, value = change.get("scope"), change.get("setting"), change.get("value")
+    if scope == "agent" and set(change) == {"scope", "setting", "value"} and setting == "ownerDataSuperadmins":
+        # Owner, 23.11.2026 (Marcin, AALL): the management he names may ask about anything of his, except his own
+        # private chat with the agent. Only the primary owner names them, never a superadministrator's confirmation
+        # (a superadministrator may appoint another one: that alone opens nothing).
+        if actor != owner:
+            raise SystemExit("Памʼять і нотатки власника суперадміністраторам відкриває чи закриває лише сам власник")
+        superadmins = unique(data.get("superadmins", []))
+        if not isinstance(value, list) or len(value) > 50 or any(
+                not isinstance(item, str) or item not in superadmins or item == owner for item in value):
+            raise SystemExit("Памʼять і нотатки можна відкрити лише чинним суперадміністраторам: список їхніх ID")
+        data[setting] = unique(value)
+        return ("Памʼять і нотатки власника бачать суперадміністратори " + ", ".join(data[setting])
+                + "; його особисту переписку з агентом не бачить ніхто"
+                if data[setting] else "Памʼять і нотатки власника суперадміністраторам закрито")
     if scope == "agent" and set(change) == {"scope", "setting", "value"}:
         valid = (
             setting == "replyToMode" and value in ("off", "first", "all")
