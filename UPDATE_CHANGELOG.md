@@ -1,8 +1,8 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-11-23.e07fb20f85da`
+- Реліз: `2026-11-23.ff29d7f1f007`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `e07fb20f85da5128a2c4f1ad4cf7c03f0a7254d7`
+- Ревізія вихідного комплекту: `ff29d7f1f00705a3ed4e5d58e703575266860535`
 - Дата релізу: `2026-11-23`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
@@ -19,7 +19,15 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    Staff sessions no longer read the owner's task list (~/.atarax)
+    Company mode: a failed give-back answers uncertain; a refused apply gives admission back; «Було → стане» only when it reads differently
+    Company mode cards: a rename moves and narrows nothing (the store's rule); the agent card from its preview
+    Company mode: a resource confirmation gives admission back in one guarded statement, never on phase two off
+    Receiver golden: pin the merged receiver (main's golden and the branch's last one to the history)
+    Company mode: a resource confirmation that applies nothing gives admission back
+    Company mode cards: second review (a site keeps its address, the change card follows the base rule, agent losses shown)
+    Company mode cards: review fixes (changes, exact targets, English, escapes, long cards, connected agent)
+    Company mode: the rights card names the person and each right in words
+    Company mode: the resource card speaks plain words, like the access cards
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не

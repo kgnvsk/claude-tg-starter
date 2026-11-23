@@ -1075,7 +1075,7 @@ type CorporateGatewayPolicyResult =
   | { ok: false; reason: string }
 
 type CorporateGatewayPolicyPreviewResult =
-  | { ok: true; token: string; summary: string; expiresAt: number; audience?: string; rights?: string[] }
+  | { ok: true; token: string; summary: string; html?: string; expiresAt: number; audience?: string; rights?: string[] }
   | { ok: false; reason: string; detail?: string }
 
 let corporateRuntimePromise: Promise<CorporateGatewayRuntime | null> | undefined
@@ -1926,7 +1926,8 @@ async function sendCorporateText(
     const parts = chunk(text, partChars, 'newline')
     const markdown = options?.format === 'markdownv2' || (keyboard != null && text.startsWith('*'))
     for (const [index, part] of parts.slice(0, -1).entries()) {
-      await sendCorporateText(chatId, threadId, index === 0 ? replyTo : null, part, markdown ? { format: 'markdownv2' } : undefined)
+      await sendCorporateText(chatId, threadId, index === 0 ? replyTo : null, part,
+        markdown ? { format: 'markdownv2' } : options?.format === 'html' ? { format: 'html' } : undefined)
     }
     return sendCorporateText(chatId, threadId, null, parts.at(-1)!, options)
   }
@@ -1985,11 +1986,12 @@ async function sendCorporateText(
   return sent.message_id
 }
 
-// An owner card's HTML as plain text: the bold tags and the profile link go (its name or @username stays), the three
-// escapes the module writes come back.
+// An owner card's HTML as plain text: the bold tags go, a profile link leaves its name, a resource's file or site link
+// leaves «name (address)», and the four escapes the module writes come back.
 function htmlCardToPlain(html: string): string {
-  return html.replace(/<\/?b>|<a href="tg:\/\/user\?id=\d+">|<\/a>/g, '')
-    .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&')
+  return html.replace(/<a href="(https:\/\/[^"]+)">([^<]*)<\/a>/g, '$2 ($1)')
+    .replace(/<\/?b>|<a href="tg:\/\/user\?id=\d+">|<\/a>/g, '')
+    .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&amp;/g, '&')
 }
 
 function corporateConversationKey(
@@ -7165,7 +7167,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           return ownerChangeResult(outcome, true, preview.audience,
             args.action === 'register' && preview.rights?.length ? `resourceId "${args.id}" і capabilityId: ${preview.rights.join(', ')}` : undefined)
         }
-        await sendCorporateText(OWNER_CHAT_ID, null, null, preview.summary, { resourceToken: preview.token })
+        // Owner, 23.11.2026: the card is in plain words, formatted like his access cards.
+        await sendCorporateText(OWNER_CHAT_ID, null, null, preview.html ?? preview.summary, { resourceToken: preview.token, ...(preview.html ? { format: 'html' as const } : {}) })
         return { content: [{ type: 'text', text: preview.audience
           ? `Ресурс ще не змінено. Власнику надіслано точний опис і кнопки підтвердження та скасування. Ресурс спільний; після підтвердження ${sharedAudience(preview.audience)}.`
           : 'Ресурс ще не змінено. Власнику надіслано точний опис і кнопки підтвердження та скасування; доступ співробітників налаштовується окремо.' }] }
@@ -7242,9 +7245,19 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           const { CapabilityStore } = await import(new URL('./capability-store.ts', pathToFileURL(CORPORATE_MODULE)).href)
           const store = new CapabilityStore(join(STATE_DIR, 'messages.db'), { primaryOwnerId: OWNER_CHAT_ID })
           const preview = store.createAgentOwnerPreview({ subject, proposedGrants, requestedBy: OWNER_CHAT_ID, expiresAt: Date.now() + 3600000 }, Date.now())
-          const summary = proposedGrants.length ? 'Права підключеного агента:\n' + proposedGrants.map(g => `${store.getResource(g.resourceId)?.label ?? g.resourceId}: ${g.capabilityId}`).join('\n')
-            : 'Відкликати всі надані цьому агенту права на твої ресурси? Твої права не зміняться.'
-          const messageId = await sendCorporateText(OWNER_CHAT_ID, null, null, summary, { policyToken: preview.token })
+          // Owner, 23.11.2026: the agent, each right in words and its resource, formatted like his other cards.
+          const { agentAccessCard } = await import(new URL('./action-summary.ts', pathToFileURL(CORPORATE_MODULE)).href)
+          const named = (g: { capabilityId: string; resourceId: string | null }) => {
+            const resource = g.resourceId == null ? null : store.getResource(g.resourceId)
+            return { capabilityId: g.capabilityId, resourceId: g.resourceId, label: resource?.label ?? null, gone: g.resourceId != null && resource == null }
+          }
+          // What the agent has now, so the card shows what it loses too (review of PR 538).
+          let had: Array<{ capabilityId: string; resourceId: string | null }> = []
+          try { had = store.resolve(subject).grants } catch {}
+          const card = typeof agentAccessCard === 'function' ? agentAccessCard(subject, had.map(named), preview.proposedGrants.map(named), ownerNoticeLocale()) : null
+          const summary = card?.html ?? (proposedGrants.length ? 'Права підключеного агента:\n' + proposedGrants.map(g => `${store.getResource(g.resourceId)?.label ?? g.resourceId}: ${g.capabilityId}`).join('\n')
+            : 'Відкликати всі надані цьому агенту права на твої ресурси? Твої права не зміняться.')
+          const messageId = await sendCorporateText(OWNER_CHAT_ID, null, null, summary, { policyToken: preview.token, ...(card ? { format: 'html' as const } : {}) })
           store.bindAgentAccessMessage(preview.token, subject, { chatId: OWNER_CHAT_ID, messageId })
           return { content: [{ type: 'text', text: 'Запит надіслано власнику. Права зміняться лише після підтвердження.' }] }
         }
@@ -7274,8 +7287,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           OWNER_CHAT_ID,
           null,
           null,
-          preview.summary,
-          { policyToken: preview.token },
+          preview.html ?? preview.summary,
+          { policyToken: preview.token, ...(preview.html ? { format: 'html' as const } : {}) },
         )
         return {
           content: [{

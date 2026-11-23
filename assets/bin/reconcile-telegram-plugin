@@ -28,10 +28,24 @@ UPSTREAM_SERVER_SHA256 = (
 )
 UPSTREAM_PACKAGE_START = "bun install --no-summary 1>&2 && bun server.ts"
 GOLDEN_SERVER_SHA256 = (
-    "595f1986f5e6db790bc22eeb10bce536b7674217d88c2712f1566b12882ced58"
+    "0fd1150fc9fc7cba12a4a11705e5bf63996a07c7c229d5bf0c7a7cf524729a21"
 )
 PREVIOUS_GOLDEN_SERVER_SHA256S = frozenset(
     {
+        # The golden before the agent card read only the store's preview (PR 538, the last review round).
+        "e056d718db97cc2c17bd0ae2e3c12b7b2c5677bb6cb2b0eb8e175eb8bb099de3",
+        # The golden after the merge of main into PR 538, before the agent card read its preview.
+        "b645bcb21ac028554ac232f651c801711113723b070b45834e7670c4ad10fc29",
+        # ce79bbc32ef8 Merge pull request #536 from kgnvsk/feat/company-principal-20261123
+        "595f1986f5e6db790bc22eeb10bce536b7674217d88c2712f1566b12882ced58",
+        # The golden before the merge of main (PR 538, fourth commit: the cards' second review).
+        "52ce623e67e13dff191e97484e1ae8fdfda6278600f66702ddc98283678d1b92",
+        # The golden before the cards' second review (PR 538, third commit: the first review's fixes).
+        "0ce4a4f899c7b45ff1724accbcfa968f3e4022b3780bfbc2fff7906d1f822412",
+        # The golden before the cards' review fixes (PR 538, second commit: the rights card in words).
+        "36f8af5d5393b271ee1a23e08ae6852facba06979ea9c91e9060e4e4cbb506f9",
+        # The golden before the rights card spoke plain words (PR 538, first commit: the resource card in words).
+        "04217002f34ed1cca00d08ed41c215337ff3ac95bcc83f3bf76ab4911d0a769b",
         # 992c4bba6751 Merge pull request #514 from kgnvsk/codex/premium-audit-20261119
         "a68e2afc81236655f7985d55167e64e8214d964b8cb9251e280787fd399e9fd6",
         # The golden before the inactivity check retained observed work across transcript rotation.

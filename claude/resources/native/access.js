@@ -87,10 +87,9 @@ function scopedResource(input, current) {
       } catch {
         throw new Error("invalid browser origin");
       }
-      if (url.protocol !== "https:" || url.origin !== input.origin || url.username || url.password || isIP(url.hostname) || !url.hostname.includes(".") || url.hostname.endsWith(".") || url.hostname.endsWith(".local") || url.hostname.endsWith(".internal") || url.hostname.endsWith(".localhost"))
+      if (url.protocol !== "https:" || url.origin !== input.origin || url.username || url.password || isIP(url.hostname) || !url.hostname.includes(".") || url.hostname.endsWith(".") || !/^[a-z0-9._-]+$/.test(url.hostname) || url.hostname.endsWith(".local") || url.hostname.endsWith(".internal") || url.hostname.endsWith(".localhost"))
         throw new Error("invalid browser origin");
-      labelKey = "origin.1";
-      resource2 = { id: input.id, label, connector: "browser", capabilityIds: ["browser.read"], config: { [labelKey]: url.origin } };
+      resource2 = { id: input.id, label, connector: "browser", capabilityIds: ["browser.read"], config: { "origin.1": url.origin } };
     } else if (input.connector === "memory" && input.kind === "company" && exactFields(input, ["action", "id", "label", "connector", "kind"])) {
       resource2 = { id: input.id, label, connector: "memory", capabilityIds: ["memory.company.read"], config: { corporateKey: "company" } };
     } else if (input.connector === "image" && input.kind === "generator" && exactFields(input, ["action", "id", "label", "connector", "kind"])) {
