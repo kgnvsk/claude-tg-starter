@@ -1,8 +1,8 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-11-23.69bd5cb57e34`
+- Реліз: `2026-11-23.3a451e32825c`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `69bd5cb57e34dc2065cb739e3052c4cd63b1ed2a`
+- Ревізія вихідного комплекту: `3a451e32825c2abbef2e244a4c6c59d9f244a101`
 - Дата релізу: `2026-11-23`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
@@ -19,7 +19,9 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    The agent speaks the language chosen at install with its owner and superadmins; Ukrainian with its developer
+    personal-inbox: the owner-send list test holds on the Individual kit's own tags; README and parse errors
+    personal-inbox: review of the owner-send update — only where the module and its run log are, earlier releases' bytes count as the kit's
+    personal-inbox: an update keeps owner-send current; files in WhatsApp lead to the skill
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не

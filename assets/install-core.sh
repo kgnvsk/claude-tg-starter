@@ -851,18 +851,22 @@ python3 "$KIT/assets/lib/reconcile-managed-runtime.py" \
 # Removed helpers without a verified baseline may contain owner changes.
 # reconcile-managed-runtime handles proven managed retirements; do not delete
 # unclassified paths after the update plan has preserved them (main d71c3f84).
-# A move from main's line retires bin/owner_approval.py, which main's ~/bin/owner-send (24.10) loads at start: sending
-# from the owner's personal accounts stopped on Brodsky and ST (01.11.2026). Only that file takes this kit's version,
-# and only while it holds the bytes its module setup recorded; one the bot changed stays and is named. The module's
-# other files are main's newer ones and stay: this kit's would undo their fixes.
-if [ -f "$H/bin/owner-send" ] && [ ! -L "$H/bin/owner-send" ] && [ ! -e "$H/bin/owner_approval.py" ] \
-  && grep -q 'owner_approval' "$H/bin/owner-send"; then
+# ~/bin/owner-send follows the kit on every update, by its module's own rule: only while it holds the bytes the module
+# setup recorded or an earlier kit's (modules/personal-inbox/known-sha256.json); one the bot changed stays and is named.
+# 01.11.2026, Brodsky and ST: a move from main's line retired bin/owner_approval.py, which main's owner-send loaded at
+# start. 23.11.2026, Brodsky: his kit of 19.11 sent WhatsApp files, his owner-send of 10.10 knew no --file, and the agent
+# told the owner «файлом нельзя, модуль шлёт только текст». The current owner-send works beside an older bridge and names
+# the setup that teaches that bridge files; the bridge and the other helpers come only with that setup. Not for a product
+# without the module (a role kit carries no modules/personal-inbox), and not for a setup older than wa-bridge-run (10.10):
+# its bridge log has no run lines, so the current owner-send would read its archive as never settled.
+if product_has_feature personal-inbox && [ -f "$H/bin/owner-send" ] && [ ! -L "$H/bin/owner-send" ] \
+  && [ -x "$H/bin/wa-bridge-run" ] && [ -s "$H/.claude/product/modules/personal-inbox.files.json" ]; then
   owner_send_stage="$(mktemp -d)"
   install -d -m 755 "$owner_send_stage/bin"
   install -m 755 "$KIT/modules/personal-inbox/bin/owner-send" "$owner_send_stage/bin/owner-send"
   chown -R "$AGENT_USER:$AGENT_USER" "$owner_send_stage"
   runuser -u "$AGENT_USER" -- env HOME="$H" python3 "$KIT/assets/lib/module-setup.py" refresh personal-inbox \
-    "$owner_send_stage" || echo "  ⚠ ~/bin/owner-send не оновлено (див. вище): надсилання з особистих акаунтів не працює" >&2
+    "$owner_send_stage" || echo "  ⚠ ~/bin/owner-send лишився як був (див. вище)" >&2
   rm -rf "$owner_send_stage"
 fi
 

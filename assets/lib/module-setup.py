@@ -9,8 +9,9 @@
 
 A module's helpers are not managed files: their owner may have edited them. `install` keeps, beside the
 module's release record, the hash of every file it put in place, and replaces only a file that is missing,
-already the same, or still the bytes it installed. Anything else stops the whole setup before one file is
-written; the kit's own version is left beside the record for the operator to compare.
+already the same, or still the bytes it installed or an earlier release did (the module's known-sha256.json).
+Anything else stops the whole setup before one file is written; the kit's own version is left beside the record
+for the operator to compare.
 """
 from __future__ import annotations
 
@@ -60,6 +61,21 @@ def write(path: Path, data: bytes, mode: int) -> None:
     os.replace(temporary, path)
 
 
+def released(name: str) -> dict[str, set[str]]:
+    """Bytes earlier kit releases put in a module's place (modules/<name>/known-sha256.json of this kit): a copy of
+    them is the kit's own even where the record names other bytes, as after a hand repair from the installed kit
+    (owner-send on Brodsky and ST, 01.11.2026)."""
+    try:
+        listed = json.loads((Path(__file__).resolve().parents[2] / "modules" / name / "known-sha256.json")
+                            .read_text(encoding="utf-8"))
+    except (OSError, ValueError, RecursionError):
+        return {}
+    if not isinstance(listed, dict):
+        return {}
+    return {path: {value for value in values if isinstance(value, str)}
+            for path, values in listed.items() if isinstance(values, list)}
+
+
 def install(name: str, staged: Path, check: bool = False) -> int:
     home = Path.home()
     STATE.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -70,6 +86,7 @@ def install(name: str, staged: Path, check: bool = False) -> int:
         accepted = {}  # a record that cannot be read vouches for nothing
     if not isinstance(accepted, dict):
         accepted = {}
+    known = released(name)
     planned, conflicts = [], []
     for source in sorted(path for path in staged.rglob("*") if path.is_file() and not path.is_symlink()):
         relative = source.relative_to(staged).as_posix()
@@ -77,7 +94,7 @@ def install(name: str, staged: Path, check: bool = False) -> int:
         new = digest(source)
         if target.is_symlink() or (target.exists() and not target.is_file()):
             conflicts.append(relative)
-        elif target.exists() and digest(target) not in (new, accepted.get(relative)):
+        elif target.exists() and digest(target) not in (new, accepted.get(relative), *known.get(relative, ())):
             conflicts.append(relative)
         else:
             planned.append((source, target, relative, new))
@@ -117,6 +134,7 @@ def refresh(name: str, staged: Path) -> int:
     if not isinstance(accepted, dict) or not accepted:
         print(f"Модуль «{name}» тут не ставили (немає запису його файлів), тому оновлення його не чіпає.", file=sys.stderr)
         return 3
+    known = released(name)
     planned, kept = STATE / f"{name}.planned", []
     for source in sorted(path for path in staged.rglob("*") if path.is_file() and not path.is_symlink()):
         relative = source.relative_to(staged).as_posix()
@@ -127,7 +145,7 @@ def refresh(name: str, staged: Path) -> int:
             continue
         if target.exists():
             current = digest(target)
-            if current != new and current != accepted.get(relative):
+            if current != new and current != accepted.get(relative) and current not in known.get(relative, ()):
                 kept.append(relative)  # the owner's own version
                 continue
             if current != new:
