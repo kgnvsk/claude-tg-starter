@@ -1,8 +1,8 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-11-23.fdc5f1ac3884`
+- Реліз: `2026-11-23.e07fb20f85da`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `fdc5f1ac38840de43ba3303fdea62ef5710c3ccf`
+- Ревізія вихідного комплекту: `e07fb20f85da5128a2c4f1ad4cf7c03f0a7254d7`
 - Дата релізу: `2026-11-23`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
@@ -19,12 +19,7 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    Tests: two area tests import their sibling helper the way the release runs them
-    Department head: a chat the owner named stays; a head who never started the bot leaves his day to the owner
-    Revert "Company sessions: the task queue (~/.atarax) is closed (review of PR 536)"
-    Company sessions: the task queue (~/.atarax) is closed (review of PR 536)
-    Department head: broadcasts follow the bot's access list, his calendar only (review of PR 536)
-    Company agents name the department head they were made for (PRINCIPAL_*)
+    Staff sessions no longer read the owner's task list (~/.atarax)
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не
