@@ -15,8 +15,9 @@ import tempfile
 PLACEHOLDERS = (
     "AGENT_NAME", "OWNER_NAME", "OWNER_TG_USERNAME", "OWNER_CHAT_ID",
     "BOT_USERNAME", "TIMEZONE", "CALENDAR_EMAIL", "DEPLOY_DATE",
-    "AGENT_HOME", "AGENT_SERVICE", "AGENT_USER",
+    "AGENT_HOME", "AGENT_SERVICE", "AGENT_USER", "OWNER_LANGUAGE",
 )
+LANGUAGES = {"uk": "українська", "ru": "російська", "pl": "польська", "en": "англійська"}
 
 
 def read_no_follow(path: Path) -> str:
@@ -91,8 +92,12 @@ def main() -> None:
     source = Path(sys.argv[-2])
     destination = Path(sys.argv[-1])
     text = read_no_follow(source)
+    values = {name: os.environ.get(name, "") for name in PLACEHOLDERS}
+    # The language chosen at install (owner, 23.11.2026), named from the notice language, so install, update and its
+    # pre-stop check render the same persona; Ukrainian when it is not set.
+    values["OWNER_LANGUAGE"] = LANGUAGES.get(os.environ.get("OWNER_NOTICE_LOCALE", ""), "українська")
     for name in PLACEHOLDERS:
-        text = text.replace("{{" + name + "}}", os.environ.get(name, ""))
+        text = text.replace("{{" + name + "}}", values[name])
 
     if managed_action:
         baseline = Path(sys.argv[2])

@@ -377,7 +377,7 @@ preflight_personas_before_stop() (
   trap 'rm -f "${exports_file:-}"' EXIT
   python3 "$KIT/assets/bin/saved-env-export" "$ENV_SAVED" \
     AGENT_NAME OWNER_NAME OWNER_TG_USERNAME OWNER_CHAT_ID BOT_USERNAME \
-    TIMEZONE CALENDAR_EMAIL AGENT_ROLE > "$exports_file"
+    TIMEZONE CALENDAR_EMAIL AGENT_ROLE OWNER_NOTICE_LOCALE > "$exports_file"
   while IFS= read -r -d '' name && IFS= read -r -d '' value; do
     printf -v "$name" '%s' "$value"
     export "$name"
@@ -422,7 +422,7 @@ preflight_personas_before_stop() (
         AGENT_NAME="$AGENT_NAME" OWNER_NAME="${OWNER_NAME:-}" \
         OWNER_TG_USERNAME="${OWNER_TG_USERNAME:-}" OWNER_CHAT_ID="${OWNER_CHAT_ID:-}" \
         BOT_USERNAME="${BOT_USERNAME:-}" TIMEZONE="${TIMEZONE:-}" \
-        CALENDAR_EMAIL="${CALENDAR_EMAIL:-}" DEPLOY_DATE="$(date +%F)" \
+        CALENDAR_EMAIL="${CALENDAR_EMAIL:-}" DEPLOY_DATE="$(date +%F)" OWNER_NOTICE_LOCALE="${OWNER_NOTICE_LOCALE:-uk}" \
         AGENT_HOME="$H" AGENT_SERVICE="$AGENT_SERVICE" AGENT_USER="$AGENT_USER" \
         python3 "$KIT/assets/lib/render-template.py" "$@" "$copy" "$output" || status=$?
       rm -rf -- "$persona_tmp"

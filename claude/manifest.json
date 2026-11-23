@@ -7,7 +7,7 @@
     "local-foundation-v1"
   ],
   "source": "codex/starter/product.json",
-  "sourceRevision": "9c08c6327956b91bc992bc229a3012cdb6392e9e",
+  "sourceRevision": "69bd5cb57e34dc2065cb739e3052c4cd63b1ed2a",
   "sourceDirty": false,
   "features": [
     "browser"
@@ -155,7 +155,7 @@
     "modules/telegram-corporate/native-transcribe.ts": "a9fed254b97c5cdd82f6048b17bea997604901006de6a2ace8b92d1e1b1da5c4",
     "modules/telegram-corporate/native-video-project.ts": "c4501775a0033d492b3afe6ffa2209f4b21a0aa7273cb28cf9240c97289a148a",
     "modules/telegram-corporate/owner-access.ts": "d0dec43d9321f6866c822539d7ce19dbc4e0176c5169b67e3eadf66663b4f135",
-    "modules/telegram-corporate/parity.ts": "1958eac41a21d5c66cfce452e944ff123dfc788a6e229ad7716288918e7da885",
+    "modules/telegram-corporate/parity.ts": "6c03b0171fd9a1597de5a8349b99df5db140c622bfa8d95fe9dff22eca7b64d4",
     "modules/telegram-corporate/protocol.ts": "de084e0730cbd74aa0ce1dd4e820632c043770edd8f2f0d0db985d28857190e3",
     "modules/telegram-corporate/quota.ts": "5933c6cd8ac914171cb9f0163422b78cd516271835f6a408234c8b1402c4a671",
     "modules/telegram-corporate/remote-mcp.ts": "540d18e191f4a3a097a79cdaab361851c4772f01deff7f33b4f58bc73de26159",
@@ -167,7 +167,7 @@
     "modules/telegram-corporate/resource-meta-accounts.ts": "92b5678d28236f65c5d68fc5638b97c88a0cda401a86cebfa3abe345c2e5c5a0",
     "modules/telegram-corporate/resource-sheets.ts": "079155f75d48f2aed3d74d8be79a821aac3d976ac05781990b9d72afbbe5c881",
     "modules/telegram-corporate/resource-telegram-groups.ts": "e74423465ed08faa80182266d5d45c73b44f769395f35d3147785a4b7e15d098",
-    "modules/telegram-corporate/runtime.ts": "e6792bda87b47f18cb46f5a7fbbf3eb9b2ebd494ab6c426b8eedb9393b750fd4",
+    "modules/telegram-corporate/runtime.ts": "5bc6aad6eb16b8639f7e4e0fdf74dff80becaa3e324796d358cf7e2418ee197c",
     "modules/telegram-corporate/settings-access.ts": "344ef31374db78cb7f9b900ca27579d3e8f0f01beff710f920058d0598d096b8",
     "modules/telegram-corporate/store.ts": "ace425c435c90cf271bcff64f0b0367b15e59cb350e7593f72e454fccd071e26",
     "modules/telegram-corporate/task-schedules.ts": "12cdd121406502e80a4485f22df7f3ccc4c6659fd11cef1da9efeec6bb877d55",

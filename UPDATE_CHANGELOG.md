@@ -1,8 +1,8 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-11-23.9c08c6327956`
+- Реліз: `2026-11-23.69bd5cb57e34`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `9c08c6327956b91bc992bc229a3012cdb6392e9e`
+- Ревізія вихідного комплекту: `69bd5cb57e34dc2065cb739e3052c4cd63b1ed2a`
 - Дата релізу: `2026-11-23`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
@@ -19,8 +19,7 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    Shared Claude memory: name the folder by the vault's real path, as the CLI does
-    Every session of the agent shares the main session's own Claude memory
+    The agent speaks the language chosen at install with its owner and superadmins; Ukrainian with its developer
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не
