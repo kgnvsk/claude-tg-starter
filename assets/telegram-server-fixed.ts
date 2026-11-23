@@ -48,7 +48,7 @@ try {
     if (!m || process.env[m[1]] !== undefined) continue
     // The service has already sourced the managed file. A standalone receiver reads its shell-quoted name here.
     const value = m[2]!
-    process.env[m[1]!] = m[1] === 'OWNER_NAME' && value.startsWith("'") && value.endsWith("'")
+    process.env[m[1]!] = (m[1] === 'OWNER_NAME' || m[1] === 'PRINCIPAL_NAME') && value.startsWith("'") && value.endsWith("'")
       ? value.slice(1, -1).replaceAll(`'"'"'`, "'") : value
   }
 } catch {}
@@ -8558,7 +8558,9 @@ function ownerAlreadyIntroduced(home: string): boolean {
 // /start stays a transport command. Only the owner's first natural message may start their onboarding.
 function startReply(senderId: string, telegramName?: string): string {
   const owner = senderId === OWNER_CHAT_ID
-  const name = ((owner ? process.env.OWNER_NAME?.trim() : '') || telegramName || '').trim().replace(/\s+/gu, ' ').slice(0, 200)
+  // The department head a company agent was made for is greeted by the name it was set up with (owner, 23.11.2026).
+  const given = owner ? process.env.OWNER_NAME : senderId === process.env.PRINCIPAL_CHAT_ID ? process.env.PRINCIPAL_NAME : ''
+  const name = (given?.trim() || telegramName || '').trim().replace(/\s+/gu, ' ').slice(0, 200)
   const hello = ({ ru: 'Привет', en: 'Hi', pl: 'Cześć' } as Record<string, string>)[ownerNoticeLocale()] ?? 'Привіт'
   const greeting = name ? `${hello}, ${name}!` : `${hello}!`
   if (owner && !ownerAlreadyIntroduced(process.env.AGENT_ROOT || homedir())) {

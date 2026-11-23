@@ -3,7 +3,7 @@
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from telegram_api import api_base, is_local, local_file_root, open_local_file
+from telegram_api import api_base, broadcast_chat, is_local, local_file_root, open_local_file
 
 if __name__ == '__main__':
     try:
@@ -11,7 +11,9 @@ if __name__ == '__main__':
             print(api_base())
         elif sys.argv[1:] == ['local-root']:
             print(local_file_root() or '')
+        elif len(sys.argv) in (3, 4) and sys.argv[1] == 'broadcast-chat':
+            print(broadcast_chat(*sys.argv[2:]))
         else:
-            raise ValueError('usage: telegram-api base|local-root')
+            raise ValueError('usage: telegram-api base|local-root|broadcast-chat CHAT [CALENDAR_EMAIL]')
     except (OSError, ValueError):
         sys.exit('telegram-api: configuration is unavailable or invalid; no cloud fallback')

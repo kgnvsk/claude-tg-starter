@@ -442,6 +442,35 @@ preflight_personas_before_stop
 # in CLAUDE.md. A rule for a company chat cannot go there, so the update stops before the agent does.
 runuser -u "$AGENT_USER" -- python3 "$KIT/assets/lib/owner-rules-restore.py" --check "$H" >/dev/null || exit 2
 # END owner rules preflight
+# BEGIN principal preflight
+# An agent made for a department head (PRINCIPAL_* in the saved settings) is refused by install-core outside an
+# activated company mode, and once he is its owner (an agent passed to him): say so here, while the bot still runs.
+principal_saved="$(python3 "$KIT/assets/bin/saved-env-export" --value "$ENV_SAVED" PRINCIPAL_CHAT_ID)" || exit 1
+if [ -n "$principal_saved" ]; then
+  principal_owner="$(python3 "$KIT/assets/bin/saved-env-export" --value "$ENV_SAVED" OWNER_CHAT_ID)" || exit 1
+  while IFS= read -r -d '' name && IFS= read -r -d '' value; do
+    [ "$name" != OWNER_CHAT_ID ] || principal_owner="$value"
+  done < <(python3 "$KIT/assets/bin/update-safety-check" profile-export --home "$H")
+  if [ "$principal_saved" = "$principal_owner" ]; then
+    echo "FATAL: керівник із PRINCIPAL_CHAT_ID тепер власник цього агента; прибери PRINCIPAL_* зі збережених налаштувань ($ENV_SAVED) і повтори оновлення" >&2
+    exit 2
+  fi
+  principal_company=0
+  if { [ -f "$CORPORATE_MARKER" ] && [ ! -L "$CORPORATE_MARKER" ]; } || { [ -f "$CORPORATE_DB" ] && [ ! -L "$CORPORATE_DB" ] \
+      && [ "$(runuser -u "$AGENT_USER" -- sqlite3 -readonly "$CORPORATE_DB" \
+        "SELECT isolation_activated FROM corporate_runtime_state WHERE singleton=1;" 2>/dev/null)" = 1 ]; }; then
+    [ "$(python3 "$KIT/assets/lib/merge-env.py" --value "$CORPORATE_STATE_DIR/.env" TG_CORPORATE_SESSIONS)" != 1 ] \
+      || principal_company=1
+  fi
+  if [ "$principal_company" != 1 ] \
+      || [ "$(python3 "$KIT/assets/bin/saved-env-export" --value "$ENV_SAVED" MODULE_TELEGRAM_CORPORATE)" = 0 ] \
+      || ! python3 "$KIT/assets/lib/product-config.py" --file "$KIT/assets/product/runtime.json" \
+        has-feature telegram-corporate-sessions; then
+    echo "FATAL: агент для керівника (PRINCIPAL_*) оновлюється лише в активованому режимі компанії; увімкни «Корпоративні сесії» в Novsky і повтори оновлення" >&2
+    exit 2
+  fi
+fi
+# END principal preflight
 if [ "${1:-}" = --license-preflight ]; then
   exit 0
 fi

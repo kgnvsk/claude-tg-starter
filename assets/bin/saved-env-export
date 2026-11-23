@@ -20,6 +20,9 @@ EXPORTABLE = {
     "OPENAI_API_KEY", "NOVSKY_LICENSE_KEY",
     "OWNER_CHAT_ID", "OWNER_EMAIL", "OWNER_NAME", "OWNER_NOTICE_LOCALE",
     "OWNER_TG_USERNAME", "RECALL_API_KEY", "RECALL_REGION",
+    # The department head an agent of a company was made for (owner, 23.11.2026). Only the saved settings carry him
+    # through an update: the live profile never overlays him (update-safety-check PROFILE_KEYS), so clearing sticks.
+    "PRINCIPAL_CHAT_ID", "PRINCIPAL_EMAIL", "PRINCIPAL_NAME", "PRINCIPAL_ROLE", "PRINCIPAL_TG_USERNAME",
     "RETRY_INITIAL_MS", "RETRY_MAX_MS",
     "SITE_PASSWORD", "TELEGRAM_BOT_TOKEN", "TG_CORPORATE_SESSIONS",
     "TG_DELIVERY_AUTHORITY", "TG_DROP_PENDING_ON_BOOT",

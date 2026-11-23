@@ -28,10 +28,12 @@ UPSTREAM_SERVER_SHA256 = (
 )
 UPSTREAM_PACKAGE_START = "bun install --no-summary 1>&2 && bun server.ts"
 GOLDEN_SERVER_SHA256 = (
-    "a68e2afc81236655f7985d55167e64e8214d964b8cb9251e280787fd399e9fd6"
+    "595f1986f5e6db790bc22eeb10bce536b7674217d88c2712f1566b12882ced58"
 )
 PREVIOUS_GOLDEN_SERVER_SHA256S = frozenset(
     {
+        # 992c4bba6751 Merge pull request #514 from kgnvsk/codex/premium-audit-20261119
+        "a68e2afc81236655f7985d55167e64e8214d964b8cb9251e280787fd399e9fd6",
         # The golden before the inactivity check retained observed work across transcript rotation.
         "03e8cd09d4c1c180a98fa9eb97d988a37f6541f33e1fe622bacd2e8f9a0901bf",
         # The golden before recognizing an existing owner's confirmed private conversation on Start.

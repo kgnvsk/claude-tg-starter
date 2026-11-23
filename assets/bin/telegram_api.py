@@ -4,6 +4,7 @@ A local API is opt-in. Invalid configuration never falls back to Telegram's clou
 that would log the same bot into a second receiver after the operator's cutover.
 """
 from pathlib import Path
+import json
 import os
 import re
 import stat
@@ -82,3 +83,25 @@ def open_local_file(path):
         os.close(descriptor)
         raise ValueError('Telegram returned a non-regular file')
     return os.fdopen(descriptor, 'rb')
+
+
+def broadcast_chat(chat, calendar=None, home=None):
+    """Owner, 23.11.2026: where a cron broadcast that needs no answer goes (the day's calendar, the social digests),
+    given the chat it is set to. The owner's own chat (OWNER_CHAT_ID in ~/.agent-profile.env) gives way to the
+    department head a company agent was made for (PRINCIPAL_CHAT_ID) while the bot still admits him (admins and
+    allowFrom of its access list), read at each send; any other chat, such as a team group the owner named, stays.
+    A calendar goes to him only when it is his own: CALENDAR_EMAIL is his PRINCIPAL_EMAIL."""
+    chat, home = str(chat), Path(home or Path.home())
+    try:
+        profile = dict(re.findall(r"(?m)^(OWNER_CHAT_ID|PRINCIPAL_CHAT_ID|PRINCIPAL_EMAIL)=['\"]?([^'\"\s]*)['\"]?$",
+                                  (home / '.agent-profile.env').read_text(encoding='utf-8')))
+        principal = profile.get('PRINCIPAL_CHAT_ID', '')
+        if (chat != profile.get('OWNER_CHAT_ID') or not re.fullmatch(r'[1-9][0-9]{0,19}', principal) or principal == chat
+                or calendar is not None and not (calendar and calendar.lower() == profile.get('PRINCIPAL_EMAIL', '').lower())):
+            return chat
+        state = Path(os.environ.get('TELEGRAM_STATE_DIR') or home / '.claude/channels/telegram')
+        access = json.loads((state / 'access.json').read_text(encoding='utf-8'))
+        listed = lambda key: isinstance(access.get(key), list) and principal in map(str, access[key])
+        return principal if listed('admins') and listed('allowFrom') else chat
+    except (OSError, ValueError, AttributeError):
+        return chat

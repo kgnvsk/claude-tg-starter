@@ -169,6 +169,49 @@ if [ "$MODULE_CHANNEL_PUBLISH" = 1 ]; then
     exit 1
   }
 fi
+# BEGIN principal input
+# Owner, 23.11.2026: the CEO owns every agent of his company; an agent made for a department head names him here. He
+# works with it as its superadministrator in his own company chat and gets its daily broadcasts, so it needs company
+# mode: without it a superadministrator closes the bot to everyone but the owner. Empty keeps the agent its owner's.
+PRINCIPAL_CHAT_ID="${PRINCIPAL_CHAT_ID:-}"
+PRINCIPAL_NAME="${PRINCIPAL_NAME:-}"
+PRINCIPAL_TG_USERNAME="${PRINCIPAL_TG_USERNAME:-}"
+PRINCIPAL_ROLE="${PRINCIPAL_ROLE:-}"
+# His own Google account: the day's calendar goes to him only when CALENDAR_EMAIL is this address.
+PRINCIPAL_EMAIL="${PRINCIPAL_EMAIL:-}"
+PRINCIPAL_SETTINGS=""
+principal_line() {  # one printable line of at most 80 characters, in any locale
+  python3 -c 'import sys; v = sys.argv[1]; sys.exit(0 if v.strip() and len(v) <= 80 and v.isprintable() else 1)' "$1"
+}
+if [ -n "$PRINCIPAL_CHAT_ID$PRINCIPAL_NAME$PRINCIPAL_TG_USERNAME$PRINCIPAL_ROLE$PRINCIPAL_EMAIL" ]; then
+  [ "$MODULE_TELEGRAM_CORPORATE" = 1 ] && [ "$TG_CORPORATE_SESSIONS" = 1 ] || {
+    echo "FATAL: PRINCIPAL_* — агент для керівника працює лише в режимі компанії: потрібні модуль компанії й TG_CORPORATE_SESSIONS=1" >&2
+    exit 1
+  }
+  [[ "$PRINCIPAL_CHAT_ID" =~ ^[1-9][0-9]{0,19}$ ]] && [ "$PRINCIPAL_CHAT_ID" != "$OWNER_CHAT_ID" ] || {
+    echo "FATAL: PRINCIPAL_CHAT_ID має бути Telegram chat ID керівника — додатне ціле число, інше, ніж у власника" >&2
+    exit 1
+  }
+  principal_line "$PRINCIPAL_NAME" || {
+    echo "FATAL: PRINCIPAL_NAME — ім’я керівника одним рядком, до 80 знаків" >&2
+    exit 1
+  }
+  [[ "$PRINCIPAL_TG_USERNAME" =~ ^([A-Za-z0-9_]{5,32})?$ ]] || {
+    echo "FATAL: PRINCIPAL_TG_USERNAME — username керівника в Telegram без @: 5–32 латинські літери, цифри або _" >&2
+    exit 1
+  }
+  [ -z "$PRINCIPAL_ROLE" ] || principal_line "$PRINCIPAL_ROLE" || {
+    echo "FATAL: PRINCIPAL_ROLE — посада керівника одним рядком, до 80 знаків" >&2
+    exit 1
+  }
+  [ -z "$PRINCIPAL_EMAIL" ] || { [ "${#PRINCIPAL_EMAIL}" -le 254 ] \
+    && [[ "$PRINCIPAL_EMAIL" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]]; } || {
+    echo "FATAL: PRINCIPAL_EMAIL — пошта Google-акаунта керівника, наприклад maria@example.com" >&2
+    exit 1
+  }
+  PRINCIPAL_SETTINGS="PRINCIPAL_CHAT_ID PRINCIPAL_NAME PRINCIPAL_TG_USERNAME PRINCIPAL_ROLE PRINCIPAL_EMAIL"
+fi
+# END principal input
 # BEGIN optional module maintenance guard
 # These installers write outside managed-runtime.json and have no recorded
 # previous-kit baseline. Replaying them would silently replace owner edits.
@@ -1156,15 +1199,25 @@ if [ ! -e "$ACCESS_FILE" ]; then
   fi
   render_template "$KIT/assets/templates/access.json.template" "$ACCESS_FILE"
 fi
+# BEGIN admin reconciliation
 if [ "$CLAUDE_UPDATE_MAINTENANCE" = 1 ]; then
   # Runtime-added admins are authoritative admission state. Keep them long
   # enough for the owner to review during the post-update migration plan.
   runuser -u "$AGENT_USER" -- python3 "$H/bin/access-update" preserve-admins \
     "$ACCESS_FILE" "$OWNER_CHAT_ID" "$ADDITIONAL_ADMIN_CHAT_IDS"
 else
+  # The department head the agent was made for stays an administrator through a reinstall, as the additional ones do.
   runuser -u "$AGENT_USER" -- python3 "$H/bin/access-update" reconcile-admins \
-    "$ACCESS_FILE" "$OWNER_CHAT_ID" "$ADDITIONAL_ADMIN_CHAT_IDS"
+    "$ACCESS_FILE" "$OWNER_CHAT_ID" "$ADDITIONAL_ADMIN_CHAT_IDS${PRINCIPAL_CHAT_ID:+,$PRINCIPAL_CHAT_ID}"
+  # He is seated as the superadministrator while the access list has never had any (a new agent, or its first install
+  # retried), never as a reader of the owner's data (ownerDataSuperadmins); afterwards his role is the owner's to change.
+  if [ -n "$PRINCIPAL_CHAT_ID" ] && runuser -u "$AGENT_USER" -- python3 -c \
+      'import json, sys; sys.exit("superadmins" in json.load(open(sys.argv[1], encoding="utf-8")))' "$ACCESS_FILE"; then
+    runuser -u "$AGENT_USER" -- python3 "$H/bin/access-update" set-superadmins \
+      "$ACCESS_FILE" "$OWNER_CHAT_ID" "$PRINCIPAL_CHAT_ID"
+  fi
 fi
+# END admin reconciliation
 
 MANAGED_RENDERED_FILES=("$H/CLAUDE.md" "$MANAGED_CLAUDE" "$MANAGED_PRODUCT" "$ACCESS_FILE")
 while IFS= read -r -d '' source; do
@@ -1257,8 +1310,10 @@ secrets_umask="$(umask)"
 umask 077
 MANAGED_CHANNEL_ENV="$(mktemp)"
 : > "$MANAGED_CHANNEL_ENV"
+# The receiver greets the department head by name (PRINCIPAL_*); an empty value clears a former one in this merged file.
 for name in TELEGRAM_BOT_TOKEN OPENAI_API_KEY MEMORY_EMBEDDINGS_OPENAI RECALL_API_KEY RECALL_REGION TG_DROP_PENDING_ON_BOOT \
-  TG_DELIVERY_AUTHORITY OWNER_CHAT_ID OWNER_NAME TG_CORPORATE_SESSIONS GOG_KEYRING_BACKEND GOG_KEYRING_PASSWORD; do
+  TG_DELIVERY_AUTHORITY OWNER_CHAT_ID OWNER_NAME TG_CORPORATE_SESSIONS GOG_KEYRING_BACKEND GOG_KEYRING_PASSWORD \
+  PRINCIPAL_CHAT_ID PRINCIPAL_NAME; do
   write_shell_value "$MANAGED_CHANNEL_ENV" "$name"
 done
 # The whole agent on receipts for a new agent only: an update never writes these lines, so it cannot switch a
@@ -1306,6 +1361,8 @@ semantic_memory_default() {
 semantic_memory_default
 
 : > "$CONFIG_FILE"
+# The saved settings and the profile below are written whole and name a department head only when there is one: a kit
+# from before these keys refuses saved settings that name them, so an agent without one keeps settings it can read.
 for name in AGENT_NAME OWNER_NAME OWNER_TG_USERNAME OWNER_CHAT_ID ADDITIONAL_ADMIN_CHAT_IDS ALERT_COPY_CHAT_IDS \
   OWNER_EMAIL BOT_USERNAME TIMEZONE TELEGRAM_BOT_TOKEN OPENAI_API_KEY VOICE_SETUP_STATUS \
   MEMORY_EMBEDDINGS_OPENAI \
@@ -1313,7 +1370,7 @@ for name in AGENT_NAME OWNER_NAME OWNER_TG_USERNAME OWNER_CHAT_ID ADDITIONAL_ADM
   CALENDAR_EMAIL VAULT_LOCALE OWNER_NOTICE_LOCALE MODULE_DESIGN_PACK MODULE_CHANNEL_PUBLISH \
   MODULE_SOCIAL_BROWSER MODULE_TRANSPORT_DAEMON MODULE_VAULT_WEB \
   MODULE_INSTAGRAM_DM MODULE_YOUTUBE_COMMENTS MODULE_TELEGRAM_CORPORATE \
-  CHANNEL_ID SITE_PASSWORD ACTIVE_ROLES AGENT_ROLE; do
+  CHANNEL_ID SITE_PASSWORD ACTIVE_ROLES AGENT_ROLE $PRINCIPAL_SETTINGS; do
   write_shell_value "$CONFIG_FILE" "$name"
 done
 chmod 600 "$CONFIG_FILE"
@@ -1347,7 +1404,7 @@ profile_new="$(mktemp "$PROFILE_FILE.XXXXXX")"
 for name in AGENT_NAME AGENT_GENDER OWNER_NAME OWNER_TG_USERNAME OWNER_CHAT_ID ADDITIONAL_ADMIN_CHAT_IDS ALERT_COPY_CHAT_IDS \
   OWNER_EMAIL BOT_USERNAME TIMEZONE CALENDAR_EMAIL VAULT_LOCALE OWNER_NOTICE_LOCALE \
   TG_DROP_PENDING_ON_BOOT TG_CORPORATE_SESSIONS OWNER_PROGRESS_NOTICES OWNER_TECHNICAL_ALERTS SECURITY_NOTICE_CHAT \
-  READ_CONTEXT_BEFORE_ANSWER; do
+  READ_CONTEXT_BEFORE_ANSWER $PRINCIPAL_SETTINGS; do
   write_shell_value "$profile_new" "$name"
 done
 "${AGENT_HOME_WRITE[@]}" own 600 "$profile_new"
