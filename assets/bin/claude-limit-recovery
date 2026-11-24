@@ -1517,6 +1517,8 @@ def _scan_transcript(
             if any(
                 _interruption_ancestry_truncated(event, events_by_uuid)
                 for event in interruptions
+                # A re-appended copy is never classified (telegram_origin), so its ancestry cannot matter.
+                if events_by_uuid.get(event["uuid"]) is event
             ):
                 raise StateError("provider interruption ancestry exceeds context limit")
         # A prefix read must not hide truncation of the unread snapshot suffix.
@@ -1602,6 +1604,23 @@ def scan_incremental(projects_dir: Path, state: dict) -> tuple[dict, list[dict]]
     return current, batches
 
 
+# Claude re-appends events it already wrote, under their uuids, stamped by the process that writes the copy. 2.1.301
+# does it when the next queued prompt starts: the new prompt's id, the current working folder, tool output emptied (ST,
+# 17.10.2026). 2.1.309 does it on /compact for the segment the previous compaction kept: another entrypoint, the head
+# re-linked under the new summary, Edit's originalFile emptied (Atlas, 23.11.2026); a newer CLI stamps its version.
+# Nothing here reads these fields from a copy: the map keeps the first record, and telegram_origin classifies only it.
+COSMETIC_DUPLICATE_KEYS = {"slug", "cwd", "promptId", "entrypoint", "version", "parentUuid", "toolUseResult"}
+
+
+def _duplicate_comparable(record: dict) -> dict:
+    """The event without the bookkeeping a re-append rewrites; 2.1.309 also recounts the message's token usage."""
+    comparable = {key: value for key, value in record.items() if key not in COSMETIC_DUPLICATE_KEYS}
+    message = comparable.get("message")
+    if isinstance(message, dict) and "usage" in message:
+        comparable["message"] = {key: value for key, value in message.items() if key != "usage"}
+    return comparable
+
+
 def _batch_uuid_map(events: list[dict]) -> dict[str, dict]:
     result: dict[str, dict] = {}
     for envelope in events:
@@ -1612,11 +1631,10 @@ def _batch_uuid_map(events: list[dict]) -> dict[str, dict]:
         if not isinstance(event_uuid, str) or not event_uuid:
             raise StateError("invalid transcript event identifier")
         if event_uuid in result:
-            # Claude may append the same event with a cosmetic session slug.
-            # Ignore only that top-level field; all ancestry, content and
-            # provenance must remain identical, including JSON value types.
-            previous = {key: value for key, value in result[event_uuid].items() if key != "slug"}
-            repeated = {key: value for key, value in record.items() if key != "slug"}
+            # A re-appended copy (COSMETIC_DUPLICATE_KEYS). Type, time, the message save its token usage, origin
+            # and error fields must remain identical, including JSON value types.
+            previous = _duplicate_comparable(result[event_uuid])
+            repeated = _duplicate_comparable(record)
             if json.dumps(previous, sort_keys=True) != json.dumps(repeated, sort_keys=True):
                 raise StateError("duplicate transcript event identifier")
             # Keep the first object so an appended copy cannot become new work.

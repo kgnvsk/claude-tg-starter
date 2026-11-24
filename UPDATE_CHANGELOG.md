@@ -1,9 +1,9 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-11-23.ff29d7f1f007`
+- Реліз: `2026-11-24.f8de18f77752`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `ff29d7f1f00705a3ed4e5d58e703575266860535`
-- Дата релізу: `2026-11-23`
+- Ревізія вихідного комплекту: `f8de18f7775212dac405bf8ccf141ed67f93a05d`
+- Дата релізу: `2026-11-24`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
 
@@ -19,15 +19,8 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    Company mode: a failed give-back answers uncertain; a refused apply gives admission back; «Було → стане» only when it reads differently
-    Company mode cards: a rename moves and narrows nothing (the store's rule); the agent card from its preview
-    Company mode: a resource confirmation gives admission back in one guarded statement, never on phase two off
-    Receiver golden: pin the merged receiver (main's golden and the branch's last one to the history)
-    Company mode: a resource confirmation that applies nothing gives admission back
-    Company mode cards: second review (a site keeps its address, the change card follows the base rule, agent losses shown)
-    Company mode cards: review fixes (changes, exact targets, English, escapes, long cards, connected agent)
-    Company mode: the rights card names the person and each right in words
-    Company mode: the resource card speaks plain words, like the access cards
+    Limit watcher review: version and tool results are bookkeeping, a copy's ancestry is not re-checked
+    Limit watcher reads the segment Claude 2.1.309 re-appends on /compact, and the 17.10 fix again
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не
