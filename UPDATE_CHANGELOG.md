@@ -1,8 +1,8 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-11-24.f8de18f77752`
+- Реліз: `2026-11-24.ae0a40118a4e`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `f8de18f7775212dac405bf8ccf141ed67f93a05d`
+- Ревізія вихідного комплекту: `ae0a40118a4e72cd7b333794b727cdf4f9d5d948`
 - Дата релізу: `2026-11-24`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
@@ -19,8 +19,7 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    Limit watcher review: version and tool results are bookkeeping, a copy's ancestry is not re-checked
-    Limit watcher reads the segment Claude 2.1.309 re-appends on /compact, and the 17.10 fix again
+    Release area tests find a test's sibling helper, as the CI shards do
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не
