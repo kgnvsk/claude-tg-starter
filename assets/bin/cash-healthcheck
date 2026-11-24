@@ -862,10 +862,12 @@ if ! sudo systemctl is-active "$SVC" >/dev/null 2>&1; then
             ;;
     esac
     if [ "$(( $(date -u +%s) - service_down_since ))" -ge "${SERVICE_DOWN_ALERT_AFTER:-300}" ]; then
-        alert "service-down" "$(notice health.service_down 'Я не можу запуститися вже кілька хвилин, і автоматичний старт не допомагає. Напиши нам.')"
+        # Told once, the owner needs no copy every 10 minutes (Bobby, 24.11.2026: twelve in two hours).
+        alert "service-down" "$(notice health.service_down 'Я не можу запуститися вже кілька хвилин, і автоматичний старт не допомагає. Напиши нам.')" 21600
     fi
 else
-    rm -f "$STAMP/service-down-since.epoch"
+    # The six-hour repeat holds within one outage: once the service runs again, the next outage is news.
+    rm -f "$STAMP/service-down-since.epoch" "$STAMP/cash-alert-service-down.ts"
 fi
 
 # 2. Claude process alive? (-u: only THIS instance's user — a neighbour bot's process

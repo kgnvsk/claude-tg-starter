@@ -1,8 +1,8 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-11-24.ae0a40118a4e`
+- Реліз: `2026-11-24.98d0a66409e4`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `ae0a40118a4e72cd7b333794b727cdf4f9d5d948`
+- Ревізія вихідного комплекту: `98d0a66409e4d5ef7e7680cfdf1c6f7e98ef3864`
 - Дата релізу: `2026-11-24`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
@@ -19,7 +19,8 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    Release area tests find a test's sibling helper, as the CI shards do
+    A service still down is repeated to the owner at most every six hours
+    Tests: a dead service's alert repeats at most every six hours, and a recovered one's next outage is news
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не
