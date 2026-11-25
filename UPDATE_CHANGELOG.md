@@ -1,8 +1,8 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-11-25.d6b25c41f725`
+- Реліз: `2026-11-25.0d30cac49bf2`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `d6b25c41f7255b6557e9d26ee2ccd5c97f16d2fc`
+- Ревізія вихідного комплекту: `0d30cac49bf2f67260f0f17733f67294d2e791b5`
 - Дата релізу: `2026-11-25`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
@@ -19,9 +19,14 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    Video phase comment: ToolSearch is on in a trusted chat with the agent's servers too (review nit)
-    Review of the ToolSearch fix: only chats with MCP beside the bridge, a fixed auto, the video phase lets it run
-    Company sessions load MCP tools on demand: ToolSearch in their tool set
+    Company runtime: review of PR 548, round 3 — the file reply is no action an access waits on; honest bump promises
+    Company runtime: review of PR 548, round 2 — a speed bump instead of a wall, real browser steps on the rerun
+    Tests: the delegated rerun test waits for the delayed rerun
+    Company runtime: review of PR 548 — one shared retry, honest lines, the rerun never repeats an unconfirmed action
+    Tests: the delegated fixture runs each engine's own scheduler; the notice test reads both close lines
+    Company runtime: an action the bot's own rerun left unconfirmed still blocks an access re-run
+    Company runtime: one automatic retry per request, also for a worker that timed out
+    Company runtime: a broken request runs once more by itself before «write again» (Claude)
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не
