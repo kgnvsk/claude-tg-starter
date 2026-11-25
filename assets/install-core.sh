@@ -967,6 +967,28 @@ if product_has_feature browser && [ "$AGENT_USER" = claude ] && [ -f "$browser_u
       echo "WARN: службу браузера не вдалося оновити до команди запуску цього кита" >&2
     fi
   fi
+  # Kits of 19-29.10 wrote claude-browser.service.d/30-hardening.conf with MemoryHigh=1536M and MemoryMax=2G for the
+  # browser of one session; later kits dropped those limits but left the file on installed servers. One browser serves
+  # every session since 19.11, and at that cap it stalls on memory most of the time (Арти, 25.11.2026: 90% of its time
+  # stalled, Chromium re-reading its files from disk, load 27 on 4 CPUs). Exactly those two lines of the kit's own
+  # drop-in go (the network block and the other limits stay); the reload sets the running browser's cgroup without the
+  # cap, so its tabs stay. cash-healthcheck watches its memory instead. Other values and a drop-in somebody else wrote
+  # stay as they are.
+  browser_cap="$browser_unit.d/30-hardening.conf"
+  if [ -f "$browser_cap" ] && [ ! -L "$browser_cap" ] && grep -q '^# Kit drop-in for claude-browser.service' "$browser_cap" \
+      && grep -q -x -E 'MemoryHigh=1536M|MemoryMax=2G' "$browser_cap"; then
+    if grep -v -x -E 'MemoryHigh=1536M|MemoryMax=2G' "$browser_cap" > "$browser_cap.new" && chmod 644 "$browser_cap.new" \
+        && mv -f "$browser_cap.new" "$browser_cap"; then
+      if systemctl daemon-reload; then
+        echo "  браузер: знято межу пам'яті 2 ГБ від старого кита"
+      else
+        echo "WARN: межу пам'яті браузера знято у файлі; вона зникне після наступного перезавантаження systemd" >&2
+      fi
+    else
+      rm -f "$browser_cap.new" 2>/dev/null || true
+      echo "WARN: межу пам'яті браузера від старого кита не вдалося зняти" >&2
+    fi
+  fi
   # What systemd has loaded decides: a server still running without the flag takes it at a restart. One that does
   # not come back is the health check's to repair and report.
   case "$(systemctl show claude-browser.service -p ExecStart --value 2>/dev/null || true)" in

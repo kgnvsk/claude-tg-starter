@@ -1,8 +1,8 @@
 {
   "schema": "claude-kit-release/v1",
-  "releaseId": "2026-11-24.98d0a66409e4",
-  "sourceKitRevision": "98d0a66409e4d5ef7e7680cfdf1c6f7e98ef3864",
-  "releaseDate": "2026-11-24",
+  "releaseId": "2026-11-25.6884015464ca",
+  "sourceKitRevision": "6884015464ca9c344e89c83ef9fcfd8fad746d16",
+  "releaseDate": "2026-11-25",
   "productId": "starter",
   "displayName": "Novsky Starter",
   "updateMode": "reconcile-existing",
