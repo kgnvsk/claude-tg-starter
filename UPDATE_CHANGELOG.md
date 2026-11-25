@@ -1,8 +1,8 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-11-25.e7130987e608`
+- Реліз: `2026-11-25.d6b25c41f725`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `e7130987e608b7a57f7fe07287aa3c3acbf34a7c`
+- Ревізія вихідного комплекту: `d6b25c41f7255b6557e9d26ee2ccd5c97f16d2fc`
 - Дата релізу: `2026-11-25`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
@@ -19,8 +19,9 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    Review: nothing is written while a process outlived the stop
-    A bot stopped after its stop timeout counts as stopped
+    Video phase comment: ToolSearch is on in a trusted chat with the agent's servers too (review nit)
+    Review of the ToolSearch fix: only chats with MCP beside the bridge, a fixed auto, the video phase lets it run
+    Company sessions load MCP tools on demand: ToolSearch in their tool set
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не
