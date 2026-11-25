@@ -1,8 +1,8 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-11-25.ebc97413766a`
+- Реліз: `2026-11-25.42fcaff690aa`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `ebc97413766aad08e9a1723359bafb6358d2fad9`
+- Ревізія вихідного комплекту: `42fcaff690aa5b64762a3f433c651b307877e58a`
 - Дата релізу: `2026-11-25`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
@@ -19,10 +19,7 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    Slack: possibly-done errors stay unknown, disconnect always forgets, refusals named, offered only where it exists
-    Slack: through the bridge, off the Codex grammar, refusals not unknown, rotation named, revoke on disconnect
-    Staff prompt and team-access skill name Slack beside Google and Meta
-    Company and owner: a person's own Slack, as that person, not through the owner's claude.ai connector
+    slack-personal: a description within the 200-character limit, so the kit installs again
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не
