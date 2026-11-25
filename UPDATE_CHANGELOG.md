@@ -1,8 +1,8 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-11-25.42fcaff690aa`
+- Реліз: `2026-11-25.8242338933b1`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `42fcaff690aa5b64762a3f433c651b307877e58a`
+- Ревізія вихідного комплекту: `8242338933b146a73a0e19acb4930a03eaa07674`
 - Дата релізу: `2026-11-25`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
@@ -19,7 +19,9 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    slack-personal: a description within the 200-character limit, so the kit installs again
+    Review of PR 552: a first Slack check left unanswered keeps the access just stored, in company mode too
+    reply names delivery_id once; personal Slack calls an access dead only when Slack says so
+    Release check: every run passes the shipped skill catalog through install-core's skill-doctor
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не

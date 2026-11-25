@@ -28,10 +28,12 @@ UPSTREAM_SERVER_SHA256 = (
 )
 UPSTREAM_PACKAGE_START = "bun install --no-summary 1>&2 && bun server.ts"
 GOLDEN_SERVER_SHA256 = (
-    "aa47e2eabfb6515f5c8ec658e0f46eb61f0265a89ebf70d3433b9fe002430c3f"
+    "e3b170a01a482cba64568f6c2418abbf3eb7b1452e9344b40c71a8426fe89d18"
 )
 PREVIOUS_GOLDEN_SERVER_SHA256S = frozenset(
     {
+        # ebc97413766a Merge pull request #549 from kgnvsk/feat/personal-slack-20261125
+        "aa47e2eabfb6515f5c8ec658e0f46eb61f0265a89ebf70d3433b9fe002430c3f",
         # ff29d7f1f007 Merge pull request #538 from kgnvsk/fix/human-resource-card
         "0fd1150fc9fc7cba12a4a11705e5bf63996a07c7c229d5bf0c7a7cf524729a21",
         # The golden before the agent card read only the store's preview (PR 538, the last review round).

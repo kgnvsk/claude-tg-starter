@@ -6698,16 +6698,12 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           phase: { type: 'string', enum: ['progress', 'final'],
             description: 'progress for acknowledgements or ongoing work; final for the current answer, refusal or clarification question. Continue ordinary messages and attachments using conversation history; Telegram Reply is optional context. A final reply records delivery of the answer, not proof that an external action succeeded. Recorded only after every part and attachment succeeds.' },
           delivery_id: { type: 'string',
-            description: 'Original inbound delivery_id. Always pass it for a background result or when several requests share a turn.' },
+            description: 'Exact delivery_id from the inbound notification. Always pass it for a background result or when several requests share a turn. Must match its persisted offered/started chat, message and topic; never copy a different turn or infer the queue head. Routing evidence only, not an access grant.' },
           task_id: { type: 'string',
             description: 'For progress only: exact ID returned by the background Agent or shell task performing this request. Allows the CLI to serve other messages while this result remains pending. Never invent an ID or reuse another request\'s task.' },
           thread_id: {
             type: 'integer', minimum: 1, maximum: Number.MAX_SAFE_INTEGER,
             description: 'Forum topic ID from inbound thread_id. Preserve it for every reply and attachment, even without reply_to.',
-          },
-          delivery_id: {
-            type: 'string',
-            description: 'Exact delivery_id from the inbound notification. Must match its persisted offered/started chat, message and topic; never copy a different turn or infer the queue head. Routing evidence only, not an access grant.',
           },
           general_topic: {
             type: 'boolean',
