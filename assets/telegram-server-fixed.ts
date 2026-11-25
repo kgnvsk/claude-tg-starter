@@ -9889,7 +9889,7 @@ async function handleInbound(
   if (ownerShared) {
     // Full tools do not make a public chat a credential intake. Never retain
     // a pasted connection secret, even when the company module is unavailable.
-    const setup = /(?:^|\n)\s*(?:META_TOKEN|MCP_URL)\b|\b(?:access_token|refresh_token)\s*[:=]|\bEAA[A-Za-z0-9_-]{16,}\b|\bya29\.[A-Za-z0-9_-]{16,}/i.test(text)
+    const setup = /(?:^|\n)\s*(?:META_TOKEN|MCP_URL)\b|\b(?:access_token|refresh_token)\s*[:=]|\bEAA[A-Za-z0-9_-]{16,}\b|\bya29\.[A-Za-z0-9_-]{16,}|\bxox[a-z]-[A-Za-z0-9-]{10,}/i.test(text)
       || (text.match(/https?:\/\/[^\s<>]+/gi) ?? []).some(raw => {
         try {
           const url = new URL(raw)

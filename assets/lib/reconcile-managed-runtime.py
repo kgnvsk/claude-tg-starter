@@ -106,6 +106,7 @@ MANAGED_BIN_NAMES = frozenset(
         "set-vercel-token",
         "skill-brief",
         "skill-doctor",
+        "slack-personal",
         "speak",
         "subagent-result-nudge",
         "sql-readonly",

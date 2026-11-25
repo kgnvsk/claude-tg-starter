@@ -206,6 +206,7 @@
     "bin/settings-model-guard",
     "bin/skill-brief",
     "bin/skill-doctor",
+    "bin/slack-personal",
     "bin/speak",
     "bin/sql-readonly",
     "bin/subagent-result-nudge",

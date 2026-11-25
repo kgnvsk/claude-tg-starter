@@ -1,8 +1,8 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-11-25.0d30cac49bf2`
+- Реліз: `2026-11-25.ebc97413766a`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `0d30cac49bf2f67260f0f17733f67294d2e791b5`
+- Ревізія вихідного комплекту: `ebc97413766aad08e9a1723359bafb6358d2fad9`
 - Дата релізу: `2026-11-25`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
@@ -19,14 +19,10 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    Company runtime: review of PR 548, round 3 — the file reply is no action an access waits on; honest bump promises
-    Company runtime: review of PR 548, round 2 — a speed bump instead of a wall, real browser steps on the rerun
-    Tests: the delegated rerun test waits for the delayed rerun
-    Company runtime: review of PR 548 — one shared retry, honest lines, the rerun never repeats an unconfirmed action
-    Tests: the delegated fixture runs each engine's own scheduler; the notice test reads both close lines
-    Company runtime: an action the bot's own rerun left unconfirmed still blocks an access re-run
-    Company runtime: one automatic retry per request, also for a worker that timed out
-    Company runtime: a broken request runs once more by itself before «write again» (Claude)
+    Slack: possibly-done errors stay unknown, disconnect always forgets, refusals named, offered only where it exists
+    Slack: through the bridge, off the Codex grammar, refusals not unknown, rotation named, revoke on disconnect
+    Staff prompt and team-access skill name Slack beside Google and Meta
+    Company and owner: a person's own Slack, as that person, not through the owner's claude.ai connector
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не

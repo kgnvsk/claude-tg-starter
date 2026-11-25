@@ -28,10 +28,12 @@ UPSTREAM_SERVER_SHA256 = (
 )
 UPSTREAM_PACKAGE_START = "bun install --no-summary 1>&2 && bun server.ts"
 GOLDEN_SERVER_SHA256 = (
-    "0fd1150fc9fc7cba12a4a11705e5bf63996a07c7c229d5bf0c7a7cf524729a21"
+    "aa47e2eabfb6515f5c8ec658e0f46eb61f0265a89ebf70d3433b9fe002430c3f"
 )
 PREVIOUS_GOLDEN_SERVER_SHA256S = frozenset(
     {
+        # ff29d7f1f007 Merge pull request #538 from kgnvsk/fix/human-resource-card
+        "0fd1150fc9fc7cba12a4a11705e5bf63996a07c7c229d5bf0c7a7cf524729a21",
         # The golden before the agent card read only the store's preview (PR 538, the last review round).
         "e056d718db97cc2c17bd0ae2e3c12b7b2c5677bb6cb2b0eb8e175eb8bb099de3",
         # The golden after the merge of main into PR 538, before the agent card read its preview.

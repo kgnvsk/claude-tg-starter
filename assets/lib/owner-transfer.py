@@ -85,7 +85,8 @@ FOREIGN_HOLDS = ("zz-maintenance-hold.conf", "zy-novsky-transaction.conf")
 TICK_HOLDER = ".atarax/reminders.worker.lock.holder"
 # The previous owner's mail and accounts the agent signed in to: the new owner would read and send as him.
 ACCOUNTS = ((".config/gogcli", "Google (Gmail, Календар, Диск)"), (".local/share/gogcli", "Google (Gmail, Календар, Диск)"),
-            (".config/icloud-mail/credentials.json", "пошта iCloud"), (".config/gh/hosts.yml", "GitHub (вхід gh)"))
+            (".config/icloud-mail/credentials.json", "пошта iCloud"), (".config/gh/hosts.yml", "GitHub (вхід gh)"),
+            (".config/slack-personal/token.json", "Slack (від його імені)"))
 # The kit's and Novsky's own tasks that follow the owner; every other task to the previous owner's chat is his.
 SYSTEM_TASKS = ("memory-review", "novsky-onboarding")
 # Everything this command may change in the agent's home, copied before the first change; skills come from the check.

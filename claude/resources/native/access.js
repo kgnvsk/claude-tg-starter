@@ -292,7 +292,7 @@ var CAPABILITY_CATALOG = Object.freeze({
   "integrations.manage": capability("integrations.manage", {
     kind: "write",
     adapter: "builtin",
-    operations: ["status", "connect", "run", "disconnect", "cancel"],
+    operations: ["status", "connect", "run", "disconnect", "cancel", "setup", "configure"],
     sharedAllowed: false,
     requiresResource: false,
     requiresConfirmation: false,
