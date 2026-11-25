@@ -1,8 +1,8 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-11-25.6884015464ca`
+- Реліз: `2026-11-25.e7130987e608`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `6884015464ca9c344e89c83ef9fcfd8fad746d16`
+- Ревізія вихідного комплекту: `e7130987e608b7a57f7fe07287aa3c3acbf34a7c`
 - Дата релізу: `2026-11-25`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
@@ -19,11 +19,8 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    Review: the reload lifts the cap; the shared browser keeps its tabs
-    Lint: the browser drop-in is one per host, written by the primary only
-    Review: a quiet owner gets no status at all; background work binds itself
-    An update takes the 2 GB cap of an older kit off the shared browser
-    The owner's «no status messages» outranks the status rule
+    Review: nothing is written while a process outlived the stop
+    A bot stopped after its stop timeout counts as stopped
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не

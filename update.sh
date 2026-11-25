@@ -95,8 +95,16 @@ esac
 require_primary_service_stopped() {
   local state status=0
   state="$(systemctl is-active "$AGENT_SERVICE" 2>/dev/null)" || status=$?
-  if [ "$status" -ne 3 ] || [ "$state" != inactive ]; then
+  # A stop that ran past its timeout ends «failed»: stopped as well (Арти, 25.11.2026: one process took longer than
+  # 30 s, and the update rolled back a bot that was already down). «activating» and «deactivating» are not stopped.
+  if [ "$status" -ne 3 ] || { [ "$state" != inactive ] && [ "$state" != failed ]; }; then
     echo "FATAL: перед оновленням $AGENT_SERVICE має бути зупинено" >&2
+    return 1
+  fi
+  # After such a stop a process blocked in a system call can outlive even SIGKILL; nothing is written while one is
+  # still in the unit's group.
+  if grep -qsE ":/(.*/)?${AGENT_SERVICE//./\\.}(/.*)?$" /proc/[0-9]*/cgroup; then
+    echo "FATAL: у $AGENT_SERVICE лишилися процеси після зупинки" >&2
     return 1
   fi
 }
