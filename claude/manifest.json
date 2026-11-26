@@ -7,7 +7,7 @@
     "local-foundation-v1"
   ],
   "source": "codex/starter/product.json",
-  "sourceRevision": "d57514cfaf272781ad9eaa41f4534db307169010",
+  "sourceRevision": "8a504d1725d6e5a307c7bc25b0babb6d57178979",
   "sourceDirty": false,
   "features": [
     "browser"
@@ -149,7 +149,7 @@
     "modules/telegram-corporate/native-download.ts": "22165d298f49db9d8624d960fbba8fc82ab38ff594b273afbb676b4a7cce9943",
     "modules/telegram-corporate/native-file-reply.ts": "e053520d7886880825d7cdf22c3a8796634cfeae3c3b32056fd14b3f381b9a99",
     "modules/telegram-corporate/native-mcp.ts": "8d30db011510c0074f71d24c3443eb2db57e8a9a7c46f4958874e2032777193b",
-    "modules/telegram-corporate/native-profile.ts": "2fffd815e700101275b51bedf4cda32d364461badc8124220e4712fe95d37ddd",
+    "modules/telegram-corporate/native-profile.ts": "1d7ea4a44fd2144d712a73fba79453d89825a6a4a5d31b792732979598fb5cd4",
     "modules/telegram-corporate/native-readiness.ts": "ecff867750a70ca61f242ccddd4d85eefc55bd5383fbeb1e4cde17198ed419d7",
     "modules/telegram-corporate/native-reminder.ts": "8b6b822fc41aee3ea792c058b38ce877f6c655bc7a66de4b74c0096a2c0f7a33",
     "modules/telegram-corporate/native-transcribe.ts": "a9fed254b97c5cdd82f6048b17bea997604901006de6a2ace8b92d1e1b1da5c4",

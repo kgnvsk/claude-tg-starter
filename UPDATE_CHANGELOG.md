@@ -1,8 +1,8 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-11-26.d57514cfaf27`
+- Реліз: `2026-11-26.8a504d1725d6`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `d57514cfaf272781ad9eaa41f4534db307169010`
+- Ревізія вихідного комплекту: `8a504d1725d6e5a307c7bc25b0babb6d57178979`
 - Дата релізу: `2026-11-26`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
@@ -19,10 +19,7 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    install-core: the comment on the parity report names no chown
-    install-core: the agent replaces a parity report it cannot write
-    Company sessions: the bot token's copy and the Instagram and Meta module secrets are closed like the originals
-    install-core: the agent opens its own parity log, root no longer writes through a link there
+    Company sessions: the Instagram and Meta files are readable again; only the bot token's copy stays closed
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не
