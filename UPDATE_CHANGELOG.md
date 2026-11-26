@@ -1,8 +1,8 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-11-26.c2432bb1a8db`
+- Реліз: `2026-11-26.40c9ba511831`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `c2432bb1a8dbbc2aacf8a586d7565436240ee106`
+- Ревізія вихідного комплекту: `40c9ba51183171f0919a89555607ebafc18f4f27`
 - Дата релізу: `2026-11-26`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
@@ -19,9 +19,7 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    Managed files: mode and owner are set by the open file, not by its name
-    Installers: three notes of the review before the merge
-    Installers: four more places where root went by a name in the agent's home
+    Managed files: the update's transaction leaves the agent's home
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не

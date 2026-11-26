@@ -6,6 +6,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import base64
 import codecs
+import errno
 import hashlib
 import json
 import os
@@ -760,6 +761,26 @@ def atomic_install_bytes(
         temporary.unlink(missing_ok=True)
 
 
+def copy_preimage(source: Path, backup: Path) -> int | None:
+    """The live file's bytes into the transaction and its mode, both taken from the file itself: a link or anything
+    else put in its place since the plan was made is refused, never followed. None when there is no file."""
+    try:
+        descriptor = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        if error.errno == errno.ELOOP:
+            raise UpdateError("managed live path changed during apply") from error
+        raise
+    with os.fdopen(descriptor, "rb") as input_handle:
+        metadata = os.fstat(input_handle.fileno())
+        if not stat.S_ISREG(metadata.st_mode):
+            raise UpdateError("managed live path changed during apply")
+        with backup.open("xb") as output_handle:
+            shutil.copyfileobj(input_handle, output_handle)
+    return stat.S_IMODE(metadata.st_mode)
+
+
 def apply_plan(
     home: Path,
     kit: Path,
@@ -774,30 +795,21 @@ def apply_plan(
     if any(decision.action in blocked for decision in plan.decisions):
         raise UpdateError("managed runtime update is blocked by owner changes")
     baseline_path.parent.mkdir(parents=True, exist_ok=True)
-    baseline_existed = baseline_path.is_file()
     values = render_context(home)
-    with tempfile.TemporaryDirectory(
-        prefix=".managed-runtime-transaction.",
-        dir=baseline_path.parent,
-    ) as transaction_name:
+    # The transaction is the caller's own temporary folder, not one made by name in the agent's ~/.claude/product: there
+    # the agent could put its own folder in that name, and root's copies went wherever its links pointed (security
+    # review, 26.11.2026).
+    with tempfile.TemporaryDirectory(prefix="managed-runtime-transaction.") as transaction_name:
         transaction = Path(transaction_name)
         preimages: dict[str, tuple[Path | None, int | None]] = {}
         for index, decision in enumerate(plan.decisions):
             if decision.action not in {"install", "remove"}:
                 continue
-            target = live_path(home, decision.path)
-            if target.is_file():
-                backup = transaction / f"{index}.preimage"
-                shutil.copy2(target, backup, follow_symlinks=False)
-                preimages[decision.path] = (
-                    backup,
-                    stat.S_IMODE(target.stat().st_mode),
-                )
-            else:
-                preimages[decision.path] = (None, None)
+            backup = transaction / f"{index}.preimage"
+            mode = copy_preimage(live_path(home, decision.path), backup)
+            preimages[decision.path] = (None, None) if mode is None else (backup, mode)
         baseline_backup = transaction / "baseline.preimage"
-        if baseline_existed:
-            shutil.copy2(baseline_path, baseline_backup, follow_symlinks=False)
+        baseline_existed = copy_preimage(baseline_path, baseline_backup) is not None
         written = []
         accepting_baseline = False
         try:
