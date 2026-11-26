@@ -1,8 +1,8 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-11-26.8a504d1725d6`
+- Реліз: `2026-11-26.3f89d33aef1b`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `8a504d1725d6e5a307c7bc25b0babb6d57178979`
+- Ревізія вихідного комплекту: `3f89d33aef1b077a5b0f15ce8584e5caa1045151`
 - Дата релізу: `2026-11-26`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
@@ -19,7 +19,10 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    Company sessions: the Instagram and Meta files are readable again; only the bot token's copy stays closed
+    Module installers: three notes of the review before the merge
+    Tests: the agent's steps are pinned to runuser
+    Module installers: the token copy gets its mode by name
+    Module installers: root reaches the agent's home only through agent-home.py or as the agent
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не
