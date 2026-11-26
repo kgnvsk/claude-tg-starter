@@ -207,10 +207,12 @@ def write_baseline(
             json.dump(normalized, handle, ensure_ascii=False, indent=2, sort_keys=True)
             handle.write("\n")
             handle.flush()
+            # By the open file, not by its name: the temporary name is in the agent's folder and could be
+            # swapped for a link.
+            os.fchmod(handle.fileno(), 0o600)
+            if uid is not None and gid is not None:
+                os.fchown(handle.fileno(), uid, gid)
             os.fsync(handle.fileno())
-        os.chmod(temporary, 0o600)
-        if uid is not None and gid is not None:
-            os.chown(temporary, uid, gid)
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
@@ -719,10 +721,12 @@ def atomic_install(
         with source.open("rb") as input_handle, os.fdopen(descriptor, "wb") as output_handle:
             shutil.copyfileobj(input_handle, output_handle)
             output_handle.flush()
+            # By the open file, not by its name: the temporary name is in the agent's folder and could be
+            # swapped for a link.
+            os.fchmod(output_handle.fileno(), mode)
+            if uid is not None and gid is not None:
+                os.fchown(output_handle.fileno(), uid, gid)
             os.fsync(output_handle.fileno())
-        os.chmod(temporary, mode)
-        if uid is not None and gid is not None:
-            os.chown(temporary, uid, gid)
         os.replace(temporary, target)
     finally:
         temporary.unlink(missing_ok=True)
@@ -745,10 +749,12 @@ def atomic_install_bytes(
         with os.fdopen(descriptor, "wb") as output_handle:
             output_handle.write(payload)
             output_handle.flush()
+            # By the open file, not by its name: the temporary name is in the agent's folder and could be
+            # swapped for a link.
+            os.fchmod(output_handle.fileno(), mode)
+            if uid is not None and gid is not None:
+                os.fchown(output_handle.fileno(), uid, gid)
             os.fsync(output_handle.fileno())
-        os.chmod(temporary, mode)
-        if uid is not None and gid is not None:
-            os.chown(temporary, uid, gid)
         os.replace(temporary, target)
     finally:
         temporary.unlink(missing_ok=True)

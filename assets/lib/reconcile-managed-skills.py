@@ -219,8 +219,10 @@ def write_policy(path: Path, policy: dict[str, object]) -> None:
             )
             handle.write("\n")
             handle.flush()
+            # By the open file, not by its name: the temporary name is in the agent's folder and could be
+            # swapped for a link.
+            os.fchmod(handle.fileno(), 0o600)
             os.fsync(handle.fileno())
-        os.chmod(temporary, 0o600)
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)

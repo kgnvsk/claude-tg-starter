@@ -1242,14 +1242,18 @@ fi
 # END admin reconciliation
 
 MANAGED_RENDERED_FILES=("$H/CLAUDE.md" "$MANAGED_CLAUDE" "$MANAGED_PRODUCT" "$ACCESS_FILE")
+managed_bin=()
 while IFS= read -r -d '' source; do
   destination="$H/bin/$(basename "$source")"
   MANAGED_RENDERED_FILES+=("$destination")
+  managed_bin+=("$destination")
   if grep -q '{{[A-Z_]*}}' "$source"; then
     render_template "$destination" "$destination"
   fi
-  chmod 755 "$destination"
 done < <(find "$KIT/assets/bin" -maxdepth 1 -type f -print0)
+# By the file itself, not by its name: chmod would follow a link the agent swapped in (security review, 26.11.2026).
+# One call for all of them (the renderer keeps a file's mode, so nothing waits on this between two files).
+"${AGENT_HOME_WRITE[@]}" own 755 "${managed_bin[@]}"
 initialize_limit_recovery_state
 # Managed skills are already rendered and checked by their applicator. Owner
 # text retained there must not pass through the template renderer again.
@@ -1420,17 +1424,19 @@ case "$OWNER_TECHNICAL_ALERTS" in on|off) ;; *) OWNER_TECHNICAL_ALERTS= ;; esac
 if [ "$OWNER_TECHNICAL_ALERTS" = off ] && [ -z "${ALERT_COPY_CHAT_IDS:-}" ]; then
   echo "WARN: OWNER_TECHNICAL_ALERTS=off без ALERT_COPY_CHAT_IDS — технічні сповіщення лишатимуться тільки в журналі" >&2
 fi
-# Written whole beside the profile and put in its place at once: a helper that runs meanwhile reads the old profile
-# or the new one, never an empty one (an empty one names no copies and no setting, and the owner would get the alert).
-profile_new="$(mktemp "$PROFILE_FILE.XXXXXX")"
+# Written whole and put in the profile's place at once: a helper that runs meanwhile reads the old profile or the new
+# one, never an empty one (an empty one names no copies and no setting, and the owner would get the alert). Written in
+# root's own temporary file, not beside the profile: the home is the agent's, and a name made there could be swapped
+# for a link between two of these appends (security review, 26.11.2026).
+profile_new="$(mktemp)"
 for name in AGENT_NAME AGENT_GENDER OWNER_NAME OWNER_TG_USERNAME OWNER_CHAT_ID ADDITIONAL_ADMIN_CHAT_IDS ALERT_COPY_CHAT_IDS \
   OWNER_EMAIL BOT_USERNAME TIMEZONE CALENDAR_EMAIL VAULT_LOCALE OWNER_NOTICE_LOCALE \
   TG_DROP_PENDING_ON_BOOT TG_CORPORATE_SESSIONS OWNER_PROGRESS_NOTICES OWNER_TECHNICAL_ALERTS SECURITY_NOTICE_CHAT \
   READ_CONTEXT_BEFORE_ANSWER $PRINCIPAL_SETTINGS; do
   write_shell_value "$profile_new" "$name"
 done
-"${AGENT_HOME_WRITE[@]}" own 600 "$profile_new"
-mv -fT -- "$profile_new" "$PROFILE_FILE"
+"${AGENT_HOME_WRITE[@]}" copy 600 "$profile_new" "$PROFILE_FILE"
+rm -f -- "$profile_new"
 umask "${secrets_umask:-022}"
 if [ "$AGENT_USER" = claude ]; then
   rm -f /home/claude/.cash-agent.env

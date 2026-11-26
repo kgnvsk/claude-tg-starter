@@ -19,4 +19,5 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 python3 "$SCRIPT_DIR/reconcile-managed-skills.py" agents \
   "$AGENTS_DIR" "$KIT/assets/agents" "$BASELINE" --active-roles "$ACTIVE_ROLES"
 [ ! -d "$AGENTS_DIR" ] || chown -R "$AGENT_USER:$AGENT_USER" "$AGENTS_DIR"
-[ ! -f "$BASELINE" ] || chown "$AGENT_USER:$AGENT_USER" "$BASELINE"
+# -h: a link swapped into the baseline's name is chowned itself, not its target (security review, 26.11.2026).
+[ ! -f "$BASELINE" ] || chown -h "$AGENT_USER:$AGENT_USER" "$BASELINE"

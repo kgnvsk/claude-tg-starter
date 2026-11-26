@@ -7,7 +7,7 @@
     "local-foundation-v1"
   ],
   "source": "codex/starter/product.json",
-  "sourceRevision": "3f89d33aef1b077a5b0f15ce8584e5caa1045151",
+  "sourceRevision": "c2432bb1a8dbbc2aacf8a586d7565436240ee106",
   "sourceDirty": false,
   "features": [
     "browser"
@@ -50,7 +50,7 @@
     "codex/setup.py": "d950735dde0ed1cdd9a96edd5e52b2573ce4691c938c47b4b56a39176af39e8b",
     "native/local_claude.py": "ebdba3706e15a1f1843e66150493a3f51a6866a6c92390b491ec0ecdb06a9ce6",
     "assets/lib/agent-license.py": "cdd70579e18386b64fb6b238ed818330815cadf0c3e55e820a7a6740a8b01d84",
-    "assets/lib/reconcile-managed-skills.py": "26dc92eaac854038b3cd893377b375b625594cc261349a794374092a9daa64e8",
+    "assets/lib/reconcile-managed-skills.py": "d2a3bfab2b330ddaf11705922e77ff0ee7ba0542dc61f0cc5e0bb8a60de80268",
     "assets/skills/research/SKILL.md": "9f6607fcb2029d90d5b40d98918c2d3aa2da2058edec5907b647e784b02d569e",
     "assets/skills/backup-recovery/SKILL.md": "2e1d461525589346f2745bce9c0f8cc6706fe64009362a55a80f6930c745ae36",
     "assets/skills/backup-recovery/github-copy.md": "369093bbf2106f3e9ae6fabcca7c59146d55b5e308bfcd5192abffbda75e4366",
