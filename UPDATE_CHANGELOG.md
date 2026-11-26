@@ -1,8 +1,8 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-11-26.ae8682a3a573`
+- Реліз: `2026-11-26.5129352c989a`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `ae8682a3a57313da13be1eaec6a3a180b07c11d8`
+- Ревізія вихідного комплекту: `5129352c989a3e2767bf8175b1585b9711e369f3`
 - Дата релізу: `2026-11-26`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
@@ -19,7 +19,11 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    Remove a stray folder a local test run left in the tree
+    Smoke comment: the folders are handed over in step 2, before the first applicator that reads the records
+    Second review: the folders change owner only after the first managed write
+    Role script: Novsky's four-argument call stays, and as root it drops to the agent
+    Tests: the installer slices run the adoption call through a no-op helper
+    Managed files: the update's applicators run as the agent, not as root
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не

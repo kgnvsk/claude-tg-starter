@@ -872,7 +872,8 @@ for runtime in bun claude; do
 done
 
 echo "[2/7] керовані ресурси; дані власника зберігаються"
-python3 "$KIT/assets/bin/update-safety-check" apply \
+runuser -u "$AGENT_USER" -- env HOME="$H" \
+  python3 "$KIT/assets/bin/update-safety-check" apply \
   --home "$H" \
   --kit "$KIT" \
   --policy "$KIT/assets/product/managed-runtime.json" \
@@ -888,7 +889,15 @@ if product_has_feature browser; then
   fi
 fi
 # END browser helper install
-python3 "$KIT/assets/lib/reconcile-managed-runtime.py" \
+# The applicators of managed files, the one above too, run with the agent's own rights: where root went by a name in
+# the agent's folders, a name swapped for a link sent root's write, mode or ownership elsewhere (security review,
+# 26.11.2026). What an interrupted run or an operator left in their folders as root would be unreadable or unreplaceable
+# to them, so root hands those folders over first, each step opened from its parent and no link followed. Only here,
+# once the first managed files are written: before that a failed update is rolled back by Novsky, whose rollback takes
+# an owner changed in these folders for a change it cannot explain and leaves the bot stopped.
+"${AGENT_HOME_WRITE[@]}" adopt "$H/.claude/product" "$H/.claude/skills" "$H/.claude/skills.disabled" "$H/.claude/agents"
+runuser -u "$AGENT_USER" -- env HOME="$H" \
+  python3 "$KIT/assets/lib/reconcile-managed-runtime.py" \
   "$H" "$KIT/assets/product/managed-runtime.json" \
   "$H/.claude/product/managed-runtime.json"
 # Removed helpers without a verified baseline may contain owner changes.
@@ -1008,7 +1017,8 @@ chmod 644 "/etc/logrotate.d/cash-$AGENT_USER"
 # BEGIN managed skill installation
 # Render the candidate before comparing it to the installed checksum. Copying
 # or rendering again below would bypass owner-edit preservation.
-env AGENT_NAME="$AGENT_NAME" OWNER_NAME="$OWNER_NAME" \
+runuser -u "$AGENT_USER" -- env HOME="$H" \
+  AGENT_NAME="$AGENT_NAME" OWNER_NAME="$OWNER_NAME" \
   OWNER_TG_USERNAME="$OWNER_TG_USERNAME" OWNER_CHAT_ID="$OWNER_CHAT_ID" \
   BOT_USERNAME="$BOT_USERNAME" TIMEZONE="$TIMEZONE" \
   CALENDAR_EMAIL="$CALENDAR_EMAIL" DEPLOY_DATE="$DEPLOY_DATE" \
@@ -1030,8 +1040,8 @@ env AGENT_NAME="$AGENT_NAME" OWNER_NAME="$OWNER_NAME" \
   "$H/.claude/product/plugin-contract.json"
 # The same checksum applicator protects base and role subagents. It installs
 # selected role files directly, without copying/deleting the raw role folder.
-chown -R "$AGENT_USER:$AGENT_USER" "$H/.claude/skills" "$H/.claude/agents"
-bash "$KIT/assets/lib/activate-role-subagents.sh" "$KIT" "$H" "$AGENT_USER" "${ACTIVE_ROLES:-}"
+runuser -u "$AGENT_USER" -- env HOME="$H" \
+  bash "$KIT/assets/lib/activate-role-subagents.sh" "$KIT" "$H" "$AGENT_USER" "${ACTIVE_ROLES:-}"
 
 if product_has_feature telegram-corporate-sessions; then
   if [ ! -x "$H/.venvs/heif/bin/python" ]; then
@@ -1727,7 +1737,7 @@ if [ -d "$EXTERNAL_SKILLS" ]; then
       exit 1
     }
   done < <(python3 "$PRODUCT_CONFIG" list externalSkills)
-  chown -R "$AGENT_USER:$AGENT_USER" "$H/.claude/skills"
+  "${AGENT_HOME_WRITE[@]}" adopt "$H/.claude/skills"
 fi
 # All packaged skills were reconciled together above. The default-off list moves a
 # skill aside on its first install, and whatever the owner switched off
@@ -1746,9 +1756,7 @@ if [ -e "$SKILLS_OFF_STATE" ] && [ ! -L "$SKILLS_OFF_STATE" ]; then
   "${AGENT_HOME_WRITE[@]}" own 600 "$SKILLS_OFF_STATE"
 fi
 runuser -u "$AGENT_USER" -- python3 "$KIT/assets/lib/apply-disabled-skills.py" "$H" "$SKILLS_DEFAULT_OFF"
-if [ -d "$H/.claude/skills.disabled" ]; then
-  chown -R "$AGENT_USER:$AGENT_USER" "$H/.claude/skills.disabled"
-fi
+"${AGENT_HOME_WRITE[@]}" adopt "$H/.claude/skills.disabled"
 
 if product_has_feature media-downloads || \
    product_has_feature vercel || \
@@ -1916,7 +1924,8 @@ if [ "$STARTER_FOUNDATION_REQUIRED" = 1 ]; then
     }
   rm -f "$H/.claude/product/starter-foundation-pending"
 fi
-python3 "$KIT/assets/bin/update-safety-check" accept \
+runuser -u "$AGENT_USER" -- env HOME="$H" \
+  python3 "$KIT/assets/bin/update-safety-check" accept \
   --home "$H" \
   --kit "$KIT" \
   --policy "$KIT/assets/product/managed-runtime.json" \

@@ -18,6 +18,8 @@ Usage:
   agent-home.py <home> <user> own <mode|-> <file>...       each regular file made the agent's, with the mode (- keeps it)
   agent-home.py <home> <user> read <file>                  the file to stdout; exit 4 when it or a folder on its way is
                                                              missing
+  agent-home.py <home> <user> adopt <directory>...         each directory with the directories and regular files below it
+                                                             made the agent's, no link followed; a missing one is skipped
 """
 from __future__ import annotations
 
@@ -173,15 +175,58 @@ def own(home: int, top: str, owner: tuple[int, int] | None, mode: int | None, pa
             os.close(fd)
 
 
+def adopt_tree(fd: int, owner: tuple[int, int]) -> None:
+    """The open directory, every directory below it and every regular file in them becomes the agent's. Each is opened
+    from its parent's descriptor without following a link and given over by that descriptor, never by its name: a name
+    can be swapped between the look and the change. A regular file with another name keeps its owner (that name could
+    stand outside the home), and so does a link or any other kind: the agent owns the folder and replaces them itself."""
+    try:
+        here = os.fstat(fd)
+        if (here.st_uid, here.st_gid) != owner:
+            os.fchown(fd, *owner)
+        for name in os.listdir(fd):
+            try:
+                info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+                if stat.S_ISDIR(info.st_mode):
+                    adopt_tree(os.open(name, DIRECTORY, dir_fd=fd), owner)
+                elif stat.S_ISREG(info.st_mode) and (info.st_uid, info.st_gid) != owner:
+                    file = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOCTTY | os.O_CLOEXEC, dir_fd=fd)
+                    try:
+                        opened = os.fstat(file)
+                        if stat.S_ISREG(opened.st_mode) and opened.st_nlink == 1:
+                            os.fchown(file, *owner)
+                    finally:
+                        os.close(file)
+            except OSError as error:
+                # Removed or put in another kind's place meanwhile: what stands there now is not followed.
+                if error.errno not in (errno.ENOENT, errno.ELOOP, errno.ENOTDIR, errno.ENXIO):
+                    raise
+    finally:
+        os.close(fd)
+
+
+def adopt(home: int, top: str, owner: tuple[int, int] | None, paths: list[str]) -> None:
+    if owner is None:  # only root hands anything over
+        return
+    for path in paths:
+        names = below(top, path)
+        try:
+            fd = walk(home, names, None, create=False)
+        except (FileNotFoundError, Refused):
+            # Nothing there, or a link the agent made on the way: its files are where it put them, root does not go.
+            continue
+        adopt_tree(fd, owner)
+
+
 def main(argv: list[str]) -> int:
     action = argv[3] if len(argv) > 3 else ""
     if not ((action in ("dir", "own") and len(argv) >= 6) or (action == "copy" and len(argv) == 7)
-            or (action == "read" and len(argv) == 5)):
+            or (action == "read" and len(argv) == 5) or (action == "adopt" and len(argv) >= 5)):
         print(__doc__[__doc__.index("Usage:"):].rstrip(), file=sys.stderr)
         return 2
     top, user = argv[1], argv[2]
-    # own - keeps the file's mode; every other mode is octal.
-    mode = None if action == "read" or (action == "own" and argv[4] == "-") else int(argv[4], 8)
+    # own - keeps the file's mode; every other mode is octal; adopt takes none.
+    mode = None if action in ("read", "adopt") or (action == "own" and argv[4] == "-") else int(argv[4], 8)
     # Reading needs no account: an installer reads before it makes one.
     if os.geteuid() == 0 and action != "read":
         account = pwd.getpwnam(user)
@@ -202,6 +247,8 @@ def main(argv: list[str]) -> int:
                 make_dirs(home, top, user, owner, mode, argv[5:])
             elif action == "copy":
                 copy(home, top, user, owner, mode, argv[5], argv[6])
+            elif action == "adopt":
+                adopt(home, top, owner, argv[4:])
             else:
                 own(home, top, owner, mode, argv[5:])
         finally:
