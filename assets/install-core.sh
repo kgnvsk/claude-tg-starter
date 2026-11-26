@@ -1822,9 +1822,11 @@ if product_has_feature telegram-corporate-sessions && [ "$MODULE_TELEGRAM_CORPOR
     bash "$KIT/modules/telegram-corporate/install.sh"
   # Parallel sessions are as capable as the owner's: same skills, same
   # subagents, rendered copies. A trimmed worker package stops the install.
+  # The agent opens its own log: a redirect opened by this root shell would write through a link planted there.
+  # It drops the old report first: an install that stopped midway left it as root's file, which the agent cannot open.
   runuser -u "$AGENT_USER" -- env HOME="$H" \
     PATH="$H/.local/bin:$H/.bun/bin:/usr/local/bin:/usr/bin:/bin" \
-    "$H/bin/corporate-control" parity --json >"$H/logs/corporate-parity.json" || {
+    sh -c 'rm -f "$HOME/logs/corporate-parity.json" && "$HOME/bin/corporate-control" parity --json >"$HOME/logs/corporate-parity.json"' || {
     echo "FATAL: паралельні сесії не рівні головній — корпоративний воркер бачить не ті скіли чи субагентів, що агент (див. $H/logs/corporate-parity.json)" >&2
     exit 1
   }

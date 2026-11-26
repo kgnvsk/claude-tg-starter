@@ -1,9 +1,9 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-11-25.8242338933b1`
+- Реліз: `2026-11-26.d57514cfaf27`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `8242338933b146a73a0e19acb4930a03eaa07674`
-- Дата релізу: `2026-11-25`
+- Ревізія вихідного комплекту: `d57514cfaf272781ad9eaa41f4534db307169010`
+- Дата релізу: `2026-11-26`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
 
@@ -19,9 +19,10 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    Review of PR 552: a first Slack check left unanswered keeps the access just stored, in company mode too
-    reply names delivery_id once; personal Slack calls an access dead only when Slack says so
-    Release check: every run passes the shipped skill catalog through install-core's skill-doctor
+    install-core: the comment on the parity report names no chown
+    install-core: the agent replaces a parity report it cannot write
+    Company sessions: the bot token's copy and the Instagram and Meta module secrets are closed like the originals
+    install-core: the agent opens its own parity log, root no longer writes through a link there
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не
