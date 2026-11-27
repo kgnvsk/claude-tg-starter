@@ -1,9 +1,9 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-11-26.5129352c989a`
+- Реліз: `2026-11-27.6b9a7c47f4a4`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `5129352c989a3e2767bf8175b1585b9711e369f3`
-- Дата релізу: `2026-11-26`
+- Ревізія вихідного комплекту: `6b9a7c47f4a410dc519dd7d02b025d896505229a`
+- Дата релізу: `2026-11-27`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
 
@@ -19,11 +19,9 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    Smoke comment: the folders are handed over in step 2, before the first applicator that reads the records
-    Second review: the folders change owner only after the first managed write
-    Role script: Novsky's four-argument call stays, and as root it drops to the agent
-    Tests: the installer slices run the adoption call through a no-op helper
-    Managed files: the update's applicators run as the agent, not as root
+    Second review of PR 562: «revoked at Slack» only on Slack's own word that a token is gone
+    Review of PR 562: disconnect spends the refresh token, status names an ended access, a blip is not Slack's answer
+    Personal Slack: Slack's rotating access is accepted and renewed; a failed setup names Slack's answer
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не
