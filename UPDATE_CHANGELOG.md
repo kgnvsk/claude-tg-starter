@@ -1,8 +1,8 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-11-27.6b9a7c47f4a4`
+- Реліз: `2026-11-27.7b8701e05ae6`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `6b9a7c47f4a410dc519dd7d02b025d896505229a`
+- Ревізія вихідного комплекту: `7b8701e05ae6ea98d9592b63cf4f210e1d79499d`
 - Дата релізу: `2026-11-27`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
@@ -19,9 +19,7 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    Second review of PR 562: «revoked at Slack» only on Slack's own word that a token is gone
-    Review of PR 562: disconnect spends the refresh token, status names an ended access, a blip is not Slack's answer
-    Personal Slack: Slack's rotating access is accepted and renewed; a failed setup names Slack's answer
+    A function the agent lacks is not an access request, and no hand-off is claimed that no tool made
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не
