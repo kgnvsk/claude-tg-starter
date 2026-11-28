@@ -1,9 +1,9 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-11-27.7b8701e05ae6`
+- Реліз: `2026-11-28.34ed25373ecd`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `7b8701e05ae6ea98d9592b63cf4f210e1d79499d`
-- Дата релізу: `2026-11-27`
+- Ревізія вихідного комплекту: `34ed25373ecd78183767742b0806f87df63879f9`
+- Дата релізу: `2026-11-28`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
 
@@ -19,7 +19,13 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    A function the agent lacks is not an access request, and no hand-off is claimed that no tool made
+    A person's own Telegram: the points of the third review
+    A person's own Telegram: the «not the code» receipt carries no example code
+    A person's own Telegram: while a login is live, the chat belongs to it
+    A person's own Telegram: the findings of the independent review
+    A person's own Telegram: what the live check showed
+    A person's own Telegram: the helper becomes a file of the company module, and the points of its first review
+    Company mode: a person's own Telegram account, connected by that person and sent from only on their confirmation
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не
