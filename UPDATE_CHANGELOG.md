@@ -1,8 +1,8 @@
 # Оновлення Novsky Starter
 
-- Реліз: `2026-11-28.34ed25373ecd`
+- Реліз: `2026-11-28.1119cc114771`
 - Продукт: `starter` — Novsky Starter
-- Ревізія вихідного комплекту: `34ed25373ecd78183767742b0806f87df63879f9`
+- Ревізія вихідного комплекту: `1119cc114771a9005916749eb83a54c2aa18d6dd`
 - Дата релізу: `2026-11-28`
 - Режим оновлення: `reconcile-existing`; пакет дозволено застосовувати лише до
   того самого `productId`.
@@ -19,13 +19,12 @@
 не перелік можливостей цього продукту. Заголовки можуть стосуватися інших
 продуктів; точний склад цього пакета наведено нижче.
 
-    A person's own Telegram: the points of the third review
-    A person's own Telegram: the «not the code» receipt carries no example code
-    A person's own Telegram: while a login is live, the chat belongs to it
-    A person's own Telegram: the findings of the independent review
-    A person's own Telegram: what the live check showed
-    A person's own Telegram: the helper becomes a file of the company module, and the points of its first review
-    Company mode: a person's own Telegram account, connected by that person and sent from only on their confirmation
+    A person's own Telegram: a rerun's two stops are each once
+    A person's own Telegram: the tool's new pins, and the rerun test reads a refusal as text
+    A person's own Telegram: the points of the second review
+    A person's own Telegram: the points of the rework's review
+    A person's own Telegram: forwards alone are not their word, a token never goes
+    A person's own Telegram sends by the owner's rules, with no confirmation step
 
 Перелік складено з комітів комплекту між попереднім релізом і цим. Ревізію для
 `git` беріть із поля «Ревізія вихідного комплекту» вище: мітка релізу — це не
